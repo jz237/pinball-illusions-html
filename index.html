@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Pinball Illusions</title>
+    <meta
+      name="description"
+      content="Clean-room browser reconstruction of the Amiga AGA release of Pinball Illusions."
+    />
+    <link rel="stylesheet" href="./src/browser/styles.css" />
+  </head>
+  <body>
+    <main class="cabinet">
+      <!--
+        The playfield window is 336 x 256 source pixels, magnified by a whole
+        number only. The backing store is resized to that magnification in
+        main.ts and the element is left at its natural size, so one source pixel
+        is always an exact square block of device pixels.
+      -->
+      <canvas id="playfield" width="336" height="256" aria-label="Pinball playfield"></canvas>
+
+      <p id="boot" class="boot">Loading Law 'n Justice…</p>
+
+      <ul class="controls">
+        <li><kbd>Z</kbd> <span>left flipper</span></li>
+        <li><kbd>/</kbd> <span>right flipper</span></li>
+        <li><kbd>Space</kbd> <span>hold to wind the plunger, release to launch</span></li>
+        <li><kbd>&larr;</kbd> <kbd>&rarr;</kbd> <kbd>&uarr;</kbd> <span>nudge — five and it tilts</span></li>
+        <li><kbd>Enter</kbd> <span>start a new game</span></li>
+        <li><kbd>P</kbd> <span>pause</span></li>
+        <li><kbd>F9</kbd> <span>whole-table view</span></li>
+      </ul>
+    </main>
+
+    <script type="module" src="./src/main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,16 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.vite/
+test-results/
+
+# Preservation media must never enter this repository.
+*.ipf
+*.adf
+*.dsk
+*.rom
+*.lha
+*.mod
+*.exe
+private/
+extracted/

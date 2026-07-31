@@ -1,0 +1,119 @@
+/*
+ * Presentation.
+ *
+ * The whole job here is to stay out of the way of a 336 x 256 picture. The
+ * surround is near-black so nothing on the page competes with the playfield for
+ * contrast — a bright page next to a dark table makes the table look muddy —
+ * and every rule that touches the canvas exists to stop a browser from
+ * resampling it. Integer magnification is done in JavaScript by resizing the
+ * backing store; CSS must therefore NOT scale the element, or the two scalings
+ * would compose into a fractional one and the rails would wobble.
+ */
+
+:root {
+  color-scheme: dark;
+  --surround: #05070c;
+  --bezel: #10151f;
+  --edge: #232c3d;
+  --ink: #8ea3bd;
+  --ink-dim: #55647a;
+  --key: #1b2331;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: radial-gradient(ellipse at 50% 0%, #0d1320 0%, var(--surround) 70%);
+  color: var(--ink);
+  font: 13px/1.5 ui-monospace, "DejaVu Sans Mono", "Cascadia Mono", monospace;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* A cabinet does not scroll. If the window is too small the picture drops to
+     the next whole magnification rather than the page growing a scrollbar. */
+  overflow: hidden;
+}
+
+.cabinet {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  padding: 16px;
+}
+
+#playfield {
+  display: block;
+  background: #000;
+  border: 2px solid var(--edge);
+  border-radius: 3px;
+  box-shadow:
+    0 0 0 6px var(--bezel),
+    0 18px 48px rgb(0 0 0 / 70%);
+
+  /* Nearest-neighbour on every engine that has ever had a name for it. The
+     canvas context also sets imageSmoothingEnabled = false on every blit;
+     both are needed, because the context flag governs drawImage and this
+     governs the browser's final composite of the element itself. */
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+
+  /* Space and the arrow keys are game controls. Without this a stray gesture
+     scrolls or selects instead of flipping. */
+  touch-action: none;
+  user-select: none;
+}
+
+.boot {
+  margin: 0;
+  color: var(--ink-dim);
+}
+
+.boot[hidden] {
+  display: none;
+}
+
+.controls {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 6px 18px;
+  max-width: 640px;
+  color: var(--ink-dim);
+}
+
+.controls li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+kbd {
+  font: inherit;
+  background: var(--key);
+  border: 1px solid var(--edge);
+  border-bottom-width: 2px;
+  border-radius: 3px;
+  padding: 1px 6px;
+  color: var(--ink);
+}
+
+/* Short windows: the control list is reference material, not gameplay, so it is
+   what gives way when there is no room for both. */
+@media (max-height: 560px) {
+  .controls {
+    display: none;
+  }
+}
