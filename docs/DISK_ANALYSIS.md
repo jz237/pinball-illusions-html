@@ -159,10 +159,27 @@ repeat segment_count:
 u8    payloads[]      concatenated, in descriptor order
 ```
 
-Payloads are normally Imploder streams beginning `ATN!`, whose own header repeats
-the decompressed size. `type_flags & 0xFFFF` is the content class — **0 for
-relocatable 68000 code, 2 for data**. Bit 16 (`0x00010000`) marks a segment stored
-raw with no `ATN!` header; `main.bin` segment 9 is the only observed instance.
+Payloads are Imploder streams beginning `ATN!`, whose own header repeats the
+decompressed size. `type_flags & 0xFFFF` is the content class — **0 for
+relocatable 68000 code, 2 for data**.
+
+**Bit 16 (`0x00010000`) is BSS**: allocate `decompressed_size` bytes at load
+time; **no payload is stored in the package** and the splitter must consume zero
+input bytes for such a descriptor. This mirrors Amiga hunk BSS, which fits,
+since slot index equals hunk number.
+
+This was first mis-read as "segment stored raw", and the mistake is worth
+keeping on record because of how it failed: the splitter copied `declared` bytes
+out of the file for `main.bin`'s descriptor 9, which sliced payload belonging to
+descriptors 10 and 11 into a bogus `.raw` file and silently never extracted the
+real final two segments. The correction was proven by accounting, not
+plausibility: `main.bin` declares 12 segments but contains 11 `ATN!` streams,
+and the stream after descriptor 8's declares 228 bytes — descriptor 10's size,
+not descriptor 9's 11,664. Decisively, `menudata.bin` declares two
+`0x00010002` segments of **81,920 bytes each — 320×256, a screen buffer — in a
+36,000-byte file**, which could not possibly be stored. With BSS handled, every
+package's payloads consume its file exactly, including `intro.bin` (BSS
+allocations of 512 and 249,600 bytes).
 
 `flipdat1.bin` is the exception: no `TSL!` magic, no compression — a flat raw file.
 
