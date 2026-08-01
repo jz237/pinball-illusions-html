@@ -27,7 +27,7 @@
 // giving back. Write-offs are reported per site, because a site is a place on
 // the table and that is what gets fixed.
 //
-// Usage:  npx vite-node scripts/aggressive-census.mts [-- <tableId> ...]
+// Usage:  npx vite-node scripts/aggressive-census.mts [-- [--ticks=N] <tableId> ...]
 
 import { readFileSync } from "node:fs";
 import { createGame, debugSnapshot, runTicks, startGame } from "../src/browser/game-loop.js";
@@ -61,8 +61,15 @@ import type {
  *
  * A stall reported here therefore means what it says again: the playfield
  * stopped giving the ball back.
+ *
+ * OVERRIDABLE with `--ticks=N`, and that is not a convenience either. A
+ * write-off RATE is only comparable against another rate measured over the same
+ * budget: a longer game visits more of the table and ends more balls, so the
+ * same absolute number of strands reads as a smaller fraction. Two figures from
+ * different budgets are two different measurements, and the census now says
+ * which budget produced the one it printed.
  */
-const CENSUS_TICKS = 40_000;
+const DEFAULT_CENSUS_TICKS = 40_000;
 const BALLS_PER_GAME = 3;
 /** Plunge holds swept, inclusive. 90 games a table. */
 const FIRST_PULL = 8;
@@ -126,6 +133,8 @@ class ScriptedInput implements InputSource {
 
 export interface CensusResult {
   readonly tableId: TableId;
+  /** Ticks each game was given. A rate is only comparable at an equal budget. */
+  readonly censusTicks: number;
   readonly games: number;
   readonly completed: number;
   readonly drained: number;
@@ -134,7 +143,10 @@ export interface CensusResult {
   readonly stalls: readonly string[];
 }
 
-export function aggressiveCensus(tableId: TableId): CensusResult {
+export function aggressiveCensus(
+  tableId: TableId,
+  censusTicks: number = DEFAULT_CENSUS_TICKS,
+): CensusResult {
   let drained = 0;
   let writtenOff = 0;
   let completed = 0;
@@ -161,7 +173,7 @@ export function aggressiveCensus(tableId: TableId): CensusResult {
     });
 
     let last = new Map<number, { x: number; y: number; level: number }>();
-    for (let tick = 0; tick < CENSUS_TICKS; tick += 1) {
+    for (let tick = 0; tick < censusTicks; tick += 1) {
       const report = runTicks(game, input, 1)[0];
       for (const id of report?.drained ?? []) {
         const seen = last.get(id);
@@ -204,6 +216,7 @@ export function aggressiveCensus(tableId: TableId): CensusResult {
 
   return {
     tableId,
+    censusTicks,
     games,
     completed,
     drained,
@@ -215,24 +228,31 @@ export function aggressiveCensus(tableId: TableId): CensusResult {
 
 function main(argv: readonly string[]): number {
   const wanted = argv.filter((arg) => !arg.startsWith("-"));
+  const ticksArg = argv.find((arg) => arg.startsWith("--ticks="));
+  const censusTicks = ticksArg === undefined ? DEFAULT_CENSUS_TICKS : Number(ticksArg.slice(8));
+  if (!Number.isInteger(censusTicks) || censusTicks < 1) {
+    console.error(`--ticks must be a positive whole number, got ${ticksArg}`);
+    return 1;
+  }
   const tables = wanted.length > 0 ? (wanted as TableId[]) : [...TABLE_IDS];
   let worst = 0;
+  console.log(`tick budget ${censusTicks.toLocaleString()} per game`);
   for (const tableId of tables) {
-    const result = aggressiveCensus(tableId);
+    const result = aggressiveCensus(tableId, censusTicks);
     const ends = result.drained + result.writtenOff;
     const rate = ends === 0 ? 0 : result.writtenOff / ends;
     worst = Math.max(worst, rate);
     console.log(
       `${tableId.padStart(15)}  completed ${result.completed}/${result.games}  ` +
         `ends ${ends}  drained ${result.drained}  written off ${result.writtenOff} ` +
-        `(${(rate * 100).toFixed(1)}%)`,
+        `(${(rate * 100).toFixed(1)}%)  @${result.censusTicks} ticks`,
     );
     for (const [site, count] of result.sites.slice(0, 8)) {
       console.log(`${" ".repeat(17)}${site} x${count}  (${((count / ends) * 100).toFixed(1)}% of ends)`);
     }
     for (const stall of result.stalls) console.log(`${" ".repeat(17)}STALL ${stall}`);
   }
-  console.log(`worst write-off rate ${(worst * 100).toFixed(1)}%`);
+  console.log(`worst write-off rate ${(worst * 100).toFixed(1)}% at ${censusTicks} ticks per game`);
   return 0;
 }
 
