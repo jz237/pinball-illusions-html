@@ -397,12 +397,16 @@ const BEHAVIOURS: readonly MaterialBehaviour[] = [
  * worth naming them: rubber was 845 where nothing in the game exceeds 612;
  * the slingshot was modelled as LESS bouncy than a wall when it is in fact the
  * bounciest surface on the table, twice a wall; and the kicks were 420 and 560
- * against a real 2625 and 4125 Q10 per tick. `friction` is the one field here
+ * against a real 14000 and 22000 Q10 per tick. `friction` is the one field here
  * that is still this port's own — see `WALL_FRICTION` for why there is no
  * per-surface friction number in the original to import.
  *
- * The kicks are in Q10 per tick through the acceleration bridge the ramp drive
- * is already calibrated to, and the arithmetic is in `surface-physics.ts`.
+ * THE ELASTICITIES DID NOT MOVE WHEN THE TIMEBASE WAS CORRECTED AND COULD NOT
+ * HAVE. They are the original's `$36` word times four, and `$36` is a pure ratio
+ * — 153/256, 89/256 — so it crosses between the two velocity scales exactly.
+ * The KICKS are velocities and moved by the full 4x of the corrected bridge:
+ * 2625 -> 14000 and 4125 -> 22000. See `surface-physics.ts` for the bridge and
+ * `timebase.ts` for why it is four.
  */
 export const DEVICE_PRESETS: Readonly<Record<string, Omit<MaterialBehaviour, "index">>> = {
   rubber: {
@@ -418,7 +422,7 @@ export const DEVICE_PRESETS: Readonly<Record<string, Omit<MaterialBehaviour, "in
     passable: false,
     elasticity: 612,
     friction: WALL_FRICTION,
-    kick: 2625,
+    kick: 14000,
     confidence: "measured",
   },
   bumper: {
@@ -426,7 +430,7 @@ export const DEVICE_PRESETS: Readonly<Record<string, Omit<MaterialBehaviour, "in
     passable: false,
     elasticity: 356,
     friction: WALL_FRICTION,
-    kick: 4125,
+    kick: 22000,
     confidence: "measured",
   },
 };

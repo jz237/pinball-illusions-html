@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+
+import { SIMULATION_GRAVITY } from "../src/game/timebase.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
@@ -17,6 +19,22 @@ import { ANGLE_UNITS_PER_TURN, BALL_RADIUS_PIXELS, angleDelta } from "../src/gam
 import { Q10_ONE, pixelsToQ10, q10Multiply, q10ToPixel } from "../src/core/fixed-point.js";
 import type { Q10 } from "../src/core/fixed-point.js";
 import type { FlipperConfig, FlipperState, FlipperSweep } from "../src/game/flippers.js";
+
+/**
+ * A bat parked at a stroke with no angular velocity.
+ *
+ * The stroke is state in two parts now — see `FlipperState` — because the
+ * measured bat accelerates and carries its rate across a reversal. Every literal
+ * in this file that used to be `{ stroke }` is a bat that has been PLACED there
+ * rather than one that has arrived, so its rate is zero.
+ */
+function batAt(stroke: number): FlipperState {
+  return { stroke, rate: 0 };
+}
+
+/** Whole ticks a full up-stroke and a full return take. 3.5 and 6.25 measured. */
+const UP_STROKE_TICKS = Math.ceil(FLIPPER_UP_TICKS);
+const DOWN_STROKE_TICKS = Math.ceil(FLIPPER_DOWN_TICKS);
 import {
   FLIPPER_AT_REST,
   FLIPPER_BOSS_RADIUS_PIXELS,
@@ -31,6 +49,7 @@ import {
   FLIPPER_PLACEMENT_NOTE,
   FLIPPER_REST_ANGLE_UNITS,
   FLIPPER_SURFACE,
+  FLIPPER_STEPS_PER_TICK,
   FLIPPER_SWEEP_UNITS,
   FLIPPER_TAPER_START_PIXELS,
   FLIPPER_TIP_RADIUS_PIXELS,
@@ -38,6 +57,10 @@ import {
   LOWER_FLIPPER_PIVOT_COLUMNS,
   LOWER_FLIPPER_PIVOT_ROW,
   QUARTER_TURN_UNITS,
+  BAT_ANGLE_UNITS_PER_TURN,
+  FLIPPER_UP_MAX_RATE,
+  MEASURED_FLIPPER_PIVOTS,
+  batAngleToBearing,
   batRadiusAt,
   cosineUnits,
   createFlipperBank,
@@ -61,7 +84,7 @@ import {
 const BALL_RADIUS: Q10 = pixelsToQ10(BALL_RADIUS_PIXELS);
 
 /** The gravity the rest of the simulation is calibrated against. */
-const GRAVITY = 24;
+const GRAVITY = SIMULATION_GRAVITY;
 
 const LEFT = flipperConfigsFor("law-n-justice")[0] as FlipperConfig;
 const RIGHT = flipperConfigsFor("law-n-justice")[1] as FlipperConfig;
@@ -95,6 +118,15 @@ function ballRestingOn(
     x: (config.pivotX + q10Multiply(along, axisX) + q10Multiply(standoff, faceX)) | 0,
     y: (config.pivotY + q10Multiply(along, axisY) + q10Multiply(standoff, faceY)) | 0,
   };
+}
+
+/** How far along the bat's axis a ball centre projects, from the pivot. Q10. */
+function axisOffset(config: FlipperConfig, state: FlipperState, ball: BallState): number {
+  const angle = flipperAngle(config, state);
+  return (
+    q10Multiply(ball.x - config.pivotX, cosineUnits(angle)) +
+    q10Multiply(ball.y - config.pivotY, sineUnits(angle))
+  );
 }
 
 /** Signed distance of a ball centre from the bat's axis, along the striking face. */
@@ -297,8 +329,8 @@ describe("the stroke", () => {
 
   it("comes home in exactly the advertised number of ticks, and slower", () => {
     expect(FLIPPER_DOWN_TICKS).toBeGreaterThan(FLIPPER_UP_TICKS);
-    let state: FlipperState = { stroke: FLIPPER_SWEEP_UNITS };
-    for (let tick = 0; tick < FLIPPER_DOWN_TICKS - 1; tick += 1) {
+    let state: FlipperState = batAt(FLIPPER_SWEEP_UNITS);
+    for (let tick = 0; tick < DOWN_STROKE_TICKS - 1; tick += 1) {
       state = tickFlipper(LEFT, state, false).to;
       expect(state.stroke).toBeGreaterThan(0);
     }
@@ -325,22 +357,54 @@ describe("the stroke", () => {
   it("keeps the bearing inside the arc between rest and fully flipped", () => {
     for (const config of [LEFT, RIGHT]) {
       for (let stroke = 0; stroke <= config.sweep; stroke += 1) {
-        const angle = flipperAngle(config, { stroke });
+        const angle = flipperAngle(config, batAt(stroke));
         expect(angle).toBeGreaterThanOrEqual(0);
         expect(angle).toBeLessThan(ANGLE_UNITS_PER_TURN);
         // Measured from rest, the turn is `direction * stroke` and never more.
         // `| 0` only to collapse the -0 that `-1 * 0` produces on the left bat.
-        expect(angleDelta(config.restAngle, angle)).toBe((config.direction * stroke) | 0);
+        expect(angleDelta(config.restAngle, angle)).toBe(
+          (config.direction * batAngleToBearing(stroke)) | 0,
+        );
       }
     }
   });
 
   it("reports the turn it made this tick, signed by the direction it turns", () => {
+    // The first tick of a stroke is the coil winding up, not the coil at full
+    // rate: four steps of 0, 20, 40, 60 leave the bat 120 bat units along.
+    const firstTick = 120;
     const up = tickFlipper(LEFT, FLIPPER_AT_REST, true);
-    expect(sweptAngle(up)).toBe(-LEFT.upRate);
+    expect(up.to.stroke).toBe(firstTick);
+    expect(sweptAngle(up)).toBe(-batAngleToBearing(firstTick));
     const rightUp = tickFlipper(RIGHT, FLIPPER_AT_REST, true);
-    expect(sweptAngle(rightUp)).toBe(RIGHT.upRate);
+    expect(sweptAngle(rightUp)).toBe(batAngleToBearing(firstTick));
     expect(sweptAngle(tickFlipper(LEFT, FLIPPER_AT_REST, false))).toBe(0);
+  });
+
+  it("accelerates: the bat covers more ground on every tick of the stroke", () => {
+    let state = FLIPPER_AT_REST;
+    let previous = 0;
+    for (let tick = 0; tick < UP_STROKE_TICKS - 1; tick += 1) {
+      const sweep = tickFlipper(LEFT, state, true);
+      const moved = sweep.to.stroke - state.stroke;
+      expect(moved).toBeGreaterThan(previous);
+      previous = moved;
+      state = sweep.to;
+    }
+    // ...and the last tick is short only because it hits the stop.
+    expect(tickFlipper(LEFT, state, true).to.stroke).toBe(FLIPPER_SWEEP_UNITS);
+  });
+
+  it("carries the bat's momentum across a release, so a stab is not a hold", () => {
+    // Two ticks of coil, then the button up: the spring has to cancel a rate of
+    // 120 units a step at 30 a step before the bat starts back, so it is still
+    // climbing on the tick after the release.
+    let state = tickFlipper(LEFT, FLIPPER_AT_REST, true).to;
+    state = tickFlipper(LEFT, state, true).to;
+    expect(state.rate).toBeGreaterThan(0);
+    const afterRelease = tickFlipper(LEFT, state, false);
+    expect(afterRelease.to.stroke).toBeGreaterThan(state.stroke);
+    expect(afterRelease.to.rate).toBeLessThan(state.rate);
   });
 
   it("returns the same state object when nothing moved, so no tick allocates", () => {
@@ -350,11 +414,11 @@ describe("the stroke", () => {
 
   it("raises the tip on both flippers, mirrored", () => {
     const rest = flipperEndpoints(LEFT, FLIPPER_AT_REST);
-    const flipped = flipperEndpoints(LEFT, { stroke: LEFT.sweep });
+    const flipped = flipperEndpoints(LEFT, batAt(LEFT.sweep));
     expect(flipped.tipY).toBeLessThan(rest.tipY);
 
     const rightRest = flipperEndpoints(RIGHT, FLIPPER_AT_REST);
-    const rightFlipped = flipperEndpoints(RIGHT, { stroke: RIGHT.sweep });
+    const rightFlipped = flipperEndpoints(RIGHT, batAt(RIGHT.sweep));
     expect(rightFlipped.tipY).toBeLessThan(rightRest.tipY);
     // Same height, mirrored horizontally about the pair's axis.
     expect(rightRest.tipY).toBe(rest.tipY);
@@ -391,7 +455,8 @@ describe("the bat's silhouette", () => {
 
   it("samples the arc finely enough that the tip cannot step over a ball", () => {
     const steps = substepsFor(LEFT, BALL_RADIUS);
-    const tipTravel = Math.abs(tangentialSpeed(LEFT.length, LEFT.upRate));
+    const fastest = batAngleToBearing(FLIPPER_UP_MAX_RATE * FLIPPER_STEPS_PER_TICK);
+    const tipTravel = Math.abs(tangentialSpeed(LEFT.length, fastest));
     expect(steps).toBeGreaterThan(1);
     // No two consecutive poses put the tip further apart than the ball is wide.
     expect(tipTravel / steps).toBeLessThan(2 * BALL_RADIUS);
@@ -420,12 +485,25 @@ describe("a flipper at rest", () => {
     const start = ballRestingOn(LEFT, FLIPPER_AT_REST, 18);
     const ball = createBall(0, start.x, start.y);
     const states = [FLIPPER_AT_REST];
+    let checked = 0;
     for (let tick = 0; tick < 60; tick += 1) {
       runTicks([ball], [LEFT], [false], 1, states);
       // A tilted bat sheds the ball off its tip, which is correct; what must
       // never happen is the ball appearing underneath it.
+      //
+      // ONCE THE BALL IS PAST THE TIP THERE IS NO "UNDERNEATH" TO BE ON. The
+      // guard is new and the reason it is needed is the timebase: at the
+      // measured gravity the ball leaves the tip in about half the ticks it used
+      // to, and this loop then went on measuring its distance from the bat's
+      // INFINITE axis while it fell freely past the end of a 45 px bat, which
+      // reads as -2514 and means nothing. The assertion is now made only where
+      // the bat exists, and the count below is what stops the guard quietly
+      // turning the whole test off.
+      if (axisOffset(LEFT, FLIPPER_AT_REST, ball) > LEFT.length + BALL_RADIUS) break;
       expect(faceOffset(LEFT, FLIPPER_AT_REST, ball)).toBeGreaterThan(-Q10_ONE);
+      checked += 1;
     }
+    expect(checked).toBeGreaterThan(10);
   });
 
   it("stops a ball dropped onto it rather than passing it through", () => {
@@ -453,7 +531,7 @@ describe("flipping", () => {
   it("launches a resting ball up the table", () => {
     const start = ballRestingOn(LEFT, FLIPPER_AT_REST, 25);
     const ball = createBall(0, start.x, start.y);
-    runTicks([ball], [LEFT], [true], FLIPPER_UP_TICKS + 2);
+    runTicks([ball], [LEFT], [true], UP_STROKE_TICKS + 2);
     // Up the screen is -y, and it has to be a real shot, not a nudge.
     expect(ball.velocityY).toBeLessThan(-2 * Q10_ONE);
     expect(ball.y).toBeLessThan(start.y);
@@ -464,8 +542,8 @@ describe("flipping", () => {
     const right = ballRestingOn(RIGHT, FLIPPER_AT_REST, 25);
     const leftBall = createBall(0, left.x, left.y);
     const rightBall = createBall(0, right.x, right.y);
-    runTicks([leftBall], [LEFT], [true], FLIPPER_UP_TICKS + 2);
-    runTicks([rightBall], [RIGHT], [true], FLIPPER_UP_TICKS + 2);
+    runTicks([leftBall], [LEFT], [true], UP_STROKE_TICKS + 2);
+    runTicks([rightBall], [RIGHT], [true], UP_STROKE_TICKS + 2);
     // Exactly mirrored, not merely similar: the sine table's quadrant symmetry
     // is integer-exact and the two configs differ only in that reflection.
     expect(rightBall.velocityY).toBe(leftBall.velocityY);
@@ -478,14 +556,14 @@ describe("flipping", () => {
     const start = ballRestingOn(LEFT, FLIPPER_AT_REST, 25);
 
     const struck = createBall(0, start.x, start.y);
-    runTicks([struck], [LEFT], [true], FLIPPER_UP_TICKS + 2);
+    runTicks([struck], [LEFT], [true], UP_STROKE_TICKS + 2);
 
     // The same ball against a bat already fully raised: it is in the way, but it
     // is not moving, so all it can do is bounce the ball's own fall back.
-    const raised: FlipperState = { stroke: LEFT.sweep };
+    const raised: FlipperState = batAt(LEFT.sweep);
     const parked = ballRestingOn(LEFT, raised, 25);
     const resting = createBall(0, parked.x, parked.y);
-    runTicks([resting], [LEFT], [true], FLIPPER_UP_TICKS + 2, [raised]);
+    runTicks([resting], [LEFT], [true], UP_STROKE_TICKS + 2, [raised]);
 
     expect(speedOf(struck)).toBeGreaterThan(4 * speedOf(resting));
   });
@@ -495,15 +573,15 @@ describe("flipping", () => {
     const atTip = ballRestingOn(LEFT, FLIPPER_AT_REST, 40);
     const bossBall = createBall(0, atBoss.x, atBoss.y);
     const tipBall = createBall(1, atTip.x, atTip.y);
-    runTicks([bossBall], [LEFT], [true], FLIPPER_UP_TICKS + 2);
-    runTicks([tipBall], [LEFT], [true], FLIPPER_UP_TICKS + 2);
+    runTicks([bossBall], [LEFT], [true], UP_STROKE_TICKS + 2);
+    runTicks([tipBall], [LEFT], [true], UP_STROKE_TICKS + 2);
     expect(speedOf(tipBall)).toBeGreaterThan(speedOf(bossBall));
   });
 
   it("does not fire a ball that the bat is moving away from", () => {
     // Bat fully up, button released: it retreats, so the ball follows it down
     // under gravity rather than being thrown.
-    const raised: FlipperState = { stroke: LEFT.sweep };
+    const raised: FlipperState = batAt(LEFT.sweep);
     const start = ballRestingOn(LEFT, raised, 25);
     const ball = createBall(0, start.x, start.y);
     runTicks([ball], [LEFT], [false], 4, [raised]);
@@ -515,7 +593,7 @@ describe("flipping", () => {
     // 2 px-thick end of the bat clean past a ball that should have been hit.
     const start = ballRestingOn(LEFT, FLIPPER_AT_REST, FLIPPER_LENGTH_PIXELS - 3);
     const ball = createBall(0, start.x, start.y);
-    const { contacts } = runTicks([ball], [LEFT], [true], FLIPPER_UP_TICKS);
+    const { contacts } = runTicks([ball], [LEFT], [true], UP_STROKE_TICKS);
     expect(contacts).toBeGreaterThan(0);
     expect(ball.velocityY).toBeLessThan(0);
   });
@@ -737,7 +815,7 @@ describe("placement", () => {
       const map = mapFor(id);
       for (const config of flipperConfigsFor(id)) {
         for (let stroke = 0; stroke <= config.sweep; stroke += 17) {
-          const state: FlipperState = { stroke };
+          const state: FlipperState = batAt(stroke);
           const angle = flipperAngle(config, state);
           const axisX = cosineUnits(angle);
           const axisY = sineUnits(angle);
@@ -765,13 +843,37 @@ describe("placement", () => {
     // one of them.
     expect(FLIPPER_PLACEMENT_NOTE).toContain("flipdat1.bin");
     expect(FLIPPER_PLACEMENT_NOTE).toContain("inferred");
-    expect(FLIPPER_PLACEMENT_NOTE).toContain("upper flipper not located");
+    expect(FLIPPER_PLACEMENT_NOTE).toContain("upper flipper located");
     // The file's own split: 85 poses, a 48-row gap, then the remaining 24.
     expect(FLIPPER_FIRST_BANK_FRAMES).toBe(85);
     expect(FLIPPER_FRAME_COUNT - FLIPPER_FIRST_BANK_FRAMES).toBe(24);
     // A flipper takes its power from the swing, never from a fake outward kick.
     expect(FLIPPER_SURFACE.kick).toBe(0);
     expect(FLIPPER_SURFACE.passable).toBe(false);
+  });
+
+  it("agrees with the pivots the table packages state, to within two pixels", () => {
+    // The inferred placement is what runs — see FLIPPER_PLACEMENT_NOTE — because
+    // it is re-derived from a shipped asset by the tests above and the table
+    // packages are not in this repository. This is the other half of that
+    // bargain: the two must never drift apart, and if they ever do, one of the
+    // two readings is wrong and it will fail here rather than in play.
+    for (const id of TABLE_IDS) {
+      const inferred = LOWER_FLIPPER_PIVOT_COLUMNS[id];
+      const measured = MEASURED_FLIPPER_PIVOTS[id];
+      const gap = {
+        id,
+        left: Math.abs(inferred.left - measured.left),
+        right: Math.abs(inferred.right - measured.right),
+        row: Math.abs(LOWER_FLIPPER_PIVOT_ROW - measured.row),
+      };
+      expect(gap.left).toBeLessThanOrEqual(2);
+      expect(gap.right).toBeLessThanOrEqual(2);
+      expect(gap.row).toBeLessThanOrEqual(2);
+      // And the right-hand pivots are exact on all three tables, which is the
+      // part of the agreement that is not luck.
+      expect({ id, right: gap.right }).toEqual({ id, right: 0 });
+    }
   });
 
   it("declares itself inferred, and says so about the missing upper flipper", () => {
@@ -797,7 +899,7 @@ describe("placement", () => {
   it("draws every pose the stroke reaches from a frame the file contains", () => {
     for (const config of [LEFT, RIGHT]) {
       for (let stroke = 0; stroke <= config.sweep; stroke += 1) {
-        expect(flipperFrameIndex(flipperAngle(config, { stroke }))).not.toBeNull();
+        expect(flipperFrameIndex(flipperAngle(config, batAt(stroke)))).not.toBeNull();
       }
     }
   });
@@ -812,7 +914,7 @@ describe("a table's bank of flippers", () => {
     let bank = createFlipperBank("law-n-justice");
     expect([...bank.states.values()].every((s) => s.stroke === 0)).toBe(true);
 
-    for (let tick = 0; tick < FLIPPER_UP_TICKS; tick += 1) {
+    for (let tick = 0; tick < UP_STROKE_TICKS; tick += 1) {
       bank = tickFlipperBank(bank, flipperInputFrom(true, false)).bank;
     }
     expect(bank.states.get("lower-left")?.stroke).toBe(FLIPPER_SWEEP_UNITS);
@@ -824,7 +926,7 @@ describe("a table's bank of flippers", () => {
     const { sweeps } = tickFlipperBank(bank, flipperInputFrom(false, true));
     expect(sweeps.map((s) => s.config.id)).toEqual(bank.configs.map((c) => c.id));
     expect(sweeps[0]?.to.stroke).toBe(0);
-    expect(sweeps[1]?.to.stroke).toBe(bank.configs[1]?.upRate);
+    expect(sweeps[1]?.to.stroke).toBe(120);
   });
 
   it("does not mutate the bank it was given", () => {
@@ -847,39 +949,61 @@ describe("a table's bank of flippers", () => {
     );
     const materials = materialTableFor("law-n-justice");
     const forces: SimulationForces = { gravityY: GRAVITY, nudgeX: 0, nudgeY: 0 };
+    /**
+     * Pixels of the ball's 24 px fall that pass before the button goes down.
+     *
+     * TEN, and it is what a player does rather than a fudge: a flipper stroke
+     * takes 3.5 ticks (measured — see FLIPPER_UP_TICKS) and a shot is made by
+     * starting it BEFORE the ball arrives so the bat is already moving when they
+     * meet. This test used to press on the tick the contact was reported, which
+     * at the port's old gravity was near enough because the ball took three
+     * times as long to fall; at the measured gravity the bat was still in its
+     * first slow step when the ball landed and the "shot" carried it 194 px.
+     * Ten pixels of lead puts the meeting in the fast half of the stroke and the
+     * same ball goes 491 px, which is the whole playfield.
+     */
+    const LEAD = 10;
 
     /**
      * Drops a ball onto the left bat and either flips or does not.
      *
-     * Left alone the ball rolls down the tilted bat and off its tip, and drains
-     * on tick 109; the budget is long enough to see that happen and long enough
-     * for a flipped ball to complete its trip up the table and come back.
+     * Left alone the ball rolls down the tilted bat and off its tip and drains.
+     * The flip is triggered by the ball ARRIVING rather than by a tick number:
+     * a fixed tick was calibrated against a gravity that was 5.3x too weak, and
+     * on the measured timebase the ball reaches the bat in a third of the time,
+     * so the bat was already at the top of its stroke and standing still when
+     * the ball landed on it. Waiting for the first contact makes the test say
+     * what it means — "a bat swung under a ball that is on it saves the ball" —
+     * at any gravity.
      */
-    function drop(flip: boolean): { drained: boolean; minY: number } {
+    function drop(flip: boolean): { drainTick: number; minY: number } {
       const start = ballRestingOn(LEFT, FLIPPER_AT_REST, 26, 24);
       const balls = createBallSet([createBall(0, start.x, start.y)]);
       let bank = createFlipperBank("law-n-justice");
-      let drained = false;
+      let drainTick = -1;
       let minY = start.y;
-      for (let tick = 0; tick < 140; tick += 1) {
-        // Flip once the ball has had time to arrive, then hold.
-        const held = flip && tick >= 12;
+      const trigger = start.y + pixelsToQ10(LEAD);
+      for (let tick = 0; tick < 400; tick += 1) {
+        const held = flip && (balls.balls[0] as BallState).y >= trigger;
         const ticked = tickFlipperBank(bank, flipperInputFrom(held, false));
         bank = ticked.bank;
         const result = stepBalls(balls, map, materials, forces);
-        if (result.drained.length > 0) drained = true;
+        if (result.drained.length > 0 && drainTick < 0) drainTick = tick;
         resolveFlipperContacts(balls.balls, ticked.sweeps);
         const ball = balls.balls[0] as BallState;
         if (ball.active && ball.y < minY) minY = ball.y;
       }
-      return { drained, minY };
+      return { drainTick, minY };
     }
 
     const ignored = drop(false);
     const saved = drop(true);
-    expect(ignored.drained).toBe(true);
-    expect(saved.drained).toBe(false);
-    // And not merely held: a full flip sends it the length of the playfield.
+    // Left alone the ball rolls off the tip and is gone inside a second.
+    expect(ignored.drainTick).toBeGreaterThan(0);
+    expect(ignored.drainTick).toBeLessThan(100);
+    // Flipped, it is still in play four times as long...
+    expect(saved.drainTick === -1 || saved.drainTick > 4 * ignored.drainTick).toBe(true);
+    // ...and not merely held: a full flip sends it the length of the playfield.
     expect(q10ToPixel(saved.minY)).toBeLessThan(q10ToPixel(ignored.minY) - 400);
   });
 
@@ -907,7 +1031,9 @@ describe("configuration validation", () => {
     expect(() => validateFlipperConfig({ ...LEFT, sweep: 0 })).toThrow(RangeError);
     expect(() => validateFlipperConfig({ ...LEFT, sweep: -8 })).toThrow(RangeError);
     expect(() => validateFlipperConfig({ ...LEFT, sweep: 12.5 })).toThrow(RangeError);
-    expect(() => validateFlipperConfig({ ...LEFT, sweep: ANGLE_UNITS_PER_TURN })).toThrow(RangeError);
+    expect(() => validateFlipperConfig({ ...LEFT, sweep: BAT_ANGLE_UNITS_PER_TURN })).toThrow(
+      RangeError,
+    );
   });
 
   it("rejects a bat that could not be drawn", () => {
@@ -921,7 +1047,9 @@ describe("configuration validation", () => {
   });
 
   it("rejects a stroke rate that would never finish", () => {
-    expect(() => validateFlipperConfig({ ...LEFT, upRate: 0 })).toThrow(RangeError);
-    expect(() => validateFlipperConfig({ ...LEFT, downRate: -1 })).toThrow(RangeError);
+    expect(() => validateFlipperConfig({ ...LEFT, upAcceleration: 0 })).toThrow(RangeError);
+    expect(() => validateFlipperConfig({ ...LEFT, upMaxRate: 0 })).toThrow(RangeError);
+    expect(() => validateFlipperConfig({ ...LEFT, downAcceleration: -1 })).toThrow(RangeError);
+    expect(() => validateFlipperConfig({ ...LEFT, downMaxRate: -1 })).toThrow(RangeError);
   });
 });

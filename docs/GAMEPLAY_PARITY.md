@@ -152,9 +152,75 @@ anywhere in the shipped data** — established by exhaustive search, not merely 
 `Exit`, `Info`. **Any option label in this reconstruction is the project's own invention
 and must be documented as such.** The semantics are facts; the words are not. **[disk]**
 
+## The timebase — SETTLED, and it was 5.33x wrong
+
+The first defect this project found by PLAYING rather than by measuring: **the ball moved
+as if it were in space.** Gravity was 24 Q10 per tick squared — inherited as a chosen
+value from the sibling Pinball Dreams reconstruction and never measured — and a ball fell
+the playfield's 600 px in 227 ticks, four and a half seconds, where a real machine crosses
+the table in about one. The whole suite was green: **every physics test asserted a
+DIRECTION or a REACHABILITY and not one asserted a RATE.** `tests/timebase.test.ts` is the
+answer to that and is the file whose absence let this ship.
+
+**The frame.** One physics tick is one PAL video frame, 50 Hz. The tick is `main.seg00`
++0x00A618 and each of its seven call sites sits in a loop ending on a raster wait
+(`cmpi.b #$54,$dff006.l / bcs`). `$50(a5)`, which every duration in the game is scaled by,
+is **not a game constant**: +0x00040E reads `ExecBase->VBlankFrequency` (the byte at
+ExecBase+0x212) into it, so it is 50 on PAL and 60 on NTSC, and its seventeen uses are all
+`mulu.w`/`divu.w` turning whole SECONDS into frames. **[disk]**
+
+**The frame's shape.** The tick is unrolled into FOUR collision passes (`jsr $b4ba` at
++0x00A64C, +0x00A696, +0x00A6E0, +0x00A728 — the first of the four had been missed here,
+and `ROLLING_SLIP_FRICTION` was computed over three) and EIGHT integration sub-steps
+(`jsr $b6e8` at +0x00A660/666, +0x00A6AA/6B0, +0x00A6F4/6FA, +0x00A73C/742). **[disk]**
+
+**The unit bridge, which is forced.** Each sub-step is `pos_Q10 += v >> 1` — the `asr.w #1`
+at +0x00B710/+0x00B712 — so eight of them travel **4v** per frame, not 8v, and the
+`asr.l #10` at +0x00B724 proves the original's position is the same Q10 pixels this port
+uses. Therefore **one original velocity unit is 4 Q10 per tick and one unit of per-sub-step
+acceleration is 32 Q10 per tick squared.** Independently confirmed by the engine's own
+velocity clamp of ±4095 (+0x00B4D6, +0x00B692): 4095>>1 is 2047 Q10, one unit under two
+pixels, i.e. the clamp is chosen so a ball cannot move 2 px between collision passes.
+**[disk]**
+
+**Gravity is 128.** Option record 2 (`$E86(a5)`, min 2, max 8, **default 4**) added to the
+ball's Y acceleration once per sub-step at +0x00B758, with no multiply, no shift and no
+per-table factor anywhere on the path — `$E86` has exactly two readers in the whole 53 KB
+segment. 4 × 32 = 128 Q10 per tick squared; a 600 px fall takes 98 ticks, 1.96 s. The
+slider's range is 64…256, so **the port's 24 was 2.7x below the weakest setting the
+original ships.** **[disk]**
+
+**What the correction moved, and by how much.** Every decoded velocity by 4x and every
+decoded acceleration by 32x — the ramp drive vectors (1…15 units are now 32…480 Q10/tick²),
+the pop bumper (5500 → 22,000), the slingshot (3500 → 14,000 plus ±400 → ±1600 along the
+face), the nudge (600 → 2400, and 600 is measured at +0x00BC3E/+0x00BCA6/+0x00BCE6). What
+did **not** move: every restitution, because the original's `$36` word is a pure ratio;
+every duration, because they are frames; `WALL_FRICTION`, because it is a coefficient. What
+moved by **sqrt** rather than by the factor: the plunger, because a fixed climb makes launch
+speed go as √g — 2.309x, not 5.33x, and it was re-swept in the real loop rather than scaled
+(6 px/tick → 14). **[disk]/[inferred]**
+
+**The flipper stroke, which was listed as unfindable and is not.** The bat's animation is
+the tail of `$BC24`, entered at +0x00BD46, and `$BC24` is called **once per collision pass —
+four times a frame**. The bat is not driven at a constant rate: it carries an angular
+VELOCITY under constant acceleration to a cap, and the per-table flipper records at
+`$2346(a5)` (four records of 0x1FA bytes, reached from the surface-id jump table entries for
+ids 1…4) give every number, identical on all three tables and mirrored between the bats:
+**sweep 18 poses = 54°, coil 20 units/step capped at 120, spring 30 capped at 50.** That is
+a full stroke in **3.5 ticks** and a return in 6.25, and a tip speed of 17.7 px/tick where
+this port's chosen constant-rate stroke gave 9.4. The same records also carry the **pivots**
+— (86,556)/(199,556), (112,556)/(227,556), (113,556)/(227,556) — within two pixels of the
+ones this project had inferred from the map's free-centre spans, and a **third record on
+Law 'n Justice at (37,302) sweeping 11 poses, which is the upper-left flipper this document
+has been carrying as [open]**. Neither the disk pivots nor the third bat are wired in: both
+change how a table plays and want their own change with their own census. **[disk]**
+
 ## Physical layout
 
-- Three flippers per table. **[src]**
+- Three flippers per table. **[src]** — and Law 'n Justice's third is now located on the
+  disk: record 0 of its flipper array, pivot (37,302), an 11-pose (33°) sweep with the same
+  coil and spring rates as the lower pair. BabeWatch and Extreme Sports carry two records
+  only. Recorded in `flippers.ts` as `LAW_N_JUSTICE_UPPER_FLIPPER` and not wired in. **[disk]**
 - Bumpers, ball traps, ramps, multi-level playfields. **[src]**
 - Vertically scrolling playfield in normal play; full-screen hi-res during multiball. **[src]**
 - Nudge with a tilt penalty for overuse. **[src]**
@@ -304,7 +370,16 @@ and must be documented as such.** The semantics are facts; the words are not. **
   survival through the staircase bend above `y = 400` (in at 6664 Q10, out at 2492). With
   friction corrected all three tables complete the shot on six. A full pull still
   finishes the shot and a two-thirds pull still does not, so pull length still aims.
-  **[inferred]**
+  **SUPERSEDED BY THE TIMEBASE, AND IT IS THE CLEANEST ILLUSTRATION OF WHY:** every
+  number in the paragraph above was swept honestly in the real loop, and all of it was
+  swept against a gravity of 24 that had never been measured. At the true 128 a six-pixel
+  plunge reaches `y = 403` of a 510 px climb and no table completes at any pull. Re-swept,
+  the ceiling is **fourteen** pixels a tick and the shot first completes at 29 / 17 / 27 of
+  32. Note the factor: √(16/3) = 2.309, because a fixed climb makes launch speed go as
+  √g — this is the one constant in the audit that did *not* move by the 5.33x everything
+  decoded off the disk moved by. The two-thirds line is gone: BabeWatch now completes from
+  53%, because its lane is the only one the ramp map does not drive and its channel hands
+  over to the upper line at `y = 384` rather than climbing to the top. **[inferred]**
 - **Contact friction is a Coulomb impulse, not a percentage.** `reflectVelocity` used to
   scale the ball's ENTIRE tangential velocity by `1 - friction` every time it ran, and
   its guard against doing that off-impact never fired, because `stepBalls` adds gravity

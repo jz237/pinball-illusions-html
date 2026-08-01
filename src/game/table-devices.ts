@@ -80,7 +80,18 @@ export interface DeviceRecord {
   readonly repeatScore: number;
   /** True when the record carries the per-player flag byte the repeat path needs. */
   readonly repeatable: boolean;
-  /** Kicker only: the velocity written straight over the ball's. */
+  /**
+   * Kicker only: the velocity written straight over the ball's, in the
+   * ORIGINAL'S velocity units as they sit on the disk.
+   *
+   * Left raw, and nothing reads it yet: the device layer that would apply it is
+   * not built. Whoever builds it must put it through `originalVelocityToQ10` in
+   * `timebase.ts` — the original's `movem.w $6(a0),d0-d1 / movem.w d0-d1,$e(a4)`
+   * at +0x00B6C0 writes the record's words straight into the ball's velocity
+   * words, so the conversion is the plain 4x one with no caveat. The only
+   * non-zero pair across the three shipped tables is BabeWatch's surface 64,
+   * (0, -3000), which is 12,000 Q10 a tick upward and a 549 px ejection.
+   */
   readonly velocityX: number;
   readonly velocityY: number;
 }

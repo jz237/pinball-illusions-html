@@ -57,7 +57,7 @@ import {
 } from "../src/game/ball-locks.js";
 import type { BallLock } from "../src/game/ball-locks.js";
 import { createBallSet, freeBallCount, spawnBall, stepBalls } from "../src/game/ball-physics.js";
-import { PLUNGER_REFERENCE_GRAVITY } from "../src/game/plunger.js";
+import { SIMULATION_GRAVITY } from "../src/game/timebase.js";
 import { freeCentre, levelViewsOf } from "../src/game/level-scan.js";
 
 function idleInput(): InputSource {
@@ -367,7 +367,7 @@ describe("a lock in a running game", () => {
 
     for (let tick = 0; tick < 200; tick += 1) {
       stepBalls(set, map, materials, {
-        gravityY: PLUNGER_REFERENCE_GRAVITY,
+        gravityY: SIMULATION_GRAVITY,
         nudgeX: 0,
         nudgeY: 0,
       });
@@ -388,7 +388,7 @@ describe("a lock in a running game", () => {
     const rolling = spawnBall(set, pixelsToQ10(168), pixelsToQ10(599), 0, 4000, 0);
 
     const step = stepBalls(set, map, materials, {
-      gravityY: PLUNGER_REFERENCE_GRAVITY,
+      gravityY: SIMULATION_GRAVITY,
       nudgeX: 0,
       nudgeY: 0,
     });
@@ -533,13 +533,22 @@ describe("the zero-deadlock guarantee, restated for locks", () => {
 
       // The machine owes a replacement and pays it.
       expect(debugSnapshot(game).pendingServes, `${tableId} replacement queued`).toBe(1);
-      runTicks(game, idleInput(), 400);
+
+      // Watched every tick rather than sampled at the end, and the difference is
+      // the timebase. A replacement the MACHINE owes is auto-launched — the
+      // player is not asked to wind a spring for a ball they did not lose — and
+      // at the measured gravity that ball can complete its whole trip and drain
+      // inside the four hundred ticks this waits, leaving the table empty again
+      // with a fresh serve pending. That is the machine working, and the sample
+      // at the end read it as the machine never having paid at all.
+      let everFree = 0;
+      for (let tick = 0; tick < 400; tick += 1) {
+        runTicks(game, idleInput(), 1);
+        everFree = Math.max(everFree, freeBallCount(game.balls));
+      }
       const state = debugSnapshot(game);
       expect(state.phase, `${tableId} phase`).toBe("in-play");
-      expect(
-        freeBallCount(game.balls),
-        `${tableId} never got its replacement ball`,
-      ).toBeGreaterThan(0);
+      expect(everFree, `${tableId} never got its replacement ball`).toBeGreaterThan(0);
     });
 
     it(`${tableId} ends the ball when the last one drains with a saucer still full`, () => {

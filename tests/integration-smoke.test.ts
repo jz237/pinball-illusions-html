@@ -31,6 +31,8 @@
  */
 
 import { describe, expect, it } from "vitest";
+
+import { SIMULATION_GRAVITY } from "../src/game/timebase.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
@@ -59,7 +61,7 @@ const MAP: TableMap = parseTableMapDocument(DOCUMENT);
 const MATERIALS = materialTableFor("law-n-justice");
 
 /** Downward acceleration per tick. A chosen value, matching the unit tests. */
-const GRAVITY: SimulationForces = { gravityY: 24, nudgeX: 0, nudgeY: 0 };
+const GRAVITY: SimulationForces = { gravityY: SIMULATION_GRAVITY, nudgeX: 0, nudgeY: 0 };
 
 const TICKS = 400;
 
@@ -208,7 +210,7 @@ describe("balls dropped on the real playfield", () => {
       // Alternating hard nudges: the cheapest way to drive balls into the walls
       // from every direction without hand-picking trajectories.
       const forces: SimulationForces = {
-        gravityY: 24,
+        gravityY: SIMULATION_GRAVITY,
         nudgeX: tick % 5 === 0 ? (tick % 10 === 0 ? 1800 : -1800) : 0,
         nudgeY: tick % 7 === 0 ? -1200 : 0,
       };
@@ -241,5 +243,11 @@ describe("balls dropped on the real playfield", () => {
       }
       runTicks(set, 120, GRAVITY, `stack at (${sx},${sy})`);
     }
-  });
+    // The budget is 30 s rather than the default 5 because the work grew with
+    // the timebase and not with the test: `integrateBall` probes the path a
+    // pixel at a time, and at the measured gravity a falling ball covers 16 px
+    // in a tick where it used to cover 3, so the same 140 stacks of six balls
+    // cost about five times as many probes. Nothing about what is asserted
+    // changed.
+  }, 30_000);
 });

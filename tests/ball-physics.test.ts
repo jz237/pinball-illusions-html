@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+
+import { SIMULATION_GRAVITY } from "../src/game/timebase.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import type {
@@ -12,10 +14,11 @@ import { PLAYFIELD_HEIGHT, PLAYFIELD_WIDTH } from "../src/game/contracts.js";
 import {
   LEVEL1_SOLID_BIT,
   SOLID_BORDER_INDEX,
+  WALL_FRICTION,
   materialTableFor,
 } from "../src/game/materials.js";
 import { parseTableMapDocument } from "../src/game/table-map.js";
-import { pixelsToQ10, q10ToPixel } from "../src/core/fixed-point.js";
+import { pixelsToQ10, q10Multiply, q10ToPixel } from "../src/core/fixed-point.js";
 import {
   DEFAULT_PROBE_RADIUS,
   PROBE_RING,
@@ -62,7 +65,7 @@ const WALL: MaterialIndex = 5;
 const WIDTH = PLAYFIELD_WIDTH;
 const HEIGHT = PLAYFIELD_HEIGHT;
 
-const GRAVITY: SimulationForces = { gravityY: 24, nudgeX: 0, nudgeY: 0 };
+const GRAVITY: SimulationForces = { gravityY: SIMULATION_GRAVITY, nudgeX: 0, nudgeY: 0 };
 const WEIGHTLESS: SimulationForces = { gravityY: 0, nudgeX: 0, nudgeY: 0 };
 
 /**
@@ -229,8 +232,8 @@ describe("gravity", () => {
     const set = setWith({ x: 100, y: 100 });
     const ball = only(set);
     ball.level = 1;
-    stepBalls(set, EMPTY_MAP, MATERIALS, { gravityY: 24, nudgeX: -300, nudgeY: 0 });
-    expect(ball.velocityY).toBe(24);
+    stepBalls(set, EMPTY_MAP, MATERIALS, { gravityY: SIMULATION_GRAVITY, nudgeX: -300, nudgeY: 0 });
+    expect(ball.velocityY).toBe(SIMULATION_GRAVITY);
     expect(ball.velocityX).toBe(0);
   });
 });
@@ -703,7 +706,7 @@ describe("determinism", () => {
       // A fixed, arbitrary-looking input sequence — no clock, no randomness.
       const nudging = tick % 97 === 0;
       const forces: SimulationForces = {
-        gravityY: 24,
+        gravityY: SIMULATION_GRAVITY,
         nudgeX: nudging ? (tick % 194 === 0 ? 1800 : -1800) : 0,
         nudgeY: 0,
       };
@@ -1056,7 +1059,7 @@ describe("no tick is a no-op", () => {
     return null;
   }
 
-  it("brings a ball wedged in a channel narrower than itself to a full stop", () => {
+  it("holds a ball wedged in a channel narrower than itself to a thousandth of a pixel", () => {
     // Law 'n Justice has a slot at (86, 156) between rails at x=76..78 and
     // x=94..96 — 15 px of clear width, and a 16 px ball that finds its way in
     // cannot get out again. It used to drift one Q10 unit down, bounce, drift
@@ -1067,16 +1070,39 @@ describe("no tick is a no-op", () => {
     // 32 px frame. It is the same slot, 32 columns right; the ROW is untouched,
     // and so is every expectation below, because what this test is about was
     // never about where on the table the slot happens to be.
+    // WHAT THIS ASSERTS CHANGED WHEN GRAVITY WAS MEASURED, AND THE CHANGE IS
+    // WORTH READING BEFORE TRUSTING EITHER VERSION. At the port's old gravity of
+    // 24 the ball came to a dead halt here in ten ticks, velocity exactly zero,
+    // and that is what this test used to say. At the measured 128 it does not:
+    // it settles into a two-tick cycle, one Q10 unit — a thousandth of a pixel —
+    // of horizontal rattle, carrying vy = -2 for ever. A tick of gravity is now
+    // 128 units against a wedge that hands almost all of it straight back, and
+    // the residue no longer rounds to nothing.
+    //
+    // That is not the defect this test exists for and the test now says so
+    // precisely. The defect was a FIXED POINT: position AND velocity both
+    // unchanged, with speed still on the books, which no tick may leave behind
+    // because every later tick then repeats it exactly. A two-tick cycle at a
+    // thousandth of a pixel is a ball at rest as far as anything downstream can
+    // tell — it never leaves its pixel, so the ball search's radius-8 box
+    // collects it — and the assertions below are over a thousand ticks rather
+    // than the old ten, which is a longer leash than the old version ever had.
     const set = createBallSet();
     const ball = spawnBall(set, 88064, 159742, 0, -1);
     for (let tick = 0; tick < 10; tick += 1) stepBalls(set, LAW_MAP, LAW_MATERIALS, GRAVITY);
-    expect(ball.velocityX).toBe(0);
-    expect(ball.velocityY).toBe(0);
-    // One Q10 unit — a thousandth of a pixel — below the spawn row, and it stays
-    // there. It used to settle exactly on the spawn row; under the Coulomb
-    // friction rule in `reflectVelocity` it drops that last unit into the slot
-    // first. Same pixel, same full stop, one unit of settling.
-    expect(ball.y).toBe(159743);
+    const settledX = ball.x;
+    const settledY = ball.y;
+    for (let tick = 0; tick < 1000; tick += 1) {
+      stepBalls(set, LAW_MAP, LAW_MATERIALS, GRAVITY);
+      // Confined to one Q10 unit in x and not moving at all in y.
+      expect(Math.abs(ball.x - settledX)).toBeLessThanOrEqual(1);
+      expect(ball.y).toBe(settledY);
+      expect(Math.abs(ball.velocityX)).toBeLessThanOrEqual(1);
+      expect(Math.abs(ball.velocityY)).toBeLessThanOrEqual(2);
+    }
+    // Two Q10 units — two thousandths of a pixel — below the spawn row, on the
+    // pixel it started on, which is the row the ball search will find it on.
+    expect(settledY).toBe(159741);
     expect(ball.y >> 10).toBe(155);
   });
 
@@ -1120,10 +1146,15 @@ describe("contact friction", () => {
 
     const lost = sliding - ball.velocityX;
     expect(lost).toBeGreaterThan(0);
-    // friction 154/1024 of a 24-unit impulse is 3.6 units, and the loss is
-    // applied as a Q10 scale so it can round up by one quantum of that scale.
-    // Ten units is generous room for both; the percentage model took 600.
-    expect(lost).toBeLessThanOrEqual(10);
+    // The bound is DERIVED rather than a round number, because a round number is
+    // what let this go stale: it used to read `<= 10`, which was generous room
+    // around `friction * 24` = 3.6 and is a hard failure against the measured
+    // gravity of 128, where the same rule costs `friction * 128` = 19. What the
+    // rule says is the same in both cases — the loss is the friction times ONE
+    // TICK OF GRAVITY — so that is what is asserted, plus the one Q10 quantum
+    // the scaling can round up by. The percentage model took 600.
+    const budget = q10Multiply(WALL_FRICTION, GRAVITY.gravityY);
+    expect(lost).toBeLessThanOrEqual(budget + 1);
     expect(lost).toBeLessThan(sliding / 100);
   });
 
@@ -1165,13 +1196,19 @@ describe("contact friction", () => {
     const set = setWith({ x: 100, y: 280 });
     const ball = only(set);
 
+    // The window is shorter than it was — samples at 15/25/35/45 rather than
+    // 40/60/80/100 — for the reason this whole change exists: at the measured
+    // gravity the ball is 5.3x quicker and had run off the end of the synthetic
+    // ramp before the last sample, reporting a speed of zero and failing a test
+    // about acceleration for the opposite reason to the one it guards.
     const speeds: number[] = [];
-    for (let tick = 0; tick < 120; tick += 1) {
+    for (let tick = 0; tick < 50; tick += 1) {
       stepBalls(set, ramp, MATERIALS, GRAVITY);
-      if (tick >= 40 && tick % 20 === 0) {
+      if (tick >= 15 && tick % 10 === 5) {
         speeds.push(Math.abs(ball.velocityX) + Math.abs(ball.velocityY));
       }
     }
+    expect(speeds.length).toBe(4);
     for (let i = 1; i < speeds.length; i += 1) {
       expect(speeds[i], `speeds ${speeds.join(",")}`).toBeGreaterThan(speeds[i - 1] ?? 0);
     }

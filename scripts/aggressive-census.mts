@@ -183,9 +183,14 @@ export function aggressiveCensus(
     let last = new Map<number, { x: number; y: number; level: number }>();
     for (let tick = 0; tick < censusTicks; tick += 1) {
       const report = runTicks(game, input, 1)[0];
+      const retired = new Set(report?.writtenOff ?? []);
       for (const id of report?.drained ?? []) {
         const seen = last.get(id);
-        if ((seen?.y ?? -1) >= 590) drained += 1;
+        // Asked, not inferred from the ball's last row: at the measured gravity
+        // a ball crossing the drain line is last sampled at y=586..589, and the
+        // old `y >= 590` test counted twelve ordinary drains a table as
+        // strandings. See GameTickReport.writtenOff.
+        if (!retired.has(id)) drained += 1;
         else {
           writtenOff += 1;
           const key = `(${seen?.x},${seen?.y})L${seen?.level}`;

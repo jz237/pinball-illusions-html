@@ -24,7 +24,6 @@ import {
   PLUNGER_CHARGE_TICKS,
   PLUNGER_FULL_CHARGE,
   PLUNGER_IDLE,
-  PLUNGER_REFERENCE_GRAVITY,
   SERVE_INSET_PIXELS,
   SHOOTER_LANE_BY_TABLE,
   chargeLevel,
@@ -40,6 +39,7 @@ import {
   tickPlunger,
   validatePlungerConfig,
 } from "../src/game/plunger.js";
+import { SIMULATION_GRAVITY, VELOCITY_CLAMP_Q10 } from "../src/game/timebase.js";
 import type { PlungerConfig, PlungerInput, PlungerOutcome } from "../src/game/plunger.js";
 
 const CONFIG = DEFAULT_PLUNGER_CONFIG;
@@ -144,9 +144,19 @@ describe("the shooter lane", () => {
     //     keeps a little more speed through the bend above y=400 that `plunger.ts`
     //     already identifies as the expensive part of that shot.
     //
-    // Re-swept through the real loop on the shipped maps, the shot first
-    // completes at hold 29 / 21 / 23 of 32 — launches of 5664 / 4384 / 5440 Q10,
-    // which is 90.6% / 65.6% / 71.9% of the pull.
+    // AND IT BROKE AGAIN WHEN GRAVITY WAS MEASURED, which is exactly what it is
+    // for. Every number in it was swept honestly in the real loop against a
+    // gravity of 24 that had never been measured at all; at the true 128 a full
+    // plunge of six pixels a tick reaches y=403 of a 510 px climb and no table
+    // completes its shot at any pull. The ceiling is re-swept, not rescaled —
+    // and it could not have been rescaled, because a fixed climb makes launch
+    // speed go as sqrt(g), 2.309x, not as the 5.33x every decoded velocity moved
+    // by. See MAX_LAUNCH_SPEED.
+    //
+    // Re-swept through the real loop on the shipped maps at gravity 128 and a
+    // ceiling of 14 px/tick, the shot first completes at hold 29 / 17 / 27 of 32
+    // — launches of 13,184 / 8,576 / 12,416 Q10, which is 90.6% / 53.1% / 84.4%
+    // of the pull, all three ranges contiguous to 32.
     //
     // THE TWO-THIRDS LINE IS GONE AND WHAT REPLACES IT IS STRICTLY STRONGER. The
     // old check was "a two-thirds pull must not complete", one-sided and against a
@@ -160,15 +170,15 @@ describe("the shooter lane", () => {
     // was standing in for: that an under-plunge always gives the ball back, at
     // every starting pull on every table.
     const SHOT_REQUIRES: Readonly<Record<string, number>> = {
-      "law-n-justice": 5664,
-      babewatch: 4384,
-      "extreme-sports": 5440,
+      "law-n-justice": 13184,
+      babewatch: 8576,
+      "extreme-sports": 12416,
     };
     /** The plunge hold, of 32, at which each table's shot first completes. */
     const THRESHOLD_HOLD: Readonly<Record<string, number>> = {
       "law-n-justice": 29,
-      babewatch: 21,
-      "extreme-sports": 23,
+      babewatch: 17,
+      "extreme-sports": 27,
     };
     for (const tableId of ["law-n-justice", "babewatch", "extreme-sports"] as const) {
       const config = plungerConfigFor(tableId);
@@ -184,20 +194,28 @@ describe("the shooter lane", () => {
       // ...and one tick less does not. Bracketed, so the number cannot drift in
       // either direction without this failing.
       expect(launchSpeedFor(chargeAfter(hold - 1), config)).toBeLessThan(requires);
-      // And the shot needs MOST of the pull, or pull length stops meaning
-      // anything: 21 of 32 is the weakest of the three and only the top third of
-      // the travel completes on any table.
-      expect(hold).toBeGreaterThanOrEqual(21);
-      // Still under two substeps of the anti-tunnelling limit, so nothing clips.
-      expect(config.maxLaunchSpeed).toBeLessThan(pixelsToQ10(16));
+      // And the shot needs most of the pull on the two tables whose lanes the
+      // ramp map drives, which is where pull length does its aiming: 29 and 27
+      // of 32. BabeWatch is the exception and it is a geometric one rather than
+      // a slack one — its lane is the only one the drive map does not touch and
+      // its `topY` is 384 rather than 34, because BabeWatch's lower line loses
+      // the channel half way up and the upper line carries the rest. A shorter
+      // climb needs a slower ball. See MAX_LAUNCH_SPEED.
+      expect(hold).toBeGreaterThanOrEqual(tableId === "babewatch" ? 17 : 27);
+      // Inside the engine's own measured velocity clamp, so a full plunge is
+      // never silently truncated. (This used to say `< pixelsToQ10(16)`, which
+      // was a guard against the signed-16-bit limit; the real bound is the
+      // +-4095 the original clamps to, which is 16,380 and slightly tighter.)
+      expect(config.maxLaunchSpeed).toBeLessThan(VELOCITY_CLAMP_Q10);
       expect(config.maxLaunchSpeed).toBe(FULL_PLUNGE_SPEED_BY_TABLE[tableId]);
       validatePlungerConfig(config);
     }
-    // Six on the undriven lanes, seven on the one whose arch shot has to clear a
-    // flat-topped bumper. Both are measured; see FULL_PLUNGE_SPEED_BY_TABLE.
+    // One ceiling serves all three again: on the corrected timebase every table
+    // completes contiguously from it, so there is nothing for a per-table value
+    // to buy. See FULL_PLUNGE_SPEED_BY_TABLE for the two and three it has been.
     expect(FULL_PLUNGE_SPEED_BY_TABLE["law-n-justice"]).toBe(MAX_LAUNCH_SPEED);
     expect(FULL_PLUNGE_SPEED_BY_TABLE.babewatch).toBe(MAX_LAUNCH_SPEED);
-    expect(FULL_PLUNGE_SPEED_BY_TABLE["extreme-sports"]).toBe(pixelsToQ10(7));
+    expect(FULL_PLUNGE_SPEED_BY_TABLE["extreme-sports"]).toBe(MAX_LAUNCH_SPEED);
   });
 
   it("has a lane for every table", () => {
@@ -650,7 +668,7 @@ describe("launching up the real Law 'n Justice lane", () => {
   );
   const MATERIALS = materialTableFor("law-n-justice");
   const GRAVITY: SimulationForces = {
-    gravityY: PLUNGER_REFERENCE_GRAVITY,
+    gravityY: SIMULATION_GRAVITY,
     nudgeX: 0,
     nudgeY: 0,
   };
@@ -746,7 +764,7 @@ describe("the reference constants", () => {
     const travel = pixelsToQ10(
       q10ToPixel(CONFIG.serveY) - LAW_N_JUSTICE_SHOOTER_LANE.topY,
     );
-    const g = PLUNGER_REFERENCE_GRAVITY;
+    const g = SIMULATION_GRAVITY;
     const rise = (MAX_LAUNCH_SPEED * MAX_LAUNCH_SPEED) / (2 * g) - MAX_LAUNCH_SPEED / 2;
     expect(rise).toBeGreaterThan(travel);
   });
@@ -755,7 +773,7 @@ describe("the reference constants", () => {
     const travel = pixelsToQ10(
       q10ToPixel(CONFIG.serveY) - LAW_N_JUSTICE_SHOOTER_LANE.topY,
     );
-    const g = PLUNGER_REFERENCE_GRAVITY;
+    const g = SIMULATION_GRAVITY;
     const rise = (MIN_LAUNCH_SPEED * MIN_LAUNCH_SPEED) / (2 * g) - MIN_LAUNCH_SPEED / 2;
     expect(rise).toBeLessThan(travel / 10);
   });

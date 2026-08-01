@@ -29,12 +29,22 @@
  *     out. A 45 px bat next to a 16 px ball is 2.8 ball diameters, which is a
  *     real machine's proportion to two significant figures.
  *
- * Everything about WHERE the bats sit is INFERRED and marked as such, because
- * the flippers are not in the playfield map and the placement tables are inside
- * `main.bin`, which is a packed TSL container (entropy 7.73) this project has
- * not unpacked. Searching the unpacked table segments for the frame row offsets,
- * frame heights and per-frame pivot offsets found nothing, so there is no
- * measured placement to be had yet. See FLIPPER_PLACEMENT_NOTE.
+ * WHERE THE BATS SIT IS NOW MEASURED TOO, and this file used to say it could not
+ * be. The placement was looked for in the wrong place: it is not in `main.bin`
+ * at all but in the TABLE packages, as four 0x1FA-byte flipper records reached
+ * through $2346(a5) from the surface-id handlers for ids 1..4 at +0x00AE80,
+ * +0x00AE86, +0x00AE90 and +0x00AE9A. Each record opens with a type byte, a
+ * handler byte, the pivot as two words, the rest pose and the flipped pose, and
+ * then the stroke rates. The pivots read (86,556) and (199,556) on Law 'n
+ * Justice, (112,556) and (227,556) on BabeWatch and (113,556) and (227,556) on
+ * Extreme Sports — within two pixels of what this project had inferred from the
+ * map's free-centre spans, which is a good independent check on both.
+ *
+ * Law 'n Justice also carries a THIRD record, at pivot (37,302), sweeping 11
+ * poses instead of 18 — the upper-left flipper this file has always said it
+ * could not locate. It is recorded in LAW_N_JUSTICE_UPPER_FLIPPER and NOT wired
+ * in: giving a table a third bat is a change to how it plays and wants its own
+ * pass with the census, not a line in a timebase audit.
  *
  * ---------------------------------------------------------------------------
  * WHY THE STROKE IS A SCALAR AND NOT AN ANGLE
@@ -57,8 +67,8 @@
  * resting on a still bat therefore gets `elasticity` and settles; the same ball
  * caught by a bat sweeping under it leaves at roughly (1 + elasticity) times the
  * bat's surface speed there. That is also why `elasticity` is deliberately low
- * (400, against 845 for rubber): a live flipper should be dead enough to trap a
- * ball on, and take its power from the swing instead.
+ * (400, against 612 for the measured rubber row): a live flipper should be dead
+ * enough to trap a ball on, and take its power from the swing instead.
  *
  * The lever arm is the real one — the vector from the pivot to the point on the
  * bat's SURFACE that the ball touches, not the axial distance — so a ball caught
@@ -68,9 +78,9 @@
  * ---------------------------------------------------------------------------
  * WHY THE TICK IS SUBDIVIDED
  * ---------------------------------------------------------------------------
- * At the up-stroke rate the tip travels 9.4 px in one tick. The bat is barely
+ * At full stroke rate the tip travels 17.7 px in one tick. The bat is barely
  * 2 px thick out there, so a ball 8 px in radius sitting near the tip is inside
- * a 9 px window that one tick's rotation can step straight over: test only the
+ * a window that one tick's rotation can step straight over: test only the
  * end-of-tick pose and the flipper passes through the ball without touching it.
  * The arc is therefore sampled at `substepsFor` intermediate poses and the FIRST
  * one that touches is the one that resolves. The sample count is derived from
@@ -101,6 +111,12 @@ import {
 } from "./collision-probe.js";
 import type { Q10 } from "../core/fixed-point.js";
 import { Q10_ONE, pixelsToQ10, q10Clamp, q10Multiply } from "../core/fixed-point.js";
+import {
+  ORIGINAL_ANGLE_UNITS_PER_POSE,
+  ORIGINAL_ANGLE_UNITS_PER_TURN,
+  ORIGINAL_FLIPPER_STEPS_PER_FRAME,
+  VELOCITY_CLAMP_Q10,
+} from "./timebase.js";
 
 // ---------------------------------------------------------------------------
 // Deterministic trigonometry
@@ -256,40 +272,99 @@ export function flipperFrameIndex(angle: number): number | null {
 // Timing and surface
 // ---------------------------------------------------------------------------
 
-/**
- * Sweep of the stroke, in angle units: 272 of 2048, or 47.8 degrees.
- *
- * A Williams-era flipper sweeps about 48 degrees, and 272 is the value in that
- * region that both `FLIPPER_UP_TICKS` and `FLIPPER_DOWN_TICKS` divide exactly,
- * so neither stroke has to round and neither accumulates a remainder.
- */
-export const FLIPPER_SWEEP_UNITS = 272;
+// ---------------------------------------------------------------------------
+// The stroke, MEASURED — this whole block used to be chosen
+// ---------------------------------------------------------------------------
+//
+// THE BAT IS NOT DRIVEN AT A CONSTANT RATE AND IT IS NOT STEPPED ONCE A TICK.
+// The animation is the tail of the routine at main.seg00 +0x00BC24, entered at
+// +0x00BD46 with no `rts` between, and $BC24 is called ONCE PER COLLISION PASS —
+// +0x00A65A, +0x00A6A4, +0x00A6EE, +0x00A736, and four times again in each of
+// the two no-ball paths at +0x00A750 and +0x00A770. So the bat advances FOUR
+// TIMES per 50 Hz frame, and what advances is an angular VELOCITY under
+// constant acceleration to a cap:
+//
+//     00BD86  movem.w $10(a0), d0-d4   ; d0 angvel, d1 angle, d2 limit,
+//                                      ; d3 up accel, d4 up max rate
+//     00BD8C  add.w   d0, d1           ; angle += angvel      <- POSITION FIRST
+//     00BD8E  bmi.b   $bd98            ; ran past rest? clamp to rest, angvel 0
+//     00BD98  cmp.w   d2, d1 / bgt     ; ran past the limit? clamp, angvel 0,
+//                                      ; and set the "fully flipped" flag $23F5
+//     00BDA8  sub.w   d3, d0           ; angvel += accel
+//     00BDAA  cmp.w   d4, d0 / bgt     ; capped at the max rate
+//     00BDB4  move.w  d1, $12(a0)      ; store the angle
+//     00BDB8  asr.w   #$6, d1
+//     00BDBA  move.w  d1, $1a(a0)      ; POSE OFFSET = angle >> 6
+//
+// The release path at +0x00BDC4 is the same shape with the record's OTHER pair,
+// and it carries the current angular velocity across the reversal rather than
+// zeroing it, so a button released mid-stroke decelerates and then falls back.
+//
+// The numbers come out of the per-table flipper records — four records of 0x1FA
+// bytes at $2346(a5), reached from the surface-id jump table at +0x00AE40 whose
+// entries for ids 1..4 are +0, +0x1FA, +0x3F4, +0x5EE — and they are IDENTICAL
+// on all three tables and mirrored between the two bats:
+//
+//   law-n-justice  lower left  pivot (86,556)  poses 10 -> 112  down(30,+50) up(20,-120)
+//                  lower right pivot (199,556) poses 50 ->  68  down(30,-50) up(20,+120)
+//   babewatch      lower left  pivot (112,556) / right (227,556), same rates
+//   extreme-sports lower left  pivot (113,556) / right (227,556), same rates
+//
+// 112 wraps to -8 against a base of 10, so both bats sweep EIGHTEEN of the 120
+// three-degree poses: 54 degrees, 1152 angle units, and the two ends of the
+// sweep are stored as the poses themselves.
+
+/** The bat's own angle scale: 64 units to a drawn pose, 7680 to a turn. */
+export const BAT_ANGLE_UNITS_PER_POSE = ORIGINAL_ANGLE_UNITS_PER_POSE;
+export const BAT_ANGLE_UNITS_PER_TURN = ORIGINAL_ANGLE_UNITS_PER_TURN;
+
+/** Times the bat's angle advances per tick. MEASURED: four, one per collision pass. */
+export const FLIPPER_STEPS_PER_TICK = ORIGINAL_FLIPPER_STEPS_PER_FRAME;
 
 /**
- * Ticks from rest to fully flipped: 4, or 80 ms at the 50 Hz PAL step.
+ * Sweep of the stroke: 18 poses, 1152 bat angle units, 54 degrees. MEASURED.
  *
- * A real flipper is quicker than that, but at 50 Hz a two-tick stroke gives the
- * moving-bat impulse only two distinct speeds to sample and the difference
- * between an early and a late flip nearly vanishes. Four ticks keeps the stroke
- * inside human reaction error while leaving the timing of the flip audible in
- * where the ball goes, which is the point of the mechanism.
+ * It was 272 of 2048 — 47.8 degrees — chosen because "a Williams-era flipper
+ * sweeps about 48 degrees" and because 4 and 8 divide it. The real bat is six
+ * degrees wider and the numbers that set it are on the disk.
  */
-export const FLIPPER_UP_TICKS = 4;
+export const FLIPPER_SWEEP_POSES = 18;
+export const FLIPPER_SWEEP_UNITS = FLIPPER_SWEEP_POSES * BAT_ANGLE_UNITS_PER_POSE;
+
+/** Bat units per step the coil adds to the angular rate, and its cap. MEASURED. */
+export const FLIPPER_UP_ACCELERATION = 20;
+export const FLIPPER_UP_MAX_RATE = 120;
+
+/** The same for the return spring, which is weaker and slower. MEASURED. */
+export const FLIPPER_DOWN_ACCELERATION = 30;
+export const FLIPPER_DOWN_MAX_RATE = 50;
 
 /**
- * Ticks from fully flipped back to rest: 8.
+ * Ticks from rest to fully flipped: 3.5, and it is now a RESULT rather than a
+ * setting.
  *
- * Longer than the up-stroke, as on a real machine, where the up-stroke is driven
- * by the coil and the return only by a spring. It also gives the player a
- * usable window to catch a ball on the way down.
+ * Replaying the measured stroke — rate 0, 20, 40, 60, 80, 100, 120, 120... with
+ * the angle advanced before the rate — the sweep of 1152 units is consumed on
+ * the 14th step, and there are four steps to a tick. The port chose FOUR ticks,
+ * which is remarkably close; what was wrong was not the duration but the SHAPE.
+ * A constant-rate bat sweeps at 68 of the port's angle units a tick throughout,
+ * where the real one peaks at 480 bat units a step * 4 = 128 port units a tick,
+ * nearly twice as fast, and does it only in the second half of the stroke. A
+ * ball caught early and a ball caught late leave at genuinely different speeds,
+ * which is the whole of what flipper timing is.
+ *
+ * At the tip, 45 px out, the peak is 17.7 px a tick — 885 px a second, against a
+ * measured velocity clamp of 800 — so a full-strength flipper shot now crosses
+ * the 600 px playfield in about half a second. At the old constant rate it was
+ * 9.4 px a tick, which after the gravity correction would have made a flipper
+ * shot WEAKER than a scoop kicker and a bumper twice as strong as a bat. That
+ * would have been the next defect, and it was found by re-deriving this rather
+ * than by playing it.
  */
-export const FLIPPER_DOWN_TICKS = 8;
+export const FLIPPER_UP_TICKS = 3.5;
 
-/** Angle units the stroke advances per tick while the button is held. */
-export const FLIPPER_UP_RATE = FLIPPER_SWEEP_UNITS / FLIPPER_UP_TICKS;
-
-/** Angle units the stroke retreats per tick once the button is released. */
-export const FLIPPER_DOWN_RATE = FLIPPER_SWEEP_UNITS / FLIPPER_DOWN_TICKS;
+/** Ticks from fully flipped back to rest: 6.25. Also a result. */
+export const FLIPPER_DOWN_TICKS = 6.25;
 
 /**
  * The bat's surface, in the same shape the map's materials use so that the one
@@ -329,7 +404,14 @@ export interface FlipperConfig {
   readonly pivotY: Q10;
   /** Bearing at rest, 2048 units, y downward. */
   readonly restAngle: number;
-  /** Angle units swept from rest to fully flipped. Always positive. */
+  /**
+   * BAT angle units swept from rest to fully flipped, always positive, on the
+   * original's 7680-per-turn scale rather than the 2048 the bearings use.
+   *
+   * The bat keeps its own scale because the measured stroke is expressed in it —
+   * 64 units to a drawn pose, an acceleration of 20 and a cap of 120 — and none
+   * of those are whole numbers of the coarser one. `flipperAngle` converts.
+   */
   readonly sweep: number;
   /** +1 when flipping increases the bearing, -1 when it decreases it. */
   readonly direction: 1 | -1;
@@ -340,8 +422,12 @@ export interface FlipperConfig {
   readonly tipRadius: Q10;
   /** Distance from the pivot at which the taper starts, Q10. */
   readonly taperStart: Q10;
-  readonly upRate: number;
-  readonly downRate: number;
+  /** Bat units per step the coil adds to the angular rate, and its cap. */
+  readonly upAcceleration: number;
+  readonly upMaxRate: number;
+  /** The same for the return spring. */
+  readonly downAcceleration: number;
+  readonly downMaxRate: number;
   readonly surface: MaterialBehaviour;
   /** Where the pivot and angles came from. */
   readonly confidence: "measured" | "inferred";
@@ -386,18 +472,28 @@ export interface FlipperConfig {
  * 34.6 px between the two tips, 2.2 ball diameters, and the whole stroke clears
  * the painted geometry at both ends.
  *
- * THE UPPER FLIPPER IS NOT PLACED. Illusions has three per table, and the
- * input layer already carries an `upperFlipper` control, but nothing in the
- * collision layer marks where the third pivot goes: the mid-playfield features
- * that look like candidates are posts with rubbers strung between them. Rather
- * than invent a coordinate, `flipperConfigsFor` returns the two that can be
- * derived and `hasUpperFlipper` reports false. Adding it later is data, not
- * code — every function here takes a list.
+ * THE INFERENCE WAS THEN CHECKED AGAINST THE DISK AND SURVIVED, WITHIN TWO
+ * PIXELS. The flipper records in the table packages (see the file header) give
+ * the pivots outright: MEASURED_FLIPPER_PIVOTS below. Every one of the six
+ * columns is within two pixels of the inferred one and three are exact, and the
+ * row is 556 against the inferred 558.
+ *
+ * The INFERRED placement is still what the simulation runs on, and that is a
+ * deliberate choice rather than an oversight. The inferred numbers are
+ * mechanically re-derived from a shipped asset by the placement tests, so they
+ * cannot rot; the disk numbers cannot be, because the table packages are not in
+ * this repository. Swapping them in also moves both bats two rows up and shifts
+ * one of them sideways, which is a change to how a table PLAYS, and belongs in a
+ * change that can run the census against it rather than in a timebase audit. The
+ * test suite asserts the two agree to within two pixels, so the day they stop
+ * agreeing is the day something is wrong with one of them.
  */
 export const FLIPPER_PLACEMENT_NOTE =
-  "Bat geometry measured from pkg/flipdat1.bin; pivots inferred from measured " +
-  "Law 'n Justice map anchors (guide tips row 556, free ball-centre span row 558); " +
-  "upper flipper not located.";
+  "Bat geometry measured from pkg/flipdat1.bin; sweep and both stroke rates " +
+  "measured from the per-table flipper records at $2346(a5) (Table00N.seg04); " +
+  "pivots inferred from measured map anchors (guide tips row 556, free " +
+  "ball-centre span row 558) and cross-checked against those records to within " +
+  "two pixels; upper flipper located on Law 'n Justice and not wired in.";
 
 /** Rest bearing of a left flipper: 152 units below horizontal, 26.7 degrees. */
 export const FLIPPER_REST_ANGLE_UNITS = 152;
@@ -419,6 +515,43 @@ export const LOWER_FLIPPER_PIVOT_COLUMNS: Readonly<
   "law-n-justice": Object.freeze({ left: 84, right: 199 }),
   babewatch: Object.freeze({ left: 112, right: 227 }),
   "extreme-sports": Object.freeze({ left: 112, right: 227 }),
+});
+
+/**
+ * What the disk says, for the cross-check: word +2 and word +4 of each table's
+ * two lower-flipper records, which are the pivot's x and y in whole pixels.
+ *
+ * Not used by the simulation. See FLIPPER_PLACEMENT_NOTE for why the inferred
+ * placement above is still the one that runs, and `tests/flippers.test.ts` for
+ * the assertion that the two never drift more than two pixels apart.
+ */
+export const MEASURED_FLIPPER_PIVOTS: Readonly<
+  Record<TableId, { readonly left: number; readonly right: number; readonly row: number }>
+> = Object.freeze({
+  "law-n-justice": Object.freeze({ left: 86, right: 199, row: 556 }),
+  babewatch: Object.freeze({ left: 112, right: 227, row: 556 }),
+  "extreme-sports": Object.freeze({ left: 113, right: 227, row: 556 }),
+});
+
+/**
+ * Law 'n Justice's UPPER-LEFT flipper, measured and deliberately not wired in.
+ *
+ * Record 0 of its flipper array: pivot (37,302), rest pose 23, flipped pose 12,
+ * so an ELEVEN pose sweep — 33 degrees, two thirds of a lower bat — with the
+ * same coil and spring rates as the lower pair. BabeWatch and Extreme Sports
+ * have no such record; their arrays carry the two lower bats only.
+ *
+ * `hasUpperFlipper` still answers false and `flipperConfigsFor` still returns
+ * two. Giving one table a third bat changes how it plays, needs its surface id
+ * (the jump table's entry 1..4 to record mapping) confirmed, and belongs in its
+ * own change with its own census run.
+ */
+export const LAW_N_JUSTICE_UPPER_FLIPPER = Object.freeze({
+  pivotXPixels: 37,
+  pivotYPixels: 302,
+  restPose: 23,
+  flippedPose: 12,
+  sweepPoses: 11,
 });
 
 function lowerFlipper(
@@ -445,9 +578,14 @@ function lowerFlipper(
     bossRadius: pixelsToQ10(FLIPPER_BOSS_RADIUS_PIXELS),
     tipRadius: pixelsToQ10(FLIPPER_TIP_RADIUS_PIXELS),
     taperStart: pixelsToQ10(FLIPPER_TAPER_START_PIXELS),
-    upRate: FLIPPER_UP_RATE,
-    downRate: FLIPPER_DOWN_RATE,
+    upAcceleration: FLIPPER_UP_ACCELERATION,
+    upMaxRate: FLIPPER_UP_MAX_RATE,
+    downAcceleration: FLIPPER_DOWN_ACCELERATION,
+    downMaxRate: FLIPPER_DOWN_MAX_RATE,
     surface: FLIPPER_SURFACE,
+    // The pivot, the sweep and both stroke rates are read off the table
+    // package now. What is still this port's own is the REST BEARING and the
+    // bat's elasticity, so the configuration as a whole is not yet "measured".
     confidence: "inferred",
   };
 }
@@ -474,14 +612,18 @@ export function validateFlipperConfig(config: FlipperConfig): FlipperConfig {
   if (!Number.isInteger(config.sweep) || config.sweep <= 0) {
     throw new RangeError(`flipper sweep must be a positive whole number: ${config.sweep}`);
   }
-  if (config.sweep >= ANGLE_UNITS_PER_TURN) {
+  if (config.sweep >= BAT_ANGLE_UNITS_PER_TURN) {
     throw new RangeError(`flipper sweep must be under one turn: ${config.sweep}`);
   }
-  if (!Number.isInteger(config.upRate) || config.upRate <= 0) {
-    throw new RangeError(`flipper upRate must be a positive whole number: ${config.upRate}`);
-  }
-  if (!Number.isInteger(config.downRate) || config.downRate <= 0) {
-    throw new RangeError(`flipper downRate must be a positive whole number: ${config.downRate}`);
+  for (const [field, value] of [
+    ["upAcceleration", config.upAcceleration],
+    ["upMaxRate", config.upMaxRate],
+    ["downAcceleration", config.downAcceleration],
+    ["downMaxRate", config.downMaxRate],
+  ] as const) {
+    if (!Number.isInteger(value) || value <= 0) {
+      throw new RangeError(`flipper ${field} must be a positive whole number: ${value}`);
+    }
   }
   if (config.length <= 0) {
     throw new RangeError(`flipper length must be positive: ${config.length}`);
@@ -503,14 +645,38 @@ export function validateFlipperConfig(config: FlipperConfig): FlipperConfig {
 // ---------------------------------------------------------------------------
 
 /**
- * Where the bat is in its stroke. 0 is fully at rest, `config.sweep` fully
- * flipped; the value cannot leave that range, so no caller has to wrap it.
+ * Where the bat is in its stroke, and how fast it is turning.
+ *
+ * `stroke` is 0 at rest and `config.sweep` fully flipped, in BAT angle units,
+ * and cannot leave that range, so no caller has to wrap it. `rate` is the
+ * angular velocity in bat units per STEP, four steps to a tick, signed with
+ * positive meaning "toward flipped".
+ *
+ * THE RATE IS REAL STATE AND NOT DERIVABLE FROM THE STROKE. The original carries
+ * the angular velocity across a reversal — release the button mid-stroke and the
+ * spring has to cancel the coil's momentum before the bat starts back — so two
+ * bats at the same angle are not in the same condition. It is the field that
+ * makes a stab of the button different from a hold, and this port had neither it
+ * nor the acceleration that needs it.
  */
 export interface FlipperState {
   readonly stroke: number;
+  readonly rate: number;
 }
 
-export const FLIPPER_AT_REST: FlipperState = Object.freeze({ stroke: 0 });
+export const FLIPPER_AT_REST: FlipperState = Object.freeze({ stroke: 0, rate: 0 });
+
+/**
+ * The bat's angle on the 2048-unit bearing scale the geometry uses.
+ *
+ * Integer division rather than rounding, so the conversion is a pure function of
+ * the integers: the full 1152-unit sweep lands on 307 of 2048, i.e. 53.96
+ * degrees against the measured 54, and the fifth of a unit that is lost is a
+ * fortieth of a pixel at the tip.
+ */
+export function batAngleToBearing(units: number): number {
+  return Math.trunc((units * ANGLE_UNITS_PER_TURN) / BAT_ANGLE_UNITS_PER_TURN);
+}
 
 /**
  * One tick of one flipper: where the bat started, where it ended, and which bat
@@ -524,48 +690,83 @@ export interface FlipperSweep {
 }
 
 /**
- * Advances one flipper by a tick.
+ * Advances one flipper by a tick: FOUR steps of the measured stroke.
  *
  * `held` is the state of the button at the end of the tick. A press and release
  * inside the same tick is not special-cased: unlike the plunger, whose whole
  * behaviour is the length of a hold, a flipper that never spent a sample point
  * down never moved the bat, and pretending otherwise would let a key that
  * bounced fire a shot.
+ *
+ * The step is the original's, in the original's order — POSITION FIRST, then the
+ * rate — so the first step of a stroke moves the bat by whatever it was already
+ * doing and not by the coil. That order is what makes the up-stroke take
+ * fourteen steps rather than thirteen, and it is the reason a bat cannot jump on
+ * the tick the button goes down.
+ *
+ * Hitting either end clamps the angle and kills the rate, exactly as +0x00BD90
+ * and +0x00BD9C do. There is no bounce off the stops.
  */
 export function tickFlipper(
   config: FlipperConfig,
   state: FlipperState,
   held: boolean,
 ): FlipperSweep {
-  const target = held ? config.sweep : 0;
-  const rate = held ? config.upRate : config.downRate;
   let stroke = state.stroke;
-  if (stroke < target) {
-    stroke = Math.min(target, stroke + rate);
-  } else if (stroke > target) {
-    stroke = Math.max(target, stroke - rate);
+  let rate = state.rate;
+  for (let step = 0; step < FLIPPER_STEPS_PER_TICK; step += 1) {
+    stroke += rate;
+    // The far stop is INCLUSIVE going up and EXCLUSIVE coming back, which reads
+    // like a typo and is not: the original's up path continues only while
+    // `angle > limit` (+0x00BD98 `cmp.w d2,d1 / bgt`) and its down path while
+    // `angle >= limit` (+0x00BDDA `cmp.w d4,d3 / bge`). That one bit of
+    // asymmetry is what lets a bat sitting on the stop start back down at all —
+    // reaching a stop also SKIPS the acceleration (`clr.w $10(a0)` then a branch
+    // past it), so a symmetric test would weld the bat to the top of its stroke.
+    const stopped = held ? stroke >= config.sweep : stroke > config.sweep;
+    if (stopped) {
+      stroke = config.sweep;
+      rate = 0;
+      continue;
+    }
+    if (stroke < 0) {
+      stroke = 0;
+      rate = 0;
+      continue;
+    }
+    rate = held
+      ? Math.min(config.upMaxRate, rate + config.upAcceleration)
+      : Math.max(-config.downMaxRate, rate - config.downAcceleration);
   }
   return {
     config,
     from: state,
-    to: stroke === state.stroke ? state : { stroke },
+    to: stroke === state.stroke && rate === state.rate ? state : { stroke, rate },
   };
 }
 
 /** The bat's bearing at a stroke, normalised into 0..2047. */
 export function flipperAngle(config: FlipperConfig, state: FlipperState): number {
-  return normalizeAngle(config.restAngle + config.direction * state.stroke);
+  return normalizeAngle(config.restAngle + config.direction * batAngleToBearing(state.stroke));
 }
 
 /**
- * Angle units the bat turned through this tick, signed.
+ * BEARING units the bat turned through this tick, signed — the 2048 scale, not
+ * the bat's own, because this is what the impulse and the pose sampling take.
+ *
+ * Computed as the difference of the two converted bearings rather than by
+ * converting the difference, so that it is exactly the arc the poses sampled
+ * between `from` and `to` and a tick can never report motion the renderer did
+ * not draw.
  *
  * `| 0` because a bat that did not move on a left flipper otherwise reports -0,
  * which compares equal to 0 under `===` but not under `Object.is`, and this
  * value ends up in replay records where the two must not be distinguishable.
  */
 export function sweptAngle(sweep: FlipperSweep): number {
-  return (sweep.config.direction * (sweep.to.stroke - sweep.from.stroke)) | 0;
+  const from = batAngleToBearing(sweep.from.stroke);
+  const to = batAngleToBearing(sweep.to.stroke);
+  return (sweep.config.direction * (to - from)) | 0;
 }
 
 /** True once the bat has reached the end of its stroke. */
@@ -686,7 +887,9 @@ function touchAt(
  * chosen, so a shorter or slower bat costs less.
  */
 export function substepsFor(config: FlipperConfig, ballRadius: Q10 = DEFAULT_PROBE_RADIUS): number {
-  const tipTravel = Math.abs(tangentialSpeed(config.length, config.upRate));
+  // The fastest a tick can turn: the coil at its cap for all four steps.
+  const fastest = batAngleToBearing(config.upMaxRate * FLIPPER_STEPS_PER_TICK);
+  const tipTravel = Math.abs(tangentialSpeed(config.length, fastest));
   return Math.max(1, Math.ceil(tipTravel / ballRadius) + 1);
 }
 
@@ -710,7 +913,11 @@ export interface FlipperContact {
   readonly struck: boolean;
 }
 
-const VELOCITY_LIMIT = 32767;
+// The original's own clamp, +-4095 of its velocity units. See `timebase.ts`.
+// It matters here in a way it never did before: the measured stroke puts the tip
+// at 17.7 px a tick and the clamp is 16, so a tip strike is the one impulse in
+// the game that the machine's own limiter actually catches.
+const VELOCITY_LIMIT = VELOCITY_CLAMP_Q10;
 
 function clampVelocity(value: number): number {
   return q10Clamp(Math.trunc(value), -VELOCITY_LIMIT, VELOCITY_LIMIT);

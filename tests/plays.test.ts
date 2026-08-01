@@ -12,9 +12,7 @@
 import { describe, expect, it } from "vitest";
 import {
   BALL_SEARCH_BOX_PIXELS,
-  BALL_SEARCH_PULSES,
   BALL_SEARCH_TICKS,
-  SERVE_DELAY_TICKS,
   createGame,
   debugSnapshot,
   runTicks,
@@ -29,7 +27,7 @@ import type { TableId } from "../src/game/contracts.js";
 import { TABLE_IDS } from "../src/game/contracts.js";
 import { materialTableFor } from "../src/game/materials.js";
 import { createBallSet, spawnBall, stepBalls } from "../src/game/ball-physics.js";
-import { PLUNGER_REFERENCE_GRAVITY } from "../src/game/plunger.js";
+import { SIMULATION_GRAVITY } from "../src/game/timebase.js";
 import { freeCentre, levelViewsOf } from "../src/game/level-scan.js";
 import type { LevelViews } from "../src/game/level-scan.js";
 
@@ -131,10 +129,20 @@ describe("the plunger", () => {
     runTicks(game, input, 110);
 
     const atLaunch = liveBalls(game)[0]?.pixelY ?? 0;
-    runTicks(game, input, 200);
-    const highest = Math.min(
-      ...runTicks(game, input, 100).map(() => liveBalls(game)[0]?.pixelY ?? 9999),
-    );
+
+    // The HIGHEST POINT OF THE WHOLE FLIGHT, sampled every tick, rather than the
+    // lowest y seen in a hundred-tick window starting two hundred ticks after
+    // the launch. The window was calibrated against a gravity that was 5.33x too
+    // weak: at the measured one the ball has been up and come back before it
+    // opens, so the old form reported the ball's position on its way down and
+    // failed a test about the ball going up. Tracking the minimum is what the
+    // test always meant and it does not depend on how fast the table is.
+    let highest = atLaunch;
+    for (let tick = 0; tick < 300; tick += 1) {
+      runTicks(game, input, 1);
+      const y = liveBalls(game)[0]?.pixelY;
+      if (y !== undefined && y < highest) highest = y;
+    }
 
     // Smaller y is further up the table.
     expect(highest).toBeLessThan(atLaunch - 100);
@@ -328,14 +336,26 @@ describe("a whole game", () => {
       ball.level = 0;
     }
 
-    // Four search windows plus a serve delay. The search fires the machine's own
-    // coils BALL_SEARCH_PULSES times before it writes a ball off — see
-    // BALL_SEARCH_PULSES in game-loop.ts — so a ball the playfield really cannot
-    // return takes (pulses + 1) windows to be given up on, not one. This spiral
-    // is walled on every side, so the pulses move it and it comes straight back,
-    // which is exactly the case the bound exists for.
-    const windows = (BALL_SEARCH_PULSES + 1) * 40;
-    const reports = runTicks(game, idleInput(), windows + SERVE_DELAY_TICKS + 120);
+    // Four search windows plus a serve delay, and then a great deal more,
+    // because the coils actually work now.
+    //
+    // The search fires the machine's own coils BALL_SEARCH_PULSES times before
+    // it writes a ball off — see BALL_SEARCH_PULSES in game-loop.ts — so a ball
+    // the playfield really cannot return takes (pulses + 1) windows at least.
+    // The budget used to be exactly that plus a serve delay, on the premise that
+    // "this spiral is walled on every side, so the pulses move it and it comes
+    // straight back". THAT PREMISE DIED WITH THE OLD VELOCITY BRIDGE. The pulse
+    // is the measured slingshot coil, and at 14,000 Q10 per tick rather than
+    // 2,625 it throws the ball clean out of the spiral, across the table and
+    // into the sealed strip at (8,388) — where it is just as unreturnable, but
+    // it took several hundred ticks of real travel to get there and every tick of
+    // it legitimately reset the search's clock.
+    //
+    // So the mechanism is intact and does MORE work than it did; only the budget
+    // has to allow for the work. Traced, this ball is written off on tick 650 of
+    // the run below. A thousand leaves margin without hiding a hang: the assertion
+    // is still that this exact ball is given up on and the next one is served.
+    const reports = runTicks(game, idleInput(), 1000);
     expect(reports.flatMap((r) => r.drained)).toContain(ball?.id);
     expect(debugSnapshot(game).ballsServed).toBeGreaterThan(1);
   });
@@ -480,13 +500,19 @@ function playTable(tableId: TableId, ticks = 20_000, hold = 60): TableRun {
   let last = new Map<number, { x: number; y: number }>();
   for (let tick = 0; tick < ticks; tick += 1) {
     const report = runTicks(game, input, 1)[0];
+    const retired = new Set(report?.writtenOff ?? []);
     for (const id of report?.drained ?? []) {
       const seen = last.get(id);
       ends.push({
         tick,
         x: seen?.x ?? -1,
         y: seen?.y ?? -1,
-        drained: (seen?.y ?? -1) >= 590,
+        // ASKED, NOT INFERRED. This used to be `y >= 590` — the ball's last
+        // sampled row — which is a function of how fast the ball is moving and
+        // stopped being true the moment gravity was measured: at 13 px a tick a
+        // ball crossing the drain line is last seen at 586..589. The loop
+        // reports which balls the search retired; see GameTickReport.writtenOff.
+        drained: !retired.has(id),
       });
     }
     last = new Map();
@@ -677,9 +703,11 @@ function writeOffCensus(tableId: TableId): WriteOffCensus {
     let last = new Map<number, { x: number; y: number }>();
     for (let tick = 0; tick < CENSUS_TICKS; tick += 1) {
       const report = runTicks(game, input, 1)[0];
+      const retired = new Set(report?.writtenOff ?? []);
       for (const id of report?.drained ?? []) {
         const seen = last.get(id);
-        if ((seen?.y ?? -1) >= 590) drained += 1;
+        // See `playTable` for why this asks the loop instead of reading the row.
+        if (!retired.has(id)) drained += 1;
         else {
           writtenOff += 1;
           const key = `(${seen?.x},${seen?.y})`;
@@ -804,7 +832,7 @@ describe("the deterministic ball traps", () => {
     const startX = ball.x;
     const startY = ball.y;
     for (let tick = 0; tick < ticks; tick += 1) {
-      stepBalls(set, map, materials, { gravityY: PLUNGER_REFERENCE_GRAVITY, nudgeX: 0, nudgeY: 0 });
+      stepBalls(set, map, materials, { gravityY: SIMULATION_GRAVITY, nudgeX: 0, nudgeY: 0 });
     }
     return {
       x: ball.x / 1024,
@@ -985,19 +1013,42 @@ describe("all three tables", () => {
       // What must be true now is a disjunction, and it is the honest one: put a
       // ball at any of these places and within the search's own window it has
       // either LEFT the box — it rolled out, which is what a ball on a slope
-      // does — or it has come to an EXACT stop, velocity zero, which is what a
-      // ball in a cup does and is a thing a real machine's coil would clear.
-      // What may never happen again is the third case: still inside the box,
-      // still carrying velocity, five hundred ticks later.
+      // does — or it has PARKED, which is what a ball in a cup does and is a
+      // thing a real machine's coil would clear. What may never happen again is
+      // the third case: still inside the box and still creeping across it, five
+      // hundred ticks later.
+      //
+      // ------------------------------------------------------------------------
+      // "PARKED" USED TO MEAN "VELOCITY EXACTLY ZERO", AND THAT STOPPED BEING
+      // THE SAME QUESTION WHEN GRAVITY WAS MEASURED
+      // ------------------------------------------------------------------------
+      // A ball resting in a cup approaches the surface at one tick of gravity
+      // every tick, and at 24 the residue left after the bounce rounded away to
+      // nothing, so a parked ball reported exactly (0,0). At the measured 128 it
+      // does not: BabeWatch's (91,171) face settles at (0,-1) and Extreme Sports'
+      // (302,163) cup at (5,-8), a hundredth of a pixel a tick, rattling on the
+      // spot rather than going anywhere. Read against an equality test those look
+      // exactly like the crawl this file exists to forbid, and they are its
+      // opposite.
+      //
+      // So "parked" is now measured the way the SEARCH measures it — by
+      // DISPLACEMENT over a whole window, which is the quantity that tells a
+      // crawl from a rattle — and the run is two windows long rather than one.
+      // A ball that creeps at the 16 Q10 a tick the search asks for covers eight
+      // pixels in the second window and fails; a ball rattling in a cup covers
+      // a fraction of a pixel and passes. That is strictly more searching than
+      // the equality test it replaces: it would have caught a crawl that happened
+      // to pass through exactly (0,0) on tick 500, and this cannot.
       const map = mapFor(tableId);
       const materials = materialTableFor(tableId);
+      const forces = { gravityY: SIMULATION_GRAVITY, nudgeX: 0, nudgeY: 0 };
       for (const [x, y] of HISTORIC_STRAND_SITES[tableId]) {
         const set = createBallSet();
         const ball = spawnBall(set, pixelsToQ10(x), pixelsToQ10(y));
         let startX = ball.x;
         let startY = ball.y;
         for (let tick = 0; tick < BALL_SEARCH_TICKS && ball.active; tick += 1) {
-          stepBalls(set, map, materials, { gravityY: PLUNGER_REFERENCE_GRAVITY, nudgeX: 0, nudgeY: 0 });
+          stepBalls(set, map, materials, forces);
           // The search anchors after the ball has settled onto the geometry, so
           // measure from the same place it would.
           if (tick === 0) {
@@ -1006,11 +1057,25 @@ describe("all three tables", () => {
           }
         }
         const moved = Math.max(Math.abs(ball.x - startX), Math.abs(ball.y - startY)) / 1024;
-        const stopped = ball.velocityX === 0 && ball.velocityY === 0;
+
+        // A second window, anchored where the first one left the ball.
+        const parkedX = ball.x;
+        const parkedY = ball.y;
+        let excursion = 0;
+        for (let tick = 0; tick < BALL_SEARCH_TICKS && ball.active; tick += 1) {
+          stepBalls(set, map, materials, forces);
+          excursion = Math.max(
+            excursion,
+            Math.abs(ball.x - parkedX) / 1024,
+            Math.abs(ball.y - parkedY) / 1024,
+          );
+        }
+        const parked = excursion < 1;
         expect(
-          !ball.active || moved > BALL_SEARCH_BOX_PIXELS || stopped,
+          !ball.active || moved > BALL_SEARCH_BOX_PIXELS || parked,
           `${tableId} (${x},${y}): after ${BALL_SEARCH_TICKS} ticks it had crept ${moved.toFixed(2)}px` +
-            ` and was still moving at (${ball.velocityX},${ball.velocityY})`,
+            ` and then wandered ${excursion.toFixed(2)}px more, still moving at` +
+            ` (${ball.velocityX},${ball.velocityY})`,
         ).toBe(true);
       }
     });

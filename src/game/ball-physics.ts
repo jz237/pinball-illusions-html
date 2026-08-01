@@ -119,6 +119,7 @@ import {
   ringOffsetsFor,
 } from "./collision-probe.js";
 import { SOLID_BORDER_INDEX } from "./materials.js";
+import { SIMULATION_GRAVITY, VELOCITY_CLAMP_Q10 } from "./timebase.js";
 import type { SurfaceResponse } from "./surface-physics.js";
 import {
   LEVEL_TO_LOWER_ID,
@@ -140,30 +141,51 @@ import {
 // as properties of the ball, not of the probe.
 export { BALL_RADIUS_PIXELS, integerSqrt };
 
-const VELOCITY_MIN = -32767;
-const VELOCITY_MAX = 32767;
+// The original's own velocity clamp, +-4095 of its units, measured twice over
+// at main.seg00 +0x00B4D6 and +0x00B692 and worth 16380 Q10 per tick here — 16
+// px a tick, 800 px a second. See `timebase.ts`: it is also the independent
+// confirmation of the velocity bridge, because 4095>>1 is one whisker under the
+// 2 px the original allows a ball to move between collision passes.
+//
+// It replaces a pair of signed-16-bit limits that were never a behaviour, only a
+// guard against `q10IntegrateSigned16Velocity` throwing. At the old gravity
+// nothing came close to either; at the measured one a flipper tip can throw a
+// ball at 17.7 px a tick, so the real bound now does real work.
+const VELOCITY_MIN = -VELOCITY_CLAMP_Q10;
+const VELOCITY_MAX = VELOCITY_CLAMP_Q10;
 
 /**
  * The original's rolling friction: the fraction of a resting ball's
- * along-surface speed lost in one 50 Hz frame. Q10, so 22/1024 = 2.15%.
+ * along-surface speed lost in one 50 Hz frame. Q10, so 30/1024 = 2.91%.
  *
  * DECODED, not chosen. The engine's bounce takes `5*256/(8*$3a)` of the slip per
  * pass, `$3a` comes from the 256-entry per-region table in main.seg08, and the
- * bounce runs three times a frame. The bulk region — 134 of the 256 entries —
- * has `$3a` = 21760, giving `160/21760` = 0.7353% per pass and
+ * bounce runs once per COLLISION PASS. The bulk region — 134 of the 256 entries
+ * — has `$3a` = 21760, giving `160/21760` = 0.7353% per pass.
  *
- *     1 - (1 - 160/21760)^3  =  2.1904%   ->  22 in Q10
+ * THE PASS COUNT WAS THREE HERE AND IT IS FOUR. Counted directly, the unrolled
+ * tick at +0x00A618 calls the contact routine $b4ba at +0x00A64C, +0x00A696,
+ * +0x00A6E0 and +0x00A728 — the first of the four was missed, and this file's
+ * own parenthesis used to list only the last three. So
  *
- * per frame, which is one tick here. The other seven rows of that table give
- * 0.69% to 3.1% per pass; a per-region version of this would need the RLE region
- * map at `$50(a4)` decoded as well, which has not been done, so the commonest
- * value stands for all of them and this is the ONE number in the contact model
- * that is a table average rather than a per-surface fact.
+ *     1 - (1 - 160/21760)^4  =  2.9071%   ->  30 in Q10
+ *
+ * per frame, which is one tick here, where it used to say 22. It is a correction
+ * of a miscount rather than of the timebase, but it belongs to the same audit:
+ * four collision passes and eight integration sub-steps is the whole shape of
+ * the original's frame, and every number derived from either had to be recounted
+ * against it.
+ *
+ * The other seven rows of that table give 0.69% to 3.1% per pass; a per-region
+ * version of this would need the RLE region map at `$50(a4)` decoded as well,
+ * which has not been done, so the commonest value stands for all of them and
+ * this is the ONE number in the contact model that is a table average rather
+ * than a per-surface fact.
  *
  * See `reflectVelocity` for how it is used — as a CAP on the Coulomb budget of a
  * resting contact, never as a replacement for it — and why.
  */
-export const ROLLING_SLIP_FRICTION: Q10 = 22;
+export const ROLLING_SLIP_FRICTION: Q10 = 30;
 
 // ---------------------------------------------------------------------------
 // The virtual top wall
@@ -350,7 +372,7 @@ export interface SimulationOptions {
   /**
    * Inward speed below which a contact stops the ball dead instead of bouncing.
    * Without this a ball sitting on a slope re-bounces on its own weight every
-   * tick and never settles.
+   * tick and never settles. See REST_THRESHOLD.
    */
   readonly restThreshold: number;
   /** Centre y past which the ball has left the table. Null means the map bottom. */
@@ -412,10 +434,30 @@ export interface SurfaceIdMap {
   levelChangeAt(level: PlayfieldLevel, x: number, y: number): PlayfieldLevel | null;
 }
 
+/**
+ * The rest threshold, in Q10 per tick: a bounce smaller than this is no bounce.
+ *
+ * RE-DERIVED ON THE CORRECTED TIMEBASE, not scaled by habit. This is a port
+ * constant — the original settles a ball with its per-surface `$38` minimum
+ * impact word, which is a parameter of a contact model this port does not have —
+ * but it is a constant whose only meaningful unit is TICKS OF GRAVITY. A ball
+ * lying on a surface approaches it at exactly one tick of gravity per tick, and
+ * the threshold has to sit far enough above the bounce that produces to stop the
+ * chatter and far enough below a real impact to leave one alone.
+ *
+ * It was 160 against a gravity of 24, i.e. 20/3 of a tick of gravity, and that
+ * ratio is what is preserved: 128 * 20/3 = 853. Left as 160 it would have been
+ * 1.25 ticks of gravity, and every ball on every slope would have chattered.
+ *
+ * Written as the arithmetic rather than as a literal so that it cannot be left
+ * behind if gravity is ever re-measured again.
+ */
+export const REST_THRESHOLD: Q10 = Math.trunc((SIMULATION_GRAVITY * 20) / 3);
+
 export const DEFAULT_SIMULATION_OPTIONS: SimulationOptions = {
   radius: DEFAULT_PROBE_RADIUS,
   maxSubstepDistance: DEFAULT_PROBE_RADIUS >> 1,
-  restThreshold: 160,
+  restThreshold: REST_THRESHOLD,
   drainY: null,
   topWallRows: null,
   ballToBall: true,
@@ -649,8 +691,11 @@ function clampVelocity(value: number): number {
  *
  *     v = g * sin(theta) * (1 - f) / f  =  135 * sin(theta) Q10/tick
  *
- * for g = 24 and f = 0.15 — between 0.001 and 0.036 px/tick, one to two pixels
- * a second, on every slope on every table. Traced on the shipped maps, balls
+ * for f = 0.15 and the gravity of 24 this project then had — between 0.001 and
+ * 0.036 px/tick, one to two pixels a second, on every slope on every table. (The
+ * measured gravity is 128, which would make that crawl 5.33x faster and no less
+ * wrong; the rule was rejected on its shape, not on its size.) Traced on the
+ * shipped maps at the time, balls
  * written off by the ball search were not wedged at all: at Extreme Sports'
  * (247,144) the ball advanced exactly 36 Q10 on every one of the 500 ticks the
  * search counted, and at Law 'n Justice's (40,122) exactly 1 Q10 per tick — a
@@ -665,8 +710,9 @@ function clampVelocity(value: number): number {
  *
  *   - On an impact the normal impulse is large and the loss is large, so a
  *     graze still scrubs off tangential speed the way it always did.
- *   - On a resting contact the normal impulse is ~24 Q10 and the loss is ~3.6,
- *     while gravity contributes `24 * sin(theta)` along the surface. The ball
+ *   - On a resting contact the normal impulse is ~128 Q10 — one tick of the
+ *     measured gravity — and the loss is ~19, while gravity contributes
+ *     `128 * sin(theta)` along the surface. The ball
  *     therefore ACCELERATES down any slope steeper than `atan(friction)` and is
  *     held still on anything shallower — which is the static-friction condition,
  *     and is the behaviour a slope is supposed to have.
@@ -741,7 +787,7 @@ export function reflectVelocity(
   // costs at least that and the tangential speed is guaranteed to reach zero in
   // finite time. It is bounded by the speed itself below, so it can never push
   // the ball backwards, and against a rolling ball on a slope — which gains up
-  // to a whole tick of gravity, 24 units — one unit is noise.
+  // to a whole tick of gravity, 128 units — one unit is noise.
   //
   // ---------------------------------------------------------------------------
   // AND ON A RESTING CONTACT THE COULOMB BUDGET IS CAPPED BY THE ORIGINAL'S OWN
@@ -772,9 +818,10 @@ export function reflectVelocity(
   // so a ball rolling without slipping loses nothing whatever, and NO slope,
   // however shallow, can hold a ball. `$3a` comes from a 256-entry per-region
   // table in main.seg08 whose eight distinct rows give slip fractions
-  // `5*256/(8*$3a)` of 0.0069 to 0.031 per bounce, and the bounce runs three
-  // times a frame (the unrolled tick at +0x00A660 is four groups of two
-  // integrations with a collision-and-bounce at +0x00A696, +0x00A6E0, +0x00A728).
+  // `5*256/(8*$3a)` of 0.0069 to 0.031 per bounce, and the bounce runs FOUR
+  // times a frame (the unrolled tick is four groups of a collision-and-bounce
+  // at +0x00A64C, +0x00A696, +0x00A6E0 and +0x00A728 followed by two
+  // integrations each; this used to say three and had missed the first).
   //
   // This port cannot adopt that rule wholesale, and it is worth saying why so
   // nobody tries it as a simplification: friction on SLIP needs a spin state
@@ -796,15 +843,17 @@ export function reflectVelocity(
   //
   // What that buys, in the two regimes that matter:
   //
-  //   - A BALL LYING ON A SHALLOW SLOPE ACCELERATES. Below about 140 Q10/tick of
-  //     tangential speed the proportional loss is under the Coulomb budget of 3,
+  //   - A BALL LYING ON A SHALLOW SLOPE ACCELERATES. Below about 890 Q10/tick of
+  //     tangential speed the proportional loss is under the Coulomb budget of 19,
   //     so the ball keeps a strictly positive share of the `g*sin(theta)` gravity
   //     hands it and accumulates it tick over tick. On the 7.1 to 7.9 degree
   //     faces this work was about — Law 'n Justice (86,156), BabeWatch (91,171),
-  //     Extreme Sports' plateau shoulders — it settles at about 140 Q10/tick,
-  //     which is 68 px per 500-tick ball-search window against the 8 px the
-  //     search asks for.
-  //   - A FAST BALL IS UNTOUCHED. Above 140 Q10/tick the minimum is the Coulomb
+  //     Extreme Sports' plateau shoulders — it settles at about 890 Q10/tick,
+  //     which is far past the 8 px per 500-tick window the ball search asks for.
+  //     (Both figures are `budget / ROLLING_SLIP_FRICTION` and both moved with
+  //     gravity: the budget is a fraction of one tick of it, so the crossover
+  //     rises by the same 16/3 the timebase correction applied everywhere else.)
+  //   - A FAST BALL IS UNTOUCHED. Above that the minimum is the Coulomb
   //     budget and the rule is bit-for-bit what it was. That matters: an earlier
   //     attempt exempted resting contacts outright, and because a ball rolling
   //     FAST along a floor also approaches it at only one tick of gravity, that
@@ -818,8 +867,10 @@ export function reflectVelocity(
   // so a sliding contact still always costs something and a wedged ball still
   // reaches zero in finite time.
   //
-  // The band is narrowed, not closed. Below about `atan(1/gravityY)` = 2.4
-  // degrees one tick of gravity contributes less than one Q10 unit along the
+  // The band is narrowed, not closed. Below about `atan(1/gravityY)` — 2.4
+  // degrees at the gravity of 24 this was written against, and 0.45 degrees at
+  // the measured 128, so the timebase correction narrows it by another 5.33x —
+  // one tick of gravity contributes less than one Q10 unit along the
   // surface and the floor holds the ball. That is left alone and is not a fudge:
   // a 2.4 degree surface is flat, and a genuinely flat trap — Extreme Sports has
   // one, a flat-topped mound whose crown at x=113..125, y=106 has an exactly

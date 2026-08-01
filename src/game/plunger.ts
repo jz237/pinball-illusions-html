@@ -28,7 +28,7 @@
  * same snapshot, and this module charges *before* it tests for release, so a
  * press and release inside one tick still banks one tick of charge and fires a
  * gentle nudge rather than being swallowed. That gentle nudge is deliberately
- * feeble: `minLaunchSpeed` moves the ball about twenty pixels up a five-hundred
+ * feeble: `minLaunchSpeed` moves the ball about fifteen pixels up a five-hundred
  * pixel lane, so a fumbled tap costs the player the plunge instead of silently
  * doing nothing at all.
  */
@@ -38,6 +38,7 @@ import type { BallSet } from "./ball-physics.js";
 import { spawnBall } from "./ball-physics.js";
 import type { Q10 } from "../core/fixed-point.js";
 import { Q10_ONE, pixelsToQ10, q10Clamp, q10Multiply } from "../core/fixed-point.js";
+import { SIMULATION_GRAVITY } from "./timebase.js";
 
 /** Charge is a Q10 fraction, so a full pull is 1.0 in Q10. */
 export const PLUNGER_FULL_CHARGE: Q10 = Q10_ONE;
@@ -210,173 +211,156 @@ export function shooterLaneFor(tableId: TableId): ShooterLane {
 }
 
 /**
- * Gravity the launch speeds below were calibrated against, in Q10 per tick.
+ * Gravity the launch speeds below are calibrated against, in Q10 per tick.
  *
- * Recorded here because `maxLaunchSpeed` is only meaningful relative to a pull
- * of gravity: if the simulation's gravity is ever re-measured, the launch
- * ceiling has to move with it or a full plunge stops reaching the top of the
- * lane. This constant is what makes that dependency checkable instead of
- * folklore.
+ * IT WAS 24 AND IT WAS NEVER MEASURED — an inherited constant, and the reason
+ * this whole simulation played like it was in orbit. It is now an alias of the
+ * measured `SIMULATION_GRAVITY` (128) in `timebase.ts`, kept under this name
+ * only because the dependency it documents is real and worth naming at the point
+ * of use: `maxLaunchSpeed` is meaningless except relative to a pull of gravity,
+ * and if one moves the other must.
+ *
+ * THE DEPENDENCY IS NOT LINEAR, and getting that wrong is the trap here. The
+ * lane climb is fixed geometry, so a launch that just reaches the top satisfies
+ * v^2 = 2 g h: the launch speed goes as SQRT of gravity, by sqrt(16/3) = 2.309,
+ * not by 16/3. Anyone scaling this file by the same factor as the kicks would
+ * overshoot by 2.3x. Both numbers below were re-measured by sweeping the real
+ * game loop rather than scaled by anything.
  */
-export const PLUNGER_REFERENCE_GRAVITY: Q10 = 24;
+export const PLUNGER_REFERENCE_GRAVITY: Q10 = SIMULATION_GRAVITY;
 
 /**
- * Slowest launch, one pixel per tick.
+ * Slowest launch, two pixels per tick.
  *
- * Against the reference gravity that carries the ball roughly twenty pixels up
- * the lane before it falls back — a visible dribble, not a launch. This is what
- * a sub-tick tap gets.
+ * RE-DERIVED against the measured gravity, and it had to move: a launch at v
+ * rises about v^2/(2g) before falling back, so one pixel a tick — which used to
+ * buy a twenty-pixel dribble — buys four pixels against a gravity of 128, which
+ * is inside the ball's own radius and reads as the plunger doing nothing at all.
+ * Two pixels a tick restores the visible dribble (about 16 px) that tells a
+ * player their tap was heard and cost them the plunge. This is what a sub-tick
+ * tap gets.
  */
-export const MIN_LAUNCH_SPEED = pixelsToQ10(1);
+export const MIN_LAUNCH_SPEED = pixelsToQ10(2);
 
 /**
- * Fastest launch, six pixels per tick.
+ * Fastest launch, FOURTEEN pixels per tick.
  *
- * DERIVED, not chosen — but the derivation written here used to name the wrong
- * target, and this is the corrected one.
- *
- * ---------------------------------------------------------------------------
- * THE OLD DERIVATION MEASURED THE LANE. THE SHOT IS NOT THE LANE
- * ---------------------------------------------------------------------------
- * It said: with gravity applied before each integration step a launch at v rises
- * v^2/(2g) - v/2 units, so reaching the top of Law 'n Justice's lane — 536 px
- * from the serve point — needs v >= 5145 against g = 24, and 6144 is the
- * smallest whole pixel per tick above that. Every step of that is true and the
- * conclusion is still 6144, which is exactly why the error survived: the ball
- * does not merely have to reach the top of the lane. It has to cross the top
- * arch, on the upper collision line, rubbing both rails, and still be moving
- * when it starts down the far side. A ballistic climb up an empty column is a
- * LOWER BOUND on that, not the requirement.
+ * RE-MEASURED, not rescaled. It was six, and six was measured honestly against a
+ * gravity that was 5.33x too weak — which is the whole shape of this defect: a
+ * number arrived at by sweeping the real loop is only as good as the field it
+ * was swept in.
  *
  * ---------------------------------------------------------------------------
- * WHAT THE SHOT ACTUALLY COSTS, MEASURED
+ * WHY IT DOES NOT MOVE BY THE SAME FACTOR AS EVERYTHING ELSE
  * ---------------------------------------------------------------------------
- * Swept in the real game loop — one plunge of N ticks, no flippers, no nudge, on
- * the shipped map — the launch shot first completes at:
+ * Every velocity decoded off the disk moved by 4x and every acceleration by 32x.
+ * This one is not decoded off the disk: it is the speed needed to make a fixed
+ * CLIMB. A launch at v rises about v^2/(2g) - v/2, and the climb is geometry, so
+ * v goes as sqrt(g): the factor is sqrt(16/3) = 2.309, not 16/3. Six pixels a
+ * tick times 2.309 is 13.85, and the swept answer below is 14 — the arithmetic
+ * and the measurement agree to within a pixel a tick, which is the check that
+ * says the correction is a change of scale and not a change of table.
  *
- *   law-n-justice   hold 28 of 32   launch 5504 Q10 (5.375 px/tick)   87.5% pull
- *   babewatch       hold 22 of 32   launch 4544 Q10 (4.437 px/tick)   68.75% pull
- *   extreme-sports  hold 26 of 32   launch 5184 Q10 (5.062 px/tick)   81.25% pull
+ * ---------------------------------------------------------------------------
+ * WHAT THE SHOT COSTS, SWEPT AGAIN IN THE REAL LOOP AT GRAVITY 128
+ * ---------------------------------------------------------------------------
+ * One plunge of N ticks of the 32 that make a full pull, no flippers, no nudge,
+ * on the shipped maps, "completes" meaning the ball leaves by the BOTTOM ROW
+ * rather than by the ball search. The first completing hold, and the launch
+ * speed it corresponds to:
  *
- * and what the ball does one step below each threshold is the evidence that the
- * threshold is the arch rather than the lane: Law 'n Justice at hold 27 crests
- * the crown and comes to rest on its outer shoulder at (214,20) with the channel
- * beside it; BabeWatch at hold 21 reaches (294,276), the `ramp-end` gate's own
- * row, and fails the strict `toY < gate.y` by one pixel; Extreme Sports at hold
- * 25 crosses the crown and ends in the (302,162) cup. None of the three is short
- * of the top of its lane.
+ *   law-n-justice   hold 29 of 32   launch 13,184 Q10 (12.88 px/tick)  90.6% pull
+ *   babewatch       hold 17 of 32   launch  8,576 Q10  (8.38 px/tick)  53.1% pull
+ *   extreme-sports  hold 27 of 32   launch 12,416 Q10 (12.13 px/tick)  84.4% pull
  *
- * So the binding requirement is Law 'n Justice's 5504 Q10, and six pixels per
- * tick — 6144 — is still the smallest whole pixel per tick above it, with 11.6%
- * of margin. The number does not move; the reason it is that number does.
+ * and all three completing ranges are CONTIGUOUS to 32, which is the property
+ * that makes pull length mean anything and the one that forced Extreme Sports
+ * onto its own value last time.
  *
- * The consequence is worth stating plainly rather than leaving to be rediscovered:
- * on Law 'n Justice only the top 12.5% of the pull completes the shot, so an
- * under-plunge is common. That is not a fault as long as an under-plunge gives
- * the ball back — it dribbles down the lane, `game-loop.ts` re-pins it on the rod
- * and the player shoots again — and `tests/plays.test.ts` proves exactly that for
- * every starting pull on every table.
+ * The binding table is Law 'n Justice, as before, and its arch threshold is a
+ * property of the table rather than of this constant: swept at ceilings of 13,
+ * 14 and 15 px/tick the first completing launch comes out at 12,960 / 13,184 /
+ * 12,864 Q10, i.e. about 12.7 px/tick however the ramp to it is scaled. So the
+ * requirement is ~13,000 Q10 and the ceiling is the smallest whole pixel per
+ * tick that clears it with real margin:
  *
- * IT WAS RAISED TO SEVEN, AND THAT WAS A SYMPTOM. The argument for seven was
- * that the lane hands the ball to the top arch and "the ball rubs the arch's
- * rails the whole way, losing about 18% of its speed at every contact", so a
- * six-pixel launch stalled just short of the apex at (186, 21). That 18% was the
- * friction bug in `reflectVelocity` — a flat percentage of the ball's whole
- * tangential speed taken on every tick of contact, rather than a Coulomb impulse
- * bounded by the normal force. With that corrected a ball no longer pays a
- * tariff for touching a rail it is rolling along, the arch costs what an arch
- * costs, and the launch speed goes back to the number the lane climb implies.
+ *   13 px/tick = 13,312 Q10 —  2.7% margin, and the shot completes only from
+ *                hold 31 of 32. The top 3% of the pull is not an aiming device.
+ *   14 px/tick = 14,336 Q10 — 10.6% margin, completing from 29. TAKEN.
+ *   15 px/tick = 15,360 Q10 — completing from 26, and only 6% under the
+ *                engine's own velocity clamp of 16,380.
  *
- * The same applies to BabeWatch, whose ten pixels a tick were bought entirely to
- * pay for two contacts in the bend above y=400 (measured then: in at 6664 Q10,
- * out at 2492). Under the corrected model all three tables complete their launch
- * shot on six, so the per-table override table below has one value in it rather
- * than three, and the reason for that is a physics fix rather than a coincidence.
+ * Fourteen also reproduces the ergonomics the six-pixel version had exactly:
+ * Law 'n Justice completed 29..32 then and completes 29..32 now.
  *
- * It is deliberately not raised further. The plunger is an aiming device: a full
- * pull has to finish the shot and a two-thirds pull must not, or pull length
- * stops meaning anything — and the measured thresholds above are 87.5%, 68.75%
- * and 81.25%, all of them above two thirds, on all three tables. It is also well
- * inside the signed-16-bit velocity range and under two substeps of the
- * anti-tunnelling limit, so nothing clips a wall.
+ * ---------------------------------------------------------------------------
+ * TWO INDEPENDENT CHECKS ON THE NUMBER
+ * ---------------------------------------------------------------------------
+ * In the original's own velocity units 14,336 Q10 is 3,584 — just above the
+ * slingshot coil's 3,500 and well under the pop bumper's 5,500. A plunger that
+ * hits a shade harder than a slingshot and a good deal softer than a bumper is
+ * the right ordering for a pinball machine, and it is an ordering the old value
+ * got backwards: 6,144 Q10 under the old bridge was 8,192 original units, which
+ * asked the plunger to hit half again as hard as a pop bumper to make its own
+ * lane.
+ *
+ * And it sits inside the engine's measured velocity clamp of +-16,380 with 12.5%
+ * to spare, so a full plunge is never silently truncated. (Fifteen would still
+ * fit; sixteen would not, because pixelsToQ10(16) is 16,384 and the clamp would
+ * take four units off every full pull.)
+ *
+ * ---------------------------------------------------------------------------
+ * ONE THING THAT DID CHANGE, AND IS REPORTED RATHER THAN TUNED AWAY
+ * ---------------------------------------------------------------------------
+ * BabeWatch now completes from 53% of a pull where it used to need 66%. This
+ * file used to state a design rule — "a full pull has to finish the shot and a
+ * two-thirds pull must not" — and BabeWatch no longer satisfies it. That is not
+ * fixed by giving BabeWatch a weaker plunger, because nothing measured asks for
+ * one: its lane is the one that is not driven by the ramp map at all (see
+ * `table-accel.ts`) and its `topY` is 384 rather than 34, because BabeWatch's
+ * lower line loses the channel half way up and the UPPER line carries the rest.
+ * A shorter climb needs a slower ball. The rule was a rule of thumb about two of
+ * the three tables; the geometry is the fact.
  */
-export const MAX_LAUNCH_SPEED = pixelsToQ10(6);
+export const MAX_LAUNCH_SPEED = pixelsToQ10(14);
 
 /**
  * The speed a FULL pull gives, per table.
  *
- * The table is kept — the three lanes are separately measured and a future
- * per-table measurement has to have somewhere to land — but it now holds ONE
- * value, because the differences it used to carry were all paying for the
- * friction bug rather than for anything on the tables.
+ * The table is kept — the three lanes are separately measured and a per-table
+ * value has to have somewhere to land — but it holds ONE value again.
  *
- * What that looked like before: Law 'n Justice and Extreme Sports were on seven
- * pixels a tick and BabeWatch on ten, and BabeWatch's extra three were bought
- * entirely to survive the staircase bend above y=400 (it entered at 6664 Q10 and
- * left at 2492). Under the Coulomb model in `ball-physics.ts` a ball rolling
- * along a rail no longer pays 15% of its speed per tick of contact, and all
- * three tables complete their launch shot on six — measured over plunge holds of
- * 32..91 ticks, i.e. every hold that reaches a full pull, on the shipped maps.
+ * It has been two values and it has been three. Extreme Sports was on seven
+ * pixels a tick while the others were on six, because at six a FULL pull missed
+ * a shot that a seven-eighths pull made: the full-power ball crested the arch
+ * flatter and came down onto the flat-topped bumper at x=113..125, y=115, whose
+ * contact normal is exactly vertical, and nothing rolls a ball off a level
+ * surface. That non-monotonicity was the diagnostic. Before that, BabeWatch was
+ * on ten, bought entirely to pay for a friction bug that charged a ball 15% of
+ * its speed for every tick it spent touching a rail it was rolling along.
  *
- * The value is still per-table configuration in shape, and it is still checked
- * the same way: a full pull completes the shot and a two-thirds pull does not,
- * so pull length still aims. It is inside the signed-16-bit velocity range and
- * under two substeps of the anti-tunnelling limit, so it cannot clip a wall.
+ * On the corrected timebase all three complete contiguously from a single
+ * ceiling — 29..32, 17..32 and 27..32 of 32 — so there is nothing for a
+ * per-table value to buy. The sweep is in MAX_LAUNCH_SPEED.
  *
- * MEASURED AGAIN AFTER THE MAP REFRAME, per table, by sweeping the plunge hold
- * through the real loop on the corrected maps. One value still serves all three:
- * the shot completes at hold 28 / 22 / 26 of 32 and the ceiling is above all of
- * them. See MAX_LAUNCH_SPEED for the sweep and for what each table does one step
- * below its own threshold.
- *
- * ---------------------------------------------------------------------------
- * AND THE FUTURE PER-TABLE MEASUREMENT ARRIVED: EXTREME SPORTS IS ON SEVEN
- * ---------------------------------------------------------------------------
- * What changed under it is the LANE, not the plunger. The ramp drive decoded out
- * of slot 4 (see `src/game/table-accel.ts`) gives each 8x8 block of the playfield
- * its own acceleration on top of gravity, and the shooter lane carries one —
- * which is what a shooter lane should carry, because on a real cabinet it runs up
- * the steepest part of the slope. Counted over the lane's own block columns
- * 39..41 on both levels:
+ * The lane-drive asymmetry that forced the last split is still there and is
+ * still worth recording, because it is the reason the three thresholds differ at
+ * all. Counted over the lanes' own block columns 39..41 on both levels:
  *
  *   law-n-justice    50 driven blocks, every one of them vector (0,2)
  *   babewatch         3 driven blocks, none of them in the lane's climb
  *   extreme-sports  105 driven blocks, every one of them vector (0,2)
  *
- * (0,2) is 12 Q10 per tick of extra downward acceleration — half of gravity —
- * over roughly 200 px of climb. Two of the three lanes are therefore materially
- * steeper than the model this constant was calibrated against and BabeWatch's is
- * not, which is why the table has two values in it now and had one before. The
- * difference is decoded, not fitted.
- *
- * Re-running the sweep MAX_LAUNCH_SPEED documents — every plunge hold from 1 to
- * 32 through the real loop, "completes" meaning the ball leaves by the BOTTOM ROW
- * rather than by the ball search:
- *
- *                 at 6 px/tick                    at 7 px/tick
- *   law-n-justice completes 29..32                completes 24..32
- *   babewatch     completes 21..32                completes 17..32
- *   extreme       completes 28,29,30 — NOT 31,32  completes 23..32
- *
- * Extreme Sports at six is what forces this, and the reason is not that it fails
- * but HOW: a FULL pull misses a shot that a seven-eighths pull makes. That
- * non-monotonicity is the diagnostic, not the write-off count. Traced, the
- * full-power ball crests the arch flatter and comes down onto the flat-topped
- * bumper at x=113..125, y=115, whose contact normal is exactly vertical — nothing
- * rolls a ball off a level surface, and the real machine empties it with a coil,
- * in the device layer this reconstruction does not have. At seven the shot clears
- * it and the completing range is contiguous again, which is the property that
- * makes pull length mean anything. 23 of 32 is 72%, so a two-thirds pull still
- * does not complete.
- *
- * Law 'n Justice keeps six: its lane is driven too, its threshold moved 28 -> 29
- * of 32, and its completing range stayed contiguous. BabeWatch keeps six because
- * its lane is not driven at all.
+ * (0,2) is now 64 Q10 per tick squared of extra downward acceleration — half of
+ * gravity, where under the old bridge it was read as 12 — over roughly 200 px of
+ * climb. Two of the three lanes are materially steeper than a bare ballistic
+ * model and BabeWatch's is not, which is why BabeWatch's threshold is the lowest
+ * of the three by a wide margin. That is decoded, not fitted.
  */
 export const FULL_PLUNGE_SPEED_BY_TABLE: Readonly<Record<TableId, number>> = Object.freeze({
   "law-n-justice": MAX_LAUNCH_SPEED,
   babewatch: MAX_LAUNCH_SPEED,
-  "extreme-sports": pixelsToQ10(7),
+  "extreme-sports": MAX_LAUNCH_SPEED,
 });
 
 export interface PlungerConfig {

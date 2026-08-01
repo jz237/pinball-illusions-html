@@ -205,9 +205,9 @@ import {
 import type { TableAcceleration } from "../game/table-accel.js";
 import { tableAccelerationFor } from "../game/table-accel.js";
 import type { PlungerConfig, PlungerState } from "../game/plunger.js";
+import { SIMULATION_GRAVITY } from "../game/timebase.js";
 import {
   INITIAL_PLUNGER,
-  PLUNGER_REFERENCE_GRAVITY,
   autoLaunchOutcome,
   chargeLevel,
   launchBall,
@@ -308,6 +308,47 @@ export const FIRST_SERVE_DELAY_TICKS = 25;
  * ball that could not move rather than letting it grind on. Deliberately NOT
  * applied to the ball sitting on the plunger rod, which is motionless on
  * purpose and for as long as the player likes.
+ *
+ * ---------------------------------------------------------------------------
+ * THIS NUMBER DOES NOT MOVE WITH THE TIMEBASE, AND THAT IS THE POINT OF SAYING SO
+ * ---------------------------------------------------------------------------
+ * When gravity was re-measured every velocity and every acceleration in this
+ * engine moved by 4x or 32x, so it is worth stating which constants did not.
+ * This one is a TIME. Nothing in the original counts sub-steps: every duration
+ * in the game is `seconds x $50(a5)` frames and `$50(a5)` is the OS's
+ * `VBlankFrequency`, which is 50. Five hundred ticks is ten seconds before the
+ * correction and ten seconds after it. See `timebase.ts`.
+ *
+ * What DID change is the margin around it, in the direction that helps. The
+ * search asks for BALL_SEARCH_BOX_PIXELS of movement in a window, i.e. 16 Q10 a
+ * tick; a ball on a shallow slope now carries 5.33x the speed it did, so the gap
+ * between "still rolling" and "stopped" is five times wider than it was and the
+ * test is five times less likely to retire a ball that is still going anywhere.
+ *
+ * AND THE COILS NOW ACTUALLY WORK, which is a behaviour change rather than an
+ * arithmetic one: BALL_SEARCH_PULSE is the measured slingshot coil and it is
+ * 14,000 Q10 a tick rather than 2,625, so a pulse throws a wedged ball clean out
+ * of the pocket it is in instead of nudging it. A ball the playfield truly
+ * cannot return therefore takes rather LONGER to be written off than it used to,
+ * because every pulse buys it several hundred ticks of real travel and each of
+ * those legitimately resets this clock. That is the mechanism working harder,
+ * not the search failing; `tests/plays.test.ts` budgets for it explicitly.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT THE ORIGINAL'S OWN NUMBER IS — NOT ADOPTED, AND THE REASON IS RECORDED
+ * ---------------------------------------------------------------------------
+ * `tableNNN.opt` record 6 (`$E8E(a5)`, min 0, max 10, default 5 and TEN on
+ * Extreme Sports) is consumed at +0x0049AE as `option x $50(a5)` — a per-table
+ * countdown in frames, 250 / 250 / 500, and the only per-table duration on the
+ * disk. It is tempting, and 500 is exactly Extreme Sports' value.
+ *
+ * It is not adopted because what that countdown IS is not settled:
+ * `docs/RULES_SPEC.md` reads it as a timed BALL-SAVE grace and one of the two
+ * timebase investigations read it as the ball-search window. Those are opposite
+ * mechanisms — one gives a ball back, the other takes it away — and adopting the
+ * wrong one would halve the search window on two tables on the strength of a
+ * coincidence. The number is recorded here so the next person does not have to
+ * find it again, and the identification is the thing to settle first.
  */
 export const BALL_SEARCH_TICKS = 500;
 
@@ -410,7 +451,7 @@ export interface GameOptions {
   /**
    * Downward acceleration in Q10 per tick.
    *
-   * `PLUNGER_REFERENCE_GRAVITY`, because the plunger's launch ceiling is only
+   * `SIMULATION_GRAVITY`, because the plunger's launch ceiling is only
    * meaningful relative to it: change one and the other has to move with it or
    * a full plunge stops clearing the lane.
    */
@@ -425,7 +466,7 @@ export interface GameOptions {
 
 export const DEFAULT_GAME_OPTIONS: GameOptions = Object.freeze({
   ballsPerGame: DEFAULT_BALLS_PER_GAME,
-  gravityY: PLUNGER_REFERENCE_GRAVITY,
+  gravityY: SIMULATION_GRAVITY,
   serveDelayTicks: SERVE_DELAY_TICKS,
   firstServeDelayTicks: FIRST_SERVE_DELAY_TICKS,
   ballSearchTicks: BALL_SEARCH_TICKS,
@@ -554,6 +595,24 @@ export interface GameTickReport {
   readonly served: boolean;
   readonly launched: boolean;
   readonly drained: readonly number[];
+  /**
+   * The subset of `drained` the BALL SEARCH retired rather than the drain taking.
+   *
+   * A ball leaves play in one of two ways and the difference is the whole of
+   * what a write-off census measures: it goes down the drain, which is the game
+   * working, or the search gives up on it, which is the game admitting the
+   * playfield stopped returning it. Both used to arrive as plain `drained` ids
+   * and every census told them apart by asking whether the ball's LAST SAMPLED
+   * POSITION was on the bottom rows.
+   *
+   * That heuristic is a function of how fast the ball is moving, and it broke the
+   * moment gravity was measured: a ball arriving at the drain at 13 px a tick is
+   * last seen at y=586..589 rather than y>=590, so twelve perfectly ordinary
+   * drains on Law 'n Justice were counted as strandings — a 4.2% write-off rate
+   * that was entirely an artefact of the census's own threshold. The loop knows
+   * which is which and now says so, and no caller has to guess.
+   */
+  readonly writtenOff: readonly number[];
   /** Ids a lock swallowed this tick, in device order. */
   readonly locked: readonly number[];
   /** True on the tick a multiball was lit and the saucers gave their balls back. */
@@ -730,6 +789,7 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     served: false,
     launched: false,
     drained: [],
+    writtenOff: [],
     locked: [],
     multiballStarted: false,
     missionStarted: -1,
@@ -968,6 +1028,7 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     served,
     launched,
     drained,
+    writtenOff: lost,
     locked: lockTick.locked,
     multiballStarted: lockTick.multiballStarted,
     missionStarted: modeTick.missionStarted,

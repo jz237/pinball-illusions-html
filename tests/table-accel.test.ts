@@ -39,7 +39,10 @@ import {
   tableAccelerationFor,
   tableAccelUrl,
 } from "../src/game/table-accel.js";
-import { PLUNGER_REFERENCE_GRAVITY } from "../src/game/plunger.js";
+import {
+  Q10_PER_ORIGINAL_VELOCITY_UNIT,
+  SIMULATION_GRAVITY,
+} from "../src/game/timebase.js";
 import { LEVEL0_STRUCTURE_BIT, LEVEL1_STRUCTURE_BIT } from "../src/game/materials.js";
 import { mapFor, accelFor } from "./table-fixtures.js";
 
@@ -238,26 +241,38 @@ describe("the ramp drive document", () => {
     };
     expect(driven("law-n-justice")).toBeGreaterThan(20);
     expect(driven("extreme-sports")).toBeGreaterThan(20);
-    // BabeWatch's lane is not driven, which is why it keeps six pixels a tick.
+    // BabeWatch's lane is not driven, which is why its launch threshold is the
+    // lowest of the three by a wide margin. See plunger.ts.
     expect(driven("babewatch")).toBeLessThan(10);
   });
 });
 
 describe("the unit bridge into this port", () => {
-  it("is forced by the port's own gravity against the original's, not chosen", () => {
-    // The original adds its gravity once per substep and runs eight substeps a
-    // frame; its shipped gravity is 4, from record 1 of tableNNN.opt. So one
-    // frame of gravity is 8*4 = 32 original units, this port applies
-    // PLUNGER_REFERENCE_GRAVITY Q10 once per tick, and one tick is one frame.
+  it("is forced by the original's own integrator, not solved for from this port", () => {
+    // THE OLD FORM OF THIS TEST IS THE DEFECT IT MISSED. It asserted
+    //
+    //     TICKS_PER_ORIGINAL_UNIT * (4 * 8) === PLUNGER_REFERENCE_GRAVITY * 8
+    //
+    // which cancels to 24/4 and is true for ANY gravity you care to put in it:
+    // it checked that the port was self-consistent, and the port was
+    // self-consistently 16/3 too floaty. The bridge is now closed against the
+    // ORIGINAL: each of its eight substeps moves the ball by v>>1, so one of its
+    // velocity units is four Q10 of travel per frame and one unit of per-substep
+    // acceleration is eight of those.
     const originalPerFrame = ORIGINAL_GRAVITY_PER_SUBSTEP * ORIGINAL_SUBSTEPS_PER_FRAME;
     expect(originalPerFrame).toBe(32);
-    expect(TICKS_PER_ORIGINAL_UNIT * originalPerFrame).toBe(
-      PLUNGER_REFERENCE_GRAVITY * ORIGINAL_SUBSTEPS_PER_FRAME,
+    expect(Q10_PER_ORIGINAL_VELOCITY_UNIT).toBe(ORIGINAL_SUBSTEPS_PER_FRAME / 2);
+    expect(TICKS_PER_ORIGINAL_UNIT).toBe(
+      ORIGINAL_SUBSTEPS_PER_FRAME * Q10_PER_ORIGINAL_VELOCITY_UNIT,
     );
-    // Which comes out at exactly six, and being a whole number is why the
+    // Which comes out at exactly 32, and being a whole number is why the
     // simulation path stays integral.
-    expect(TICKS_PER_ORIGINAL_UNIT).toBe(6);
+    expect(TICKS_PER_ORIGINAL_UNIT).toBe(32);
     expect(Number.isInteger(TICKS_PER_ORIGINAL_UNIT)).toBe(true);
+    // And gravity is then the shipped option through that same bridge, so the
+    // two cannot be adjusted independently of one another.
+    expect(SIMULATION_GRAVITY).toBe(ORIGINAL_GRAVITY_PER_SUBSTEP * TICKS_PER_ORIGINAL_UNIT);
+    expect(SIMULATION_GRAVITY).toBe(128);
   });
 
   it("converts each vector into Q10 per tick at that scale", () => {
@@ -281,8 +296,8 @@ describe("the unit bridge into this port", () => {
       const row = Math.floor(bestCell / ACCEL_COLUMNS);
       const [dx, dy] = acceleration.vectors[grid[bestCell] as number] as readonly [number, number];
       const drive = acceleration.driveAt(1, column * 8 + 3, row * 8 + 3);
-      expect(drive.x).toBe(dx * 6);
-      expect(drive.y).toBe(dy * 6);
+      expect(drive.x).toBe(dx * TICKS_PER_ORIGINAL_UNIT);
+      expect(drive.y).toBe(dy * TICKS_PER_ORIGINAL_UNIT);
     }
   });
 

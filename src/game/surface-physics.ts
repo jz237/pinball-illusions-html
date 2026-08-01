@@ -76,39 +76,35 @@
  *   the ball a spin state should come back for all four at once.
  *
  * ---------------------------------------------------------------------------
- * THE VELOCITY BRIDGE, WHICH IS INHERITED RATHER THAN CHOSEN
+ * THE VELOCITY BRIDGE, WHICH WAS INHERITED, CIRCULAR AND WRONG
  * ---------------------------------------------------------------------------
- * The bumper and slingshot kicks below ARE velocities, so they do need a bridge,
- * and the project already has exactly one: `table-accel.ts` fixes 1 original
- * acceleration unit per substep = `TICKS_PER_ORIGINAL_UNIT` (6) Q10 per tick
- * by matching the original's shipped gravity of 4-per-substep-times-8-substeps
- * against this port's `PLUNGER_REFERENCE_GRAVITY`. Eight substeps of one unit is
- * eight original VELOCITY units, so one original velocity unit is 6/8 = 0.75
- * Q10, and that is the conversion used here. It is derived from the same
- * constant as the ramp drive so the two can never drift apart.
+ * The bumper and slingshot kicks below ARE velocities, so they need a bridge.
+ * This file used to build one out of `table-accel.ts`'s
+ * `TICKS_PER_ORIGINAL_UNIT` (then 6), reasoning that eight substeps of one
+ * acceleration unit is eight velocity units and so one velocity unit is 6/8 =
+ * 0.75 Q10 per tick. Every step of that is sound and the answer was still wrong,
+ * because the constant it started from had itself been solved for out of this
+ * port's inherited gravity of 24 rather than measured. The two bridges agreed
+ * with each other and both were 16/3 too small; that mutual consistency is
+ * exactly why nothing here ever caught it.
  *
- * Worked: the bumper's 5500 becomes 4125 Q10/tick, which against a gravity of 24
- * Q10/tick throws a ball 4125^2 / (2*24) = 354,000 Q10 = 346 px up the table.
- * That is the right order for a pop bumper on a 600-row playfield. The other
- * candidate bridge — matching POSITION, since the original moves the ball by
- * v/2 eight times a frame and so travels 4v per frame against this port's v —
- * gives 22,000 Q10/tick and a height of 9,800 px, sixteen tables. The port's own
- * gravity is what makes the difference, and the acceleration bridge is the one
- * the shipped ramp drive is already calibrated to.
+ * The bridge is now measured, in `timebase.ts`, from the original's integrator:
+ * eight substeps of `pos += v>>1` means ONE ORIGINAL VELOCITY UNIT IS FOUR Q10
+ * PER TICK. The kicks below are therefore 5.33x what they were.
+ *
+ * Worked, and it is the disproof of the old bridge rather than a restatement of
+ * it: at 0.75 Q10 the slingshot's 3500 units became 2625 Q10/tick, which against
+ * the old gravity of 24 throws a ball 2625^2/(2*24) = 143,000 Q10 = 3987 px up
+ * the table — six and a half table lengths. At 4 Q10 against the measured
+ * gravity of 128 it is 14,000 Q10 and 766 px, which is a slingshot. The same
+ * arithmetic puts the pop bumper's 5500 at 22,000 Q10 and 1890 px, about three
+ * table lengths, which is what a 2-3 m/s pop bumper does on a shallow table.
  */
 
 import type { Q10 } from "../core/fixed-point.js";
-import { ORIGINAL_SUBSTEPS_PER_FRAME, TICKS_PER_ORIGINAL_UNIT } from "./table-accel.js";
+import { ORIGINAL_SUBSTEPS_PER_FRAME, originalVelocityToQ10 } from "./timebase.js";
 
-/**
- * Converts one of the original's VELOCITY words to Q10 per tick.
- *
- * Truncating rather than rounding, so the result is a function of the integers
- * and nothing here depends on a floating-point mode.
- */
-export function originalVelocityToQ10(units: number): Q10 {
-  return Math.trunc((units * TICKS_PER_ORIGINAL_UNIT) / ORIGINAL_SUBSTEPS_PER_FRAME);
-}
+export { originalVelocityToQ10, ORIGINAL_SUBSTEPS_PER_FRAME };
 
 /** Q10 restitution from the original's `$36` word: `Q10_ONE / 256` is 4. */
 export function originalRestitutionToQ10(word: number): Q10 {

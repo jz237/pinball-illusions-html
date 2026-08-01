@@ -54,39 +54,64 @@
  * along the rail. It is not a launcher.
  *
  * ---------------------------------------------------------------------------
- * THE UNIT BRIDGE IS FORCED, NOT CHOSEN
+ * THE UNIT BRIDGE IS FORCED, NOT CHOSEN — AND IT WAS WRONG BY 16/3
  * ---------------------------------------------------------------------------
- * This is the one number in this file that is about the reconstruction rather
- * than about the disk, so it is derived rather than tuned.
+ * The bridge now lives in `timebase.ts`, which has the disassembly. The short
+ * version, and the correction:
  *
  * The original adds its gravity ONCE PER SUBSTEP and runs EIGHT substeps per
  * 50 Hz frame (the unrolled tick at main.seg00 +0x00A660 calls the integrator
  * eight times: four collision passes x two integration sub-steps). Its shipped
  * gravity is 4 — record 1 of the seven 10-byte option records in
  * `PROGDIR:tableNNN.opt` is (min 2, max 8, cur, DEFAULT 4), read at +0x0009FE
- * into $E86(a5) and added at +0x00B758. So one frame of gravity is 8 * 4 = 32
- * original units.
+ * into $E86(a5) and added at +0x00B758.
  *
- * This port applies `PLUNGER_REFERENCE_GRAVITY` = 24 Q10 once per tick, and one
- * tick is one frame. So
+ * THIS FILE USED TO CLOSE THE BRIDGE THE WRONG WAY. It said "32 original units
+ * per frame == 24 Q10 per tick", i.e. it took the port's own inherited gravity
+ * as the reference and solved for the drive. The derivation it wrote,
  *
- *     32 original units per frame  ==  24 Q10 per tick
- *     1 original unit per substep  ==  8 * 24/32  =  6 Q10 per tick
+ *     (PLUNGER_REFERENCE_GRAVITY * 8) / (4 * 8)
  *
- * and a vector (dx, dy) contributes exactly `(6*dx, 6*dy)` Q10 per tick. Six is
- * an integer, which is why the simulation path stays integral; and it is not a
- * free parameter — it is fixed by the port's existing gravity constant against
- * the original's shipped one. Change `PLUNGER_REFERENCE_GRAVITY` and this must
- * move with it, which is what `TICKS_PER_ORIGINAL_UNIT` being derived from it
- * below is for.
+ * cancels the eights: it is 24/4 and never used the substep count at all. What
+ * it silently asserted is that one original velocity unit is one Q10 per tick.
+ * It is FOUR — each substep moves the ball by v>>1 and there are eight of them —
+ * so one unit of per-substep acceleration is 8 * 4 = 32 Q10 per tick squared,
+ * not 6. That factor of four, times the arbitrary 24/32, is precisely the 16/3
+ * by which this simulation was too floaty.
  *
- * A worked consequence: Law 'n Justice's arch crown is zone 3, vector (-1, 1),
- * so a ball stalled there gains 6 Q10/tick of leftward velocity every tick while
- * the friction budget on a resting contact takes at most
- * `q10Multiply(154, 24)` = 3 Q10/tick back. The drive wins by 3 units a tick and
- * the ball is moving 8 px well inside the 500-tick ball-search window. The
- * margin is small because the original's data is small; that is the data's
- * business, not this file's.
+ * So a vector (dx, dy) now contributes `(32*dx, 32*dy)` Q10 per tick, and the
+ * number is a property of the ORIGINAL's integrator rather than of this port's
+ * gravity: `Q10_PER_ORIGINAL_ACCEL_UNIT` is measured, `SIMULATION_GRAVITY` is
+ * measured, and neither is derived from the other. They cannot drift because
+ * neither is free.
+ *
+ * A worked consequence, restated on the corrected scale: Law 'n Justice's arch
+ * crown is zone 3, vector (-1, 1), so a ball stalled there gains 32 Q10/tick of
+ * leftward velocity every tick while the friction budget on a resting contact
+ * takes at most `q10Multiply(154, 128)` = 19 Q10/tick back. The drive wins by 13
+ * units a tick where it used to win by 3 — the correction WIDENS the ramp-escape
+ * margin rather than threatening it, because gravity and the drive rose by the
+ * same factor while the friction budget is bounded by one tick of gravity too.
+ *
+ * ---------------------------------------------------------------------------
+ * THE MAGNITUDE IS THE ORIGINAL'S. THE SAMPLING RATE IS NOT, AND IT NOW SHOWS
+ * ---------------------------------------------------------------------------
+ * The original re-reads the block under the ball on EVERY sub-step — eight times
+ * a frame, at eight points along the path (+0x00B734, `asr.w #3` on both
+ * coordinates). This port reads it once per tick, at the position the ball
+ * starts the tick in, and applies the whole frame's worth of acceleration there.
+ * Those agree exactly whenever the ball stays inside one 8 px block for the
+ * frame, and diverge when it does not.
+ *
+ * At the old gravity that never mattered, because a ball almost never crossed a
+ * block in one tick. At the measured gravity it does: a ball in free fall is
+ * moving 11.7 px a tick by the time it reaches the flippers and a pop bumper
+ * throws one 21 px in a tick, so a fast ball can cross two or three blocks
+ * between samples and will pick up the drive of the block it left rather than
+ * the ones it crossed. That is a known, stated divergence of the RATE, not of
+ * the magnitude, and it is recorded here rather than silently absorbed: closing
+ * it means moving the drive lookup inside `integrateBall`'s contact sweep, which
+ * is a change to the integrator and not to this decode.
  *
  * ---------------------------------------------------------------------------
  * THE DRIVE IS NOT OPTIONAL AND MUST NOT BE FORGETTABLE
@@ -103,7 +128,11 @@
 import { PLAYFIELD_HEIGHT, PLAYFIELD_WIDTH, TABLE_IDS } from "./contracts.js";
 import type { PlayfieldLevel, TableAccelDocument, TableId } from "./contracts.js";
 import type { Q10 } from "../core/fixed-point.js";
-import { PLUNGER_REFERENCE_GRAVITY } from "./plunger.js";
+import {
+  ORIGINAL_GRAVITY_DEFAULT,
+  ORIGINAL_SUBSTEPS_PER_FRAME as SUBSTEPS_PER_FRAME,
+  Q10_PER_ORIGINAL_ACCEL_UNIT,
+} from "./timebase.js";
 
 /** The only document schema this loader understands. */
 export const TABLE_ACCEL_SCHEMA = "pinball-illusions/table-accel/v1";
@@ -120,21 +149,21 @@ export const ACCEL_ROWS = PLAYFIELD_HEIGHT / ACCEL_BLOCK_SIZE; // 75
  * The original's gravity, per substep, from record 1 of `tableNNN.opt`
  * (min 2, max 8, default 4) — identical on all three tables.
  */
-export const ORIGINAL_GRAVITY_PER_SUBSTEP = 4;
+export const ORIGINAL_GRAVITY_PER_SUBSTEP = ORIGINAL_GRAVITY_DEFAULT;
 
 /**
  * Integration substeps the original ran per 50 Hz frame: four collision passes
  * times two integration sub-steps, unrolled at main.seg00 +0x00A660.
  */
-export const ORIGINAL_SUBSTEPS_PER_FRAME = 8;
+export const ORIGINAL_SUBSTEPS_PER_FRAME = SUBSTEPS_PER_FRAME;
 
 /**
- * Q10-per-tick contributed by one unit of the original's per-substep
- * acceleration. Six, and derived rather than chosen — see the header.
+ * Q10 per tick squared contributed by one unit of the original's per-substep
+ * acceleration: THIRTY-TWO, measured. See `timebase.ts`, and see the header for
+ * the 6 this used to be and why it was six times too small in the direction that
+ * mattered.
  */
-export const TICKS_PER_ORIGINAL_UNIT: Q10 =
-  (PLUNGER_REFERENCE_GRAVITY * ORIGINAL_SUBSTEPS_PER_FRAME) /
-  (ORIGINAL_GRAVITY_PER_SUBSTEP * ORIGINAL_SUBSTEPS_PER_FRAME);
+export const TICKS_PER_ORIGINAL_UNIT: Q10 = Q10_PER_ORIGINAL_ACCEL_UNIT;
 
 /** One block's drive, already in the port's Q10-per-tick. */
 export interface RampDriveVector {
