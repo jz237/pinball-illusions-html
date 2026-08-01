@@ -328,11 +328,55 @@ export const MAX_LAUNCH_SPEED = pixelsToQ10(6);
  * the shot completes at hold 28 / 22 / 26 of 32 and the ceiling is above all of
  * them. See MAX_LAUNCH_SPEED for the sweep and for what each table does one step
  * below its own threshold.
+ *
+ * ---------------------------------------------------------------------------
+ * AND THE FUTURE PER-TABLE MEASUREMENT ARRIVED: EXTREME SPORTS IS ON SEVEN
+ * ---------------------------------------------------------------------------
+ * What changed under it is the LANE, not the plunger. The ramp drive decoded out
+ * of slot 4 (see `src/game/table-accel.ts`) gives each 8x8 block of the playfield
+ * its own acceleration on top of gravity, and the shooter lane carries one —
+ * which is what a shooter lane should carry, because on a real cabinet it runs up
+ * the steepest part of the slope. Counted over the lane's own block columns
+ * 39..41 on both levels:
+ *
+ *   law-n-justice    50 driven blocks, every one of them vector (0,2)
+ *   babewatch         3 driven blocks, none of them in the lane's climb
+ *   extreme-sports  105 driven blocks, every one of them vector (0,2)
+ *
+ * (0,2) is 12 Q10 per tick of extra downward acceleration — half of gravity —
+ * over roughly 200 px of climb. Two of the three lanes are therefore materially
+ * steeper than the model this constant was calibrated against and BabeWatch's is
+ * not, which is why the table has two values in it now and had one before. The
+ * difference is decoded, not fitted.
+ *
+ * Re-running the sweep MAX_LAUNCH_SPEED documents — every plunge hold from 1 to
+ * 32 through the real loop, "completes" meaning the ball leaves by the BOTTOM ROW
+ * rather than by the ball search:
+ *
+ *                 at 6 px/tick                    at 7 px/tick
+ *   law-n-justice completes 29..32                completes 24..32
+ *   babewatch     completes 21..32                completes 17..32
+ *   extreme       completes 28,29,30 — NOT 31,32  completes 23..32
+ *
+ * Extreme Sports at six is what forces this, and the reason is not that it fails
+ * but HOW: a FULL pull misses a shot that a seven-eighths pull makes. That
+ * non-monotonicity is the diagnostic, not the write-off count. Traced, the
+ * full-power ball crests the arch flatter and comes down onto the flat-topped
+ * bumper at x=113..125, y=115, whose contact normal is exactly vertical — nothing
+ * rolls a ball off a level surface, and the real machine empties it with a coil,
+ * in the device layer this reconstruction does not have. At seven the shot clears
+ * it and the completing range is contiguous again, which is the property that
+ * makes pull length mean anything. 23 of 32 is 72%, so a two-thirds pull still
+ * does not complete.
+ *
+ * Law 'n Justice keeps six: its lane is driven too, its threshold moved 28 -> 29
+ * of 32, and its completing range stayed contiguous. BabeWatch keeps six because
+ * its lane is not driven at all.
  */
 export const FULL_PLUNGE_SPEED_BY_TABLE: Readonly<Record<TableId, number>> = Object.freeze({
   "law-n-justice": MAX_LAUNCH_SPEED,
   babewatch: MAX_LAUNCH_SPEED,
-  "extreme-sports": MAX_LAUNCH_SPEED,
+  "extreme-sports": pixelsToQ10(7),
 });
 
 export interface PlungerConfig {

@@ -108,6 +108,29 @@ export interface TableMapDocument {
   readonly rows: readonly (readonly number[])[];
 }
 
+/**
+ * On-disk shape of `public/generated/tables/<id>.accel.json`: the per-8x8-block
+ * ramp drive decoded from slot 4. See `table-accel.ts` for what it means and
+ * `scripts/export-table-accel.mjs` for where it comes from.
+ */
+export interface TableAccelDocument {
+  readonly schema: "pinball-illusions/table-accel/v1";
+  readonly tableId: TableId;
+  readonly displayName: string;
+  readonly provenance: {
+    readonly sourceClass: string;
+    readonly description: string;
+    readonly authorizationRequired: boolean;
+  };
+  readonly blockSize: number;
+  readonly columns: number;
+  readonly rows: number;
+  /** Signed (dx, dy) pairs in the ORIGINAL's per-substep velocity units. */
+  readonly vectors: readonly (readonly number[])[];
+  /** One per playfield level; per block row, flat [inclusive_end_column, vector index]. */
+  readonly levels: readonly (readonly (readonly number[])[])[];
+}
+
 /** One ball in flight. Positions are Q10; velocities are signed 16-bit. */
 export interface BallState {
   readonly id: number;

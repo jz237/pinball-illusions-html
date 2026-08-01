@@ -10,7 +10,6 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { readFileSync } from "node:fs";
 import {
   BALL_SEARCH_BOX_PIXELS,
   BALL_SEARCH_TICKS,
@@ -22,20 +21,15 @@ import {
 import type { Game, InputSource } from "../src/browser/game-loop.js";
 import { CONTROLS, IDLE_SNAPSHOT } from "../src/browser/input.js";
 import type { Control, ControlEdges, ControlSnapshot } from "../src/browser/input.js";
-import { parseTableMapDocument } from "../src/game/table-map.js";
+import { mapFor } from "./table-fixtures.js";
 import { pixelsToQ10 } from "../src/core/fixed-point.js";
-import type { TableId, TableMapDocument } from "../src/game/contracts.js";
+import type { TableId } from "../src/game/contracts.js";
 import { TABLE_IDS } from "../src/game/contracts.js";
 import { materialTableFor } from "../src/game/materials.js";
 import { createBallSet, spawnBall, stepBalls } from "../src/game/ball-physics.js";
 import { PLUNGER_REFERENCE_GRAVITY } from "../src/game/plunger.js";
 import { freeCentre, levelViewsOf } from "../src/game/level-scan.js";
 import type { LevelViews } from "../src/game/level-scan.js";
-
-function mapFor(tableId: TableId) {
-  const url = new URL(`../public/generated/tables/${tableId}.map.json`, import.meta.url);
-  return parseTableMapDocument(JSON.parse(readFileSync(url, "utf8")) as TableMapDocument);
-}
 
 function realMap() {
   return mapFor("law-n-justice");

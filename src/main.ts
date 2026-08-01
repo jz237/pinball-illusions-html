@@ -29,6 +29,7 @@ import type { Control } from "./browser/input.js";
 import { integerScaleFor, setPlayfieldArtwork } from "./browser/playfield-renderer.js";
 import { loadTableMap } from "./game/table-map.js";
 import { loadTableArt } from "./game/table-art.js";
+import { loadTableAcceleration } from "./game/table-accel.js";
 import type { TableId } from "./game/contracts.js";
 
 const TABLE: TableId = "law-n-justice";
@@ -125,12 +126,21 @@ async function boot(): Promise<void> {
   const context = requireContext(canvas);
   const router = new InputRouter();
 
-  // Two files per table, and both are required. The map is the collision
-  // geometry the physics reads; the artwork is the picture the player sees.
-  // Fetched together because neither depends on the other, and awaited before
-  // the loop starts because the renderer refuses to draw a table whose artwork
-  // is missing rather than inventing a substitute for it.
-  const [map, artwork] = await Promise.all([loadTableMap(TABLE), loadTableArt(TABLE)]);
+  // Three files per table, and all three are required. The map is the collision
+  // geometry the physics reads; the artwork is the picture the player sees; the
+  // ramp drive is the per-block acceleration that carries the ball along
+  // surfaces too shallow for gravity to move it against friction, without which
+  // a ball reaching an arch stops there for the rest of the game. Fetched
+  // together because none depends on the others, and all awaited before the loop
+  // starts — the renderer refuses to draw a table whose artwork is missing, and
+  // `createGame` refuses to assemble one whose drive is missing, rather than
+  // either of them inventing a substitute.
+  const [map, artwork] = await Promise.all([
+    loadTableMap(TABLE),
+    loadTableArt(TABLE),
+    // Registers itself; `createGame` reads it back out of the registry.
+    loadTableAcceleration(TABLE),
+  ]);
   setPlayfieldArtwork(map, artwork);
   const game = createGame(map);
 

@@ -115,10 +115,20 @@
  * ---------------------------------------------------------------------------
  * There is no rubber-versus-wall distinction anywhere in this data. Collision
  * is a SINGLE BIT per level: solid or not solid. No per-material restitution,
- * friction or kick table exists in the segments; the only per-region constant
- * table found (Table00N.seg04.bin +6304, 4-byte signed x/y pairs) is a
- * per-8x8-block ACCELERATION added to velocity each frame — ramp guidance and
- * slope, not bounce.
+ * friction or kick table exists in the segments.
+ *
+ * There IS a per-region constant table and it carries ACCELERATION rather than
+ * bounce: the RAMP DRIVE, now decoded, shipped and applied. This note used to
+ * describe it as "Table00N.seg04.bin +6304, 4-byte signed x/y pairs ... a
+ * per-8x8-block acceleration", which named only half of it. File offset 6304
+ * (data offset 6300) is the short list of signed (dx, dy) word pairs; the part
+ * that carries the GEOMETRY is the two 42x75 BLOCK MAPS in front of it, at data
+ * 0 and data 3150, one per playfield level, whose bytes index that list. See
+ * `scripts/export-table-accel.mjs` for the decode and the disassembly of the
+ * consumer at main.seg00 +0x00B70A, and `table-accel.ts` for what the physics
+ * does with it. Its existence is also why no amount of tuning the numbers below
+ * could have closed the shallow-slope traps: the missing term was never a
+ * coefficient.
  *
  * So: every `passable` flag and every `kind` below is derived from the data.
  * NOT ONE elasticity, friction or kick number in this file is measured. They
@@ -167,8 +177,17 @@ const ROLLING_FRICTION: Q10 = 20;
 
 /** Plain wall restitution, mid of the 0.55-0.7 band the project settled on. */
 const WALL_ELASTICITY: Q10 = 640;
-/** Tangential loss on a wall graze, ~0.15. */
-const WALL_FRICTION: Q10 = 154;
+/**
+ * Tangential loss on a wall graze, ~0.15.
+ *
+ * Exported because it is not only a coefficient: under the Coulomb rule in
+ * `reflectVelocity` it also fixes a STATIC FRICTION ANGLE of
+ * `atan(154/1024)` = 8.55 degrees, below which a slope holds a ball
+ * indefinitely. `ball-physics.ts` derives its slope release from this number so
+ * the two can never drift apart, and `releaseFromShallowSlope` documents why the
+ * original — whose bounce has no Coulomb term at all — never needed one.
+ */
+export const WALL_FRICTION: Q10 = 154;
 
 /**
  * Free space: the ball rolls through, losing only rolling friction.

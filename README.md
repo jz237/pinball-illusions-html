@@ -24,6 +24,36 @@ collision map for all three tables has been decoded and shipped:
   `node scripts/export-table-maps.mjs <segment-dir>` rewrites them and
   `--check` re-decodes and compares without writing.
 
+And the **ramp drive** is decoded and shipped beside them, in
+`public/generated/tables/*.accel.json`:
+
+- Slot 4 of each table package opens with **two 42 x 75 byte block maps**, one per
+  playfield level, one byte per **8 x 8 pixel** block of the 336 x 600 playfield,
+  followed by a short list of signed **(dx, dy)** word pairs the bytes index. The
+  engine adds that pair to the ball's velocity beside gravity on every integration
+  substep; the consumer is disassembled in full in
+  `scripts/export-table-accel.mjs`, at `main.seg00 +0x00B70A`.
+- This is what a ramp uses to carry the ball, and a reconstruction cannot do
+  without it. Any surface shallower than the contact model's static-friction angle
+  of `atan(154/1024)` = 8.55 degrees is an equilibrium, and the tables are full of
+  them because a real ramp is nearly flat. No choice of friction coefficient
+  escapes that — and the original never needed one, because its bounce has no
+  Coulomb term at all. See `src/game/table-accel.ts`.
+- `scripts/export-table-accel.mjs` is the generator of record, with the same
+  `<segment-dir>` and `--check` interface as the map exporter, and four fatal
+  self-checks: the module's relocation table must parse to the byte and rewrite
+  nothing in the decoded region; the slot-0 descriptor must delimit all three
+  structures exactly; the vectors must be shaped like a ramp drive; and the block
+  maps must be mostly zero and spatially coherent.
+- `tests/table-accel.test.ts` does the part a comment cannot: it measures the
+  shipped block maps against the shipped collision maps and asserts that the
+  driven blocks land on the ramps.
+
+`scripts/aggressive-census.mts` is the survey instrument the strand sites are
+measured with — a player who taps the bats on a fixed cadence whatever the ball
+is doing, over every plunge hold from 8 to 97, 90 games and 270 ball ends a
+table. It is deliberately not a test; `tests/plays.test.ts` holds the contracts.
+
 ### What runs today
 
 A Q10 fixed-point N-ball simulation, a 50 Hz fixed-step scheduler, ring-based

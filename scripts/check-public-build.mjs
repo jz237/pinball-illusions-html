@@ -107,6 +107,7 @@ const AUTHORIZATION_ENV = "PINBALL_ILLUSIONS_DERIVED_AUTHORIZED";
 const DERIVED_MARKERS = [
   { class: "disk-derived-collision-geometry", noun: "collision map" },
   { class: "disk-derived-playfield-artwork", noun: "playfield artwork" },
+  { class: "disk-derived-ramp-acceleration", noun: "ramp drive" },
 ];
 
 /** Tolerates both `"sourceClass":"x"` and the spaced form a formatter might emit. */

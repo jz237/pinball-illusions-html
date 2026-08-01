@@ -14,8 +14,6 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 
 import type { ControlSnapshot } from "../src/browser/input.js";
 import { InputRouter } from "../src/browser/input.js";
@@ -29,20 +27,17 @@ import {
   startGame,
 } from "../src/browser/game-loop.js";
 import type { Game, GameTickReport } from "../src/browser/game-loop.js";
-import type { TableMap, TableMapDocument } from "../src/game/contracts.js";
-import { parseTableMapDocument } from "../src/game/table-map.js";
+import type { TableMap } from "../src/game/contracts.js";
+import { mapFor } from "./table-fixtures.js";
 import { pixelsToQ10, q10ToPixel } from "../src/core/fixed-point.js";
 import { plungerConfigFor, servePosition } from "../src/game/plunger.js";
 import { FixedStepScheduler } from "../src/core/fixed-step-scheduler.js";
 
-const MAP_PATH = fileURLToPath(
-  new URL("../public/generated/tables/law-n-justice.map.json", import.meta.url),
-);
-
-/** Parsed once: it is read-only and expanding 336x600 per test is wasteful. */
-const MAP: TableMap = parseTableMapDocument(
-  JSON.parse(readFileSync(MAP_PATH, "utf8")) as TableMapDocument,
-);
+/**
+ * Parsed once: it is read-only and expanding 336x600 per test is wasteful.
+ * `mapFor` also registers the table's ramp drive, which `createGame` requires.
+ */
+const MAP: TableMap = mapFor("law-n-justice");
 
 const SERVE = servePosition(plungerConfigFor("law-n-justice"));
 

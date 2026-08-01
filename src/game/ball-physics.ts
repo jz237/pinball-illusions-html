@@ -52,6 +52,18 @@
  * been deleted rather than left as a dead knob.
  *
  * ---------------------------------------------------------------------------
+ * GRAVITY IS NOT THE ONLY ACCELERATION
+ * ---------------------------------------------------------------------------
+ * `stepBalls` adds a second one: the RAMP DRIVE, a per-8x8-block (dx, dy) looked
+ * up from the ball's position and the level it is on. It is decoded from the
+ * original's own data — two 42x75 block maps and a short vector list at the
+ * front of slot 4 — and `table-accel.ts` holds both the decode and the reason a
+ * reconstruction cannot do without it: with a 0.15 friction coefficient the
+ * static-friction angle is 8.55 degrees, every ramp face shallower than that is
+ * an equilibrium, and the original's answer was to drive the ball rather than to
+ * pick a friction number that works everywhere. There is no such number.
+ *
+ * ---------------------------------------------------------------------------
  * WHY A TICK ALWAYS MAKES PROGRESS
  * ---------------------------------------------------------------------------
  * Contact is evaluated at a position the ball can actually reach, never at a
@@ -107,6 +119,7 @@ import {
   ringOffsetsFor,
 } from "./collision-probe.js";
 import { SOLID_BORDER_INDEX } from "./materials.js";
+import type { TableAcceleration } from "./table-accel.js";
 import type { LevelGate, PlayfieldLevel } from "./playfield-levels.js";
 import {
   levelAfterCrossing,
@@ -122,6 +135,28 @@ export { BALL_RADIUS_PIXELS, integerSqrt };
 
 const VELOCITY_MIN = -32767;
 const VELOCITY_MAX = 32767;
+
+/**
+ * The original's rolling friction: the fraction of a resting ball's
+ * along-surface speed lost in one 50 Hz frame. Q10, so 22/1024 = 2.15%.
+ *
+ * DECODED, not chosen. The engine's bounce takes `5*256/(8*$3a)` of the slip per
+ * pass, `$3a` comes from the 256-entry per-region table in main.seg08, and the
+ * bounce runs three times a frame. The bulk region — 134 of the 256 entries —
+ * has `$3a` = 21760, giving `160/21760` = 0.7353% per pass and
+ *
+ *     1 - (1 - 160/21760)^3  =  2.1904%   ->  22 in Q10
+ *
+ * per frame, which is one tick here. The other seven rows of that table give
+ * 0.69% to 3.1% per pass; a per-region version of this would need the RLE region
+ * map at `$50(a4)` decoded as well, which has not been done, so the commonest
+ * value stands for all of them and this is the ONE number in the contact model
+ * that is a table average rather than a per-surface fact.
+ *
+ * See `reflectVelocity` for how it is used — as a CAP on the Coulomb budget of a
+ * resting contact, never as a replacement for it — and why.
+ */
+export const ROLLING_SLIP_FRICTION: Q10 = 22;
 
 // ---------------------------------------------------------------------------
 // The virtual top wall
@@ -322,6 +357,19 @@ export interface SimulationOptions {
   readonly topWallRows: number | null;
   /** Ball-to-ball collision. On by default; multiball is the whole point. */
   readonly ballToBall: boolean;
+  /**
+   * The table's RAMP DRIVE: the per-8x8-block acceleration the original added
+   * to velocity beside gravity. See `table-accel.ts`.
+   *
+   * Null means no drive, and that is the right default for the many unit tests
+   * below that simulate on synthetic maps where "a ramp" means nothing. It is
+   * NOT a safe default for a real table — a shallow ramp face is an equilibrium
+   * under the contact model's friction angle and a ball that reaches one stops
+   * for good — so the game loop does not go through this option's default:
+   * `createGame` obtains the drive from `tableAccelerationFor`, which throws
+   * rather than answering null. There is no path to a real game without it.
+   */
+  readonly rampDrive: TableAcceleration | null;
 }
 
 export const DEFAULT_SIMULATION_OPTIONS: SimulationOptions = {
@@ -331,6 +379,7 @@ export const DEFAULT_SIMULATION_OPTIONS: SimulationOptions = {
   drainY: null,
   topWallRows: null,
   ballToBall: true,
+  rampDrive: null,
 };
 
 interface ResolvedOptions {
@@ -340,6 +389,7 @@ interface ResolvedOptions {
   readonly drainY: Q10;
   readonly topWallRows: number;
   readonly ballToBall: boolean;
+  readonly rampDrive: TableAcceleration | null;
 }
 
 /**
@@ -369,6 +419,7 @@ function resolveOptions(map: TableMap, options?: Partial<SimulationOptions>): Re
     drainY: options?.drainY ?? pixelsToQ10(map.height),
     topWallRows,
     ballToBall: options?.ballToBall ?? DEFAULT_SIMULATION_OPTIONS.ballToBall,
+    rampDrive: options?.rampDrive ?? DEFAULT_SIMULATION_OPTIONS.rampDrive,
   };
 }
 
@@ -576,9 +627,96 @@ export function reflectVelocity(
   // finite time. It is bounded by the speed itself below, so it can never push
   // the ball backwards, and against a rolling ball on a slope — which gains up
   // to a whole tick of gravity, 24 units — one unit is noise.
+  //
+  // ---------------------------------------------------------------------------
+  // AND ON A RESTING CONTACT THE COULOMB BUDGET IS CAPPED BY THE ORIGINAL'S OWN
+  // ROLLING RULE, WHICH IS WHAT CLOSES THE SHALLOW-SLOPE TRAPS
+  // ---------------------------------------------------------------------------
+  // Coulomb friction has a STATIC FRICTION ANGLE: `atan(154/1024)` = 8.55
+  // degrees, below which the budget is at least as large as the tangential speed
+  // gravity supplies and a ball lying on the surface is held there for the rest
+  // of the game. The tables are full of surfaces shallower than that, because a
+  // real ramp is nearly flat, and no choice of coefficient escapes it — raising
+  // friction widens the band and lowering it turns the whole table to ice.
+  //
+  // THE ORIGINAL HAS NO SUCH ANGLE, because it has no Coulomb term at all. Its
+  // bounce is at main.seg00 +0x00B620 and its whole tangential rule is
+  //
+  //     00b626  move.w  $3a(a4), d5
+  //     00b62a  move.w  $26(a4), d3     ; ball SPIN
+  //     00b62e  sub.w   d2, d3          ;  - tangential speed = the SLIP
+  //     00b632  asl.l   #8, d3
+  //     00b634  divs.w  d5, d3          ;  / $3a
+  //     00b638  asl.w   #2, d3          ; x 5/8
+  //     00b63a  add.w   d4, d3
+  //     00b63c  asr.w   #3, d3
+  //     00b63e  add.w   d3, d2          ; tangential += that
+  //     00b640  sub.w   d4, $26(a4)     ; spin -= the same
+  //
+  // — a fraction of the SLIP between the ball's spin and its along-surface speed,
+  // so a ball rolling without slipping loses nothing whatever, and NO slope,
+  // however shallow, can hold a ball. `$3a` comes from a 256-entry per-region
+  // table in main.seg08 whose eight distinct rows give slip fractions
+  // `5*256/(8*$3a)` of 0.0069 to 0.031 per bounce, and the bounce runs three
+  // times a frame (the unrolled tick at +0x00A660 is four groups of two
+  // integrations with a collision-and-bounce at +0x00A696, +0x00A6E0, +0x00A728).
+  //
+  // This port cannot adopt that rule wholesale, and it is worth saying why so
+  // nobody tries it as a simplification: friction on SLIP needs a spin state
+  // `BallState` does not have, and dropping the spin term leaves friction
+  // proportional to the whole tangential speed — the percentage model this file
+  // already measured and rejected above, which caps a ball on a slope at
+  // `g*sin(theta)/f` instead of letting it accelerate. At the decoded coefficient
+  // that cap is 789 Q10/tick on a 45-degree ramp, under the 1000 that "lets a
+  // ball on a slope accelerate instead of settling into a crawl" demands.
+  //
+  // So the two rules are combined the only way that keeps what each is right
+  // about: ON A RESTING CONTACT THE LOSS IS THE SMALLER OF THE TWO. Coulomb
+  // never gets to take more than the original's rolling friction would, and the
+  // proportional rule never gets to cap a fast ball, because the moment it
+  // exceeds the Coulomb budget the budget wins. `resting` is `deflected === 0`,
+  // i.e. the approach was too gentle to bounce — for a plain wall an approach
+  // under 0.25 px/tick — so every graze, bounce and flipper shot is charged full
+  // Coulomb exactly as before and no impact behaviour changes.
+  //
+  // What that buys, in the two regimes that matter:
+  //
+  //   - A BALL LYING ON A SHALLOW SLOPE ACCELERATES. Below about 140 Q10/tick of
+  //     tangential speed the proportional loss is under the Coulomb budget of 3,
+  //     so the ball keeps a strictly positive share of the `g*sin(theta)` gravity
+  //     hands it and accumulates it tick over tick. On the 7.1 to 7.9 degree
+  //     faces this work was about — Law 'n Justice (86,156), BabeWatch (91,171),
+  //     Extreme Sports' plateau shoulders — it settles at about 140 Q10/tick,
+  //     which is 68 px per 500-tick ball-search window against the 8 px the
+  //     search asks for.
+  //   - A FAST BALL IS UNTOUCHED. Above 140 Q10/tick the minimum is the Coulomb
+  //     budget and the rule is bit-for-bit what it was. That matters: an earlier
+  //     attempt exempted resting contacts outright, and because a ball rolling
+  //     FAST along a floor also approaches it at only one tick of gravity, that
+  //     quietly removed friction from fast rolling everywhere — Law 'n Justice
+  //     balls carried the extra speed into the left rail and 17 of 90 census
+  //     balls died at (8,236) that had drained before.
+  //
+  // A ball on LEVEL ground still comes to rest: there is no tangential speed to
+  // keep, so the floor takes what little there is — on flat floors, in the bottom
+  // of cups, and on a raised flipper bat. And the one-unit floor still applies,
+  // so a sliding contact still always costs something and a wedged ball still
+  // reaches zero in finite time.
+  //
+  // The band is narrowed, not closed. Below about `atan(1/gravityY)` = 2.4
+  // degrees one tick of gravity contributes less than one Q10 unit along the
+  // surface and the floor holds the ball. That is left alone and is not a fudge:
+  // a 2.4 degree surface is flat, and a genuinely flat trap — Extreme Sports has
+  // one, a flat-topped mound whose crown at x=113..125, y=106 has an exactly
+  // vertical contact normal — is emptied on the real machine by a coil, in the
+  // device layer this reconstruction does not have yet.
   const budget = q10Multiply(friction, normalImpulse);
-  const drop = friction > 0 && normalImpulse > 0 ? Math.max(1, budget) : budget;
+  const full = friction > 0 && normalImpulse > 0 ? Math.max(1, budget) : budget;
   const tangentSpeed = integerSqrt(tangentX * tangentX + tangentY * tangentY);
+  const resting = deflected === 0 && friction > 0 && normalImpulse > 0;
+  const drop = resting
+    ? Math.max(1, Math.min(budget, q10Multiply(ROLLING_SLIP_FRICTION, tangentSpeed)))
+    : full;
   // Friction opposes sliding; it cannot reverse it, so the loss stops at rest.
   const keep =
     tangentSpeed <= drop ? 0 : Math.trunc(((tangentSpeed - drop) * Q10_ONE) / tangentSpeed);
@@ -909,9 +1047,30 @@ export function stepBalls(
     // see `nudgeReachesLevel` for the arch measurements that forced this. Gravity
     // still applies on every level — a ball rolls down a ramp.
     const shoved = nudgeReachesLevel(ball.level);
-    ball.velocityX = clampVelocity(ball.velocityX + (shoved ? forces.nudgeX : 0));
+
+    // The RAMP DRIVE, read at the position the ball starts the tick in and added
+    // beside gravity — the same two additions the original makes, in the same
+    // order, at main.seg00 +0x00B754/+0x00B758. It applies on both levels and
+    // whether or not the ball is in contact with anything: the original does not
+    // test either, and a ball flying through a habitrail's mouth really is being
+    // pushed along it. `table-accel.ts` has the derivation of the Q10 scale and
+    // the measurements of the shallow-slope equilibria this exists to clear.
+    //
+    // No `nudgeReachesLevel` equivalent guards it, and there is nothing to guard
+    // against: it is a property of the place, not an impulse from the cabinet.
+    const drive =
+      resolved.rampDrive === null
+        ? null
+        : resolved.rampDrive.driveAt(ball.level, q10ToPixel(ball.x), q10ToPixel(ball.y));
+
+    ball.velocityX = clampVelocity(
+      ball.velocityX + (shoved ? forces.nudgeX : 0) + (drive === null ? 0 : drive.x),
+    );
     ball.velocityY = clampVelocity(
-      ball.velocityY + forces.gravityY + (shoved ? forces.nudgeY : 0),
+      ball.velocityY +
+        forces.gravityY +
+        (shoved ? forces.nudgeY : 0) +
+        (drive === null ? 0 : drive.y),
     );
 
     // Captured before the move, because a level change is a CROSSING: the ball

@@ -125,6 +125,8 @@ import {
   tickFlipperBank,
 } from "../game/flippers.js";
 import { materialTableFor } from "../game/materials.js";
+import type { TableAcceleration } from "../game/table-accel.js";
+import { tableAccelerationFor } from "../game/table-accel.js";
 import type { PlungerConfig, PlungerState } from "../game/plunger.js";
 import {
   INITIAL_PLUNGER,
@@ -298,6 +300,11 @@ export type GamePhase = "attract" | "in-play" | "game-over";
 export interface Game {
   readonly map: TableMap;
   readonly materials: MaterialTable;
+  /**
+   * The table's ramp drive. Not optional and not nullable: see `table-accel.ts`
+   * for why a game without it is a different machine.
+   */
+  readonly rampDrive: TableAcceleration;
   readonly options: GameOptions;
   readonly plungerConfig: PlungerConfig;
   readonly nudgeConfig: NudgeConfig;
@@ -343,10 +350,21 @@ const NUDGE_CONTROLS: readonly (readonly [Control, NudgeDirection])[] = Object.f
   Object.freeze(["nudgeForward", "forward"] as const),
 ]);
 
+/**
+ * Assembles a game on one table's geometry.
+ *
+ * `tableAccelerationFor` THROWS when the table's ramp drive has not been
+ * registered, and that is on purpose: the drive is what carries a ball along a
+ * ramp face too shallow for gravity to move it against friction, so a game
+ * missing it looks entirely normal until a ball reaches an arch and stops
+ * forever. Better a boot failure that names the file to load. See
+ * `table-accel.ts`.
+ */
 export function createGame(map: TableMap, options?: Partial<GameOptions>): Game {
   return {
     map,
     materials: materialTableFor(map.tableId),
+    rampDrive: tableAccelerationFor(map.tableId),
     options: resolveGameOptions(options),
     plungerConfig: plungerConfigFor(map.tableId),
     nudgeConfig: nudgeConfigFor(map.tableId),
@@ -521,7 +539,13 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
 
   // ---- physics -----------------------------------------------------------
   const forces: SimulationForces = { gravityY: game.options.gravityY, nudgeX, nudgeY };
-  const step = stepBalls(game.balls, game.map, game.materials, forces, game.options.simulation);
+  // The drive is spread in LAST so a caller cannot switch it off through
+  // `options.simulation` without noticing they have done it — and it is the
+  // game's own, from the registry, not something the options carry.
+  const step = stepBalls(game.balls, game.map, game.materials, forces, {
+    ...game.options.simulation,
+    rampDrive: game.rampDrive,
+  });
   resolveFlipperContacts(
     game.balls.balls,
     bankTick.sweeps,
