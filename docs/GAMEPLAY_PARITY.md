@@ -67,8 +67,16 @@ simulate exactly one ball.
   and does nothing. **[disk]**
 - **Multiball is a TOP-UP, not a fixed count.** Opcode `$6C` takes the target ball
   count as a word parameter and loops `while (live + queued < N) queued++`, so two-ball
-  and three-ball multiballs are both expressible; which one a given table asks for is
-  per-table script data and is still **[open]**. A locked ball is released by opcode
+  and three-ball multiballs are both expressible. **Which one each table asks for is
+  now SETTLED, from the shipped scripts themselves:** across all 970 exported mode
+  scripts (Law 'n Justice 304, BabeWatch 342, Extreme Sports 324) every
+  `BALLS_UP_TO` operand is **2 or 3** — LnJ one 2 and three 3s, BW three 2s and three
+  3s, ES three 3s — and a raw byte scan of the script segments in `seg_clean`
+  (`Table00N.bin.seg04.bin`, pattern `00 1B 00 xx`) matches the export exactly with
+  **zero occurrences of operand 4**. No shipped script ever requests four balls, the
+  engine would refuse it if one did (`cmpi.w #$3,d1 / bhi` at data `0x5BD0`), and the
+  ball array is physically three objects — the four-ball question is settled at both
+  the content and the capability level. **[disk]** A locked ball is released by opcode
   `$68` (data `0x5B4E`), which does *not* kick it out of the saucer — it clears the
   held flag, re-initialises the ball object and increments the serve queue `$D86(a5)`.
   Locked balls come back out of the **plunger lane**, one at a time, gated by
@@ -85,7 +93,28 @@ simulate exactly one ball.
   zero sites across `main.seg00` and `main.seg01`. Worse, `device+$02`, the byte that
   gates those increments, is **zero on every type-4 device on all three tables as
   shipped**, so the counting path is dead at load time. The rule lives in per-table
-  script data and the script streams have not been located. **[open]**
+  script data, **and the scripts are now located and readable** (the mode-VM export):
+  - Every lock device carries its own capture script via `device+$14`
+    (`move.l $14(a1),d0 / jsr $6c10` at `0x557A`), and those scripts are exported —
+    BabeWatch's five locks fire scripts 52/53/54/55/57, LnJ's three fire 62/63/64,
+    ES's two fire 36/37. They award and light lamps; **none releases a ball or starts
+    a multiball directly**. **[disk]**
+  - The multiball scripts themselves are decoded. **BabeWatch is a per-game lock
+    LADDER, not "hold two saucers":** launcher scripts 110/114/117/119 print
+    `BALL 1..4 LOCKED` and `MODE_START` the four multiball modes 179 ("SHOW YOUR
+    MUSCLES", `BALLS_UP_TO 2`), 182 ("SURF THEM WAVES", `BALLS_UP_TO 3`),
+    188 ("HAVE A BURGER DUDE", `BALLS_UP_TO 2`), 192 ("MONEY HUNT",
+    `BALLS_UP_TO 3`) — so the FIRST lock of the game already starts a two-ball
+    multiball. LnJ's multiball scripts 93/94 do `BALL_REMOVE 24` (release the jail's
+    held balls to the serve queue) then `BALLS_UP_TO 2`/`3`. **[disk]**
+  - What is still **[open]** is the dispatch that runs the Nth launcher on the Nth
+    capture: nothing in the export references scripts 110–119 (their mission records
+    have `selector -1`), so the counter that picks `BALL 1 LOCKED` versus
+    `BALL 2 LOCKED` — and the alternates `n MORE TO START MODE` used while a
+    lock-gated mode is lit — lives in a structure not yet exported. Until it is
+    traced, the port's "two saucers held lights a three-ball multiball" stays a
+    labelled reconstruction (`ball-locks.ts`), now known to be tighter than the
+    original's BabeWatch rule.
 - The display switches to a high-resolution full-screen mode while multiball is
   active so every ball stays visible; toggleable by the player. **[src]** — the
   mechanism is now identified as option record 7 with its two display configurations
@@ -109,7 +138,12 @@ value that fills the three-ball ceiling without exceeding it), and that a captur
 which leaves nothing rolling buys the player a replacement ball. Balls the machine
 owes itself are auto-launched after half a second, because a player already flipping
 two balls cannot also be winding a spring; a ball the *player* was given is never
-auto-launched.
+auto-launched. A third labelled behaviour joined them with the measured flipper: a
+ball that settles inside an **occupied** saucer — which capture must refuse, per the
+engine — is swallowed back to the trough as an owed serve by the ball search rather
+than written off, which is the decoded `$68` release semantics applied to the one
+place the playfield genuinely cannot return a ball from (see the census baseline
+below, and `runBallSearch` in `game-loop.ts`).
 
 ## Options — SETTLED
 
@@ -640,10 +674,12 @@ under emulation as the cheapest way to get it.
   four balls.** The engine's ball array is three objects long and the multiball opcode
   refuses any count above three outright (see "Defining feature: multiball"), so
   whatever Iron Man is, this engine cannot put four balls on the playfield. No literal
-  4 is used as a ball count anywhere either; the mode object is referenced by exactly
-  four award records, and that is an inference from record counts rather than a decoded
-  constant. The table's own menu blurb says "Iron Man **Races**". What the mode
-  actually does remains **[open]**.
+  4 is used as a ball count anywhere either — settled twice over now: every
+  `BALLS_UP_TO` operand in Extreme Sports' 324 exported scripts is 3, and the raw
+  `seg04` byte scan (`00 1B 00 xx`) contains no operand 4 — the mode object is
+  referenced by exactly four award records, and that is an inference from record
+  counts rather than a decoded constant. The table's own menu blurb says "Iron Man
+  **Races**". What the mode actually does remains **[open]**.
 - Extreme Sports carries **no lock or multiball string at all** in `Table003.seg04` —
   60 printable strings, none matching lock/multi/ball N/kick/saucer/hole — yet its zone
   list has **two type-4 capture devices**, one per level, at (249,159)-(269,179) on
@@ -678,6 +714,64 @@ Parity means deciding about these deliberately rather than by accident:
   behaviour without a candidate cause.
 
 Both are candidates for a "faithful / fixed" toggle rather than silent correction.
+
+## Census baseline — at the measured flipper, camera and tilt (2026-08)
+
+The first full census after the invented flipper/camera/tilt were replaced by the
+measured models, and the current baseline for every future comparison. **Every
+figure below is at the 40,000-tick budget** (`scripts/aggressive-census.mts`,
+90 games/table, plunge holds 8..97, bat cadences 17..30, nudge every 700 ticks)
+unless it says otherwise; a rate is only comparable against another rate at the
+same budget.
+
+- **Completions: 90/90 on all three tables, zero stalls.** A separate whole-game
+  probe at the same budget with a nudge every 400 ticks completed 270/270.
+- **Write-offs: 0.0% / 0.0% / 0.0%** (Law 'n Justice 288 ends, BabeWatch 270,
+  Extreme Sports 279 — all real drains). The census as first run read BW at 0.4%:
+  one deterministic strand at `(220,289)` level 0, hold 25 / cadence 20 — a
+  replacement ball settling in the physical bottom of the `lower-bowl` saucer
+  while the saucer held ball 1, refused by capture (the engine's own
+  occupied-means-ignore at `0x5536`) and unreachable by gravity, ramp drive or the
+  slingshot pulses (kicked 30 px out, rolled straight back, twice). Fixed in
+  `runBallSearch`: a still ball inside an occupied saucer is swallowed to the
+  trough as an owed serve — the decoded `$68` semantics, saucer balls leave via
+  the trough and return from the plunger lane — instead of being pulsed and
+  written off. After the fix the same census slice reads 0.0% with LnJ/ES
+  figures unchanged to the ball. **[measured]**
+- **Determinism holds:** hold-40 games run twice per table give byte-identical
+  tick-state hash chains and scores (LnJ `84bc21a6` / 1,185,000; BW `3a0540a8` /
+  265,000; ES `8be26f7e` / 50,000).
+- **Missions and multiball run at the measured energies.** Aggressive play:
+  missions started LnJ 87, ES 29, BW 5; locks LnJ 128, BW 11, ES 57; multiball
+  starts LnJ 19 (in 12/90 games), ES 1, BW 0; max simultaneous balls 3 on every
+  table. Every mission started in play ended with its ball (lifetimes 111–1641
+  ticks); a VM-only run of the shipped scripts with no shots confirms the WAIT
+  clocks time out to END (LnJ 7, BW 3, ES 10 reach END; the rest park on untimed
+  shot-waits that end at drain, by design).
+- **BabeWatch plays much tighter at the measured flipper, and that is the
+  machine, not a defect.** Its aggressive-play ball ends dropped 311 → 270
+  (exactly zero extra balls: no multiball started in 90 games, 11 lock captures,
+  never two in one game, missions in only 3/90), and its mean score (331k) is
+  now the lowest of the three. The multiball machinery itself is intact — forced
+  lock-release tests get three balls rolling on every table — the measured
+  flipper simply no longer reaches the upper saucers often enough to satisfy the
+  port's two-saucer reconstruction. The decoded BabeWatch rule is looser (first
+  lock starts a 2-ball multiball — see "Defining feature: multiball"), so wiring
+  the decoded ladder is the correct future fix, as its own change with its own
+  census. **[measured]**
+- **Scores (mean / median / max):** LnJ 1,673,000 / 860,000 / 15,545,000;
+  BW 330,722 / 265,000 / 2,690,000; ES 609,167 / 380,000 / 9,810,000. The
+  previously quoted 20.9M/11.4M/11.3M came from an unrecorded harness and is
+  **not budget-comparable**; at this budget LnJ leads by ~3× as before, but ES
+  now outscores BW (their old gap was 1%, within noise).
+- **The four-ball question is settled — no.** No shipped script asks for more
+  than three and the engine could not grant it; full derivation under "Defining
+  feature: multiball". `Iron Man`, whatever it is, is not four live balls.
+- **Tilt under the shipped rule** (record 3 per key PRESS, decay 4/tick, trips
+  at 200): two nudges can never tilt (196 max), a third inside about half a
+  second does (measured 100/160/220 at 10-tick spacing, identical on all three
+  tables). At census cadences — one nudge per 700 or 400 ticks — the table
+  tilted 0 times in 540 games, so census play is tilt-neutral.
 
 ## How the open items get closed
 

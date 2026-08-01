@@ -107,6 +107,14 @@ import { q10ToPixel } from "../core/fixed-point.js";
  *
  * So an "Iron Man four-ball mode" on Extreme Sports, whatever it was, cannot
  * have been four balls on the playfield in this engine.
+ *
+ * AND NOTHING EVER ASKED. The content side is settled too, by census of the
+ * shipped scripts: across all 970 exported mode scripts (LnJ 304, BW 342,
+ * ES 324) every BALLS_UP_TO operand is 2 or 3 — LnJ {2:1, 3:3}, BW {2:3, 3:3},
+ * ES {3:3}, Iron Man included — and a raw byte scan of the seg_clean script
+ * segments (pattern 00 1B 00 xx) matches the export exactly, with zero
+ * occurrences of operand 4. Four live balls were never possible AND never
+ * requested. See docs/GAMEPLAY_PARITY.md, "Defining feature: multiball".
  */
 export const MAX_SIMULTANEOUS_BALLS = 3;
 
@@ -149,8 +157,22 @@ export const MULTIBALL_BALL_COUNT = 3;
  *
  * For Law 'n Justice and Extreme Sports there is no such string — Extreme Sports
  * has no lock or multiball string at all — so two is a reconstruction on those
- * tables and is labelled one. If the script grammar is ever cracked, this
- * constant is where the real number goes.
+ * tables and is labelled one.
+ *
+ * THE SCRIPTS ARE NOW LOCATED, AND THEY SAY THE REAL RULE IS LOOSER — this
+ * paragraph is the trail for whoever wires it. The mode-VM export reads every
+ * lock device's own capture script (device+$14, `jsr $6c10` at 0x557A): they
+ * award and light lamps and never start a multiball themselves. The multiball
+ * scripts are separate, and on BabeWatch they form a per-game LADDER: launcher
+ * scripts 110/114/117/119 print "BALL 1..4 LOCKED" and MODE_START the modes at
+ * scripts 179 (BALLS_UP_TO 2), 182 (3), 188 (2), 192 (3) — the FIRST lock of a
+ * game already starts a two-ball multiball. LnJ's scripts 93/94 do BALL_REMOVE
+ * then BALLS_UP_TO 2/3. What is still missing is the dispatch that runs the Nth
+ * launcher on the Nth capture (nothing in the export references scripts
+ * 110..119; their mission records carry selector -1), so this constant stays
+ * the shipped reconstruction — now known to be TIGHTER than the original's
+ * BabeWatch rule, which matters at the measured flipper energies because the
+ * upper saucers are rarely reachable there. See docs/GAMEPLAY_PARITY.md.
  */
 export const LOCKS_TO_LIGHT_MULTIBALL = 2;
 

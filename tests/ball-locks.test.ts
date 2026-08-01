@@ -635,6 +635,69 @@ describe("the zero-deadlock guarantee, restated for locks", () => {
       ).toBeLessThanOrEqual(MAX_SIMULTANEOUS_BALLS);
     });
   }
+
+  it("returns a ball stranded in an occupied saucer to the trough, not the drain", () => {
+    // The site the first census at the measured flipper found, reproduced
+    // literally: BabeWatch's lower-bowl saucer holds ball one, and the
+    // replacement ball settles at the physical bottom of the same bowl —
+    // (219,290), inside the saucer's (200,250)-(230,295) rectangle — where
+    // capture must refuse it (the engine's occupied-means-ignore) and gravity,
+    // the ramp drive and the slingshot pulses cannot return it. The ball search
+    // used to retire it as a write-off; the fix swallows it to the trough as an
+    // owed serve, which is what the decoded release path ($68) does with every
+    // ball that leaves a saucer. See `runBallSearch` in game-loop.ts.
+    const game = createGame(mapFor("babewatch"), { ballsPerGame: 3, ballSearchTicks: 40 });
+    startGame(game);
+    runTicks(game, idleInput(), 60);
+
+    // The served ball comes off the rod and is parked at the strand site.
+    const state = debugSnapshot(game);
+    const stray = game.balls.balls.find((one) => one.id === state.laneBallId);
+    expect(stray).toBeDefined();
+    if (stray === undefined) return;
+    game.laneBallId = null;
+    stray.x = pixelsToQ10(219);
+    stray.y = pixelsToQ10(290);
+    stray.velocityX = 0;
+    stray.velocityY = 0;
+    stray.level = 0;
+
+    // The bowl is occupied by a DIFFERENT ball, held exactly as a capture
+    // leaves one. Set directly rather than via captureBalls, which would take
+    // the parked ball first — it is also inside the rectangle, which is the
+    // whole point.
+    const bowl = ballLocksFor("babewatch").find((device) => device.id === "lower-bowl");
+    expect(bowl).toBeDefined();
+    if (bowl === undefined) return;
+    const held = spawnBall(game.balls, pixelsToQ10(228), pixelsToQ10(257), 0, 0, bowl.level);
+    held.heldBy = bowl.id;
+    game.locks.held.set(bowl.id, held.id);
+
+    // Run until the search acts, and stop there: the re-served ball would go on
+    // to drain under an idle player, which is the ordinary end of ball one and
+    // not what this test is about.
+    const swallowed: number[] = [];
+    const drained: number[] = [];
+    for (let tick = 0; tick < 400 && swallowed.length === 0; tick += 1) {
+      const report = runTicks(game, idleInput(), 1)[0]!;
+      swallowed.push(...report.swallowed);
+      drained.push(...report.drained);
+    }
+
+    // Swallowed to the trough, never drained and never written off.
+    expect(swallowed).toContain(stray.id);
+    expect(drained).not.toContain(stray.id);
+    // The saucer keeps the ball it was legitimately holding.
+    expect(heldBallIn(game.locks, bowl.id)).toBe(held.id);
+    // The machine owes itself the serve, and the player is not charged a ball
+    // for it: this is still ball one, and it comes back out of the lane.
+    expect(debugSnapshot(game).pendingServes).toBe(1);
+    runTicks(game, idleInput(), 60);
+    const after = debugSnapshot(game);
+    expect(after.phase).toBe("in-play");
+    expect(after.ballsServed).toBe(1);
+    expect(after.laneBallId !== null || freeBallCount(game.balls) > 0).toBe(true);
+  });
 });
 
 describe("what is decoded and what is not", () => {

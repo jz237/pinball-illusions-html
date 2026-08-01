@@ -160,6 +160,7 @@ import {
   captureBalls,
   createLockBank,
   heldBallCount,
+  lockCovers,
   releaseHeldBalls,
 } from "../game/ball-locks.js";
 import { BALL_RADIUS_PIXELS, DEFAULT_PROBE_RADIUS } from "../game/collision-probe.js";
@@ -618,6 +619,15 @@ export interface GameTickReport {
    * which is which and now says so, and no caller has to guess.
    */
   readonly writtenOff: readonly number[];
+  /**
+   * Ids the ball search returned to the TROUGH this tick instead of writing
+   * off: balls that had settled inside a saucer already holding one.
+   *
+   * These are NOT ball ends and are deliberately not in `drained`: the ball
+   * comes back out of the plunger lane as an owed serve, exactly as a released
+   * lock ball does. See `runBallSearch` for the site that made this necessary.
+   */
+  readonly swallowed: readonly number[];
   /** Ids a lock swallowed this tick, in device order. */
   readonly locked: readonly number[];
   /** True on the tick a multiball was lit and the saucers gave their balls back. */
@@ -795,6 +805,7 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     launched: false,
     drained: [],
     writtenOff: [],
+    swallowed: [],
     locked: [],
     multiballStarted: false,
     missionStarted: -1,
@@ -988,7 +999,11 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
   awards.push(...modeAwardsAsAwards(modeTick));
 
   // ---- ball search -------------------------------------------------------
-  const lost = runBallSearch(game);
+  const search = runBallSearch(game);
+  const lost = search.lost;
+  // A swallowed ball is inactive but NOT drained: it is back in the trough and
+  // the machine owes a serve for it, so it must not reach the end-of-ball path.
+  if (search.swallowed.length > 0) pruneInactiveBalls(game.balls);
 
   // ---- drain -------------------------------------------------------------
   let gameOver = false;
@@ -1042,6 +1057,7 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     launched,
     drained,
     writtenOff: lost,
+    swallowed: search.swallowed,
     locked: lockTick.locked,
     multiballStarted: lockTick.multiballStarted,
     missionStarted: modeTick.missionStarted,
@@ -1418,8 +1434,38 @@ function ballsLeftTheBox(
  * for as long as the rules like — writing it off after ten seconds would make
  * every lock a slow drain — and it is exempt for the same reason the ball on the
  * plunger rod is.
+ *
+ * ---------------------------------------------------------------------------
+ * THE OCCUPIED-SAUCER POCKET, AND WHY IT IS A TROUGH RETURN, NOT A WRITE-OFF
+ * ---------------------------------------------------------------------------
+ * Found by the first census at the measured flipper energies: BabeWatch, hold
+ * 25 / cadence 20, deterministic. Ball 1 is captured by the `lower-bowl` saucer
+ * (rectangle (200,250)-(230,295), level 0) and held at (228,257); the
+ * replacement ball rolls into the SAME bowl at ~tick 4820 and settles jittering
+ * at (219,290) — the bowl's physical bottom. The saucer refuses it, exactly as
+ * the original's capture handler does (`move.b $1(a1),d0 / bne` at +0x005536:
+ * occupied means ignore), and the bowl is a concave pocket on plain surface 0
+ * with ramp drive (0,0) — measured from the decoded maps — so gravity never
+ * returns it. The coil pulses threw it 30 px out and it rolled straight back
+ * down both times; the search then retired a ball that was never lost, and the
+ * census read 0.4% write-offs against a 0.0% baseline.
+ *
+ * The recovery is the machine's own, not an invention: the one coil AT a ball
+ * seated in a saucer is the saucer kicker, and the decoded release path
+ * (opcode $68, data 0x5B4E) says what that kicker does with a ball — it goes to
+ * the TROUGH and comes back out of the PLUNGER LANE as a serve. It never throws
+ * a ball onto the playfield. So when the stillness clock expires and the still
+ * ball is sitting inside an occupied saucer's rectangle, the saucer swallows it:
+ * deactivated, one serve owed, no coil pulse spent and no ball end recorded.
+ * The slingshot pulses stay the answer everywhere else; they are simply the
+ * wrong coil for a ball that is sitting in a hole with a kicker under it.
+ *
+ * Verified: the hold-25 repro now returns the ball to the lane at the first
+ * expiry and the game completes with all three balls ending in real drains;
+ * the full BabeWatch census slice is back to 0.0% at the same budget.
  */
-function runBallSearch(game: Game): number[] {
+function runBallSearch(game: Game): { lost: number[]; swallowed: number[] } {
+  const none: { lost: number[]; swallowed: number[] } = { lost: [], swallowed: [] };
   const live = freeBalls(game.balls);
   if (
     live.length === 0 ||
@@ -1428,16 +1474,34 @@ function runBallSearch(game: Game): number[] {
   ) {
     game.stillTicks = 0;
     game.stillAnchors = anchorsFor(live);
-    return [];
+    return none;
   }
 
   game.stillTicks += 1;
-  if (game.stillTicks < game.options.ballSearchTicks) return [];
+  if (game.stillTicks < game.options.ballSearchTicks) return none;
 
   game.stillTicks = 0;
   game.stillAnchors = [];
 
-  // The coils first. See BALL_SEARCH_PULSES for why this is bounded per serve
+  // The saucer kicker first: a still ball inside an OCCUPIED saucer goes back
+  // to the trough as an owed serve. See the header for the measured site and
+  // for why this is the decoded $68 semantics rather than a new rule.
+  const swallowed: number[] = [];
+  for (const ball of live) {
+    if (!restsInOccupiedSaucer(game, ball)) continue;
+    ball.active = false;
+    ball.velocityX = 0;
+    ball.velocityY = 0;
+    swallowed.push(ball.id);
+  }
+  if (swallowed.length > 0) {
+    // Deactivated first, so the trough cap in `oweServes` sees them gone.
+    oweServes(game, swallowed.length);
+    game.stillAnchors = anchorsFor(freeBalls(game.balls));
+    return { lost: [], swallowed };
+  }
+
+  // The coils next. See BALL_SEARCH_PULSES for why this is bounded per serve
   // rather than per stillness: a pulse that could be earned again by moving
   // would let a ball be shoved back and forth forever, which is exactly how the
   // search was defeated once before.
@@ -1446,7 +1510,7 @@ function runBallSearch(game: Game): number[] {
     game.searchPulses -= 1;
     for (const ball of live) pulseBall(game, ball, spent);
     game.stillAnchors = anchorsFor(live);
-    return [];
+    return none;
   }
 
   const lost: number[] = [];
@@ -1454,7 +1518,21 @@ function runBallSearch(game: Game): number[] {
     ball.active = false;
     lost.push(ball.id);
   }
-  return lost;
+  return { lost, swallowed: [] };
+}
+
+/**
+ * True when this ball's centre is inside the rectangle of a saucer that is
+ * already holding a DIFFERENT ball. Such a ball can never be captured — the
+ * engine's own refusal — and on a bowl-shaped saucer it can never leave either,
+ * which is the strand the ball search's swallow branch exists for.
+ */
+function restsInOccupiedSaucer(game: Game, ball: BallState): boolean {
+  for (const device of game.locks.locks) {
+    if (!game.locks.held.has(device.id)) continue;
+    if (lockCovers(device, ball)) return true;
+  }
+  return false;
 }
 
 /**

@@ -665,6 +665,68 @@ width, or a plane count other than the obvious one is in play.
 Slot 1's size grows across the three tables in the same order the packages do,
 consistent with a per-table geometry map rather than a fixed structure.
 
+## `music001.bin` — DECODED: the shell's front-end music, one `SNT!` module
+
+The last never-decoded file on the disks is decoded, excavation only — nothing is
+wired into the game. 85,568 bytes on Disk 3, a `TSL!` package with one data
+descriptor (flags `0x00000002`, no BSS) declaring 0x182E8 = 99,048 bytes; the
+`ATN!` stream decompresses to exactly that and the payloads consume the file
+exactly. The slot is hunk-wrapped pure data: u32 body length 0x182E0, body, empty
+relocation table. Clean split in `seg_clean/music001.bin.seg00.*`.
+
+**The body is one `SNT!` bank — DICE's repacked ProTracker — holding ONE song:**
+the layout `sound.py` proved for the in-table slot-7/8 banks, here with 31 sample
+descriptors (12 live: indices 1–7, 9–11, 14, 15), song length 14, restart 127,
+order list `[0,6,4,3,10,3,10,1,7,5,2,5,8,9]`, 11 packed patterns and 94,128 bytes
+of signed 8-bit PCM ending 2 pad bytes short of the body end.
+
+**The packed pattern cell encoding is cracked**, from the playback decoder at
+`main.seg00` body `$7F8A–$7FE6`, and verified bit-exact: all 11 patterns decode to
+exactly 256 cells (4 channels × 64 rows, row-major) consuming exactly their
+offset-table byte ranges. A byte with bit 7 set is one whole cell — `0x80` empty,
+`0xC0` "repeat this channel's previous event" (cached at channel state `$38–$3A`);
+bit 7 clear opens a 3-byte event: `note = byte0 >> 1` (1-based into a 36-entry
+period table), `instrument = ((byte1 >> 4) << 1) | (byte0 & 1)`,
+`effect = byte1 & 0xF`, `param = byte2`. Note→period is the standard ProTracker
+16-finetune × 36-note table at `main.seg00` `$A198` (stride `$48`, ft0 = 856..113;
+lookup at `$83F2–$8404`). Effects present are plain ProTracker: `4`/`6` vibrato,
+`C` set-volume, `EA/EB` fine slides, `F` set-speed (F08 then F04), `1`/`3`
+portamento, `9` sample offset. ~3× compression against the raw 1,024-byte
+ProTracker pattern.
+
+**Who plays it:** the shell (`main.seg00`) lazily loads `PROGDIR:music001.bin` —
+path string at body `$CAE7`, entry 5 of the shell's file table at `$CB22` — at
+body `$E74–$E9E`: if the cache long `$D44(a5)` is empty it calls the loader
+(`jsr $B90`, mode 3, which unpacks the `TSL!`), then starts the module player at
+`$79EA` with d0 = start position. The player's `SNT!` parser is `$7BF8`; playback
+runs on the VBlank chain `$8240/$828A` (vector `$78`, DMA-safe double interrupt).
+The alternate entry `$7A24` parses the in-table banks at `$2378/$237C` instead.
+So `music001.bin` is the **front-end / shell music**, one module, nothing else.
+
+**The BabeWatch jukebox does NOT use it.** The jukebox UI strings are in
+`Table002.bin.seg04` at 0x7EE0–0x8090 (`PICK A SONG`, `JUKEBOX`, `IN D JUKEBOX`,
+`CHOOSE LEFT RIGHT`, `SELECT WITH RETURN`); the selectable songs are start
+positions inside BabeWatch's own two `SNT!` banks (slot 7: songlen 78, 60
+patterns, 196,578 B PCM; slot 8: songlen 28, 28 patterns, 195,122 B PCM), fed
+through the player's start-song APIs at `main.seg00` `$815E/$8182` (d1 = bank,
+d0 = 1-based order position, sentinel `$80` for 0). For the record: Table001
+slot 7 is songlen 70 / 64 patterns and slot 8 is 24 / 24; Table003 slot 7 holds
+TWO banks (70/63 and 16/16).
+
+Sample character (waveform/envelope/ZCR/FFT analysis of WAV exports in the
+research `view/audio/` directory — analysed, not listened to): #1 is a 2.56 s
+one-shot sampled percussion phrase played only at C-3; #2–#4 looped chord/pad
+clusters; #6 a looped ~350 Hz lead; #7 a 112-byte chip waveform (the only nonzero
+finetune, +2); #11 a very clean deep bass (harmonics 28/56/113 Hz). Signedness and
+rate sanity: mean absolute sample-to-sample delta is 4–16 of 255 (noise would be
+~85), and FFT peaks sit at the period-implied rates.
+
+Still open, none affecting the identification: which shell screen triggers the
+`$E74` load site (its d0 = `$11` start argument exceeds songlen 14 and is clamped
+to 0 by `$7B18–$7B2C`, so it plays the same either way); the jukebox's concrete
+song-index → order-position table in Table002; whether anything streams music001's
+instrument 1 through the kind-5 / `$7812` 26-byte-record path.
+
 ## Closed questions
 
 Recorded so nobody spends effort re-opening them:
@@ -690,8 +752,10 @@ Recorded so nobody spends effort re-opening them:
 2. Slot 1's encoding and role. Not a raster, so its earlier "collision map candidate"
    label is withdrawn; its small byte values are real and unexplained. It grows across
    the three tables in package order, consistent with per-table device or script data.
-3. Confirm the audio-sample reading of segments 7 and 8, and identify `flipdat1.bin`
-   and `music001.bin`.
+3. Confirm the audio-sample reading of segments 7 and 8, and identify `flipdat1.bin`.
+   (~~and `music001.bin`~~ — **CLOSED**: one `SNT!` tracker module, the shell's
+   front-end music; see the section above. Slots 7/8 are confirmed `SNT!` banks by
+   the same parser, `main.seg00` `$7BF8`.)
 4. Which of the two 620-row layers is the lower level. Inferred from stroke geometry,
    not read; closing it needs an emulator dump of `$22EE(a5)..$2302(a5)`.
 5. Which odd material index carries which wall behaviour (rubber / slingshot / plain
