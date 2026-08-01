@@ -5,7 +5,10 @@
  * `main.bin` hunk 0 and used unchanged. The original's shell screens are
  * 320 x 256; this reconstruction's window is 336 x 256, because that is the
  * playfield's width, so the shell is drawn into a 320-wide box centred in it —
- * eight pixels of surround each side, and not one coordinate moved.
+ * eight pixels of surround each side, and not one coordinate moved. Everything
+ * is drawn at the same whole-number magnification the playfield uses, with
+ * smoothing off, so one 1995 pixel is always an exact square block of device
+ * pixels.
  *
  * The drawing language is the original's too. `main.bin` interprets a
  * big-endian opcode stream: 0x0001 LINE(x1,y1,x2,y2), 0x0002 TEXT(x, y, asciiz)
@@ -13,24 +16,34 @@
  * on x. `line`, `box` and `text` below are those three primitives; everything
  * else in the file is a page written in them.
  *
- * WHAT IS NOT THE DISK'S
+ * WHAT IS THE DISK'S AND WHAT IS NOT
  * ---------------------------------------------------------------------------
- * The COLOURS (see `palette.ts`) and the FONTS. The original has two proportional
- * bitmap fonts in `menudata.bin` — 16 px wide, two bitplanes, line-interleaved,
- * with a 128-entry metrics table each. Neither is exported, so this draws with
- * the browser's own monospace at the original's line pitches. The one place a
- * metric leaks through is the ladder block on the info screen: the original
- * computes its right-aligned score column as `300 - (3*commas + 7*digits)`,
- * which is where the small font's 7 px digit and 3 px comma advances come from,
- * and here the same block is simply right-aligned on 300 — the same result by a
- * method the canvas already has.
+ * When the host has loaded the exported shell artwork (`ShellSkin` non-null),
+ * the presentation is `menudata.bin`'s own:
  *
- * The attract backdrop is a stand-in and says so. The original runs a 320 x 256
- * dual playfield whose lower layer is eight 32-row bands, each pointing at a
- * different horizontal offset into a 1472 x 32 strip of 46 pre-rendered frames
- * of a tumbling solid, wobbled by a sine table and cross-faded through nine
- * palette windows. None of that data is exported; eight scrolling bands are what
- * is left of the idea once the artwork is gone.
+ *   - both proportional FONTS — the 19-px two-plane menu font and the small
+ *     single-plane font — drawn glyph by glyph on the disk's own advance,
+ *     height and y-offset metrics, outline pass under fill pass exactly as the
+ *     blitter ORs them;
+ *   - the three BACKDROP strips: eight 32-row bands, each showing a 320-px
+ *     window into the 1472 x 32 strip of that screen's tumbling object
+ *     (rings for attract, cubes for the menu, crosses for table select),
+ *     wobbled by the disk's own ±64 sine table on the copper's indexing —
+ *     10 per band, 1 per tick;
+ *   - the shared 16-colour palette, whose colour 0 is the 0x36A blue;
+ *   - the original's own 16 x 16 dissolve order for the info screen's picture.
+ *
+ * Not the disk's, even skinned: the text COLOUR registers (menudata carries
+ * only the backdrop palette; white fill over black outline follows the glyph
+ * plane semantics and the fade table's white text entries, amber accents are
+ * this reconstruction's), the attract PAGE TEXT (the original's nineteen pages
+ * are the developers' own credit and greeting prose, which does not ship; the
+ * pages here are written fresh and set in the decoded font at the decoded
+ * pitch), and the hint lines naming keys, which the original never needed.
+ *
+ * Without the skin — assets still fetching, or fetch failed — every screen
+ * falls back to the browser-font placeholder rendering, so the shell is never
+ * blank.
  */
 
 import {
@@ -52,6 +65,9 @@ import {
   shellTableFor,
 } from "./shell.js";
 import type { ShellState } from "./shell.js";
+import type { ShellSkin, SkinFontKey } from "./shell-skin.js";
+import { FONT_ATLAS_WIDTH, alignShellText } from "../game/shell-art.js";
+import type { ShellFont } from "../game/shell-art.js";
 import type { HighScoreEntry } from "../game/high-scores.js";
 import type { TableId } from "../game/contracts.js";
 
@@ -64,12 +80,37 @@ export const SHELL_HEIGHT = 256;
 /** The reconstruction's window is 336 wide; the shell is centred in it. */
 export const SHELL_ORIGIN_X = 8;
 
-/** The three fonts, as logical pixel heights on the original's line pitches. */
+/** The three fallback fonts, as logical pixel heights on the original's pitches. */
 const FONT_BIG = 14;
 const FONT_SMALL = 9;
 const FONT_TINY = 7;
 
 const FONT_STACK = "ui-monospace, 'DejaVu Sans Mono', 'Courier New', monospace";
+
+/**
+ * Skin text colours. White is the measured choice — the fade table's text
+ * entries are all 0xFFF — and the outline is always black. Amber is kept for
+ * the one job the placeholder already used it for: marking the freshly-earned
+ * ladder row. The register values the original loads for its text planes are
+ * the decode's one open question, so these are stated as choices, not facts.
+ */
+const SKIN_WHITE = "#ffffff";
+const SKIN_DIM = "#9ab6d4";
+const SKIN_AMBER = "#f7c948";
+
+/** Eight 32-row bands: the original's own division of the 256-row screen. */
+const BAND_HEIGHT = 32;
+const BAND_COUNT = SHELL_HEIGHT / BAND_HEIGHT;
+
+/**
+ * Where the 320-px window sits in the 1472-px strip before the sine wobble.
+ * Centred: (1472 - 320) / 2. The wobble is ±64, so the window stays inside the
+ * strip and never needs to wrap.
+ */
+const STRIP_BASE_X = 576;
+
+/** The copper's sine indexing: 10 per band, 1 per tick. */
+const SINE_STEP_PER_BAND = 10;
 
 type Align = "left" | "center" | "right";
 
@@ -175,6 +216,7 @@ function box(
   ctx.strokeRect(left, top, width, height);
 }
 
+/** The browser-font fallback TEXT primitive. Skinned screens use `glyphs`. */
 function text(
   ctx: ShellContext,
   scale: number,
@@ -192,53 +234,147 @@ function text(
   ctx.fillText(value, px(x, scale), py(y, scale));
 }
 
-/** The screen frame: four lines, (15,15)-(304,240). */
-function frame(ctx: ShellContext, scale: number): void {
-  line(ctx, scale, 15, 15, 304, 15, SHELL_FRAME);
-  line(ctx, scale, 15, 240, 304, 240, SHELL_FRAME);
-  line(ctx, scale, 15, 15, 15, 240, SHELL_FRAME);
-  line(ctx, scale, 304, 15, 304, 240, SHELL_FRAME);
+// ---------------------------------------------------------------------------
+// The skinned primitives: the disk's fonts and backdrops
+// ---------------------------------------------------------------------------
+
+function skinFontData(skin: ShellSkin, font: SkinFontKey): ShellFont {
+  return font === "font1" ? skin.art.font1 : skin.art.font2;
+}
+
+/**
+ * One run of text in a decoded font.
+ *
+ * `y` is the glyph-box top, which is the coordinate the original's TEXT opcode
+ * carries; each glyph adds its own signed y-offset (that is how a comma sits
+ * low). Centring and right-alignment are the original's integer arithmetic in
+ * `alignShellText`. Two passes — outlines, then fills — reproduce the
+ * blitter's OR compositing; see `SkinFontLayer` in shell-skin.ts.
+ */
+function glyphs(
+  ctx: ShellContext,
+  skin: ShellSkin,
+  font: SkinFontKey,
+  scale: number,
+  x: number,
+  y: number,
+  value: string,
+  colour: string,
+  align: Align = "left",
+): void {
+  const data = skinFontData(skin, font);
+  const startPen = alignShellText(data, value, x, align);
+  ctx.imageSmoothingEnabled = false;
+  for (const layer of ["outline", "fill"] as const) {
+    const atlas = skin.fontAtlas(font, layer, colour);
+    let pen = startPen;
+    for (let i = 0; i < value.length; i += 1) {
+      const glyph = data.glyphs[value.charCodeAt(i)];
+      if (glyph === undefined) continue;
+      if (glyph.height > 0) {
+        ctx.drawImage(
+          atlas,
+          0,
+          glyph.top,
+          FONT_ATLAS_WIDTH,
+          glyph.height,
+          px(pen, scale),
+          py(y + glyph.yOffset, scale),
+          FONT_ATLAS_WIDTH * scale,
+          glyph.height * scale,
+        );
+      }
+      pen += glyph.advance;
+    }
+  }
+}
+
+/**
+ * The decoded backdrop: eight 32-row bands, each a 320-px window into that
+ * screen's 1472 x 32 tumbling-object strip, offset by the disk's own sine
+ * table with the copper's indexing — the band number times 10, plus the tick.
+ * A pure function of the tick, so two runs at the same tick draw the same
+ * frame.
+ */
+function skinBands(
+  ctx: ShellContext,
+  skin: ShellSkin,
+  role: "attract" | "menu" | "select",
+  scale: number,
+  tick: number,
+): void {
+  const strip = skin.backdrop(role);
+  const sine = skin.art.sine;
+  ctx.imageSmoothingEnabled = false;
+  for (let band = 0; band < BAND_COUNT; band += 1) {
+    const wobble = sine[(tick + band * SINE_STEP_PER_BAND) & 0xff] ?? 0;
+    ctx.drawImage(
+      strip,
+      STRIP_BASE_X + wobble,
+      0,
+      SHELL_WIDTH,
+      BAND_HEIGHT,
+      px(0, scale),
+      py(band * BAND_HEIGHT, scale),
+      SHELL_WIDTH * scale,
+      BAND_HEIGHT * scale,
+    );
+  }
+}
+
+/** The screen frame: four lines, (15,15)-(304,240) — table select's border. */
+function frame(ctx: ShellContext, scale: number, colour: string = SHELL_FRAME): void {
+  line(ctx, scale, 15, 15, 304, 15, colour);
+  line(ctx, scale, 15, 240, 304, 240, colour);
+  line(ctx, scale, 15, 15, 15, 240, colour);
+  line(ctx, scale, 304, 15, 304, 240, colour);
 }
 
 /** Clears the whole canvas, including the eight pixels either side of the box. */
-function clear(ctx: ShellContext, scale: number): void {
+function clear(ctx: ShellContext, scale: number, skin: ShellSkin | null): void {
   ctx.imageSmoothingEnabled = false;
   ctx.globalAlpha = 1;
   ctx.fillStyle = SURROUND;
   ctx.fillRect(0, 0, (SHELL_WIDTH + 2 * SHELL_ORIGIN_X) * scale, SHELL_HEIGHT * scale);
-  ctx.fillStyle = SHELL_BACKDROP;
+  ctx.fillStyle = skin === null ? SHELL_BACKDROP : skin.background;
   ctx.fillRect(px(0, scale), py(0, scale), SHELL_WIDTH * scale, SHELL_HEIGHT * scale);
 }
 
 /**
- * The eight scrolling bands. A stand-in for the tumbling-object strips; see the
- * file header.
- *
- * Eight bands of 32 rows is the original's own division of the 256-row screen,
- * and each band scrolls at its own rate because in the original each one points
- * at a different offset into the strip and the offsets are driven by a sine
- * table. Every band's phase is a function of the tick, so two runs at the same
- * tick draw the same frame.
+ * The fallback bands: eight scrolling stripes standing in for the strips when
+ * the artwork has not arrived. Deterministic in the tick, like the real thing.
  */
 function bands(ctx: ShellContext, scale: number, tick: number): void {
-  const bandHeight = 32;
   const cell = 16;
   ctx.save();
   ctx.beginPath();
   ctx.rect(px(0, scale), py(0, scale), SHELL_WIDTH * scale, SHELL_HEIGHT * scale);
   ctx.clip();
   ctx.fillStyle = SHELL_BAND;
-  for (let band = 0; band < SHELL_HEIGHT / bandHeight; band += 1) {
+  for (let band = 0; band < BAND_COUNT; band += 1) {
     const speed = band % 2 === 0 ? 1 : -1;
     const drift = (tick * (band + 2) * speed) / 8;
     const phase = ((drift % (cell * 2)) + cell * 2) % (cell * 2);
-    const top = band * bandHeight;
+    const top = band * BAND_HEIGHT;
     for (let x = -cell * 2; x < SHELL_WIDTH + cell * 2; x += cell * 2) {
       const left = x + phase;
-      ctx.fillRect(px(left, scale), py(top + 8, scale), cell * scale, (bandHeight - 16) * scale);
+      ctx.fillRect(px(left, scale), py(top + 8, scale), cell * scale, (BAND_HEIGHT - 16) * scale);
     }
   }
   ctx.restore();
+}
+
+/** Backdrop for one of the three menu screens: the real strip, or the stand-in. */
+function backdrop(
+  ctx: ShellContext,
+  scale: number,
+  skin: ShellSkin | null,
+  role: "attract" | "menu" | "select",
+  tick: number,
+): void {
+  clear(ctx, scale, skin);
+  if (skin === null) bands(ctx, scale, tick);
+  else skinBands(ctx, skin, role, scale, tick);
 }
 
 // ---------------------------------------------------------------------------
@@ -255,14 +391,18 @@ export function formatScore(value: number): string {
  *
  * The original's template at hunk-0 0x1836 is five 25-byte records, each
  * `0x08 0xB4 "N.III" 0x08 <x> <15-char score field> 0x0A`: rank and initials
- * left-aligned at x = 180, score right-aligned at x = 300. `leftX` and `rightX`
- * are parameters only because the same block is drawn on the table's own attract
- * screen too, where it has the whole width rather than the info screen's right
- * half.
+ * left-aligned at x = 180, score right-aligned at x = 300. Skinned, the block
+ * is set in the small font and the right alignment IS the original's sum —
+ * `300 - (3*commas + 7*digits)` — because 3 and 7 are that font's comma and
+ * digit advances and `alignShellText` sums the same table. `leftX` and `rightX`
+ * are parameters only because the same block is drawn on the table's own
+ * attract screen too, where it has the whole width rather than the info
+ * screen's right half.
  */
 function ladderBlock(
   ctx: ShellContext,
   scale: number,
+  skin: ShellSkin | null,
   entries: readonly HighScoreEntry[],
   leftX: number,
   rightX: number,
@@ -275,9 +415,17 @@ function ladderBlock(
     const entry = entries[i];
     if (entry === undefined) continue;
     const y = topY + i * pitch;
-    const colour = i === highlight ? SHELL_HIGHLIGHT : SHELL_TEXT;
-    text(ctx, scale, leftX, y, `${i + 1}.${entry.initials.padEnd(3, " ")}`, colour, size);
-    text(ctx, scale, rightX, y, formatScore(entry.score), colour, size, "right");
+    const rank = `${i + 1}.${entry.initials.padEnd(3, " ")}`;
+    const score = formatScore(entry.score);
+    if (skin === null) {
+      const colour = i === highlight ? SHELL_HIGHLIGHT : SHELL_TEXT;
+      text(ctx, scale, leftX, y, rank, colour, size);
+      text(ctx, scale, rightX, y, score, colour, size, "right");
+    } else {
+      const colour = i === highlight ? SKIN_AMBER : SKIN_WHITE;
+      glyphs(ctx, skin, "font2", scale, leftX, y, rank, colour);
+      glyphs(ctx, skin, "font2", scale, rightX, y, score, colour, "right");
+    }
   }
 }
 
@@ -295,10 +443,11 @@ function ladderBlock(
  * PLAYFIELD artwork, which is a better answer to "which table is this?" anyway.
  * It is 336 x 600, so it is letterboxed into the panel rather than stretched.
  *
- * The dissolve is the original's, reproduced: `units` blocks of the 16 x 16 grid
- * are revealed per frame in a fixed scrambled order. The order is a fixed
- * deterministic permutation rather than one of the four 256-byte tables at
- * menudata h4+0x780, which are not exported either.
+ * The dissolve is the original's: `DISSOLVE_UNITS_PER_FRAME` blocks of the
+ * 16 x 16 grid revealed per frame. Skinned, the order is the disk's own
+ * scrambled table (the third of the four at menudata h4+0x780); the fallback
+ * uses a fixed coprime-stride permutation with the same shape. No random
+ * source anywhere: two runs at the same frame count reveal the same blocks.
  */
 const DISSOLVE_UNITS_PER_FRAME = 4;
 const DISSOLVE_GRID = 16;
@@ -306,13 +455,12 @@ const DISSOLVE_GRID = 16;
 const DISSOLVE_CELLS = DISSOLVE_GRID * DISSOLVE_GRID;
 
 /**
- * The step between successive cells, in cells.
+ * The fallback's step between successive cells, in cells.
  *
  * Coprime to 256, so walking it visits every cell exactly once and the whole
  * picture is revealed with nothing drawn twice. 97 is 6 x 16 + 1, so each step
  * lands six rows down and one column across — a scatter rather than a raster,
- * which is the point of a dissolve. No random source anywhere: two runs at the
- * same frame count reveal exactly the same blocks.
+ * which is the point of a dissolve.
  */
 const DISSOLVE_STRIDE = 97;
 
@@ -320,9 +468,13 @@ const DISSOLVE_ORDER: readonly number[] = Object.freeze(
   Array.from({ length: DISSOLVE_CELLS }, (_, i) => ((i + 1) * DISSOLVE_STRIDE) % DISSOLVE_CELLS),
 );
 
+/** Which of the disk's four reveal orders the info screen uses: the shuffle. */
+const SKIN_DISSOLVE_TABLE = 2;
+
 function thumbnail(
   ctx: ShellContext,
   scale: number,
+  skin: ShellSkin | null,
   artwork: ShellArtworkSource,
   tableId: TableId,
   x: number,
@@ -331,10 +483,14 @@ function thumbnail(
   height: number,
   dissolveFrames: number | null,
 ): void {
-  box(ctx, scale, x, y, x + width, y + height, SHELL_FRAME, SHELL_PANEL);
+  box(ctx, scale, x, y, x + width, y + height, skin === null ? SHELL_FRAME : SKIN_WHITE, SHELL_PANEL);
   const image = artwork.imageFor(tableId);
   if (image === null) {
-    text(ctx, scale, x + width / 2, y + height / 2 - 4, "...", SHELL_DIM, FONT_SMALL, "center");
+    if (skin === null) {
+      text(ctx, scale, x + width / 2, y + height / 2 - 4, "...", SHELL_DIM, FONT_SMALL, "center");
+    } else {
+      glyphs(ctx, skin, "font2", scale, x + Math.floor(width / 2), y + Math.floor(height / 2) - 4, "...", SKIN_DIM, "center");
+    }
     return;
   }
 
@@ -370,16 +526,14 @@ function thumbnail(
     return;
   }
 
-  const revealed = Math.min(
-    DISSOLVE_ORDER.length,
-    Math.max(0, dissolveFrames) * DISSOLVE_UNITS_PER_FRAME,
-  );
+  const order = skin === null ? DISSOLVE_ORDER : (skin.art.dissolve[SKIN_DISSOLVE_TABLE] ?? DISSOLVE_ORDER);
+  const revealed = Math.min(order.length, Math.max(0, dissolveFrames) * DISSOLVE_UNITS_PER_FRAME);
   const unitW = drawWidth / DISSOLVE_GRID;
   const unitH = drawHeight / DISSOLVE_GRID;
   const sourceUnitW = source.width / DISSOLVE_GRID;
   const sourceUnitH = source.height / DISSOLVE_GRID;
   for (let i = 0; i < revealed; i += 1) {
-    const cell = DISSOLVE_ORDER[i];
+    const cell = order[i];
     if (cell === undefined) continue;
     const column = cell % DISSOLVE_GRID;
     const row = Math.floor(cell / DISSOLVE_GRID);
@@ -410,69 +564,98 @@ function imageSize(image: CanvasImageSource): { width: number; height: number } 
 // The pages
 // ---------------------------------------------------------------------------
 
-/** The credits roll. Centred on x = 160 at the original's 30-pixel pitch. */
-function drawAttract(ctx: ShellContext, scale: number, state: ShellState): void {
-  clear(ctx, scale);
-  bands(ctx, scale, state.attractTicks + state.attractPage * 64);
-  frame(ctx, scale);
+/**
+ * The credits roll.
+ *
+ * Skinned: the page's lines in the big font, centred on x = 160 on the
+ * original's own y ladder — 30-pixel pitch centred between 104 and 134, which
+ * is where its six-line pages put y = 44..194 and its two-line pages 104/134 —
+ * over the tumbling-rings strip. No border: the original's attract pages have
+ * none. The text itself is written fresh (see the header); the hint lines at
+ * the bottom are the reconstruction's, in the small font.
+ */
+function drawAttract(ctx: ShellContext, scale: number, state: ShellState, skin: ShellSkin | null): void {
+  const tick = state.attractTicks + state.attractPage * 64;
+  backdrop(ctx, scale, skin, "attract", tick);
 
   const page = ATTRACT_PAGES[state.attractPage] ?? [];
   const lines = page.length;
-  // The original's y ladder is 44, 74, 104, 134, 164, 194 for a six-line page
-  // and 104/134 for a two-line one: the block is centred on the same middle.
-  const middle = 119;
-  const top = middle - ((lines - 1) * 30) / 2 - 15;
+  if (skin === null) {
+    frame(ctx, scale);
+    const middle = 119;
+    const top = middle - ((lines - 1) * 30) / 2 - 15;
+    for (let i = 0; i < lines; i += 1) {
+      const value = page[i];
+      if (value === undefined) continue;
+      text(ctx, scale, 160, top + i * 30, value, i === 0 ? SHELL_HIGHLIGHT : SHELL_TEXT, FONT_BIG, "center");
+    }
+    text(ctx, scale, 160, 214, "PRESS SPACE", SHELL_HIGHLIGHT, FONT_SMALL, "center");
+    text(ctx, scale, 160, 226, "F1-F3 GOES STRAIGHT TO A TABLE", SHELL_DIM, FONT_TINY, "center");
+    return;
+  }
+
+  // The decoded ladder: 44, 74, 104, ... — i.e. 119 - 15*(lines-1) at pitch 30.
+  const top = 119 - 15 * (lines - 1);
   for (let i = 0; i < lines; i += 1) {
     const value = page[i];
     if (value === undefined) continue;
-    text(ctx, scale, 160, top + i * 30, value, i === 0 ? SHELL_HIGHLIGHT : SHELL_TEXT, FONT_BIG, "center");
+    glyphs(ctx, skin, "font1", scale, 160, top + i * 30, value, SKIN_WHITE, "center");
   }
-
-  text(ctx, scale, 160, 214, "PRESS SPACE", SHELL_HIGHLIGHT, FONT_SMALL, "center");
-  text(ctx, scale, 160, 226, "F1-F3 GOES STRAIGHT TO A TABLE", SHELL_DIM, FONT_TINY, "center");
+  glyphs(ctx, skin, "font2", scale, 160, 226, "PRESS SPACE", SKIN_WHITE, "center");
+  glyphs(ctx, skin, "font2", scale, 160, 240, "F1-F3 GOES STRAIGHT TO A TABLE", SKIN_DIM, "center");
 }
 
-/** The main menu. Two items and only two: display list 0xCF3C. */
-function drawMenu(ctx: ShellContext, scale: number, state: ShellState): void {
-  clear(ctx, scale);
-  bands(ctx, scale, state.frameTicks);
-  frame(ctx, scale);
+/**
+ * The main menu. Two items and only two: display list 0xCF3C — centred
+ * "Tables" at (160,90) and centred "Exit" at (160,133), with the highlight
+ * rectangles at 0xCF58 — (120,83)-(200,115) and (120,126)-(200,158) — around
+ * whichever the cursor is on. Skinned it is exactly that over the cubes strip;
+ * the fallback adds a title and boxes both items because a placeholder needs
+ * more signposting than the real artwork does.
+ */
+function drawMenu(ctx: ShellContext, scale: number, state: ShellState, skin: ShellSkin | null): void {
+  backdrop(ctx, scale, skin, "menu", state.frameTicks);
 
-  text(ctx, scale, 160, 40, "PINBALL ILLUSIONS", SHELL_HIGHLIGHT, FONT_BIG, "center");
-
-  // Highlight rectangles from 0xCF58: (120,83)-(200,115) and (120,126)-(200,158).
+  // Highlight rectangles from 0xCF58, text at the display list's own y.
   const rects = [
     { x1: 120, y1: 83, x2: 200, y2: 115, textY: 90 },
     { x1: 120, y1: 126, x2: 200, y2: 158, textY: 133 },
   ];
+
+  if (skin === null) {
+    frame(ctx, scale);
+    text(ctx, scale, 160, 40, "PINBALL ILLUSIONS", SHELL_HIGHLIGHT, FONT_BIG, "center");
+    for (let i = 0; i < rects.length; i += 1) {
+      const rect = rects[i];
+      const label = MENU_ITEMS[i];
+      if (rect === undefined || label === undefined) continue;
+      const chosen = state.menuCursor === i;
+      box(
+        ctx,
+        scale,
+        rect.x1,
+        rect.y1,
+        rect.x2,
+        rect.y2,
+        chosen ? SHELL_HIGHLIGHT : SHELL_FRAME,
+        chosen ? SHELL_HIGHLIGHT_FILL : null,
+      );
+      text(ctx, scale, 160, rect.textY, label, chosen ? SHELL_HIGHLIGHT : SHELL_TEXT, FONT_BIG, "center");
+    }
+    text(ctx, scale, 160, 200, "UP/DOWN CHOOSE   SPACE SELECTS   ESC BACK", SHELL_DIM, FONT_TINY, "center");
+    return;
+  }
+
   for (let i = 0; i < rects.length; i += 1) {
     const rect = rects[i];
     const label = MENU_ITEMS[i];
     if (rect === undefined || label === undefined) continue;
-    const chosen = state.menuCursor === i;
-    box(
-      ctx,
-      scale,
-      rect.x1,
-      rect.y1,
-      rect.x2,
-      rect.y2,
-      chosen ? SHELL_HIGHLIGHT : SHELL_FRAME,
-      chosen ? SHELL_HIGHLIGHT_FILL : null,
-    );
-    text(
-      ctx,
-      scale,
-      160,
-      rect.textY,
-      label,
-      chosen ? SHELL_HIGHLIGHT : SHELL_TEXT,
-      FONT_BIG,
-      "center",
-    );
+    if (state.menuCursor === i) {
+      box(ctx, scale, rect.x1, rect.y1, rect.x2, rect.y2, SKIN_WHITE, null);
+    }
+    glyphs(ctx, skin, "font1", scale, 160, rect.textY, label, SKIN_WHITE, "center");
   }
-
-  text(ctx, scale, 160, 200, "UP/DOWN CHOOSE   SPACE SELECTS   ESC BACK", SHELL_DIM, FONT_TINY, "center");
+  glyphs(ctx, skin, "font2", scale, 160, 226, "UP/DOWN CHOOSE   SPACE SELECTS   ESC BACK", SKIN_DIM, "center");
 }
 
 /**
@@ -480,9 +663,13 @@ function drawMenu(ctx: ShellContext, scale: number, state: ShellState): void {
  *
  * The list is a vertical strip on a 32-pixel pitch whose selected entry always
  * sits at y = 118 — the original rewrites every entry's Y to
- * `118 - 32*cursor + 32*i` every frame and clips it to 22..214. The two boxes
- * are (20,111)-(218,143) around the name and (228,111)-(300,143) labelled
- * "Info", and LEFT/RIGHT move between them.
+ * `118 - 32*cursor + 32*i` every frame and clips it to 22..214. The border is
+ * the vector list at 0xCF12, (15,15)-(304,240); the two boxes are
+ * (20,111)-(218,143) around the name and (228,111)-(300,143) labelled "Info"
+ * centred on (264,118), and LEFT/RIGHT move between them. The names are centred
+ * in their box — the box's centre is x = 119 — which is a choice, not a
+ * measurement: the list's x is the one coordinate the display list does not
+ * pin, and everything else on these screens is centred.
  *
  * The preview panel above the Info box is a reconstruction: the original's table
  * select has no artwork on it at all, the picture lives one screen further in on
@@ -493,12 +680,18 @@ function drawSelect(
   scale: number,
   state: ShellState,
   artwork: ShellArtworkSource,
+  skin: ShellSkin | null,
 ): void {
-  clear(ctx, scale);
-  bands(ctx, scale, state.frameTicks);
-  frame(ctx, scale);
+  backdrop(ctx, scale, skin, "select", state.frameTicks);
 
-  text(ctx, scale, 160, 30, "SELECT A TABLE", SHELL_HIGHLIGHT, FONT_SMALL, "center");
+  const skinned = skin !== null;
+  const focusColour = skinned ? SKIN_WHITE : SHELL_HIGHLIGHT;
+  const idleColour = skinned ? SKIN_DIM : SHELL_FRAME;
+
+  frame(ctx, scale, skinned ? SKIN_WHITE : SHELL_FRAME);
+  if (skin === null) {
+    text(ctx, scale, 160, 30, "SELECT A TABLE", SHELL_HIGHLIGHT, FONT_SMALL, "center");
+  }
 
   box(
     ctx,
@@ -507,8 +700,8 @@ function drawSelect(
     111,
     218,
     143,
-    state.column === 0 ? SHELL_HIGHLIGHT : SHELL_FRAME,
-    state.column === 0 ? SHELL_HIGHLIGHT_FILL : null,
+    state.column === 0 ? focusColour : idleColour,
+    !skinned && state.column === 0 ? SHELL_HIGHLIGHT_FILL : null,
   );
 
   ctx.save();
@@ -520,15 +713,11 @@ function drawSelect(
     if (table === undefined) continue;
     const y = 118 - 32 * state.cursor + 32 * i;
     if (y < 22 || y > 214) continue;
-    text(
-      ctx,
-      scale,
-      28,
-      y,
-      table.name,
-      i === state.cursor ? SHELL_HIGHLIGHT : SHELL_DIM,
-      FONT_BIG,
-    );
+    if (skin === null) {
+      text(ctx, scale, 28, y, table.name, i === state.cursor ? SHELL_HIGHLIGHT : SHELL_DIM, FONT_BIG);
+    } else {
+      glyphs(ctx, skin, "font1", scale, 119, y, table.name, SKIN_WHITE, "center");
+    }
   }
   ctx.restore();
 
@@ -539,36 +728,28 @@ function drawSelect(
     111,
     300,
     143,
-    state.column === 1 ? SHELL_HIGHLIGHT : SHELL_FRAME,
-    state.column === 1 ? SHELL_HIGHLIGHT_FILL : null,
+    state.column === 1 ? focusColour : idleColour,
+    !skinned && state.column === 1 ? SHELL_HIGHLIGHT_FILL : null,
   );
-  text(
-    ctx,
-    scale,
-    264,
-    118,
-    "Info",
-    state.column === 1 ? SHELL_HIGHLIGHT : SHELL_TEXT,
-    FONT_BIG,
-    "center",
-  );
+  if (skin === null) {
+    text(ctx, scale, 264, 118, "Info", state.column === 1 ? SHELL_HIGHLIGHT : SHELL_TEXT, FONT_BIG, "center");
+  } else {
+    glyphs(ctx, skin, "font1", scale, 264, 118, "Info", SKIN_WHITE, "center");
+  }
 
-  thumbnail(ctx, scale, artwork, highlightedTable(state).id, 238, 20, 52, 84, null);
+  thumbnail(ctx, scale, skin, artwork, highlightedTable(state).id, 238, 20, 52, 84, null);
 
   // Below y = 214, which is where the original clips the scrolling list: the
   // third name sits at y = 182 when the cursor is on the first, so anything
   // higher than this would be printed over it.
-  text(
-    ctx,
-    scale,
-    160,
-    216,
-    state.column === 0 ? "SPACE PLAYS THIS TABLE" : "SPACE SHOWS THE INFO SCREEN",
-    SHELL_TEXT,
-    FONT_SMALL,
-    "center",
-  );
-  text(ctx, scale, 160, 229, "UP/DOWN   LEFT/RIGHT   SPACE   ESC", SHELL_DIM, FONT_TINY, "center");
+  const action = state.column === 0 ? "SPACE PLAYS THIS TABLE" : "SPACE SHOWS THE INFO SCREEN";
+  if (skin === null) {
+    text(ctx, scale, 160, 216, action, SHELL_TEXT, FONT_SMALL, "center");
+    text(ctx, scale, 160, 229, "UP/DOWN   LEFT/RIGHT   SPACE   ESC", SHELL_DIM, FONT_TINY, "center");
+  } else {
+    glyphs(ctx, skin, "font2", scale, 160, 218, action, SKIN_WHITE, "center");
+    glyphs(ctx, skin, "font2", scale, 160, 229, "UP/DOWN   LEFT/RIGHT   SPACE   ESC", SKIN_DIM, "center");
+  }
 }
 
 /**
@@ -577,7 +758,9 @@ function drawSelect(
  * The original's layout, kept: the artwork dissolves into x 176..303, y 16..143;
  * the table's text is typed out at four characters a frame from (16,16) in the
  * small font; and the high-score ladder is typed out below it from y = 160, rank
- * and initials at x = 180 and the score right-aligned on 300.
+ * and initials at x = 180 and the score right-aligned on 300. Skinned, the
+ * small font IS the font that arithmetic was written for, and the dissolve
+ * order is the disk's own.
  *
  * What is typed is NOT the original's text. The `.mnu` package's paragraph is
  * the publisher's marketing copy and does not ship; the name is from
@@ -590,11 +773,12 @@ function drawInfo(
   scale: number,
   state: ShellState,
   artwork: ShellArtworkSource,
+  skin: ShellSkin | null,
 ): void {
-  clear(ctx, scale);
+  clear(ctx, scale, skin);
 
   const table = highlightedTable(state);
-  thumbnail(ctx, scale, artwork, table.id, 176, 16, 128, 128, state.frameTicks);
+  thumbnail(ctx, scale, skin, artwork, table.id, 176, 16, 128, 128, state.frameTicks);
 
   // Four characters a frame, over the whole block, newlines included.
   const body = [table.name, "", ...table.blurb, "", `TABLE ${String(table.slot).padStart(3, "0")}`];
@@ -605,7 +789,13 @@ function drawInfo(
     const room = Math.max(0, budget - typed);
     const shown = value.slice(0, room);
     if (shown.length > 0) {
-      text(ctx, scale, 16, 16 + i * 14, shown, i === 0 ? SHELL_HIGHLIGHT : SHELL_TEXT, FONT_SMALL);
+      if (skin === null) {
+        text(ctx, scale, 16, 16 + i * 14, shown, i === 0 ? SHELL_HIGHLIGHT : SHELL_TEXT, FONT_SMALL);
+      } else if (i === 0) {
+        glyphs(ctx, skin, "font1", scale, 16, 16, shown, SKIN_WHITE);
+      } else {
+        glyphs(ctx, skin, "font2", scale, 16, 16 + i * 14, shown, SKIN_WHITE);
+      }
     }
     // The newline costs a character too, which is what makes the typewriter
     // pause at the end of a line rather than run straight on.
@@ -614,31 +804,61 @@ function drawInfo(
   }
 
   if (budget >= typed) {
-    ladderBlock(ctx, scale, state.ladder, 180, 300, 160, 16, FONT_SMALL, -1);
-    text(ctx, scale, 16, 160, "HIGH SCORES", SHELL_HIGHLIGHT, FONT_SMALL);
-    text(ctx, scale, 16, 232, "Press ESC to exit.", SHELL_DIM, FONT_SMALL);
+    ladderBlock(ctx, scale, skin, state.ladder, 180, 300, 160, 16, FONT_SMALL, -1);
+    if (skin === null) {
+      text(ctx, scale, 16, 160, "HIGH SCORES", SHELL_HIGHLIGHT, FONT_SMALL);
+      text(ctx, scale, 16, 232, "Press ESC to exit.", SHELL_DIM, FONT_SMALL);
+    } else {
+      glyphs(ctx, skin, "font2", scale, 16, 160, "HIGH SCORES", SKIN_WHITE);
+      glyphs(ctx, skin, "font2", scale, 16, 232, "Press ESC to exit.", SKIN_DIM);
+    }
   }
 }
 
-function drawLoading(ctx: ShellContext, scale: number, state: ShellState): void {
-  clear(ctx, scale);
-  frame(ctx, scale);
+function drawLoading(ctx: ShellContext, scale: number, state: ShellState, skin: ShellSkin | null): void {
+  clear(ctx, scale, skin);
   const name = state.tableId === null ? "" : shellTableFor(state.tableId).name;
-  text(ctx, scale, 160, 110, "LOADING", SHELL_DIM, FONT_SMALL, "center");
-  text(ctx, scale, 160, 128, name, SHELL_HIGHLIGHT, FONT_BIG, "center");
+  if (skin === null) {
+    frame(ctx, scale);
+    text(ctx, scale, 160, 110, "LOADING", SHELL_DIM, FONT_SMALL, "center");
+    text(ctx, scale, 160, 128, name, SHELL_HIGHLIGHT, FONT_BIG, "center");
+    return;
+  }
+  frame(ctx, scale, SKIN_WHITE);
+  glyphs(ctx, skin, "font2", scale, 160, 104, "LOADING", SKIN_DIM, "center");
+  glyphs(ctx, skin, "font1", scale, 160, 118, name, SKIN_WHITE, "center");
 }
 
-function drawFailed(ctx: ShellContext, scale: number, state: ShellState): void {
-  clear(ctx, scale);
-  frame(ctx, scale);
-  text(ctx, scale, 160, 100, "THE TABLE WOULD NOT LOAD", SHELL_HIGHLIGHT, FONT_SMALL, "center");
-  text(ctx, scale, 160, 120, state.error ?? "", SHELL_TEXT, FONT_TINY, "center");
-  text(ctx, scale, 160, 150, "PRESS ESC", SHELL_DIM, FONT_SMALL, "center");
+function drawFailed(ctx: ShellContext, scale: number, state: ShellState, skin: ShellSkin | null): void {
+  clear(ctx, scale, skin);
+  if (skin === null) {
+    frame(ctx, scale);
+    text(ctx, scale, 160, 100, "THE TABLE WOULD NOT LOAD", SHELL_HIGHLIGHT, FONT_SMALL, "center");
+    text(ctx, scale, 160, 120, state.error ?? "", SHELL_TEXT, FONT_TINY, "center");
+    text(ctx, scale, 160, 150, "PRESS ESC", SHELL_DIM, FONT_SMALL, "center");
+    return;
+  }
+  frame(ctx, scale, SKIN_WHITE);
+  glyphs(ctx, skin, "font1", scale, 160, 90, "THE TABLE", SKIN_WHITE, "center");
+  glyphs(ctx, skin, "font1", scale, 160, 114, "WOULD NOT LOAD", SKIN_WHITE, "center");
+  glyphs(ctx, skin, "font2", scale, 160, 144, state.error ?? "", SKIN_DIM, "center");
+  glyphs(ctx, skin, "font2", scale, 160, 170, "PRESS ESC", SKIN_WHITE, "center");
 }
 
 // ---------------------------------------------------------------------------
 // The cards that sit over the playfield
 // ---------------------------------------------------------------------------
+
+/** One line of a card: text, colour, and which font carries it. */
+interface CardLine {
+  readonly value: string;
+  readonly colour: string;
+  readonly size: number;
+  /** Skinned rendering: the big menu font or the small one. */
+  readonly font: SkinFontKey;
+  /** Skinned colour; the fallback uses `colour`. */
+  readonly skinColour?: string;
+}
 
 /**
  * A card over the frozen table.
@@ -650,44 +870,49 @@ function drawFailed(ctx: ShellContext, scale: number, state: ShellState): void {
 function card(
   ctx: ShellContext,
   scale: number,
+  skin: ShellSkin | null,
   top: number,
   height: number,
-  lines: readonly { readonly value: string; readonly colour: string; readonly size: number }[],
+  lines: readonly CardLine[],
 ): void {
   ctx.globalAlpha = 0.82;
   ctx.fillStyle = SHELL_PANEL;
   ctx.fillRect(px(20, scale), py(top, scale), 280 * scale, height * scale);
   ctx.globalAlpha = 1;
-  box(ctx, scale, 20, top, 300, top + height, SHELL_FRAME, null);
+  box(ctx, scale, 20, top, 300, top + height, skin === null ? SHELL_FRAME : SKIN_WHITE, null);
 
   const pitch = 20;
   const block = (lines.length - 1) * pitch;
   let y = top + (height - block) / 2 - 7;
   for (const item of lines) {
-    text(ctx, scale, 160, y, item.value, item.colour, item.size, "center");
+    if (skin === null) {
+      text(ctx, scale, 160, y, item.value, item.colour, item.size, "center");
+    } else {
+      glyphs(ctx, skin, item.font, scale, 160, y, item.value, item.skinColour ?? SKIN_WHITE, "center");
+    }
     y += pitch;
   }
 }
 
-function drawQuitConfirm(ctx: ShellContext, scale: number): void {
-  card(ctx, scale, 88, 80, [
-    { value: "REALLY QUIT TABLE?", colour: SHELL_HIGHLIGHT, size: FONT_BIG },
-    { value: "Y QUITS - ANY OTHER KEY PLAYS ON", colour: SHELL_TEXT, size: FONT_TINY },
+function drawQuitConfirm(ctx: ShellContext, scale: number, skin: ShellSkin | null): void {
+  card(ctx, scale, skin, 88, 80, [
+    { value: "REALLY QUIT TABLE?", colour: SHELL_HIGHLIGHT, size: FONT_BIG, font: "font1" },
+    { value: "Y QUITS - ANY OTHER KEY PLAYS ON", colour: SHELL_TEXT, size: FONT_TINY, font: "font2", skinColour: SKIN_DIM },
   ]);
 }
 
-function drawGameOver(ctx: ShellContext, scale: number, state: ShellState): void {
-  card(ctx, scale, 88, 80, [
-    { value: "GAME OVER", colour: SHELL_HIGHLIGHT, size: FONT_BIG },
-    { value: formatScore(state.finalScore), colour: SHELL_TEXT, size: FONT_SMALL },
+function drawGameOver(ctx: ShellContext, scale: number, state: ShellState, skin: ShellSkin | null): void {
+  card(ctx, scale, skin, 88, 80, [
+    { value: "GAME OVER", colour: SHELL_HIGHLIGHT, size: FONT_BIG, font: "font1" },
+    { value: formatScore(state.finalScore), colour: SHELL_TEXT, size: FONT_SMALL, font: "font1" },
   ]);
 }
 
-function drawFanfare(ctx: ShellContext, scale: number, state: ShellState): void {
-  card(ctx, scale, 80, 96, [
-    { value: "PLAYER 1 GOT A", colour: SHELL_TEXT, size: FONT_SMALL },
-    { value: "HIGHSCORE", colour: SHELL_HIGHLIGHT, size: FONT_BIG },
-    { value: `${state.place + 1}${["ST", "ND", "RD", "TH", "TH"][state.place] ?? "TH"} PLACE`, colour: SHELL_TEXT, size: FONT_SMALL },
+function drawFanfare(ctx: ShellContext, scale: number, state: ShellState, skin: ShellSkin | null): void {
+  card(ctx, scale, skin, 80, 96, [
+    { value: "PLAYER 1 GOT A", colour: SHELL_TEXT, size: FONT_SMALL, font: "font2" },
+    { value: "HIGHSCORE", colour: SHELL_HIGHLIGHT, size: FONT_BIG, font: "font1" },
+    { value: `${state.place + 1}${["ST", "ND", "RD", "TH", "TH"][state.place] ?? "TH"} PLACE`, colour: SHELL_TEXT, size: FONT_SMALL, font: "font2" },
   ]);
 }
 
@@ -700,18 +925,18 @@ function drawFanfare(ctx: ShellContext, scale: number, state: ShellState): void 
  * "QWERTYUIOP", "ASDFGHJKL" and "ZXCVBNM" in the binary are the 128-byte
  * rawkey-to-ASCII table at 0x492E, not a picture of a keyboard.
  */
-function drawInitials(ctx: ShellContext, scale: number, state: ShellState): void {
+function drawInitials(ctx: ShellContext, scale: number, state: ShellState, skin: ShellSkin | null): void {
   const typed = state.initials.padEnd(3, " ");
   const caret = state.initials.length < 3 && (state.frameTicks >> 4) % 2 === 0;
   const shown = typed
     .split("")
     .map((c, i) => (caret && i === state.initials.length ? "_" : c))
     .join(" ");
-  card(ctx, scale, 76, 104, [
-    { value: "PLAYER 1", colour: SHELL_TEXT, size: FONT_SMALL },
-    { value: "ENTER YOUR NAME", colour: SHELL_TEXT, size: FONT_SMALL },
-    { value: `( ${shown} )`, colour: SHELL_HIGHLIGHT, size: FONT_BIG },
-    { value: "BACKSPACE DELETES - RETURN ACCEPTS", colour: SHELL_DIM, size: FONT_TINY },
+  card(ctx, scale, skin, 76, 104, [
+    { value: "PLAYER 1", colour: SHELL_TEXT, size: FONT_SMALL, font: "font2" },
+    { value: "ENTER YOUR NAME", colour: SHELL_TEXT, size: FONT_SMALL, font: "font2" },
+    { value: `( ${shown} )`, colour: SHELL_HIGHLIGHT, size: FONT_BIG, font: "font1" },
+    { value: "BACKSPACE DELETES - RETURN ACCEPTS", colour: SHELL_DIM, size: FONT_TINY, font: "font2", skinColour: SKIN_DIM },
   ]);
 }
 
@@ -721,25 +946,39 @@ function drawInitials(ctx: ShellContext, scale: number, state: ShellState): void
  * The original cycles GAME OVER, then each player's score, then the five-line
  * ladder a line at a time. This shows the whole ladder at once, which is the
  * same information without three seconds a line, and keeps the two keys the
- * original has here: start a game, or leave the table.
+ * original has here: start a game, or leave the table. GAME OVER and the score
+ * are set in the big font, which is the font the original's own cycle shows
+ * them in; the ladder is the small font's, whose advances are the template's
+ * own column arithmetic.
  */
-function drawLadder(ctx: ShellContext, scale: number, state: ShellState): void {
+function drawLadder(ctx: ShellContext, scale: number, state: ShellState, skin: ShellSkin | null): void {
   ctx.globalAlpha = 0.86;
   ctx.fillStyle = SHELL_PANEL;
   ctx.fillRect(px(16, scale), py(24, scale), 288 * scale, 208 * scale);
   ctx.globalAlpha = 1;
-  box(ctx, scale, 16, 24, 304, 232, SHELL_FRAME, null);
+  box(ctx, scale, 16, 24, 304, 232, skin === null ? SHELL_FRAME : SKIN_WHITE, null);
 
   const name = state.tableId === null ? "" : shellTableFor(state.tableId).name;
-  text(ctx, scale, 160, 34, name, SHELL_DIM, FONT_SMALL, "center");
-  text(ctx, scale, 160, 50, "GAME OVER", SHELL_HIGHLIGHT, FONT_BIG, "center");
-  text(ctx, scale, 160, 74, formatScore(state.finalScore), SHELL_TEXT, FONT_SMALL, "center");
+  if (skin === null) {
+    text(ctx, scale, 160, 34, name, SHELL_DIM, FONT_SMALL, "center");
+    text(ctx, scale, 160, 50, "GAME OVER", SHELL_HIGHLIGHT, FONT_BIG, "center");
+    text(ctx, scale, 160, 74, formatScore(state.finalScore), SHELL_TEXT, FONT_SMALL, "center");
+    text(ctx, scale, 160, 100, "HIGH SCORES", SHELL_DIM, FONT_SMALL, "center");
+  } else {
+    glyphs(ctx, skin, "font2", scale, 160, 32, name, SKIN_DIM, "center");
+    glyphs(ctx, skin, "font1", scale, 160, 44, "GAME OVER", SKIN_WHITE, "center");
+    glyphs(ctx, skin, "font1", scale, 160, 70, formatScore(state.finalScore), SKIN_WHITE, "center");
+    glyphs(ctx, skin, "font2", scale, 160, 100, "HIGH SCORES", SKIN_DIM, "center");
+  }
+  ladderBlock(ctx, scale, skin, state.ladder, 60, 260, 118, 18, FONT_SMALL, state.place);
 
-  text(ctx, scale, 160, 100, "HIGH SCORES", SHELL_DIM, FONT_SMALL, "center");
-  ladderBlock(ctx, scale, state.ladder, 60, 260, 118, 18, FONT_SMALL, state.place);
-
-  text(ctx, scale, 160, 210, "ENTER STARTS A GAME", SHELL_HIGHLIGHT, FONT_SMALL, "center");
-  text(ctx, scale, 160, 222, "ESC LEAVES THE TABLE", SHELL_DIM, FONT_TINY, "center");
+  if (skin === null) {
+    text(ctx, scale, 160, 210, "ENTER STARTS A GAME", SHELL_HIGHLIGHT, FONT_SMALL, "center");
+    text(ctx, scale, 160, 222, "ESC LEAVES THE TABLE", SHELL_DIM, FONT_TINY, "center");
+  } else {
+    glyphs(ctx, skin, "font2", scale, 160, 210, "ENTER STARTS A GAME", SKIN_WHITE, "center");
+    glyphs(ctx, skin, "font2", scale, 160, 221, "ESC LEAVES THE TABLE", SKIN_DIM, "center");
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -770,50 +1009,52 @@ export function shellDrawsOverPlayfield(state: ShellState): boolean {
 /**
  * Draws whichever screen the shell is on.
  *
- * A no-op for `play`, which is the game's own frame and nothing else — the
- * caller has already drawn it.
+ * `skin` is the decoded `menudata.bin` presentation, or null to fall back to
+ * the browser-font placeholder. A no-op for `play`, which is the game's own
+ * frame and nothing else — the caller has already drawn it.
  */
 export function renderShell(
   ctx: ShellContext,
   state: ShellState,
   scale: number,
   artwork: ShellArtworkSource,
+  skin: ShellSkin | null = null,
 ): void {
   switch (state.phase) {
     case "attract":
-      drawAttract(ctx, scale, state);
+      drawAttract(ctx, scale, state, skin);
       return;
     case "menu":
-      drawMenu(ctx, scale, state);
+      drawMenu(ctx, scale, state, skin);
       return;
     case "select":
-      drawSelect(ctx, scale, state, artwork);
+      drawSelect(ctx, scale, state, artwork, skin);
       return;
     case "info":
-      drawInfo(ctx, scale, state, artwork);
+      drawInfo(ctx, scale, state, artwork, skin);
       return;
     case "loading":
-      drawLoading(ctx, scale, state);
+      drawLoading(ctx, scale, state, skin);
       return;
     case "failed":
-      drawFailed(ctx, scale, state);
+      drawFailed(ctx, scale, state, skin);
       return;
     case "play":
       return;
     case "quit-confirm":
-      drawQuitConfirm(ctx, scale);
+      drawQuitConfirm(ctx, scale, skin);
       return;
     case "game-over":
-      drawGameOver(ctx, scale, state);
+      drawGameOver(ctx, scale, state, skin);
       return;
     case "fanfare":
-      drawFanfare(ctx, scale, state);
+      drawFanfare(ctx, scale, state, skin);
       return;
     case "initials":
-      drawInitials(ctx, scale, state);
+      drawInitials(ctx, scale, state, skin);
       return;
     case "ladder":
-      drawLadder(ctx, scale, state);
+      drawLadder(ctx, scale, state, skin);
       return;
   }
 }

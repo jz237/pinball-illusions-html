@@ -93,20 +93,18 @@ export const HUD_ALERT = "#ff6b5a";
 // ---------------------------------------------------------------------------
 
 /**
- * The menu screens.
+ * The menu screens' FALLBACK palette.
  *
- * Invented, and it has to be. The original's shell screens take their colours
- * from `menudata.bin` — a sixteen-entry luminance RAMP for the tumbling-object
- * backdrop, cross-faded through nine windows of a palette table at h4+0x480,
- * with the text on a separate two-plane playfield above it. That backdrop is a
- * pre-rendered animation strip of a cube, a cross and a torus, and none of it is
- * exported, so nothing here is claiming to be the disk's colours. What it does
- * claim is the disk's LAYOUT: every coordinate in `shell-screens.ts` is off the
- * display lists in `main.bin` hunk 0.
+ * The disk's own shell presentation — the two fonts, the three tumbling-object
+ * backdrop strips and their sixteen-colour palette out of `menudata.bin` — now
+ * ships (`scripts/export-shell-art.mjs` -> `public/generated/shell/`) and is
+ * what the player normally sees; `shell-screens.ts` takes those colours from
+ * the skin, not from here. These constants remain for the placeholder path
+ * that draws while the artwork is still fetching, or if the fetch fails.
  *
- * A cold blue ramp because that is what the measured step-0 window is — the
- * fade's first window reads as a dark blue ramp and its last as orange — and
- * amber for the item the cursor is on, so a selected box reads at a glance.
+ * A cold blue ramp because that is what the real palette is — colour 0 is the
+ * 0x36A blue — and amber for the item the cursor is on, so a selected box
+ * reads at a glance even in the placeholder.
  */
 export const SHELL_BACKDROP = "#0a1020";
 export const SHELL_BAND = "#111c33";

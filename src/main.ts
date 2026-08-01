@@ -68,6 +68,14 @@ import {
 import type { ShellEffect, ShellState } from "./browser/shell.js";
 import { renderShell, shellDrawsOverPlayfield } from "./browser/shell-screens.js";
 import type { ShellArtworkSource } from "./browser/shell-screens.js";
+import { createShellSkin } from "./browser/shell-skin.js";
+import type { ShellSkin } from "./browser/shell-skin.js";
+import { loadShellArt } from "./game/shell-art.js";
+import {
+  MUSIC_TOGGLE_CODE,
+  MUSIC_TOGGLE_KEY,
+  createShellMusic,
+} from "./browser/shell-music.js";
 
 /** One table, assembled and ready to play. */
 interface LoadedTable {
@@ -197,6 +205,16 @@ class SoundDeck {
     return this.#context;
   }
 
+  /**
+   * The one context, shared. The shell music runs its own nodes but must not
+   * cost the page a second `AudioContext` out of the browser's small
+   * allowance, so it borrows this deck's — created on whichever of the two
+   * asks first.
+   */
+  context(): AudioContext | null {
+    return this.#host();
+  }
+
   /** Brings a table's bank up in the background and makes it the live one. */
   select(tableId: TableId): void {
     const existing = this.#banks.get(tableId);
@@ -292,8 +310,12 @@ async function boot(): Promise<void> {
   const router = new InputRouter();
   const sound = new SoundDeck();
   const thumbnails = new ThumbnailCache();
-  const store = createScoreStore(readStorage());
+  const storage = readStorage();
+  const store = createScoreStore(storage);
   const shell = createShell(store);
+  // The shell music: driven by `shell.phase` from the frame loop below, over
+  // the deck's shared context. Never awaited, never read by the simulation.
+  const music = createShellMusic(storage, () => sound.context());
   const opened = new Map<TableId, LoadedTable>();
 
   let scale = fitCanvas(canvas);
@@ -301,13 +323,35 @@ async function boot(): Promise<void> {
   /** Set by the tick hook the moment a game reports its last ball gone. */
   let endedWithScore: number | null = null;
 
+  /**
+   * The decoded `menudata.bin` presentation — fonts, backdrop strips, palette.
+   *
+   * Fetched in the background and swapped in whenever it lands; until then (or
+   * forever, if the fetch fails) every screen draws its placeholder rendering,
+   * so the shell is usable from the first frame. Never awaited on any path
+   * that matters, exactly like the sound banks.
+   */
+  let skin: ShellSkin | null = null;
+  void loadShellArt()
+    .then((art) => {
+      skin = createShellSkin(art, (width, height) => {
+        const surface = document.createElement("canvas");
+        surface.width = width;
+        surface.height = height;
+        return surface;
+      });
+    })
+    .catch((error: unknown) => {
+      console.warn("pinball-illusions: shell artwork unavailable, using placeholder", error);
+    });
+
   thumbnails.warm();
 
   const draw = (): void => {
     if (table !== null && shellDrawsOverPlayfield(shell)) {
       renderGame(context, table.game, scale);
     }
-    renderShell(context, shell, scale, thumbnails);
+    renderShell(context, shell, scale, thumbnails, skin);
   };
 
   /**
@@ -462,6 +506,17 @@ async function boot(): Promise<void> {
     // Autoplay policies keep an audio context suspended until the player has
     // touched the page. A keypress is exactly that.
     sound.resume();
+    music.resume();
+
+    // The mute toggle, from any phase. The backquote is bound to no game
+    // control, no shell navigation, no function-key table pick and no
+    // initials character, so taking it here steals nothing from anyone.
+    if (keyEvent.code === MUSIC_TOGGLE_CODE || keyEvent.key === MUSIC_TOGGLE_KEY) {
+      if (keyEvent.repeat !== true) music.toggleMuted();
+      keyEvent.preventDefault?.();
+      return;
+    }
+
     const key = shellKeyFor(keyEvent);
 
     if (shell.phase === "play") {
@@ -514,6 +569,10 @@ async function boot(): Promise<void> {
     if (document.hidden) {
       table?.loop.scheduler.pause();
       router.releaseAll();
+      // A hidden tab gets no frames, so the music's scheduler would run its
+      // lookahead dry and leave the looped voices droning. Stop it; the first
+      // visible frame's `update` starts the song afresh.
+      music.stop();
     } else {
       table?.loop.scheduler.resume();
     }
@@ -535,6 +594,10 @@ async function boot(): Promise<void> {
    */
   const frame = (timeMs: number): void => {
     pollGamepads(router);
+    // The music follows the shell's phase: on over every menu and card, off
+    // over the ball. One call a frame both handles the transitions and pumps
+    // the scheduler's lookahead window.
+    music.update(shell.phase);
 
     if (shell.phase === "play" && table !== null) {
       // Only on the transition. `resume()` with no timestamp deliberately
@@ -550,7 +613,7 @@ async function boot(): Promise<void> {
       }
       // The shell draws nothing over a live table, but a card raised on this
       // very frame has to appear on the frame that raised it.
-      if (shell.phase !== "play") renderShell(context, shell, scale, thumbnails);
+      if (shell.phase !== "play") renderShell(context, shell, scale, thumbnails, skin);
       window.requestAnimationFrame(frame);
       return;
     }

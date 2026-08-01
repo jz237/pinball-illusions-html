@@ -115,12 +115,14 @@ const DERIVED_MARKERS = [
   { class: "disk-derived-scoring-devices", noun: "device and award table" },
   { class: "disk-derived-mode-scripts", noun: "mission and mode bytecode" },
   { class: "disk-derived-audio", noun: "sound effect" },
+  { class: "disk-derived-shell-artwork", noun: "shell artwork" },
 ];
 
 /** Manifest classes that must account for the binary files they ship beside. */
 const MEDIA_MARKERS = new Map([
   ["disk-derived-playfield-artwork", { noun: "playfield artwork", extensions: IMAGE_EXT }],
   ["disk-derived-audio", { noun: "sound effect", extensions: AUDIO_EXT }],
+  ["disk-derived-shell-artwork", { noun: "shell artwork", extensions: IMAGE_EXT }],
 ]);
 
 /** Tolerates both `"sourceClass":"x"` and the spaced form a formatter might emit. */
@@ -175,6 +177,17 @@ for await (const file of walk(root)) {
   }
   if (marker.class === "disk-derived-playfield-artwork") {
     claim(rel, doc?.image?.file, doc?.image?.sha256, media_marker.noun, "artwork manifest");
+    continue;
+  }
+  if (marker.class === "disk-derived-shell-artwork") {
+    const shellImages = Array.isArray(doc?.images) ? doc.images : null;
+    if (shellImages === null) {
+      violations.push(`${rel}: shell artwork manifest carries no images array`);
+      continue;
+    }
+    for (const image of shellImages) {
+      claim(rel, image?.file, image?.sha256, media_marker.noun, "shell artwork manifest");
+    }
     continue;
   }
   const samples = Array.isArray(doc?.samples) ? doc.samples : null;
