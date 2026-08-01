@@ -1,0 +1,414 @@
+/**
+ * THE BROWSER END OF THE MUSIC: Web Audio scheduling for the pure core's
+ * command stream, and nothing else.
+ *
+ * ---------------------------------------------------------------------------
+ * THE ONE RULE, AGAIN
+ * ---------------------------------------------------------------------------
+ * Same law as `src/browser/audio.ts`: sound may never affect the simulation.
+ * This module takes exactly one input — a `TrackerCommandStream`, a finished
+ * value the pure player core has already produced — and returns nothing the
+ * game could read. No import from `src/game/`, no state flowing back. And it
+ * is failure-tolerant the same way: a browser that refuses an `AudioContext`
+ * ends in silence, and silence is a correct outcome.
+ *
+ * ---------------------------------------------------------------------------
+ * THE CONTRACT WITH THE CORE
+ * ---------------------------------------------------------------------------
+ * The core is the deterministic half: same song data in, identical command
+ * schedule out, testable in node. Its output is the types below — an ordered
+ * list of note / pitch / volume / stop commands on four channels (the module engine
+ * this reconstructs gave the music Paula channels 0-2 and kept 3 for effects,
+ * but the synthesized song owns all four here; the effect channel in
+ * `browser/audio.ts` runs on its own nodes regardless). Times are
+ * milliseconds from song start. This layer's whole job is the affine map from
+ * that clock to `AudioContext.currentTime`, one `AudioBufferSourceNode` per
+ * note, pitched by playback rate and scaled by a gain — Paula's period and
+ * volume registers, translated.
+ *
+ * ---------------------------------------------------------------------------
+ * LAZINESS AND THE GESTURE
+ * ---------------------------------------------------------------------------
+ * Construction touches no Web Audio: `createTrackerOutput` stores a factory
+ * and `startTracker` is the first thing that calls it, so headless tests (and
+ * the module graph itself) never see an `AudioContext`. Autoplay policy is
+ * handled the same way `resumeAudio` does it — `resumeTracker` nudges a
+ * suspended context and is safe to call on every keypress.
+ */
+
+import type { ChipInstrument, InstrumentId } from "./instruments.js";
+import { instrumentById, playbackRateFor } from "./instruments.js";
+
+// ---------------------------------------------------------------------------
+// The command stream — the pure core's output format
+// ---------------------------------------------------------------------------
+
+export const TRACKER_CHANNELS = 4;
+
+/** Volume is Paula's register scale, 0..64, because the core thinks in it. */
+export const TRACKER_MAX_VOLUME = 64;
+
+/** Start an instrument on a channel, replacing whatever it was playing. */
+export interface TrackerNoteCommand {
+  readonly kind: "note";
+  /** Milliseconds from song start. */
+  readonly timeMs: number;
+  /** 0..TRACKER_CHANNELS-1. */
+  readonly channel: number;
+  readonly instrument: InstrumentId;
+  readonly frequencyHz: number;
+  /** 0..TRACKER_MAX_VOLUME. */
+  readonly volume: number;
+}
+
+/**
+ * Retune the sounding note without retriggering it — a slide or an arpeggio
+ * step, Paula's period register rewritten mid-note. A pitch on a silent
+ * channel is a no-op, exactly as writing the register of an idle channel is.
+ */
+export interface TrackerPitchCommand {
+  readonly kind: "pitch";
+  readonly timeMs: number;
+  readonly channel: number;
+  readonly frequencyHz: number;
+}
+
+/** Change the sounding note's volume without retriggering it. */
+export interface TrackerVolumeCommand {
+  readonly kind: "volume";
+  readonly timeMs: number;
+  readonly channel: number;
+  readonly volume: number;
+}
+
+/** Silence a channel. */
+export interface TrackerStopCommand {
+  readonly kind: "stop";
+  readonly timeMs: number;
+  readonly channel: number;
+}
+
+export type TrackerCommand =
+  | TrackerNoteCommand
+  | TrackerPitchCommand
+  | TrackerVolumeCommand
+  | TrackerStopCommand;
+
+export interface TrackerCommandStream {
+  /** One full pass of the song, ascending by `timeMs`. */
+  readonly commands: readonly TrackerCommand[];
+  /** Length of a pass; the next pass's time origin. */
+  readonly durationMs: number;
+  /**
+   * Where a repeat pass re-enters the command list, or null to play once —
+   * the order-list restart field of the module engine, in milliseconds.
+   * A repeat must actually advance time (`restartMs < durationMs`) or the
+   * stream is treated as play-once rather than spinning forever.
+   */
+  readonly restartMs: number | null;
+}
+
+// ---------------------------------------------------------------------------
+// Pure scheduling maths, shared with the tests
+// ---------------------------------------------------------------------------
+
+/**
+ * The affine map from song time to context time. `passOffsetMs` is the
+ * accumulated length of the passes already played (0 during the first).
+ */
+export function contextTimeFor(
+  startContextTime: number,
+  timeMs: number,
+  passOffsetMs: number = 0,
+): number {
+  return startContextTime + (passOffsetMs + timeMs) / 1000;
+}
+
+/** Paula volume to unit gain, clamped to the register's range. */
+export function gainFor(volume: number): number {
+  return Math.min(Math.max(volume, 0), TRACKER_MAX_VOLUME) / TRACKER_MAX_VOLUME;
+}
+
+// ---------------------------------------------------------------------------
+// The output object
+// ---------------------------------------------------------------------------
+
+/** The slice of `AudioContext` this module uses, so a test can supply one. */
+export interface TrackerHost {
+  readonly currentTime: number;
+  readonly destination: AudioNode;
+  readonly state: string;
+  createBuffer(numberOfChannels: number, length: number, sampleRate: number): AudioBuffer;
+  createBufferSource(): AudioBufferSourceNode;
+  createGain(): GainNode;
+  resume(): Promise<void>;
+}
+
+/** One sounding note: its source, its own gain, and the instrument it plays —
+ * kept so a later pitch command can recompute the playback rate. */
+interface ChannelVoice {
+  source: AudioBufferSourceNode;
+  gain: GainNode;
+  instrument: ChipInstrument;
+}
+
+export interface TrackerOutput {
+  readonly hostFactory: () => TrackerHost | null;
+  /** Null until `startTracker` first needs it; stays null if the factory fails. */
+  host: TrackerHost | null;
+  /** Master gain every voice feeds; mute and master volume both live here. */
+  master: GainNode | null;
+  /** Instrument buffers, built once per host. */
+  readonly buffers: Map<InstrumentId, AudioBuffer>;
+  /** The sounding voice per channel, so the next note can replace it. */
+  readonly channels: (ChannelVoice | null)[];
+  stream: TrackerCommandStream | null;
+  /** Context time at which the song's millisecond 0 sounds. */
+  startContextTime: number;
+  /** Next command to schedule within the current pass. */
+  nextIndex: number;
+  /** Accumulated milliseconds of completed passes; see `contextTimeFor`. */
+  passOffsetMs: number;
+  playing: boolean;
+  muted: boolean;
+  /** Unit master volume, 0..1. Applied at the master gain, not per note. */
+  masterVolume: number;
+}
+
+/**
+ * The real factory. Guarded so merely importing this module — or calling this
+ * in node — cannot throw; no context means no music, which is fine.
+ */
+export function defaultTrackerHostFactory(): TrackerHost | null {
+  try {
+    const Ctor = (globalThis as { AudioContext?: new () => AudioContext }).AudioContext;
+    return Ctor === undefined ? null : (new Ctor() as unknown as TrackerHost);
+  } catch {
+    return null;
+  }
+}
+
+/** Builds the output. Touches no Web Audio; the factory waits for `startTracker`. */
+export function createTrackerOutput(
+  hostFactory: () => TrackerHost | null = defaultTrackerHostFactory,
+): TrackerOutput {
+  return {
+    hostFactory,
+    host: null,
+    master: null,
+    buffers: new Map<InstrumentId, AudioBuffer>(),
+    channels: Array.from({ length: TRACKER_CHANNELS }, () => null),
+    stream: null,
+    startContextTime: 0,
+    nextIndex: 0,
+    passOffsetMs: 0,
+    playing: false,
+    muted: false,
+    masterVolume: 1,
+  };
+}
+
+function ensureHost(output: TrackerOutput): TrackerHost | null {
+  if (output.host === null) {
+    output.host = output.hostFactory();
+    if (output.host !== null) {
+      const master = output.host.createGain();
+      master.gain.value = output.muted ? 0 : output.masterVolume;
+      master.connect(output.host.destination);
+      output.master = master;
+    }
+  }
+  return output.host;
+}
+
+function bufferFor(output: TrackerOutput, host: TrackerHost, id: InstrumentId): AudioBuffer {
+  const cached = output.buffers.get(id);
+  if (cached !== undefined) return cached;
+  const instrument = instrumentById(id);
+  const buffer = host.createBuffer(1, instrument.samples.length, instrument.sampleRate);
+  buffer.getChannelData(0).set(instrument.samples);
+  output.buffers.set(id, buffer);
+  return buffer;
+}
+
+/** Stops a voice at `when`, tolerant of nodes that have already ended. */
+function stopVoice(voice: ChannelVoice | null, when: number): void {
+  if (voice === null) return;
+  try {
+    voice.source.stop(when);
+  } catch {
+    // A node that has already ended throws on `stop` in some engines; it is
+    // the outcome we wanted either way. Same note as `browser/audio.ts`.
+  }
+}
+
+function scheduleNote(
+  output: TrackerOutput,
+  host: TrackerHost,
+  command: TrackerNoteCommand,
+  when: number,
+): void {
+  if (command.channel < 0 || command.channel >= TRACKER_CHANNELS) return;
+  const instrument: ChipInstrument = instrumentById(command.instrument);
+
+  stopVoice(output.channels[command.channel] ?? null, when);
+
+  const source = host.createBufferSource();
+  source.buffer = bufferFor(output, host, command.instrument);
+  source.playbackRate.value = playbackRateFor(instrument, command.frequencyHz);
+  if (instrument.loopStart >= 0) {
+    source.loop = true;
+    source.loopStart = instrument.loopStart / instrument.sampleRate;
+    source.loopEnd = instrument.loopEnd / instrument.sampleRate;
+  }
+
+  const gain = host.createGain();
+  gain.gain.value = gainFor(command.volume);
+  source.connect(gain);
+  if (output.master !== null) gain.connect(output.master);
+  source.start(when);
+
+  output.channels[command.channel] = { source, gain, instrument };
+}
+
+function scheduleCommand(output: TrackerOutput, host: TrackerHost, command: TrackerCommand): void {
+  const when = contextTimeFor(output.startContextTime, command.timeMs, output.passOffsetMs);
+  switch (command.kind) {
+    case "note":
+      scheduleNote(output, host, command, when);
+      break;
+    case "pitch": {
+      const voice = output.channels[command.channel] ?? null;
+      if (voice !== null) {
+        voice.source.playbackRate.setValueAtTime(
+          playbackRateFor(voice.instrument, command.frequencyHz),
+          when,
+        );
+      }
+      break;
+    }
+    case "volume": {
+      const voice = output.channels[command.channel] ?? null;
+      if (voice !== null) voice.gain.gain.setValueAtTime(gainFor(command.volume), when);
+      break;
+    }
+    case "stop": {
+      stopVoice(output.channels[command.channel] ?? null, when);
+      output.channels[command.channel] = null;
+      break;
+    }
+  }
+}
+
+/** First command index at or after the restart point. */
+function restartIndex(stream: TrackerCommandStream, restartMs: number): number {
+  let index = 0;
+  while (index < stream.commands.length) {
+    const command = stream.commands[index];
+    if (command !== undefined && command.timeMs >= restartMs) break;
+    index += 1;
+  }
+  return index;
+}
+
+/**
+ * Schedules every command due within the lookahead window. Call it from the
+ * shell's frame callback; it is cheap when there is nothing to do. The window
+ * is generous enough that a dropped frame or two never starves the music, and
+ * short enough that a `stopTracker` does not leave half a minute of notes
+ * queued on dead nodes.
+ */
+export function pumpTracker(output: TrackerOutput, lookaheadSeconds: number = 0.5): void {
+  if (!output.playing || output.stream === null || output.host === null) return;
+  const stream = output.stream;
+  const horizon = output.host.currentTime + lookaheadSeconds;
+
+  for (;;) {
+    if (output.nextIndex >= stream.commands.length) {
+      const restartMs = stream.restartMs;
+      if (restartMs === null || restartMs >= stream.durationMs) {
+        // Played out, no repeat (a restart that does not advance time counts
+        // as none, rather than spinning). The looping voices sustain, which
+        // is the module engine's behaviour too; `stopTracker` is the off
+        // switch.
+        return;
+      }
+      output.passOffsetMs += stream.durationMs - restartMs;
+      output.nextIndex = restartIndex(stream, restartMs);
+      if (output.nextIndex >= stream.commands.length) return; // nothing after restart
+      continue;
+    }
+    const command = stream.commands[output.nextIndex];
+    if (command === undefined) return;
+    if (contextTimeFor(output.startContextTime, command.timeMs, output.passOffsetMs) > horizon) {
+      return;
+    }
+    scheduleCommand(output, output.host, command);
+    output.nextIndex += 1;
+  }
+}
+
+/**
+ * Starts a song. Builds the context on first use (this is the lazy edge);
+ * answers whether playback actually began — false means no audio device, and
+ * false is not an error. `atContextTime` pins millisecond 0 of the song;
+ * omitted, the song starts now.
+ */
+export function startTracker(
+  output: TrackerOutput,
+  stream: TrackerCommandStream,
+  atContextTime?: number,
+): boolean {
+  const host = ensureHost(output);
+  if (host === null) return false;
+  stopTracker(output);
+  output.stream = stream;
+  output.startContextTime = atContextTime ?? host.currentTime;
+  output.nextIndex = 0;
+  output.passOffsetMs = 0;
+  output.playing = true;
+  pumpTracker(output);
+  return true;
+}
+
+/** Stops everything now. Safe to call twice, or before anything started. */
+export function stopTracker(output: TrackerOutput): void {
+  const now = output.host === null ? 0 : output.host.currentTime;
+  for (let channel = 0; channel < output.channels.length; channel += 1) {
+    stopVoice(output.channels[channel] ?? null, now);
+    output.channels[channel] = null;
+  }
+  output.playing = false;
+  output.stream = null;
+  output.nextIndex = 0;
+  output.passOffsetMs = 0;
+}
+
+/**
+ * Mute at the master gain: scheduling continues, so unmuting rejoins the song
+ * mid-phrase instead of restarting it. Returns the new state, for a display.
+ */
+export function setTrackerMuted(output: TrackerOutput, muted: boolean): boolean {
+  output.muted = muted;
+  if (output.master !== null) output.master.gain.value = muted ? 0 : output.masterVolume;
+  return output.muted;
+}
+
+/** Master volume, 0..1, clamped. Applied unless muted. Returns what stuck. */
+export function setTrackerMasterVolume(output: TrackerOutput, volume: number): number {
+  output.masterVolume = Math.min(Math.max(volume, 0), 1);
+  if (output.master !== null && !output.muted) output.master.gain.value = output.masterVolume;
+  return output.masterVolume;
+}
+
+/**
+ * Nudges a suspended context, for browsers that will not start audio until
+ * the player has interacted with the page. Safe to call on every keypress;
+ * does nothing before the context exists. Mirrors `resumeAudio`.
+ */
+export function resumeTracker(output: TrackerOutput): void {
+  if (output.host === null || output.host.state !== "suspended") return;
+  void output.host.resume().catch(() => {
+    // An autoplay policy that will not budge is silence, not an error.
+  });
+}
