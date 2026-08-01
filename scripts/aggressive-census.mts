@@ -38,11 +38,13 @@ import { parseTableMapDocument } from "../src/game/table-map.js";
 import { TABLE_IDS } from "../src/game/contracts.js";
 import { parseTableAccelDocument, registerTableAcceleration } from "../src/game/table-accel.js";
 import { parseTableDevicesDocument, registerTableDevices } from "../src/game/table-devices.js";
+import { parseTableModesDocument, registerTableModes } from "../src/game/table-modes.js";
 import type {
   TableAccelDocument,
   TableDevicesDocument,
   TableId,
   TableMapDocument,
+  TableModesDocument,
 } from "../src/game/contracts.js";
 
 /**
@@ -87,7 +89,9 @@ const PULL_HARDER_TICKS = 4;
  * effects. `createGame` requires the drive and throws without it (see
  * src/game/table-accel.ts); the scoring layer carries the surface-id map the
  * contact model reads its restitution and its bumper kicks out of, so a census
- * run without it would be measuring a different machine.
+ * run without it would be measuring a different machine. The mission layer is
+ * loaded for the same reason: it fires the multiball opcode and takes balls off
+ * the table, so a census without it is not measuring the shipped machine.
  */
 function mapFor(tableId: TableId) {
   const accelUrl = new URL(`../public/generated/tables/${tableId}.accel.json`, import.meta.url);
@@ -99,6 +103,10 @@ function mapFor(tableId: TableId) {
     parseTableDevicesDocument(
       JSON.parse(readFileSync(devicesUrl, "utf8")) as TableDevicesDocument,
     ),
+  );
+  const modesUrl = new URL(`../public/generated/tables/${tableId}.modes.json`, import.meta.url);
+  registerTableModes(
+    parseTableModesDocument(JSON.parse(readFileSync(modesUrl, "utf8")) as TableModesDocument),
   );
   const url = new URL(`../public/generated/tables/${tableId}.map.json`, import.meta.url);
   return parseTableMapDocument(JSON.parse(readFileSync(url, "utf8")) as TableMapDocument);

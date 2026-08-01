@@ -24,7 +24,7 @@ import type { TableId } from "../src/game/contracts.js";
 import { pixelsToQ10, q10ToPixel } from "../src/core/fixed-point.js";
 import { createBallSet, spawnBall, stepBalls } from "../src/game/ball-physics.js";
 import { materialTableFor } from "../src/game/materials.js";
-import { devicesFor, mapFor } from "./table-fixtures.js";
+import { devicesFor, mapFor, modesFor } from "./table-fixtures.js";
 
 class ScriptedInput implements InputSource {
   private sequence = 0;
@@ -68,7 +68,15 @@ function playingInput(): InputSource {
   });
 }
 
-/** Every value any shipped record on one table is able to award. */
+/**
+ * Every value any shipped record on one table is able to award.
+ *
+ * Four families now, not three: the mission layer pays the packed-BCD score of
+ * the ELEMENT its `AWARD` opcode names, and those values are its own — Extreme
+ * Sports' 500,000 mission award appears in no device or zone record on the
+ * table. Adding them here keeps the assertion saying what it has always said,
+ * over more of the machine: nothing in this reconstruction may invent an award.
+ */
 function awardValuesOf(tableId: TableId): Set<number> {
   const devices = devicesFor(tableId);
   const values = new Set<number>([0]);
@@ -77,6 +85,24 @@ function awardValuesOf(tableId: TableId): Set<number> {
     values.add(record.repeatScore);
   }
   for (const record of [...devices.bumpers, ...devices.slingshots]) values.add(record.score);
+  for (const element of modesFor(tableId).elements) values.add(element.score);
+  return values;
+}
+
+/**
+ * Every BONUS value the shipped data can pay.
+ *
+ * This set used to be `{0}` and the assertion used to be `bonus === 0`, and that
+ * was a correct statement about a machine whose missions never ran. It is not
+ * one any more: the mission layer pays the element's packed-BCD BONUS field
+ * alongside its score, and those fields are not all zero — Extreme Sports'
+ * element 12 carries 7,000. The bonus counter finally has something feeding it.
+ */
+function bonusValuesOf(tableId: TableId): Set<number> {
+  const devices = devicesFor(tableId);
+  const values = new Set<number>([0]);
+  for (const record of [...devices.devices, ...devices.zones]) values.add(record.bonus);
+  for (const element of modesFor(tableId).elements) values.add(element.bonus);
   return values;
 }
 
@@ -87,23 +113,30 @@ describe("the machine keeps score", () => {
     // to be one that came off the disks.
     for (const tableId of TABLE_IDS) {
       const permitted = awardValuesOf(tableId);
+      const permittedBonus = bonusValuesOf(tableId);
       const game = createGame(mapFor(tableId), { ballsPerGame: 3 });
       startGame(game);
 
       let awarded = 0;
       let total = 0;
+      let totalBonus = 0;
       for (const report of runTicks(game, playingInput(), 6_000)) {
         for (const award of report.awards) {
           expect(permitted.has(award.score), `${tableId} awarded ${award.score}`).toBe(true);
-          expect(award.bonus, `${tableId} ${award.id} bonus`).toBe(0);
+          expect(
+            permittedBonus.has(award.bonus),
+            `${tableId} ${award.id} awarded bonus ${award.bonus}`,
+          ).toBe(true);
           awarded += 1;
           total += award.score;
+          totalBonus += award.bonus;
         }
       }
 
       expect(awarded, `${tableId} scored nothing at all in 6000 ticks`).toBeGreaterThan(0);
-      // The packed-BCD field and ordinary arithmetic have to agree exactly.
+      // The packed-BCD fields and ordinary arithmetic have to agree exactly.
       expect(debugSnapshot(game).score).toBe(total % 1_000_000_000_000);
+      expect(debugSnapshot(game).bonus).toBe(totalBonus % 1_000_000_000_000);
     }
   });
 

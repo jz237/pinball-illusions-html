@@ -31,6 +31,10 @@ import { loadTableMap } from "./game/table-map.js";
 import { loadTableArt } from "./game/table-art.js";
 import { loadTableAcceleration } from "./game/table-accel.js";
 import { loadTableDevices } from "./game/table-devices.js";
+import { loadTableModes } from "./game/table-modes.js";
+import { loadTableAudio } from "./game/table-audio.js";
+import { createAudioBank, loadAudioBank, playTick, resumeAudio } from "./browser/audio.js";
+import type { AudioBank } from "./browser/audio.js";
 import type { TableId } from "./game/contracts.js";
 
 const TABLE: TableId = "law-n-justice";
@@ -112,6 +116,31 @@ function pollGamepads(router: InputRouter): void {
   }
 }
 
+/**
+ * Brings the sound up in the background.
+ *
+ * Returns a handle whose `bank` is null until the manifest and every WAV have
+ * loaded, and stays null forever if any of that fails. Nothing awaits it and
+ * nothing checks it twice: the tick hook simply plays nothing until there is
+ * something to play.
+ */
+function startAudio(tableId: TableId): { bank: AudioBank | null } {
+  const handle: { bank: AudioBank | null } = { bank: null };
+  const Context = window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+  if (Context === undefined) return handle;
+  void (async () => {
+    try {
+      const audio = await loadTableAudio(tableId);
+      const bank = createAudioBank(new Context(), audio);
+      await loadAudioBank(bank);
+      handle.bank = bank;
+    } catch {
+      // Silence is a correct outcome for a pinball table.
+    }
+  })();
+  return handle;
+}
+
 function reportBootFailure(error: unknown): void {
   const message = error instanceof Error ? error.message : String(error);
   const notice = document.getElementById("boot");
@@ -148,9 +177,16 @@ async function boot(): Promise<void> {
     // registries.
     loadTableAcceleration(TABLE),
     loadTableDevices(TABLE),
+    loadTableModes(TABLE),
   ]);
   setPlayfieldArtwork(map, artwork);
   const game = createGame(map);
+
+  // The sound comes up AFTER the game is assembled and is never awaited on the
+  // boot path. It is presentation: a table that cannot fetch its samples, or a
+  // browser that will not open an audio context, plays in silence and every
+  // other part of the machine is unaffected. See `src/browser/audio.ts`.
+  const sound = startAudio(TABLE);
 
   let scale = fitCanvas(canvas);
   window.addEventListener("resize", () => {
@@ -169,6 +205,17 @@ async function boot(): Promise<void> {
     },
     render: (current) => renderGame(context, current, scale),
     poll: () => pollGamepads(router),
+    onTick: (report) => {
+      const bank = sound.bank;
+      if (bank !== null) playTick(bank, report);
+    },
+  });
+
+  // Autoplay policies keep an audio context suspended until the player has
+  // touched the page. A keypress is exactly that, and the loop's own input
+  // already sees every one of them.
+  window.addEventListener("keydown", () => {
+    if (sound.bank !== null) resumeAudio(sound.bank);
   });
 
   // A hidden tab gets no animation frames, so the scheduler would bank the

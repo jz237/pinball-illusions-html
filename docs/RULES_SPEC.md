@@ -24,12 +24,14 @@ rules dump and nothing here is sufficient to write mode logic from.
 | Score/bonus representation | **A** | Fully decoded from the engine's own instructions |
 | Per-event award magnitudes | **A−** | 337 award records recovered across three tables with exact values |
 | Option records 1–7 | **A** | All seven identified positionally from consuming code; layout corrected |
-| Mode/mission inventory | **B** | Counted and named from strings; the *rules* of each mode are unknown |
+| Mode/mission inventory | **A** | Counted from the engine's own selector tables and **decoded to bytecode** — see §12 |
 | Message/display format | **A** | Format proven against the engine's own printer |
 | Which trigger fires which award | **B** | **Link found.** Two of them, both structural — see §11 |
-| Mode timer values | **F** | The countdown *mechanism* is decoded; not one duration constant was found |
-| Combo windows, hurry-up rates | **F** | Not found |
-| Script/bytecode grammar | **D** | Two opcodes out of ~24 proven; record lengths not solved |
+| Mode timer values | **A−** | Every `WAIT`'s duration is an operand in the script; the seconds-per-tick multiplier is a system field, so PAL is assumed — §12 |
+| Combo windows, hurry-up rates | **D** | The ladder counters are decoded (award effect 21); the pop that reads the `$23DC` stack is not |
+| Script/bytecode grammar | **A−** | **All 31 opcodes, lengths and operands decoded**; nine operand *record types* still unidentified — §12 |
+| Sound effects | **A−** | Records, banks, periods and bindings decoded and shipped; the kind-5 resolver is inference — §13 |
+| Music | **D** | Banks, sample directories and instruments decoded; the packed pattern format is not |
 
 ~~**The single most important negative:** we can now say what an award is *worth* but not
 what *causes* it.~~ **SUPERSEDED — see §11.** The award values are not a table at all;
@@ -1059,13 +1061,174 @@ and `$23E4(a5)` are written and never read, and `device+$02` — the byte gating
 increments — is zero on every type-4 device on all three tables as shipped. "N locks
 light multiball" is per-table script data and the script streams are still **[open]**.
 
-### 11.4 The script VM, decoded
+### 11.4 The script VM — SUPERSEDED BY §12
 
-Fetch at `0x58E8`. The opcode word stored in the stream **is** the byte offset into the
-dispatch table: `opcode = 4 + 4k`. Table base data `$5912`, entries `$5916 + 4k` of
-`(handler_offset.w, length.w)`, handler `= $5916 + entry[0]`, length in bytes including
-the opcode word. 31 entries; opcode 0 terminates. Known so far: `$2C` set ball save,
-`$64` option-record-7 test, `$68` lock release, `$6C` multiball. A second, structurally
-identical VM lives at `0x66A4` (code at `object+$06`, table base `$6748`, 26 entries)
-and is undecoded. No byte range in any table module has yet been found that parses as a
-valid stream for either. **[disk]** / **[open]**
+This section used to say that "the opcode word stored in the stream **is** the byte
+offset into the dispatch table: `opcode = 4 + 4k`", and that no byte range in any table
+module parsed as a valid stream. **Both statements are wrong**, and they were wrong for
+the same reason.
+
+The dispatch at `0x58FC` is `movem.w (0x5912,PC,d0.w*4),d0-d1`, and the brief-extension
+word at `0x5900` is `$0412` — scale field bits 10..9 are `0b10`, i.e. **times four**.
+Capstone renders the base two bytes low and drops the scale entirely, which is what
+produced the "opcode = 4 + 4k" reading. The opcodes are small integers **1..31**, and
+with that correction every table module is full of valid streams: 94, 109 and 77 event
+records on the three tables. See §12. **[disk]**
+
+---
+
+## 12. The mission machine
+
+**The event record is a bytecode program.** Everything reached by `jsr $6C10` — from an
+award record at `+$1A`, a mode record at `+$16`, a trigger zone's object at `+$06` and a
+lock's object at `+$14` — is code, not data. `$6C10` itself is seven instructions and is
+a **queue append**: `move.l a0,(a1,d2.w*4)` into a 64-slot ring at `$2396(a5)`, `clr.l`
+of the next slot so the ring is self-terminating, `andi.w #$3f` on the write index.
+**[disk]**
+
+Two interpreters share the one 31-entry dispatch table:
+
+| Interpreter | Address | What it runs |
+|---|---|---|
+| Background queue | `0x58BC` | scripts a physical shot fired, **one opcode per frame** |
+| Mission | `0x57AC` / `0x57B0` | the single script in `$daa(a5)`, plus the wait machinery |
+
+### 12.1 Record layout
+
+    EVENT RECORD   +$00 u16 reserved (0 in every instance)
+                   +$02 u16 PC, a byte offset into the code area
+                   +$04 ...  the opcode stream; opcode 0x0000 is END
+
+    ELEMENT        +$00 b flags   +$01 b per-player ARMED   +$02 b per-player DONE
+                   +$04/$08 l lamp (START / AWARD path)
+                   +$0C/$10 l sound          +$14/$18 l display
+                   +$1E..$23 packed-BCD SCORE   +$26..$2B packed-BCD BONUS
+                   +$2C u16 award-effect index  +$2E s16 countdown (-1 = none)
+                   +$34 l progress-counter record (+$04 target, +$48 next step)
+
+The BCD offsets are not guessed: `AWARD` does `lea $2C(P),a3; jsr $6B96`, and `$6B96`
+walks two six-digit `ABCD` chains backwards from `a3`. Every element on all three tables
+passes the "each nibble is a decimal digit" test at those offsets, and that same test is
+what tells a real element from a false positive. **[disk]**
+
+### 12.2 How a mission progresses
+
+`START` sets an element's ARMED bit — the shot is lit. `WAIT` parks the mission on that
+element with a timeout. The player shoots; the surface id or zone under the ball is
+bound to a script; that script's `AWARD` **clears the armed bit** and pays the element's
+BCD score and bonus. The wait sees the bit go out and falls through. If the clock runs
+out first it branches to the wait's third operand. Both tests happen every frame.
+**[disk]**
+
+That one bit is the entire join between the physics and the rules.
+
+### 12.3 The corrected inventory
+
+| Table | Scripts | Elements | Modes | Selectable |
+|---|---|---|---|---|
+| Law 'n Justice | 304 | 126 | 12 | **8** |
+| BabeWatch | 342 | 125 | 12 | 5 |
+| Extreme Sports | 324 | 100 | 13 | 11 |
+
+**Law 'n Justice has eight missions, not seventeen.** The selector table at `h4+0x30AA`
+terminates with `FF FE 00 08` and that pad word is the engine's own count. Counting
+every distinct `MODE_START` target on the table — the eight, the jail wizard multiball,
+Bumper Mania and two multiball starts — gives twelve. There is no arrangement of the
+data that yields seventeen. **[disk]**
+
+Their banners, verbatim from the display records: *BLOW ALL BOMBS BEFORE / TIMER REACHES
+ZERO*, *STOP SPARKYS FIRE / FROM SPREADING*, *THE HOVER IS SPEEDING / IT IS A
+HOVERCHASE*, *SHOOT RIGHT RAMP TO / BUST DRUGDEALERS*, *GIMME YOUR BEST SHOT / TO CLEAR
+THE STREET*, *BRING ALL PRISONERS / BACK TO JAIL*, *SHOOT ALL TERRORISTS / TO FREE
+HOSTAGES*, *SHOOT FLASHING ARROWS / TO CALM DOWN RIOTS*.
+
+**Iron Man serves three balls, not four.** Extreme Sports' `h4+0x501E` issues
+`BALLS_UP_TO 3`, and the handler at `0x5BCC` refuses four or more outright with
+`cmpi.w #$3,d1 / bhi`. **[disk]**
+
+### 12.4 What is still open
+
+- **Nine of the pointer-taking opcodes address an unidentified record type**:
+  `KICK_IF`, `LINK_RESTORE`, `SET_VALUE`, `RESET_GROUP`, `RESTORE_POS`, `CLEAR_BYTE`,
+  `SET_MAX`, `SET_COUNT`, `SET_COUNT_SELF`. Their operands fail the packed-BCD test that
+  every real element passes, which is how they were caught. **[open]**
+- **The `$23DC` stack has no decoded reader.** `PUSH` and `PUSH_LINKED` write
+  `P1+$34 = P2` and push, and that is how a mission's later shots are wired at run time.
+  Four of Law 'n Justice's WAIT elements, two of BabeWatch's and four of Extreme Sports'
+  are reachable only that way and cannot be seen statically. **[open]**
+- **Nothing points at the selector tables.** They are found by scanning, and whatever
+  walks them is presumably the per-table 68k in slot 6. The reconstruction in
+  `src/game/mode-vm.ts` starts the next selector mission when a **mode-arm element** is
+  lit, an arm element being one that some mission both `COMPLETE`s and `CLEAR_DONE`s.
+  Labelled RECONSTRUCTION at the site. **[open]**
+- **`$50(a5)` is a system field**, so a `WAIT`'s seconds-to-frames multiplier is not an
+  immediate anywhere. 50 is assumed, which is the PAL field rate the rest of this
+  reconstruction runs at. **[open]**
+
+---
+
+## 13. Sound
+
+**Slots 7 and 8 are not raw PCM.** Each begins with the magic `SNT!` and is a
+ProTracker-derived module bank, parsed by `main.seg00 $7BF8`:
+
+    +$000 'SNT!'                     +$004 u32 offset of the sample PCM
+    +$008 31 x {u16 length_words, u8 finetune, u8 volume,
+                u16 repeat_words, u16 repeat_length_words}
+    +$100 u8 song length             +$102 128 x u8 order list
+    +$282 64 x u16 pattern offsets   +$302 packed pattern data
+    +$004-> the PCM, contiguous in table order
+
+Banks sit back to back and **the sound-effect PCM is appended after the last one**. The
+ratio is lopsided: roughly 1,030,000 bytes of module instruments against 150,000 bytes
+of effects across the three tables. **[disk]**
+
+### 13.1 The sound record, 26 bytes
+
+Entered by `jsr $6CD0`, which masks the first byte with 7 and indexes the word table at
+`$6CE4` **scaled by two**. Kind 2 is a PCM sample, kind 5 a bank instrument. The layout
+is proven by the per-frame DMA servicer at `$7958`, handed the record with `a3 = $DFF0D0`:
+
+    7962  move.l a1,(a3)          AUD3LC  <- +$16
+    7964  move.w $8(a0),$4(a3)    AUD3LEN <- +$08
+    796a  move.w $6(a0),$6(a3)    AUD3PER <- +$06
+    7970  move.w $4(a0),$8(a3)    AUD3VOL <- +$04
+
+    +$00 kind  +$01 flags  +$02 priority  +$04 volume  +$06 period
+    +$08 chunk (words)  +$0C chunks  +$0E loop  +$12 bank  +$14 instrument  +$16 sample
+    total bytes = 2 x chunk x chunks
+
+**The period is a pitch**, three ways: the disassembly writes it to AUD3PER; every
+period in every record is an exact ProTracker table entry; and records sharing one
+sample differ only in period and form musical intervals — BabeWatch's
+`$9774/$978E/$97A8/$97C2` are 428/404/381/360, a chromatic C-2/C#2/D-2/D#2 handed to four
+adjacent lane rectangles. PAL rate is 3546895/period. **[disk]**
+
+**Signedness** is proven twice: Paula is 8-bit signed by hardware, and the mean absolute
+first difference of every effect sample is 2-4x smaller read signed than sign-flipped.
+
+### 13.2 What plays what
+
+    device record     +$08 -> sound record      bumper record    +$02 -> sound record
+    slingshot record  +$02 -> sound record      zone object      +$02 -> sound record
+
+Uniform across all three tables. `$779E` starts an effect only if
+`cmp.w $2(a1),d7 / bcs skip` lets it — a sounding effect is never displaced by a lower
+priority — and `$09D2` sets DMACON `#$8`, i.e. **AUD3**: effects own Paula channel 3 and
+the music has 0-2. **[disk]**
+
+### 13.3 What is still open
+
+- **The kind-5 resolver.** `main.seg00` never reads `+$12` or `+$14`; the code that turns
+  (bank, instrument) into an address is elsewhere, presumably in `pkg/Pinball`. The
+  inference is strong — every pair on all three tables lands on a live sample, the
+  discriminating case works, and the four Law 'n Justice records sharing instrument 7
+  differ only in period (A-1/C-2/D-2/E-2, a rollover scale) — but it is inference, and
+  the shipped manifest marks those samples `"provenance": "inferred"`. **[open]**
+- **The packed pattern format.** 366-518 bytes per pattern where ProTracker needs 1024,
+  so it is compressed and no music can be played back. Only instruments are extracted.
+  **[open]**
+- **The drain has no sound.** No zone object on any table carries a sound record at the
+  outlanes or the middle, and there is no drain entry in the device chain. A drain is
+  therefore silent in this reconstruction rather than being given an invented sample.
+  **[open]**

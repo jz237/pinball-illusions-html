@@ -49,6 +49,10 @@ const IMAGE_EXT = new Set([
   ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".bmp", ".tif", ".tiff",
 ]);
 
+// Neither can a sound file, and a recording is a heavier rights question than a
+// picture: these are the machine's own speech callouts. Same rule, same digests.
+const AUDIO_EXT = new Set([".wav", ".ogg", ".mp3", ".flac", ".m4a", ".aac", ".opus"]);
+
 async function* walk(dir) {
   for (const entry of await readdir(dir, { withFileTypes: true })) {
     const full = join(dir, entry.name);
@@ -109,7 +113,15 @@ const DERIVED_MARKERS = [
   { class: "disk-derived-playfield-artwork", noun: "playfield artwork" },
   { class: "disk-derived-ramp-acceleration", noun: "ramp drive" },
   { class: "disk-derived-scoring-devices", noun: "device and award table" },
+  { class: "disk-derived-mode-scripts", noun: "mission and mode bytecode" },
+  { class: "disk-derived-audio", noun: "sound effect" },
 ];
+
+/** Manifest classes that must account for the binary files they ship beside. */
+const MEDIA_MARKERS = new Map([
+  ["disk-derived-playfield-artwork", { noun: "playfield artwork", extensions: IMAGE_EXT }],
+  ["disk-derived-audio", { noun: "sound effect", extensions: AUDIO_EXT }],
+]);
 
 /** Tolerates both `"sourceClass":"x"` and the spaced form a formatter might emit. */
 function declaresClass(text, sourceClass) {
@@ -117,15 +129,33 @@ function declaresClass(text, sourceClass) {
 }
 
 const derived = [];
-/** rel path of an image -> { manifest, sha256 } that claims it. */
+/** rel path of a media file -> { manifest, sha256, noun } that claims it. */
 const claimed = new Map();
-const images = [];
+const media = [];
+
+/** Records one manifest's claim on one file, or a violation explaining why not. */
+function claim(rel, name, digest, noun, what) {
+  if (typeof name !== "string" || !/^[A-Za-z0-9._-]+$/.test(name)) {
+    violations.push(`${rel}: ${what} does not name its file`);
+    return;
+  }
+  if (typeof digest !== "string" || !/^[0-9a-f]{64}$/.test(digest)) {
+    violations.push(`${rel}: ${what} ${name} carries no sha256 digest`);
+    return;
+  }
+  const target = join(dirname(rel), name);
+  if (claimed.has(target)) {
+    violations.push(`${rel}: ${target} is already claimed by ${claimed.get(target).manifest}`);
+    return;
+  }
+  claimed.set(target, { manifest: rel, sha256: digest, noun });
+}
 
 for await (const file of walk(root)) {
   const rel = relative(root, file);
   const ext = extname(file).toLowerCase();
 
-  if (IMAGE_EXT.has(ext)) images.push({ rel, file });
+  if (IMAGE_EXT.has(ext) || AUDIO_EXT.has(ext)) media.push({ rel, file, ext });
   if (ext !== ".json") continue;
 
   const text = await readFile(file, "utf8");
@@ -133,57 +163,54 @@ for await (const file of walk(root)) {
   if (marker === undefined) continue;
   derived.push({ rel, noun: marker.noun });
 
-  // An artwork manifest must also account for the image it ships beside.
-  if (marker.class !== "disk-derived-playfield-artwork") continue;
+  // A manifest that ships media beside it must account for every piece of it.
+  const media_marker = MEDIA_MARKERS.get(marker.class);
+  if (media_marker === undefined) continue;
   let doc;
   try {
     doc = JSON.parse(text);
   } catch {
-    violations.push(`${rel}: declares disk-derived artwork but is not valid JSON`);
+    violations.push(`${rel}: declares disk-derived ${media_marker.noun} but is not valid JSON`);
     continue;
   }
-  const name = doc?.image?.file;
-  const digest = doc?.image?.sha256;
-  if (typeof name !== "string" || !/^[A-Za-z0-9._-]+$/.test(name)) {
-    violations.push(`${rel}: artwork manifest does not name its image in image.file`);
+  if (marker.class === "disk-derived-playfield-artwork") {
+    claim(rel, doc?.image?.file, doc?.image?.sha256, media_marker.noun, "artwork manifest");
     continue;
   }
-  if (typeof digest !== "string" || !/^[0-9a-f]{64}$/.test(digest)) {
-    violations.push(`${rel}: artwork manifest ${name} carries no sha256 digest`);
+  const samples = Array.isArray(doc?.samples) ? doc.samples : null;
+  if (samples === null) {
+    violations.push(`${rel}: audio manifest carries no samples array`);
     continue;
   }
-  const target = join(dirname(rel), name);
-  if (claimed.has(target)) {
-    violations.push(`${rel}: ${target} is already claimed by ${claimed.get(target).manifest}`);
-    continue;
+  for (const sample of samples) {
+    claim(rel, sample?.file, sample?.sha256, media_marker.noun, "audio manifest");
   }
-  claimed.set(target, { manifest: rel, sha256: digest });
 }
 
-// Every image must be claimed, and must be the image that was claimed.
-for (const { rel, file } of images) {
-  const claim = claimed.get(rel);
-  if (claim === undefined) {
+// Every media file must be claimed, and must be the file that was claimed.
+for (const { rel, file } of media) {
+  const held = claimed.get(rel);
+  if (held === undefined) {
     violations.push(
-      `${rel}: raster image with no manifest — nothing in this build says where it came from`,
+      `${rel}: media file with no manifest — nothing in this build says where it came from`,
     );
     continue;
   }
   const actual = createHash("sha256").update(await readFile(file)).digest("hex");
-  if (actual !== claim.sha256) {
+  if (actual !== held.sha256) {
     violations.push(
-      `${rel}: sha256 ${actual.slice(0, 16)} does not match the ${claim.sha256.slice(0, 16)} ` +
-        `recorded in ${claim.manifest}`,
+      `${rel}: sha256 ${actual.slice(0, 16)} does not match the ${held.sha256.slice(0, 16)} ` +
+        `recorded in ${held.manifest}`,
     );
     continue;
   }
-  derived.push({ rel, noun: "playfield artwork" });
+  derived.push({ rel, noun: held.noun });
 }
 
-// A manifest that ships without its image is a broken build, not a safe one.
-for (const [target, claim] of claimed) {
-  if (!images.some((image) => image.rel === target)) {
-    violations.push(`${claim.manifest}: claims ${target}, which is not in the build`);
+// A manifest that ships without its media is a broken build, not a safe one.
+for (const [target, held] of claimed) {
+  if (!media.some((entry) => entry.rel === target)) {
+    violations.push(`${held.manifest}: claims ${target}, which is not in the build`);
   }
 }
 

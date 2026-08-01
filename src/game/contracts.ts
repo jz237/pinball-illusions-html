@@ -157,6 +157,49 @@ export interface TableDevicesDocument {
   readonly surfaceIds: readonly (readonly (readonly number[])[])[];
 }
 
+/**
+ * On-disk shape of `public/generated/tables/<id>.modes.json`: the mission
+ * bytecode, the playfield element records it operates on, the display text and
+ * the device/zone bindings that fire it. See `table-modes.ts` for what it means,
+ * `mode-vm.ts` for what runs it, and `scripts/export-table-modes.mjs` for where
+ * it comes from and what it does not know.
+ */
+export interface TableModesDocument {
+  readonly schema: "pinball-illusions/table-modes/v1";
+  readonly tableId: TableId;
+  readonly displayName: string;
+  readonly provenance: {
+    readonly sourceClass: string;
+    readonly description: string;
+    readonly authorizationRequired: boolean;
+  };
+  readonly opcodes: readonly Readonly<Record<string, unknown>>[];
+  readonly elements: readonly Readonly<Record<string, unknown>>[];
+  readonly messages: readonly Readonly<Record<string, unknown>>[];
+  readonly scripts: readonly Readonly<Record<string, unknown>>[];
+  readonly missions: readonly Readonly<Record<string, unknown>>[];
+  readonly triggers: Readonly<Record<string, unknown>>;
+}
+
+/**
+ * On-disk shape of `public/generated/tables/<id>.audio.json`: the sound-effect
+ * samples and the device, bumper, slingshot and zone bindings that play them.
+ * See `table-audio.ts` for what it means, `src/browser/audio.ts` for what plays
+ * it, and `scripts/export-table-audio.mjs` for where it comes from.
+ */
+export interface TableAudioDocument {
+  readonly schema: "pinball-illusions/table-audio/v1";
+  readonly tableId: TableId;
+  readonly displayName: string;
+  readonly provenance: {
+    readonly sourceClass: string;
+    readonly description: string;
+    readonly authorizationRequired: boolean;
+  };
+  readonly samples: readonly Readonly<Record<string, unknown>>[];
+  readonly triggers: readonly Readonly<Record<string, unknown>>[];
+}
+
 /** One ball in flight. Positions are Q10; velocities are signed 16-bit. */
 export interface BallState {
   readonly id: number;

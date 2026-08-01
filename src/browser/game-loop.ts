@@ -178,7 +178,9 @@ import type { TableDevices } from "../game/table-devices.js";
 import { tableDevicesFor } from "../game/table-devices.js";
 import type { Award, ScoringState } from "../game/scoring.js";
 import {
+  addToBcdField,
   applyAward,
+  awardTrigger,
   createScoringState,
   formatBcdField,
   readBcdField,
@@ -188,6 +190,18 @@ import {
   scoreZones,
   tickScoring,
 } from "../game/scoring.js";
+import type { TableModes } from "../game/table-modes.js";
+import { tableModesFor } from "../game/table-modes.js";
+import type { ModeState, ModeTickReport } from "../game/mode-vm.js";
+import {
+  EMPTY_MODE_TICK,
+  createModeState,
+  litElements,
+  missionSecondsLeft,
+  queueScript,
+  resetModesForNewBall,
+  tickModes,
+} from "../game/mode-vm.js";
 import type { TableAcceleration } from "../game/table-accel.js";
 import { tableAccelerationFor } from "../game/table-accel.js";
 import type { PlungerConfig, PlungerState } from "../game/plunger.js";
@@ -471,6 +485,16 @@ export interface Game {
    * be a bumper.
    */
   readonly devices: TableDevices | null;
+  /**
+   * The table's MISSION LAYER, or null.
+   *
+   * Nullable for the same reason the scoring layer is, and with the same
+   * consequence: without it a mode START still awards its 500,000 and the
+   * mission still never runs, which is exactly the state this project was in
+   * before the event record turned out to be a bytecode program. See
+   * `mode-vm.ts`.
+   */
+  readonly modes: TableModes | null;
   readonly options: GameOptions;
   readonly plungerConfig: PlungerConfig;
   readonly nudgeConfig: NudgeConfig;
@@ -500,6 +524,10 @@ export interface Game {
   ballsLocked: number;
   /** Packed-BCD score and bonus, plus the three award debounces. */
   scoring: ScoringState;
+  /** The mission machine's state, or null when the table has no mission layer. */
+  modeState: ModeState | null;
+  /** The lines the running mission last put on the display, newest first. */
+  modeMessages: readonly string[];
   /** The ball sitting on the plunger rod, or null once it has been launched. */
   laneBallId: number | null;
   serveCountdown: number;
@@ -530,6 +558,10 @@ export interface GameTickReport {
   readonly locked: readonly number[];
   /** True on the tick a multiball was lit and the saucers gave their balls back. */
   readonly multiballStarted: boolean;
+  /** Index into the table's mission list started this tick, or -1. */
+  readonly missionStarted: number;
+  /** True on the tick the running mission reached its END. */
+  readonly missionEnded: boolean;
   /** Everything that scored this tick, in the order it scored. */
   readonly awards: readonly Award[];
   readonly justTilted: boolean;
@@ -554,11 +586,13 @@ const NUDGE_CONTROLS: readonly (readonly [Control, NudgeDirection])[] = Object.f
  * `table-accel.ts`.
  */
 export function createGame(map: TableMap, options?: Partial<GameOptions>): Game {
+  const modes = tableModesFor(map.tableId);
   return {
     map,
     materials: materialTableFor(map.tableId),
     rampDrive: tableAccelerationFor(map.tableId),
     devices: tableDevicesFor(map.tableId),
+    modes,
     options: resolveGameOptions(options),
     plungerConfig: plungerConfigFor(map.tableId),
     nudgeConfig: nudgeConfigFor(map.tableId),
@@ -572,6 +606,8 @@ export function createGame(map: TableMap, options?: Partial<GameOptions>): Game 
     autoLaunchCountdown: 0,
     ballsLocked: 0,
     scoring: createScoringState(),
+    modeState: modes === null ? null : createModeState(modes),
+    modeMessages: [],
     laneBallId: null,
     serveCountdown: 0,
     stillTicks: 0,
@@ -609,6 +645,11 @@ export function startGame(game: Game): void {
   // an award is a first hit or a repeat are per GAME, and a new game must not
   // inherit the last one's.
   game.scoring = createScoringState();
+  // A fresh mission machine for the same reason: the DONE bits that say which
+  // shots a player has already finished are per game, so a new game must not
+  // start with half the table already completed.
+  game.modeState = game.modes === null ? null : createModeState(game.modes);
+  game.modeMessages = [];
   game.laneBallId = null;
   game.serveCountdown = game.options.firstServeDelayTicks;
   game.stillTicks = 0;
@@ -691,6 +732,8 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     drained: [],
     locked: [],
     multiballStarted: false,
+    missionStarted: -1,
+    missionEnded: false,
     awards: [],
     justTilted: false,
     gameOver: false,
@@ -860,6 +903,17 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
   const lockTick = runLocks(game);
   awards.push(...lockTick.awards);
 
+  // ---- missions ----------------------------------------------------------
+  //
+  // Every award that came from a device, a trigger zone or a lock queues that
+  // record's own script — `jsr $6c10` at +0x005582 for a lock, and the same call
+  // from the device and zone handlers. Then one frame of the mission machine.
+  // Queue first, run second, so a script fired this tick starts next tick,
+  // which is the original's ordering and what keeps one ball from satisfying two
+  // stages of a ladder in one frame.
+  const modeTick = runModes(game, awards);
+  awards.push(...modeAwardsAsAwards(modeTick));
+
   // ---- ball search -------------------------------------------------------
   const lost = runBallSearch(game);
 
@@ -880,6 +934,13 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
       // next one, and this reconstruction has no rule saying which tables do that.
       releaseHeldBalls(game.locks, game.balls.balls);
       pruneInactiveBalls(game.balls);
+      // The mission goes with the ball. The original refuses to END THE BALL
+      // while a mission is running instead (0x4F12-0x4F28 will not advance the
+      // game state while `$daa(a5)` is set), which is not reproducible here: the
+      // ball is already gone, so nothing could ever advance the script and the
+      // machine would hang. See the divergence note in `mode-vm.ts`.
+      if (game.modeState !== null) resetModesForNewBall(game.modeState);
+      game.modeMessages = [];
       game.multiball = false;
       game.plunger = resetPlunger();
       game.tilt = resetTiltForNewBall();
@@ -909,6 +970,8 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     drained,
     locked: lockTick.locked,
     multiballStarted: lockTick.multiballStarted,
+    missionStarted: modeTick.missionStarted,
+    missionEnded: modeTick.missionEnded,
     awards,
     justTilted,
     gameOver,
@@ -964,6 +1027,83 @@ export function currentScore(game: Game): number {
 /** The player's bonus, as a decimal number read out of the BCD field. */
 export function currentBonus(game: Game): number {
   return readBcdField(game.scoring.bonus);
+}
+
+/**
+ * Feeds this tick's awards into the mission machine and runs one frame of it.
+ *
+ * The join between the physics and the rules is exactly this: a device, a
+ * trigger zone or a lock that paid an award also fires its own event record, and
+ * that record's `AWARD` opcode is what puts out the lit shot a mission is
+ * waiting on. Everything else — the timers, the ladders, the timeouts — follows
+ * from that one bit going out. See `mode-vm.ts`.
+ *
+ * A device binding is looked up on both levels because the award's id carries
+ * the surface id and not the plane; the engine indexes the level's own array and
+ * a surface id is filed in exactly one of them, so asking both is the same
+ * answer with fewer things to get wrong.
+ */
+function runModes(game: Game, awards: readonly Award[]): ModeTickReport {
+  const modes = game.modes;
+  const state = game.modeState;
+  if (modes === null || state === null) return EMPTY_MODE_TICK;
+
+  for (const award of awards) {
+    const trigger = awardTrigger(award);
+    if (trigger === null) continue;
+    if (trigger.kind === "device") {
+      const lower = modes.scriptForDevice(0, trigger.id);
+      queueScript(state, lower >= 0 ? lower : modes.scriptForDevice(1, trigger.id));
+      continue;
+    }
+    const level: PlayfieldLevel = trigger.level === 1 ? 1 : 0;
+    queueScript(
+      state,
+      trigger.kind === "lock"
+        ? modes.scriptForLock(level, trigger.id)
+        : modes.scriptForZone(level, trigger.id),
+    );
+  }
+
+  const report = tickModes(modes, state);
+
+  for (const award of report.awards) {
+    addToBcdField(game.scoring.score, award.score);
+    addToBcdField(game.scoring.bonus, award.bonus);
+  }
+  // The banner is the last thing the mission said, and it goes away with the
+  // mission: a display left showing "SHOOT ALL TERRORISTS" after the mode has
+  // ended is worse than showing nothing.
+  if (report.messages.length > 0) game.modeMessages = report.messages;
+  if (report.missionEnded) game.modeMessages = [];
+  // `BALLS_UP_TO` is the multiball opcode and it is a TOP-UP with a ceiling of
+  // three, which is what `oweServes` already implements. `BALL_REMOVE` is not
+  // honoured: it takes the ball off the table so that the top-up that follows it
+  // can put several back, and since the top-up counts live balls the end state
+  // is the same three balls either way. It is reported so the omission is
+  // visible rather than assumed harmless.
+  if (report.ballsUpTo > 0) {
+    oweServes(game, ballsToTopUp(report.ballsUpTo, freeBallCount(game.balls), game.pendingServes));
+    if (report.ballsUpTo > 1) game.multiball = true;
+  }
+  return report;
+}
+
+/**
+ * The mission awards, as ordinary awards, so one list carries everything that
+ * scored this tick and `debugSnapshot().score` stays the sum of it.
+ *
+ * `source` is "mode" and the id names the element, so a test can tell a shot
+ * that paid its device record from the same shot paying its mission.
+ */
+function modeAwardsAsAwards(report: ModeTickReport): Award[] {
+  return report.awards.map((award) => ({
+    source: "mode" as const,
+    id: `mode-element-${award.element}`,
+    score: award.score,
+    bonus: award.bonus,
+    repeat: false,
+  }));
 }
 
 /**
@@ -1309,6 +1449,16 @@ export interface GameLoopOptions {
   readonly render: (game: Game) => void;
   /** Called before each frame's ticks, for pull-based devices such as gamepads. */
   readonly poll?: () => void;
+  /**
+   * Called once per SIMULATION TICK with that tick's report, for presentation
+   * that has to see every tick rather than every frame — the audio layer, which
+   * would otherwise miss every bumper in a three-tick catch-up batch.
+   *
+   * Strictly downstream: the loop does not read anything back from it, and a
+   * callback that throws must not take the simulation with it, so it is called
+   * inside a `try`. See `src/browser/audio.ts`.
+   */
+  readonly onTick?: (report: GameTickReport) => void;
   readonly scheduler?: FixedStepScheduler;
 }
 
@@ -1327,6 +1477,7 @@ export class GameLoop {
   readonly #frames: FrameScheduler;
   readonly #render: (game: Game) => void;
   readonly #poll: (() => void) | null;
+  readonly #onTick: ((report: GameTickReport) => void) | null;
   #handle: number | null = null;
   #frameCount = 0;
 
@@ -1336,6 +1487,7 @@ export class GameLoop {
     this.#frames = options.frames;
     this.#render = options.render;
     this.#poll = options.poll ?? null;
+    this.#onTick = options.onTick ?? null;
     this.scheduler = options.scheduler ?? new FixedStepScheduler();
   }
 
@@ -1382,7 +1534,13 @@ export class GameLoop {
     this.#poll?.();
     const batch = this.scheduler.advance(millisecondsToNanos(timeMs));
     for (let i = 0; i < batch.ticks; i += 1) {
-      tickGame(this.game, this.#input.sample());
+      const report = tickGame(this.game, this.#input.sample());
+      if (this.#onTick === null) continue;
+      try {
+        this.#onTick(report);
+      } catch {
+        // Presentation must never be able to stop the simulation.
+      }
     }
     this.#frameCount += 1;
     this.#render(this.game);
@@ -1432,6 +1590,21 @@ export interface GameDebugState {
   readonly bonus: number;
   /** Device id to ball id for every occupied saucer, in table order. */
   readonly locks: readonly { readonly deviceId: string; readonly ballId: number }[];
+  /**
+   * The running mission, or null.
+   *
+   * `lit` is every element armed for this player, which is the reconstruction's
+   * equivalent of looking at the lamps: those are the shots the table is asking
+   * for right now.
+   */
+  readonly mission: {
+    readonly index: number;
+    readonly title: string;
+    readonly secondsLeft: number;
+    readonly lit: readonly number[];
+  } | null;
+  /** The lines the mission last put on the display. */
+  readonly modeMessages: readonly string[];
   readonly plungerCharge: number;
   /** Consecutive motionless ticks counted toward the ball search. */
   readonly stillTicks: number;
@@ -1443,6 +1616,25 @@ export interface GameDebugState {
   readonly forceFullTable: boolean;
   readonly balls: readonly BallDebugState[];
   readonly flippers: readonly { readonly id: string; readonly stroke: number }[];
+}
+
+/**
+ * The mission the table is running, flattened for the display and for tests.
+ *
+ * Null when no mission is running, which — because `MODE_START` refuses to start
+ * a second while one is live — is the same thing as "the player may start one".
+ */
+export function runningMission(game: Game): GameDebugState["mission"] {
+  const modes = game.modes;
+  const state = game.modeState;
+  if (modes === null || state === null || state.mission < 0) return null;
+  const record = state.missionIndex < 0 ? undefined : modes.missions[state.missionIndex];
+  return {
+    index: state.missionIndex,
+    title: record?.title ?? "",
+    secondsLeft: missionSecondsLeft(state),
+    lit: litElements(state),
+  };
 }
 
 /**
@@ -1478,6 +1670,8 @@ export function debugSnapshot(game: Game): GameDebugState {
       const ballId = game.locks.held.get(device.id);
       return ballId === undefined ? [] : [{ deviceId: device.id, ballId }];
     }),
+    mission: runningMission(game),
+    modeMessages: [...game.modeMessages],
     plungerCharge: chargeLevel(game.plunger),
     stillTicks: game.stillTicks,
     searchPulses: game.searchPulses,
@@ -1601,6 +1795,21 @@ function statusLine(game: Game): string {
 }
 
 /**
+ * The mission banner: the title the mission announced and its clock.
+ *
+ * Empty when nothing is running, which is what the caller uses to decide whether
+ * to draw a second line at all. The seconds are `$dae / $50(a5)`, which is what
+ * the original puts on its own display.
+ */
+function missionLine(game: Game): string {
+  const mission = runningMission(game);
+  if (mission === null) return "";
+  const clock = mission.secondsLeft > 0 ? `  ${mission.secondsLeft}` : "";
+  const title = mission.title.length > 0 ? mission.title : game.modeMessages.join(" ");
+  return `${title}${clock}`;
+}
+
+/**
  * Draws one frame.
  *
  * Everything is redrawn every frame — there is no dirty-rectangle tracking —
@@ -1630,4 +1839,9 @@ export function renderGame(context: CanvasRenderingContext2D, game: Game, scale:
   context.textBaseline = "top";
   context.fillStyle = game.tilt.tilted ? HUD_ALERT : HUD_TEXT;
   context.fillText(statusLine(game), 6, 6);
+  const mission = missionLine(game);
+  if (mission.length > 0) {
+    context.fillStyle = HUD_ALERT;
+    context.fillText(mission, 6, 22);
+  }
 }

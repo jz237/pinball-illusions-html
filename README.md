@@ -49,6 +49,38 @@ And the **ramp drive** is decoded and shipped beside them, in
   shipped block maps against the shipped collision maps and asserts that the
   driven blocks land on the ramps.
 
+And the **missions** are decoded and shipped in
+`public/generated/tables/*.modes.json`:
+
+- The thing a mode record points at is not a data record, it is a **bytecode
+  program**. `jsr $6C10` is seven instructions and appends to a 64-slot ring; the
+  interpreters are at `0x58BC` (the background queue, one opcode per frame) and
+  `0x57AC` (the running mission, plus its wait machinery). The 31-entry dispatch
+  table at `0x5912` is indexed **scaled by four**, which is the correction that
+  unlocked it — see `docs/RULES_SPEC.md` §12 and `scripts/export-table-modes.mjs`.
+- A mission arms an element, waits on it, and advances when a shot's own script
+  `AWARD`s that element and clears its armed bit. That single bit is the whole
+  join between the physics and the rules. `src/game/mode-vm.ts` is the runtime.
+- Law 'n Justice has **eight** missions, not the seventeen secondary sources
+  claim: the selector table's terminator holds the engine's own count. Extreme
+  Sports' Iron Man serves **three** balls, not four.
+- `scripts/export-table-modes.mjs` is the generator of record, with the same
+  `<segment-dir>` and `--check` interface, and six fatal self-checks.
+
+And the **sound effects** are decoded and shipped in
+`public/generated/tables/*.audio.json` plus one WAV per sample:
+
+- Slots 7 and 8 are not raw PCM: every one begins `SNT!` and is a ProTracker-
+  derived module bank, with the effect PCM appended after the last bank. The
+  26-byte sound record's layout is proven by the DMA servicer at `$7958`, and its
+  period is a **pitch** — every value is an exact ProTracker period and records
+  that share a sample form chromatic runs across adjacent lane rectangles.
+- `src/browser/audio.ts` plays them through Web Audio on one channel with the
+  original's priority rule, and is **strictly downstream of the simulation**:
+  nothing under `src/game/` imports it, and `tests/audio.test.ts` runs the same
+  game twice — once silent, once with the whole sound layer on every tick — and
+  asserts the two snapshots are byte-identical.
+
 `scripts/aggressive-census.mts` is the survey instrument the strand sites are
 measured with — a player who taps the bats on a fixed cadence whatever the ball
 is doing, over every plunge hold from 8 to 97, 90 games and 270 ball ends a
@@ -219,9 +251,27 @@ this project draws is between **functional geometry** and **creative content**:
   the operator, and `npm run guard:public` refuses a build that contains it — or any
   raster image no manifest accounts for, or one whose bytes do not match the digest
   its manifest records — unless the authorization variable is set.
-- **Audio is newly created.** Synthesised or independently recreated rather than
-  sampled. No disk image, ROM, Amiga executable or ripped sample enters this
-  repository or any build.
+- **The mission bytecode is disk-derived, and gated the same way.** Each table's
+  event records — the programs that run its missions — its playfield element
+  records, its display text and the device and zone bindings that fire them are
+  decoded into `public/generated/tables/*.modes.json` under the
+  `disk-derived-mode-scripts` marker. Rules data: no artwork, no audio, no
+  executable code, and no 68k is emulated to run it.
+- **THE SOUND EFFECTS ARE DISK-DERIVED. This changed, and the change matters.**
+  This section used to say audio was "newly created — synthesised or
+  independently recreated rather than sampled", and while the missions were being
+  decoded the sound records turned out to be decodable too. So the effects now
+  shipped are the machine's own samples, taken out of the `SNT!` banks at the
+  Paula period each sound record names, written to `public/generated/tables/*.wav`
+  and claimed by a `disk-derived-audio` manifest carrying each file's sha256.
+  Several of them are speech, which is a heavier rights question than a still
+  picture, so they go through exactly the same authorization gate: `npm run
+  guard:public` refuses a build containing a sound file no manifest accounts for,
+  or one whose bytes do not match its recorded digest, unless the operator sets
+  the variable. **No music is shipped** — the modules' packed pattern format is
+  not decoded, so there is nothing here that could play a tune.
+- No disk image, ROM, Amiga executable or PowerPacker payload enters this
+  repository or any build, and that is checked mechanically rather than promised.
 
 Publishing the derived maps is a deliberate act, not an accident of file layout.
 `npm run guard:public` refuses the build if a map carrying the

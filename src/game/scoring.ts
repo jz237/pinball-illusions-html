@@ -61,15 +61,19 @@
  *      there does not score either.
  *
  * ---------------------------------------------------------------------------
- * EVERY BONUS FIELD IN THE SHIPPED DATA IS ZERO, AND THAT IS A RESULT
+ * WHERE THE BONUS COMES FROM — AN EARLIER NEGATIVE, NOW CLOSED
  * ---------------------------------------------------------------------------
- * $6B96 is called all over the engine, but no award record, mode record, zone
- * object or lock object on any of the three tables carries a non-zero bonus.
- * The bonus counter is fed exclusively by the mission-script VM at 0x60xx-0x62xx
- * — which takes its BCD operands out of the script instruction stream rather
- * than from any static table, and which is not decoded. So `bonus` is carried
- * through this module in full and is, as shipped, always zero. It is kept
- * because it is a real field of a real record, not because anything spends it.
+ * This header used to say that every bonus field in the shipped data was zero
+ * and that the bonus counter therefore had nothing feeding it. The first half is
+ * still true of THESE records: no award record, mode record, zone object or lock
+ * object on any of the three tables carries a non-zero bonus, so every award this
+ * module produces has `bonus === 0`.
+ *
+ * The second half was wrong, and the thing that was missing is now here. The
+ * bonus is fed by the MISSION LAYER: the PLAYFIELD ELEMENT records the mission
+ * bytecode awards carry a six-byte packed-BCD bonus at +$26 beside their score at
+ * +$1E, and several are non-zero — Extreme Sports' element 12 pays 7,000. See
+ * `mode-vm.ts`, which pays them through the same `addToBcdField` chain below.
  */
 
 import type { PlayfieldLevel } from "./contracts.js";
@@ -155,7 +159,7 @@ export function formatBcdField(field: Uint8Array): string {
 // ---------------------------------------------------------------------------
 
 /** Which family an award came from. Enough for a display and for a test. */
-export type AwardSource = "device" | "bumper" | "slingshot" | "zone" | "lock";
+export type AwardSource = "device" | "bumper" | "slingshot" | "zone" | "lock" | "mode";
 
 /** One thing that scored. */
 export interface Award {
@@ -168,6 +172,38 @@ export interface Award {
   readonly bonus: number;
   /** True when this was the repeat-hit award rather than the first-hit one. */
   readonly repeat: boolean;
+}
+
+/**
+ * What physically produced an award, as numbers rather than as a display id.
+ *
+ * The mission layer binds its scripts to device surface ids and to zone list
+ * indices (see `table-modes.ts`), so something has to turn "this award happened"
+ * back into "this device fired". Parsing the id string is done HERE, in the same
+ * module that builds it, because that is the only place where the two can never
+ * drift apart.
+ *
+ * `level` is -1 for a device: the surface id alone identifies the record, the
+ * engine indexes the level's own array with it, and the caller can ask both.
+ */
+export interface AwardTrigger {
+  readonly kind: "device" | "zone" | "lock";
+  readonly level: number;
+  readonly id: number;
+}
+
+/** The trigger behind an award, or null for the families nothing binds to. */
+export function awardTrigger(award: Award): AwardTrigger | null {
+  if (award.source === "device") {
+    const id = Number.parseInt(award.id.slice("device-".length), 10);
+    return Number.isInteger(id) ? { kind: "device", level: -1, id } : null;
+  }
+  if (award.source !== "zone" && award.source !== "lock") return null;
+  const parts = award.id.split("-");
+  const level = Number.parseInt(parts[1] ?? "", 10);
+  const index = Number.parseInt(parts[2] ?? "", 10);
+  if (!Number.isInteger(level) || !Number.isInteger(index)) return null;
+  return { kind: award.source, level, id: index };
 }
 
 /** Frames a hit timer runs for, from `move.b #$6,$2(a1)` at +0x0055E8. */
