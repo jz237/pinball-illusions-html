@@ -29,13 +29,27 @@
  * a gapless midpoint circle rather than N evenly spaced unit vectors — the
  * one-pixel collision line makes it a correctness requirement, not a nicety.
  *
+ * THE NORMAL THE BOUNCE IS TAKEN ABOUT IS `RingProbe.normalX/normalY`, NOT THE
+ * RING ENTRY. `probe.contactIndex` is the mean contact direction ROUNDED onto
+ * one of the ring's 44 entries, which near the axes are 7.1 degrees apart —
+ * comparable to the whole static-friction angle of atan(154/1024) = 8.55
+ * degrees, so the rounding alone decided whether a ball on a shallow ramp rolled
+ * or stuck. `outwardNormalOf` in collision-probe.ts has the measurement that
+ * forced the change and the Law 'n Justice site it was found on.
+ *
  * ---------------------------------------------------------------------------
  * THE TABLE THE PHYSICS SEES IS NOT QUITE THE BITMAP
  * ---------------------------------------------------------------------------
- * One shipped map is missing its top border, so the simulation collides against
- * a VIEW of the map — the bitmap plus a per-table virtual top wall. Only the
- * physics sees it; `pixels` is untouched and the renderer draws the table as it
- * shipped. See VIRTUAL_TOP_WALL_ROWS below.
+ * The map holds TWO collision lines and a ball rides one of them at a time, so
+ * every contact test below goes through a per-level VIEW of the map rather than
+ * the map itself. `playfield-levels.ts` owns both views and the rule for when a
+ * ball changes level; this file only routes each ball to the right one. On top
+ * of that, one of the three maps is missing its LOWER line's top border, so
+ * the level-0 view also carries a per-table virtual ceiling. Only the physics
+ * sees it; `pixels` is untouched and the renderer draws the table as it
+ * shipped. See VIRTUAL_TOP_WALL_ROWS below — and the note under it about the
+ * virtual LEFT wall, which the corrected maps no longer justify and which has
+ * been deleted rather than left as a dead knob.
  *
  * ---------------------------------------------------------------------------
  * WHY A TICK ALWAYS MAKES PROGRESS
@@ -88,12 +102,18 @@ import {
   meanContactIndex,
   moreDeflecting,
   numberAt,
-  outwardNormalIndex,
   passabilityOf,
   probeRing,
   ringOffsetsFor,
 } from "./collision-probe.js";
 import { SOLID_BORDER_INDEX } from "./materials.js";
+import type { LevelGate, PlayfieldLevel } from "./playfield-levels.js";
+import {
+  levelAfterCrossing,
+  levelGatesFor,
+  nudgeReachesLevel,
+  upperLevelViewFor,
+} from "./playfield-levels.js";
 
 // The ball radius and the integer square root are defined next to the probe ring
 // they are needed to build; re-exported here because callers reason about them
@@ -111,24 +131,97 @@ const VELOCITY_MAX = 32767;
  * Rows sealed off at the top of each table by a wall that is not in the bitmap.
  *
  * Law 'n Justice's exported collision layer has NO bit-0 pixel anywhere in rows
- * 0..34: the top arch is drawn, but the line that should close it off above the
- * shooter lane is simply not in the data. A ball that gets over the arch escapes
- * into a 336 px wide empty attic, roams the whole width of the table and comes
- * down somewhere it never could on the real machine. Measured on the shipped
- * map with the real probe ring, the region a ball can reach from the shooter
- * lane is 101608 centre positions with no wall and 16556 with this one — the
- * difference is entirely attic.
+ * 0..34: the top arch is drawn, but on the LOWER line the arch simply is not
+ * there. (It is on the upper line — see `playfield-levels.ts` — which is where
+ * a launched ball goes; this wall is about the lower-level ball that never
+ * should have been up there in the first place.) A lower-level ball that gets
+ * over the arch escapes into a 336 px wide empty attic, roams the whole width of
+ * the table and comes down somewhere it never could on the real machine.
  *
- * 26 was chosen by connectivity, not by eye. Flood-filling free ball centres out
- * of the shooter lane, the upper playfield stays connected to it for every wall
- * from 1 to 43 rows (4650 reachable centres in the upper-left quadrant at 26,
- * 3086 at 43) and is severed at 44, where that count drops to zero and the ball
- * can no longer be fed onto the table at all. 26 therefore sits with wide margin
- * on the safe side of the only constraint the geometry imposes.
+ * ---------------------------------------------------------------------------
+ * RE-MEASURED AFTER THE 32 PX MAP REFRAME, AND IT SURVIVED
+ * ---------------------------------------------------------------------------
+ * The shipped maps were re-exported: slot 2's payload starts at byte 4, not 8,
+ * so the old export framed every row 32 px left of where it belonged. That made
+ * every column-indexed measurement in this codebase suspect, and this wall was
+ * the first thing to re-check, because its premise is about rows that "carry no
+ * bit-0 pixel" — a claim a horizontal shift could in principle have invented.
+ * It did not. On the corrected map:
+ *
+ *   - The first row carrying ANY bit-0 pixel is still 35, and rows 35..37 carry
+ *     one 38 px fragment (x=94..131) rather than a border. Rows 0..34 are empty
+ *     on the lower line, exactly as before.
+ *   - Flooding free lower-level ball centres out of the CORRECTED serve point
+ *     (322,544) — the lane moved 32 px right, so the flood had to be re-seeded
+ *     and this is the re-seeded one: 104246 reachable centres with no wall, of
+ *     which 8242 are above row 35 — the attic. With this wall, 10760 reachable
+ *     and 188 in the attic. The walled flood's lowest row is 552, i.e. it does
+ *     NOT reach the drain, which is the premise of the whole two-level model:
+ *     the launch shot must leave the lane on the upper line.
+ *   - 26 is still chosen by connectivity, not by eye. Sweeping the wall height
+ *     and counting reachable centres in the upper-left quadrant (x < 168,
+ *     y < 300), the quadrant stays connected to the lane for every value from 0
+ *     to 43 — 30186 at 0, 2888 at 26, 2412 at 43 — and is severed at 44, where
+ *     the count drops to zero and the ball can no longer be fed onto the table
+ *     at all. The severance row is 44 under both framings, which is what a
+ *     row-indexed measurement being invariant under a horizontal reframe looks
+ *     like. 26 sits with wide margin on the safe side of it.
+ *   - The consequence for the LANE bound: on this view a radius-8 centre cannot
+ *     be above row 34, which is why `LAW_N_JUSTICE_SHOOTER_LANE.topY` is 34 and
+ *     not the raw bitmap's 8. See `plunger.ts`.
  *
  * The other two tables are properly walled in their own data and get 0. This is
  * per-table configuration, deliberately explicit and in one place, because it is
  * a correction to specific shipped data rather than a rule about pinball.
+ *
+ * ---------------------------------------------------------------------------
+ * THERE WAS A VIRTUAL LEFT WALL HERE TOO. IT IS GONE. DO NOT PUT IT BACK
+ * WITHOUT NEW EVIDENCE
+ * ---------------------------------------------------------------------------
+ * `VIRTUAL_LEFT_WALL_COLUMNS` sealed nine columns down the left of Extreme
+ * Sports and nothing on the other two. Its stated derivation was "bit 1 is solid
+ * at x=6..8 on EVERY row from y=50 to y=390, so nine columns is the upper line's
+ * own border and nothing more". On the corrected map that rail is at x=38..40 —
+ * 38 px in from the edge, not 6 — and there is a SECOND continuous bit-1 line at
+ * x=16..18 (set on every row of y=33..397, the longest such run on the table).
+ * Neither is at x=0..8. The constant named nothing.
+ *
+ * It also did nothing. Over thirty scripted games a table at every plunge
+ * strength — the same census `tests/plays.test.ts` runs — the results with the
+ * wall at 0, at 9 and at 19 are identical: 73 drains and two write-offs on
+ * Extreme Sports, both at (50,432), which is a ball resting on the crown of a
+ * post in the middle of the left playfield and nothing to do with the edge. No
+ * ball entered the strip at all, on any table, at any setting. On the other two
+ * tables the lower-level flood from the serve point never reaches the left of
+ * the table in the first place, so the knob was already inert for them.
+ *
+ * And the premise itself is weaker than it read. Where Extreme Sports' LOWER
+ * line draws a left border it draws it at x=0..3 (bit 0 is set at column 2 on
+ * 195 rows and at column 0 on 106 consecutive rows, y=415..520) — at the table
+ * edge, not 6 px in. A wall named for a rail that is 32 px from where it was
+ * thought to be, sealing a strip no ball ever enters, is a hypothesis with
+ * nothing left holding it up.
+ *
+ * ---------------------------------------------------------------------------
+ * AND BABEWATCH IN PARTICULAR DOES NOT WANT ONE BACK
+ * ---------------------------------------------------------------------------
+ * BabeWatch was the table most likely to need a left wall after the reframe,
+ * because the correction gave it a left border it did not appear to have before
+ * (bit 0 at column 0 on 49 rows under the old framing, 540 under the corrected
+ * one). Re-measured on the shipped map, that border is now the argument AGAINST
+ * a wall rather than for one:
+ *
+ *   bit 0 set at column 0 on 540 of 600 rows, and somewhere in columns 0..2 on
+ *   541 of 600. Every row of the table carries a bit-0 pixel somewhere, and the
+ *   median leftmost one is column 0.
+ *
+ * And the decisive figure is the same one on all three tables: the number of
+ * rows on which a radius-8 ball centre can be free at x < 8 is ZERO — on
+ * BabeWatch, on Law 'n Justice and on Extreme Sports alike. The leftmost free
+ * lower-line centre anywhere on any of the three is exactly x=8, which is the
+ * ball's own radius against the edge of the bitmap, where `table-map.ts` answers
+ * OUT_OF_BOUNDS_MATERIAL (bit 0 set). The edge already contains the ball. A
+ * virtual left wall would be sealing columns no ball can occupy.
  */
 export const VIRTUAL_TOP_WALL_ROWS: Readonly<Record<TableId, number>> = Object.freeze({
   "law-n-justice": 26,
@@ -137,7 +230,8 @@ export const VIRTUAL_TOP_WALL_ROWS: Readonly<Record<TableId, number>> = Object.f
 });
 
 /**
- * The map as the physics sees it: the shipped bitmap plus any virtual walls.
+ * The lower playfield as the physics sees it: the shipped bitmap plus the
+ * virtual top wall.
  *
  * Only `materialAt` is overridden. `pixels` is left alone, so the renderer draws
  * the table as it shipped and nothing paints a wall that is not really there.
@@ -145,82 +239,17 @@ export const VIRTUAL_TOP_WALL_ROWS: Readonly<Record<TableId, number>> = Object.f
  * A ball whose centre is placed inside the sealed rows is in solid material like
  * any other, and `recoverPenetration` will push it out only if free space is
  * within a ball diameter — spawn points belong on the playfield, not in the wall.
+ *
+ * There is no arch parameter here and there must not be one. An earlier version
+ * carried a SYNTHESISED top arch — a ceiling that ramped `depth` px lower over
+ * `span` px at the right edge — to deflect a launched ball out of the shooter
+ * lane. It is gone because the real arch was found: it is authored map data on
+ * the upper collision line, and `playfield-levels.ts` uses it. Do not add a
+ * fabricated ceiling back; the 30-in-60 version also cut the flipper return from
+ * over 20 px of gain to 10.
  */
-/**
- * The synthesised top arch.
- *
- * SYNTHESISED, NOT MEASURED — unlike every other piece of geometry here. Law 'n
- * Justice's map carries no collision line at all in its top rows, so there is no
- * arch in the data to decode. Without one, a ball launched up the shooter lane
- * meets a flat ceiling dead-on, rebounds with no sideways motion at all, falls
- * back down the lane and rests there permanently: the plunger becomes a one-shot
- * button that achieves nothing and the table never drains. A headless
- * play-through found exactly that — apex y=34 against a ceiling at y=34.
- *
- * A real table turns the vertical launch into a lateral entry with a curved
- * arch. This models that: over `span` pixels at the right-hand edge the ceiling
- * ramps `depth` pixels lower, so a ball rising in the lane strikes a slope
- * rather than a flat soffit and is deflected left onto the playfield. The
- * gradient is `depth / span`, and a ball arriving vertically leaves at about
- * twice that angle off vertical.
- *
- * Only the table with the gap gets one. If the real arch is ever recovered —
- * most likely by observing the original run — replace this with the measured
- * geometry and delete these numbers rather than tuning them.
- */
-export interface TopArch {
-  /** Pixels inward from the right edge over which the ceiling descends. */
-  readonly span: number;
-  /** How much lower the ceiling sits at the right edge. */
-  readonly depth: number;
-}
-
-/**
- * DISABLED PENDING EVIDENCE. Every table is null.
- *
- * A 30-in-60 arch was tried on Law 'n Justice and does deflect the ball out of
- * the lane, but it also measurably degraded the flipper return (best upward gain
- * from a flip fell from over 20px to 10px). At that point the numbers were being
- * fitted to tests rather than to the original, which is precisely the mistake
- * this project has already paid for twice.
- *
- * The better hypothesis is that the arch is not missing at all. Slots 1 and 3 of
- * each table package are still unidentified, and slot 3 is a raster of identical
- * size on all three tables — a strong candidate for geometry the lower-level
- * collision layer does not carry. Decode those before inventing anything here.
- *
- * Consequence while this stays null: on Law 'n Justice a launched ball rises to
- * the flat ceiling, returns down the shooter lane and rests there, so a game
- * cannot progress past the first ball. `tests/plays.test.ts` records that with
- * an `it.fails` characterisation test, which will start failing — and so demand
- * attention — the moment the real geometry makes it pass.
- */
-export const TOP_ARCH_BY_TABLE: Readonly<Record<TableId, TopArch | null>> = Object.freeze({
-  "law-n-justice": null,
-  babewatch: null,
-  "extreme-sports": null,
-});
-
-/** Ceiling depth at one column: the flat wall plus the arch, where there is one. */
-export function ceilingRowsAt(
-  x: number,
-  topWallRows: number,
-  arch: TopArch | null,
-  width: number,
-): number {
-  if (arch === null || arch.span <= 0) return topWallRows;
-  const start = width - arch.span;
-  if (x < start) return topWallRows;
-  const t = Math.min(1, (x - start) / arch.span);
-  return topWallRows + Math.round(arch.depth * t);
-}
-
-export function playfieldViewFor(
-  map: TableMap,
-  topWallRows: number,
-  arch: TopArch | null = TOP_ARCH_BY_TABLE[map.tableId] ?? null,
-): TableMap {
-  if (topWallRows <= 0 && arch === null) return map;
+export function playfieldViewFor(map: TableMap, topWallRows: number): TableMap {
+  if (topWallRows <= 0) return map;
   return Object.freeze({
     tableId: map.tableId,
     displayName: map.displayName,
@@ -231,10 +260,33 @@ export function playfieldViewFor(
       // Floor, matching the loader, so a probe converts to the same pixel here
       // as it would there. NaN floors to NaN, fails the comparison and falls
       // through to the map's own out-of-bounds answer.
-      const rows = ceilingRowsAt(Math.floor(x), topWallRows, arch, map.width);
-      return Math.floor(y) < rows ? SOLID_BORDER_INDEX : map.materialAt(x, y);
+      if (Math.floor(y) < topWallRows) return SOLID_BORDER_INDEX;
+      return map.materialAt(x, y);
     },
   });
+}
+
+/**
+ * Both level views for one map, built once per tick.
+ *
+ * The upper view is cached by `upperLevelViewFor`, so this is a lookup rather
+ * than a closure allocation; the lower one is rebuilt because it depends on the
+ * caller's wall settings.
+ */
+interface LevelViews {
+  readonly lower: TableMap;
+  readonly upper: TableMap;
+}
+
+function levelViewsFor(map: TableMap, topWallRows: number): LevelViews {
+  return {
+    lower: playfieldViewFor(map, topWallRows),
+    upper: upperLevelViewFor(map),
+  };
+}
+
+function viewForLevel(views: LevelViews, level: PlayfieldLevel): TableMap {
+  return level === 1 ? views.upper : views.lower;
 }
 
 /** Tunables for one simulation. Every default is a chosen value, not a measured one. */
@@ -330,7 +382,14 @@ export interface BallSet {
  * One ball. Positions are Q10; use `pixelsToQ10` at the call site so the units
  * are visible there rather than hidden behind a helper.
  */
-export function createBall(id: number, x: Q10, y: Q10, velocityX = 0, velocityY = 0): BallState {
+export function createBall(
+  id: number,
+  x: Q10,
+  y: Q10,
+  velocityX = 0,
+  velocityY = 0,
+  level: PlayfieldLevel = 0,
+): BallState {
   if (!Number.isInteger(id) || id < 0) {
     throw new RangeError(`ball id must be a non-negative integer: ${id}`);
   }
@@ -341,6 +400,10 @@ export function createBall(id: number, x: Q10, y: Q10, velocityX = 0, velocityY 
     velocityX: clampVelocity(velocityX),
     velocityY: clampVelocity(velocityY),
     active: true,
+    // Balls start on the playfield. Nothing is served onto a ramp: a ball
+    // reaches the upper level by driving through a hand-off, never by being
+    // placed there, so the level is always something the run earned.
+    level,
   };
 }
 
@@ -353,8 +416,15 @@ export function createBallSet(balls: readonly BallState[] = []): BallSet {
 }
 
 /** Adds a ball with the next free id and returns it, so the caller can steer it. */
-export function spawnBall(set: BallSet, x: Q10, y: Q10, velocityX = 0, velocityY = 0): BallState {
-  const ball = createBall(set.nextId, x, y, velocityX, velocityY);
+export function spawnBall(
+  set: BallSet,
+  x: Q10,
+  y: Q10,
+  velocityX = 0,
+  velocityY = 0,
+  level: PlayfieldLevel = 0,
+): BallState {
+  const ball = createBall(set.nextId, x, y, velocityX, velocityY, level);
   set.nextId += 1;
   set.balls.push(ball);
   return ball;
@@ -413,8 +483,8 @@ function clampVelocity(value: number): number {
  * Reflects a ball's velocity about an outward normal.
  *
  * Split into a normal and a tangential part: the normal part is reversed and
- * scaled by elasticity, the tangential part is scaled down by friction, and the
- * material's kick is added outward on top.
+ * scaled by elasticity, the tangential part is reduced by a friction IMPULSE,
+ * and the material's kick is added outward on top.
  *
  * A ball that is already leaving the surface is left ENTIRELY alone — not merely
  * left with its normal speed, as an earlier version did. Friction and kick are
@@ -423,8 +493,54 @@ function clampVelocity(value: number): number {
  * is `ceil(speed / maxSubstepDistance)`, so a ball at 4097 Q10/tick kept 72% of
  * its tangential speed where one at 4096 kept 85%, and the cliff repeated at
  * every multiple of the substep distance. Responding only to approach costs the
- * same whatever the tick was cut into, and is also the correct Coulomb rule:
- * no normal force, no friction.
+ * same whatever the tick was cut into.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY THE TANGENTIAL LOSS IS AN IMPULSE AND NOT A PERCENTAGE
+ * ---------------------------------------------------------------------------
+ * It used to be `tangent * (1 - friction)`: a flat 15% of the ball's ENTIRE
+ * along-surface speed, taken every time this function ran. The guard above was
+ * documented as confining that to real impacts — "no normal force, no friction"
+ * — and it does not, because `stepBalls` adds gravity to `velocityY` before
+ * every integration. A ball merely LYING on a surface is therefore approaching
+ * it on every single tick, `normalSpeedIn` is negative every time, and the guard
+ * never fires. The percentage rule then acted as a viscous damper on a resting
+ * ball, removing 15% of its speed along the surface every 20 ms forever.
+ *
+ * What that produces is not a ball that stops; it is a ball that never speeds
+ * up. Balancing one tick of gravity against the decay gives a TERMINAL CRAWL
+ *
+ *     v = g * sin(theta) * (1 - f) / f  =  135 * sin(theta) Q10/tick
+ *
+ * for g = 24 and f = 0.15 — between 0.001 and 0.036 px/tick, one to two pixels
+ * a second, on every slope on every table. Traced on the shipped maps, balls
+ * written off by the ball search were not wedged at all: at Extreme Sports'
+ * (247,144) the ball advanced exactly 36 Q10 on every one of the 500 ticks the
+ * search counted, and at Law 'n Justice's (40,122) exactly 1 Q10 per tick — a
+ * pixel every twenty seconds. The search asks for 8 px in 500 ticks, i.e. 16.4
+ * Q10/tick, so every slope shallower than about 7 degrees was uncleanable and a
+ * ball still visibly rolling got written off as lost.
+ *
+ * Coulomb's rule is that the tangential loss is bounded by the friction
+ * coefficient times the NORMAL IMPULSE, which for a ball resting on a surface is
+ * one tick of gravity and nothing more. So the loss is computed as a speed
+ * decrement, `min(|tangent|, friction * normalImpulse)`, and subtracted:
+ *
+ *   - On an impact the normal impulse is large and the loss is large, so a
+ *     graze still scrubs off tangential speed the way it always did.
+ *   - On a resting contact the normal impulse is ~24 Q10 and the loss is ~3.6,
+ *     while gravity contributes `24 * sin(theta)` along the surface. The ball
+ *     therefore ACCELERATES down any slope steeper than `atan(friction)` and is
+ *     held still on anything shallower — which is the static-friction condition,
+ *     and is the behaviour a slope is supposed to have.
+ *
+ * The kick is excluded from the normal impulse on purpose: a slingshot's coil
+ * fires along the normal after the ball has already bounced, and charging its
+ * energy for tangential friction would make powered devices scrub the shot they
+ * exist to launch.
+ *
+ * Integer and deterministic throughout: `integerSqrt` for the tangential
+ * magnitude, one Q10 divide for the scale.
  */
 export function reflectVelocity(
   ball: BallState,
@@ -441,15 +557,37 @@ export function reflectVelocity(
 
   const bounced = -q10Multiply(normalSpeedIn, behaviour.elasticity);
   // A ball creeping into the surface under gravity must settle, not chatter.
-  let normalSpeedOut = bounced <= restThreshold ? 0 : bounced;
-  normalSpeedOut += behaviour.kick;
+  const deflected = bounced <= restThreshold ? 0 : bounced;
+  const normalSpeedOut = deflected + behaviour.kick;
 
-  const grip = q10Clamp(Q10_ONE - behaviour.friction, 0, Q10_ONE);
+  // The surface's reaction: the ball's approach killed, plus whatever of it is
+  // handed back elastically. Never negative, so the friction budget cannot be.
+  const normalImpulse = -normalSpeedIn + deflected;
+  const friction = q10Clamp(behaviour.friction, 0, Q10_ONE);
+  // A loss that rounds to nothing is not a loss. `friction * normalImpulse`
+  // truncates to zero once the impulse is under 1/friction — about 7 Q10 units
+  // for a wall — and a ball wedged in a corner sits at exactly that scale: on
+  // Law 'n Justice a ball in the top-left triangle held v = (-1, 1) for
+  // seven hundred consecutive ticks, moving one Q10 unit a tick, which is half a
+  // pixel per ball-search window and so never left the box. It was in contact,
+  // it was sliding, and the model was taking nothing off it. One unit is the
+  // smallest loss the integer state can express, so a sliding contact always
+  // costs at least that and the tangential speed is guaranteed to reach zero in
+  // finite time. It is bounded by the speed itself below, so it can never push
+  // the ball backwards, and against a rolling ball on a slope — which gains up
+  // to a whole tick of gravity, 24 units — one unit is noise.
+  const budget = q10Multiply(friction, normalImpulse);
+  const drop = friction > 0 && normalImpulse > 0 ? Math.max(1, budget) : budget;
+  const tangentSpeed = integerSqrt(tangentX * tangentX + tangentY * tangentY);
+  // Friction opposes sliding; it cannot reverse it, so the loss stops at rest.
+  const keep =
+    tangentSpeed <= drop ? 0 : Math.trunc(((tangentSpeed - drop) * Q10_ONE) / tangentSpeed);
+
   ball.velocityX = clampVelocity(
-    q10Multiply(tangentX, grip) + q10Multiply(normalSpeedOut, normalX),
+    q10Multiply(tangentX, keep) + q10Multiply(normalSpeedOut, normalX),
   );
   ball.velocityY = clampVelocity(
-    q10Multiply(tangentY, grip) + q10Multiply(normalSpeedOut, normalY),
+    q10Multiply(tangentY, keep) + q10Multiply(normalSpeedOut, normalY),
   );
 }
 
@@ -602,10 +740,11 @@ function sweepToContact(
     if (probe.contactIndex < 0) return null;
     if (record) logContacts(log, probe, ring, materials);
 
-    const normal = outwardNormalIndex(ring, probe.contactIndex);
+    // The un-snapped normal, which is also what the bounce is taken about; see
+    // `outwardNormalOf`. Using the ring entry here and the exact vector there
+    // would let a sweep stop against a surface it then reads as leaving.
     const into =
-      q10Multiply(ball.velocityX, numberAt(ring.unitX, normal)) +
-      q10Multiply(ball.velocityY, numberAt(ring.unitY, normal));
+      q10Multiply(ball.velocityX, probe.normalX) + q10Multiply(ball.velocityY, probe.normalY);
     return into < 0 ? { probe } : null;
   };
 
@@ -753,10 +892,12 @@ export function stepBalls(
   const resolved = resolveOptions(map, options);
   const passable = passabilityOf(materials);
   const ring = ringOffsetsFor(resolved.radius);
-  // Everything below collides against the VIEW, never the raw map, so the
-  // virtual top wall is as solid as any painted one and there is no path through
-  // the integrator that can miss it.
-  const view = playfieldViewFor(map, resolved.topWallRows);
+  // Everything below collides against a VIEW, never the raw map: the level-0
+  // view carries the virtual top wall and the level-1 view swaps the collision
+  // line for the ramp one. There is no path through the integrator that reads
+  // the bitmap directly, so neither correction can be missed.
+  const views = levelViewsFor(map, resolved.topWallRows);
+  const gates = levelGatesFor(map.tableId);
 
   const contacts = new Map<number, ContactResult>();
   const drained: number[] = [];
@@ -764,20 +905,39 @@ export function stepBalls(
   for (const ball of balls.balls) {
     if (!ball.active) continue;
 
-    ball.velocityX = clampVelocity(ball.velocityX + forces.nudgeX);
-    ball.velocityY = clampVelocity(ball.velocityY + forces.gravityY + forces.nudgeY);
+    // A shove moves the cabinet, and the cabinet does not reach into a habitrail:
+    // see `nudgeReachesLevel` for the arch measurements that forced this. Gravity
+    // still applies on every level — a ball rolls down a ramp.
+    const shoved = nudgeReachesLevel(ball.level);
+    ball.velocityX = clampVelocity(ball.velocityX + (shoved ? forces.nudgeX : 0));
+    ball.velocityY = clampVelocity(
+      ball.velocityY + forces.gravityY + (shoved ? forces.nudgeY : 0),
+    );
 
-    const contact = integrateBall(ball, view, materials, passable, ring, resolved);
+    // Captured before the move, because a level change is a CROSSING: the ball
+    // has to have been on the other side of the hand-off line at the start of
+    // the tick for it to count.
+    const fromX = q10ToPixel(ball.x);
+    const fromY = q10ToPixel(ball.y);
+    const contact = integrateBall(
+      ball,
+      viewForLevel(views, ball.level),
+      materials,
+      passable,
+      ring,
+      resolved,
+    );
     if (contact !== null) {
       contacts.set(ball.id, contact);
     }
+    applyLevelGates(ball, gates, fromX, fromY);
   }
 
   if (resolved.ballToBall) {
     resolveBallCollisions(
       balls.balls,
       resolved.radius,
-      pushClampFor(view, materials, passable, ring),
+      pushClampFor(views, materials, passable, ring),
     );
   }
 
@@ -792,6 +952,34 @@ export function stepBalls(
   }
 
   return { drained, contacts };
+}
+
+/**
+ * Moves a ball onto the other collision line if this tick took it through a
+ * hand-off.
+ *
+ * Applied AFTER the integration rather than before it, so the tick the ball
+ * crosses on is resolved entirely against the level it started on and the new
+ * level takes effect from the next tick. The hand-off rows exist precisely
+ * because the two lines are identical there, so which side of the crossing the
+ * switch lands on cannot change the trajectory — but doing it after keeps the
+ * tick's contact report and its reflection consistent with one another.
+ */
+function applyLevelGates(
+  ball: BallState,
+  gates: readonly LevelGate[],
+  fromX: number,
+  fromY: number,
+): void {
+  if (gates.length === 0) return;
+  ball.level = levelAfterCrossing(
+    gates,
+    ball.level,
+    fromX,
+    fromY,
+    q10ToPixel(ball.x),
+    q10ToPixel(ball.y),
+  );
 }
 
 /**
@@ -830,14 +1018,16 @@ function recoverPenetration(
   if (centreIsFree(map, passable, ball.x, ball.y)) return;
 
   const radiusPixels = Math.max(1, Math.round(options.radius / Q10_ONE));
-  const maximum = Math.max(2 * radiusPixels, options.topWallRows + radiusPixels);
+  const maximum = Math.max(
+    2 * radiusPixels,
+    options.topWallRows + radiusPixels,
+  );
 
   const probe = probeRing(map, materials, passable, ring, ball.x, ball.y);
   if (probe.contactIndex >= 0) {
     logContacts(log, probe, ring, materials);
-    const normal = outwardNormalIndex(ring, probe.contactIndex);
-    const normalX = numberAt(ring.unitX, normal);
-    const normalY = numberAt(ring.unitY, normal);
+    const normalX = probe.normalX;
+    const normalY = probe.normalY;
     for (let step = 1; step <= maximum; step += 1) {
       const distance = pixelsToQ10(step);
       const x = (ball.x + q10Multiply(distance, normalX)) | 0;
@@ -941,12 +1131,11 @@ function integrateBall(
     const velocityX = ball.velocityX;
     const velocityY = ball.velocityY;
     if (stop.blocker !== null && stop.blocker.dominant !== null) {
-      const normal = outwardNormalIndex(ring, stop.blocker.contactIndex);
       reflectVelocity(
         ball,
         materials.behaviourFor(stop.blocker.dominant),
-        numberAt(ring.unitX, normal),
-        numberAt(ring.unitY, normal),
+        stop.blocker.normalX,
+        stop.blocker.normalY,
         options.restThreshold,
       );
     } else if (!stop.clamped) {
@@ -971,7 +1160,7 @@ function integrateBall(
 
   // The tick as a whole gets the same rule the individual passes do, because a
   // tick can go nowhere without any single pass going nowhere. Law 'n Justice
-  // has channels narrower than the ball, and one at (54, 156) held a ball that
+  // has channels narrower than the ball, and one at (86, 156) held a ball that
   // drifted one Q10 unit down, bounced, drifted back up and ended every tick on
   // the pixel it started on with the velocity it started with — position and
   // velocity both unchanged with speed still on the books, which is precisely the
@@ -1018,7 +1207,7 @@ export type PushClamp = (ball: BallState, deltaX: Q10, deltaY: Q10) => { x: Q10;
  * material either.
  */
 function pushClampFor(
-  map: TableMap,
+  views: LevelViews,
   materials: MaterialTable,
   passable: readonly boolean[],
   ring: RingOffsets,
@@ -1026,11 +1215,15 @@ function pushClampFor(
   return (ball: BallState, deltaX: Q10, deltaY: Q10): { x: Q10; y: Q10 } => {
     let dx = deltaX;
     let dy = deltaY;
+    // Each ball is clamped against its OWN level: a ball on a ramp is nowhere
+    // near the walls the playfield ball is bounded by, and using one view for
+    // both would shove one of them through geometry it cannot see.
+    const map = viewForLevel(views, ball.level);
 
     const probe = probeRing(map, materials, passable, ring, ball.x, ball.y);
     if (probe.contactIndex >= 0) {
-      const towardX = numberAt(ring.unitX, probe.contactIndex);
-      const towardY = numberAt(ring.unitY, probe.contactIndex);
+      const towardX = -probe.normalX;
+      const towardY = -probe.normalY;
       const into = q10Multiply(dx, towardX) + q10Multiply(dy, towardY);
       if (into > 0) {
         dx -= q10Multiply(into, towardX);
@@ -1090,6 +1283,10 @@ export function resolveBallCollisions(
     for (let j = i + 1; j < balls.length; j += 1) {
       const b = balls[j];
       if (b === undefined || !b.active) continue;
+      // Different levels are different heights: a ball on the top arch passes
+      // over one on the playfield, and overlapping their 2D circles is an
+      // artefact of the projection rather than a collision.
+      if (a.level !== b.level) continue;
 
       const deltaX = b.x - a.x;
       const deltaY = b.y - a.y;

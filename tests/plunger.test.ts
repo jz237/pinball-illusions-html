@@ -6,7 +6,13 @@ import type { SimulationForces, TableMap, TableMapDocument } from "../src/game/c
 import { materialTableFor } from "../src/game/materials.js";
 import { parseTableMapDocument } from "../src/game/table-map.js";
 import { Q10_ONE, pixelsToQ10, q10ToPixel } from "../src/core/fixed-point.js";
-import { createBallSet, stepBalls } from "../src/game/ball-physics.js";
+import {
+  VIRTUAL_TOP_WALL_ROWS,
+  createBallSet,
+  playfieldViewFor,
+  stepBalls,
+} from "../src/game/ball-physics.js";
+import { channelRunAt, freeCentre, levelViewsOf } from "../src/game/level-scan.js";
 import {
   DEFAULT_PLUNGER_CONFIG,
   INITIAL_PLUNGER,
@@ -83,12 +89,61 @@ describe("the shooter lane", () => {
     expect(lane.maxCentreX - x).toBeGreaterThanOrEqual(x - lane.minCentreX - 1);
   });
 
-  it("marks the two unmeasured tables as assumptions rather than measurements", () => {
-    expect(shooterLaneFor("law-n-justice").confidence).toBe("measured");
-    expect(shooterLaneFor("babewatch").confidence).toBe("assumed");
-    expect(shooterLaneFor("extreme-sports").confidence).toBe("assumed");
-    expect(plungerConfigFor("law-n-justice").laneConfidence).toBe("measured");
-    expect(plungerConfigFor("extreme-sports").laneConfidence).toBe("assumed");
+  it("has all three lanes measured off their own map, not copied", () => {
+    // Two of these used to be Law 'n Justice's lane marked `assumed`, and the
+    // assumption cost Extreme Sports a pixel: its own free centres are 322..324,
+    // so the copied span served the ball a column left of its lane's middle.
+    // (321/322 rather than 289/290 since the maps were re-exported on the
+    // correct 32 px frame — the columns moved, the one-pixel difference between
+    // the two lanes did not, which is what makes it a real measurement.)
+    for (const tableId of ["law-n-justice", "babewatch", "extreme-sports"] as const) {
+      expect(shooterLaneFor(tableId).confidence).toBe("measured");
+      expect(plungerConfigFor(tableId).laneConfidence).toBe("measured");
+    }
+    // Measured, and therefore no longer all identical.
+    expect(shooterLaneFor("babewatch").minCentreX).toBe(321);
+    expect(shooterLaneFor("extreme-sports").minCentreX).toBe(322);
+  });
+
+  it("gives each table the full-plunge speed its launch SHOT demands", () => {
+    // The table is still per-table — the three lanes are separately measured and
+    // a per-table launch measurement has to have somewhere to land — but it holds
+    // one value, and that value is DERIVED rather than fitted.
+    //
+    // THE DERIVATION THIS TEST USED TO ASSERT WAS THE WRONG ONE. It said: against
+    // g = 24 a launch at v rises v^2/(2g) - v/2, so the 536 px climb from the
+    // serve point to the top of Law 'n Justice's lane needs v >= 5145 Q10, and
+    // six pixels a tick is the smallest whole pixel above that floor — and then
+    // it checked `MAX_LAUNCH_SPEED > 5145`, which is a ballistic climb up an
+    // empty column. The shot is not the lane. The ball has to cross the top arch
+    // on the upper collision line, rubbing both rails, and still be moving on the
+    // far side. Swept through the real loop on the shipped maps, the shot first
+    // completes at hold 28 / 22 / 26 of 32, i.e. launches of 5504 / 4544 / 5184
+    // Q10 — every one of them ABOVE the 5145 the old floor allowed, so the old
+    // check could have passed on a ceiling that no longer made the shot.
+    //
+    // What is asserted now is the measured requirement, per table. It is the
+    // strictly stronger statement, and it is the one that breaks if gravity, the
+    // friction model or a map is ever re-measured.
+    const SHOT_REQUIRES: Readonly<Record<string, number>> = {
+      "law-n-justice": 5504,
+      babewatch: 4544,
+      "extreme-sports": 5184,
+    };
+    for (const tableId of ["law-n-justice", "babewatch", "extreme-sports"] as const) {
+      const config = plungerConfigFor(tableId);
+      expect(config.maxLaunchSpeed).toBe(MAX_LAUNCH_SPEED);
+      // A full pull makes the shot on this table.
+      expect(launchSpeedFor(PLUNGER_FULL_CHARGE, config)).toBeGreaterThanOrEqual(
+        SHOT_REQUIRES[tableId] as number,
+      );
+      // And a two-thirds pull does not, or pull length stops meaning anything.
+      const twoThirds = launchSpeedFor(Math.floor((PLUNGER_FULL_CHARGE * 2) / 3), config);
+      expect(twoThirds).toBeLessThan(SHOT_REQUIRES[tableId] as number);
+      // Still under two substeps of the anti-tunnelling limit, so nothing clips.
+      expect(config.maxLaunchSpeed).toBeLessThan(pixelsToQ10(16));
+      validatePlungerConfig(config);
+    }
   });
 
   it("has a lane for every table", () => {
@@ -97,6 +152,88 @@ describe("the shooter lane", () => {
       "extreme-sports",
       "law-n-justice",
     ]);
+  });
+
+  it("re-derives every shooter-lane bound from the shipped map", () => {
+    // WHY THIS TEST EXISTS. The maps were once re-exported 32 px out of phase and
+    // every column-indexed constant in the engine silently became wrong; the
+    // suite stayed green because the expectations moved with the constants. A
+    // comment saying "measured with the engine's own radius-8 ring" is not
+    // protection against that happening again. Executing the measurement is.
+    //
+    // So this re-runs the exact four-part rule written at the top of
+    // `plunger.ts` against `public/generated/tables/*.map.json`, using
+    // `level-scan.ts` — which is the same probe ring `collision-probe.ts`
+    // collides with — and asserts the shipped constants are what falls out:
+    //
+    //   bottomY                  bottommost free ball-centre row on the lane
+    //   minCentreX / maxCentreX  the free-centre run on that row
+    //   topY                     top of the unbroken run through the lane column
+    //                            that ends at bottomY
+    //
+    // Measured on THE VIEW THE PHYSICS RUNS, not the raw bitmap: Law 'n Justice's
+    // level-0 view carries a 26-row virtual ceiling, which is the whole reason
+    // its topY is 34 rather than the bitmap's 8.
+    for (const tableId of ["law-n-justice", "babewatch", "extreme-sports"] as const) {
+      const map = parseTableMapDocument(
+        JSON.parse(
+          readFileSync(
+            fileURLToPath(
+              new URL(`../public/generated/tables/${tableId}.map.json`, import.meta.url),
+            ),
+            "utf8",
+          ),
+        ) as TableMapDocument,
+      );
+      const views = levelViewsOf(
+        playfieldViewFor(map, VIRTUAL_TOP_WALL_ROWS[tableId]),
+        materialTableFor(tableId),
+      );
+      const lane = shooterLaneFor(tableId);
+      const laneX = (lane.minCentreX + lane.maxCentreX) >> 1;
+
+      // bottomY: the bottom of the LANE, which is not the bottom of the column.
+      // Below the lane's floor — a solid bit-0 run on row 561 on all three
+      // tables — the map carries nothing at all, so rows 563 and down are "free"
+      // again; they are off the end of the world, not part of the channel. The
+      // anchor is therefore the lowest row at which the lane column reads as a
+      // narrow CHANNEL rather than as open space, and the bound is the bottom of
+      // the unbroken free run through it.
+      let anchor = -1;
+      for (let y = map.height - 1; y >= 0 && anchor < 0; y -= 1) {
+        if (channelRunAt(views, 0, laneX, y) !== null) anchor = y;
+      }
+      expect(anchor, `${tableId} has no lane channel at all`).toBeGreaterThan(0);
+      let bottomY = anchor;
+      for (let y = anchor; y < map.height; y += 1) {
+        if (!freeCentre(views, 0, laneX, y)) break;
+        bottomY = y;
+      }
+      expect(bottomY, `${tableId} bottomY`).toBe(lane.bottomY);
+
+      // minCentreX / maxCentreX: the seat is the channel run on the serve row,
+      // which is the row the ball is actually put on.
+      const serveRow = bottomY - SERVE_INSET_PIXELS;
+      expect(channelRunAt(views, 0, laneX, serveRow), `${tableId} seat`).toEqual({
+        from: lane.minCentreX,
+        to: lane.maxCentreX,
+      });
+
+      // topY: the top of the unbroken run through the lane column ending at
+      // bottomY. This is what says how much runway a plunge has.
+      let topY = bottomY;
+      for (let y = bottomY; y >= 0; y -= 1) {
+        if (!freeCentre(views, 0, laneX, y)) break;
+        topY = y;
+      }
+      expect(topY, `${tableId} topY`).toBe(lane.topY);
+
+      // And the serve point the config derives from all four is inside the lane
+      // and free, so a served ball is never spawned in a wall.
+      const config = plungerConfigFor(tableId);
+      expect(q10ToPixel(config.serveY)).toBe(serveRow);
+      expect(freeCentre(views, 0, q10ToPixel(config.serveX), serveRow)).toBe(true);
+    }
   });
 
   it("refuses a lane too short to serve into, or one with inverted bounds", () => {
@@ -536,6 +673,17 @@ describe("the reference constants", () => {
     // v^2/(2g) - v/2 >= lane travel, with the launch applied before the first
     // gravity step. If gravity is ever re-measured this is the check that
     // catches a full plunge quietly failing to clear the lane.
+    //
+    // A LOWER BOUND ONLY, and labelled as one. The lane climb is the cheapest
+    // part of the launch shot — the arch above it costs more, and how much more
+    // is measured rather than modelled: see "gives each table the full-plunge
+    // speed its launch SHOT demands" above. This is kept because it is the one
+    // check that is analytic in g, so it still catches a gravity change; it is
+    // not the requirement.
+    //
+    // `topY` is 34 rather than the bitmap's 8 because the travel that matters is
+    // the travel on the view the physics collides against, and this table's
+    // level-0 view carries a 26-row virtual ceiling.
     const travel = pixelsToQ10(
       q10ToPixel(CONFIG.serveY) - LAW_N_JUSTICE_SHOOTER_LANE.topY,
     );

@@ -649,22 +649,60 @@ describe("placement", () => {
   });
 
   it("shares one bottom-of-table template across all three tables, shifted 28 px", () => {
-    // 3610 pixels of collision line either side of the drain, and the three
-    // tables disagree on six of them and two of them respectively — all single
-    // pixels, all in mirrored pairs, i.e. the artist's own retouching of one
-    // shared drawing. The exact counts are asserted rather than a threshold so
-    // that a real change to any of the three maps is a failure, not a shrug.
-    const expected: Readonly<Record<string, number>> = { babewatch: 6, "extreme-sports": 2 };
+    // 28 px SURVIVED the map reframe: swept over the corrected maps it is still
+    // the best shift of every offset in -40..+40, on both tables.
+    //
+    // The counts did not survive, and the reason is worth writing down because
+    // it is the reframe caught doing something other than adding 32. Columns
+    // 0..31 of the OLD export were physically columns 304..335 of the PREVIOUS
+    // ROW — the right-hand cabinet strip, which really is identical on all three
+    // tables and so contributed zero mismatches for free. The corrected columns
+    // 0..31 are the real left outlane, and that genuinely differs per table.
+    // Away from that band the corrected maps agree BETTER than the misframed
+    // ones did: three pixels and one, against six and two before. So the old
+    // expectations of 6 and 2 were measuring an artefact, and 57 and 55 are the
+    // honest numbers for the same window.
+    //
+    // Both are asserted: the whole window, and the window the claim is actually
+    // about. Exact counts rather than thresholds, so a real change to any of the
+    // three maps is a failure and not a shrug.
     const reference = mapFor("law-n-justice");
-    for (const id of ["babewatch", "extreme-sports"] as const) {
+    const mismatchesIn = (id: TableId, from: number, to: number): number => {
       const map = mapFor(id);
       let mismatches = 0;
       for (let y = 538; y <= 556; y += 1) {
-        for (let x = 0; x < 190; x += 1) {
+        for (let x = from; x < to; x += 1) {
           if (blocks(reference, x, y) !== blocks(map, x + 28, y)) mismatches += 1;
         }
       }
-      expect({ id, mismatches }).toEqual({ id, mismatches: expected[id] });
+      return mismatches;
+    };
+
+    const whole: Readonly<Record<string, number>> = { babewatch: 57, "extreme-sports": 55 };
+    const outlane: Readonly<Record<string, number>> = { babewatch: 54, "extreme-sports": 54 };
+    const shared: Readonly<Record<string, number>> = { babewatch: 3, "extreme-sports": 1 };
+    for (const id of ["babewatch", "extreme-sports"] as const) {
+      expect({ id, n: mismatchesIn(id, 0, 190) }).toEqual({ id, n: whole[id] });
+      expect({ id, n: mismatchesIn(id, 0, 32) }).toEqual({ id, n: outlane[id] });
+      expect({ id, n: mismatchesIn(id, 32, 190) }).toEqual({ id, n: shared[id] });
+
+      // And 28 is not a leftover either: it is the argmin over the shared part.
+      let best = 0;
+      let bestCount = Number.POSITIVE_INFINITY;
+      const map = mapFor(id);
+      for (let dx = -40; dx <= 40; dx += 1) {
+        let count = 0;
+        for (let y = 538; y <= 556; y += 1) {
+          for (let x = 32; x < 190; x += 1) {
+            if (blocks(reference, x, y) !== blocks(map, x + dx, y)) count += 1;
+          }
+        }
+        if (count < bestCount) {
+          bestCount = count;
+          best = dx;
+        }
+      }
+      expect({ id, best }).toEqual({ id, best: 28 });
     }
     expect(LOWER_FLIPPER_PIVOT_COLUMNS.babewatch.left
       - LOWER_FLIPPER_PIVOT_COLUMNS["law-n-justice"].left).toBe(28);

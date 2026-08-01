@@ -60,6 +60,46 @@ export const PLUNGER_CHARGE_RATE: Q10 = PLUNGER_FULL_CHARGE / PLUNGER_CHARGE_TIC
  * The shooter lane, as free ball-centre bounds measured against the collision
  * layer of the shipped map. These are centres, not lane walls: the ball has a
  * radius of 8, so the physical channel is 16 pixels wider than this box.
+ *
+ * ---------------------------------------------------------------------------
+ * HOW EVERY BOUND BELOW WAS MEASURED, AND WHAT RE-RUNS IT
+ * ---------------------------------------------------------------------------
+ * The shipped collision maps were exported 32 px out of phase (slot 2's payload
+ * starts at byte 4, not byte 8 — see `scripts/export-table-maps.mjs`). Every
+ * column in this file therefore moved: the lane's free centres are exactly 32
+ * px right of where they were, on all three tables. The ROWS did not move at
+ * all, and could not have: the error shifted each row's bits sideways, so a
+ * row-indexed measurement is invariant under it. That is the single cleanest
+ * check on the correction, and it is why only the x bounds changed by 32.
+ *
+ * All four bounds are measured with ONE rule, against the ring
+ * `collision-probe.ts` actually collides with, on THE VIEW THE PHYSICS RUNS —
+ * which for Law 'n Justice means the level-0 view plus its virtual top wall,
+ * not the raw bitmap:
+ *
+ *   bottomY                  bottommost free ball-centre row on the lane column
+ *   minCentreX / maxCentreX  the free-centre run on that row — the seat the ball
+ *                            is served into
+ *   topY                     top of the unbroken free-centre run through the
+ *                            lane column that ends at bottomY
+ *
+ * That last clause is not decoration. `bottomY: 556` was once shipped for Law 'n
+ * Justice, and no ball centre can be on row 556 of any of the three tables: the
+ * shared lane floor is a solid bit-0 run on row 561 and a radius-8 ring puts the
+ * bottommost free centre on row 552. A hand-read number and a probe-read number
+ * disagreed and nothing noticed.
+ *
+ * SO THE RULE IS NOW EXECUTED, NOT JUST WRITTEN DOWN. `tests/plunger.test.ts`
+ * ("re-derives every shooter-lane bound from the shipped map") re-runs exactly
+ * the four measurements above against `public/generated/tables/*.map.json` with
+ * `level-scan.ts` and asserts the constants below are what comes out. If a map
+ * is ever re-exported and a bound moves, that test fails instead of the game
+ * quietly serving a ball into a wall — which is the failure this whole file was
+ * carrying silently after the last reframe.
+ *
+ * Cross-check: the seat run each table reports is byte-identical to the run the
+ * hand-off band on the same column reports in `playfield-levels.ts`, which is
+ * two independent scans agreeing on the same channel.
  */
 export interface ShooterLane {
   /** Leftmost and rightmost free centre column. */
@@ -72,14 +112,70 @@ export interface ShooterLane {
 }
 
 /**
- * Law 'n Justice's shooter lane: a narrow full-height channel on the right of
- * the playfield, free centres spanning x=285..296 unbroken from y=4 to y=556.
+ * Law 'n Justice's shooter lane: a narrow channel on the right of the
+ * playfield, walls (bit 0) at x=310..312 and x=333..335 from y=127 down to the
+ * shared floor at y=561, free centres x=321..324 at the seat.
+ *
+ * `topY` is 34 rather than the row the walls start on: above y=127 the lane
+ * column is open playfield rather than a channel, and the free-centre run
+ * through it is unbroken from the seat all the way up to the ceiling.
+ *
+ * IT USED TO SAY 8, AND 8 IS THE RAW-BITMAP ANSWER RATHER THAN THE ENGINE'S.
+ * Law 'n Justice is the one table whose level-0 view carries a virtual top wall
+ * (`VIRTUAL_TOP_WALL_ROWS` in `ball-physics.ts` seals rows 0..25), so a radius-8
+ * centre on the view the physics actually collides against cannot be higher than
+ * row 34. Measured both ways on the shipped map with the engine's own ring: the
+ * unbroken run through column 322 ends at y=8 on the bare bitmap and at y=34 on
+ * the physics view. Nothing reads `topY` except `plungerConfigForLane`'s
+ * serve-row sanity check, so this was inert — but a lane bound that disagrees
+ * with the surface the ball collides with is exactly the kind of number that is
+ * true until someone uses it, and the reframe was a lesson in those.
  */
 export const LAW_N_JUSTICE_SHOOTER_LANE: ShooterLane = Object.freeze({
-  minCentreX: 285,
-  maxCentreX: 296,
-  topY: 4,
-  bottomY: 556,
+  minCentreX: 321,
+  maxCentreX: 324,
+  topY: 34,
+  bottomY: 552,
+  confidence: "measured",
+});
+
+/**
+ * BabeWatch's shooter lane, measured off `babewatch.map.json` with the engine's
+ * own radius-8 probe ring.
+ *
+ * Lower-line walls at x=310..312 and x=332..335 and a floor at y=561 — the SAME
+ * floor row as the other two tables, which is the strongest single piece of
+ * evidence that all three lanes are one shared cabinet part. Free ball centres
+ * are x=321..323 down the seat of the lane.
+ *
+ * `topY` stops at 384 because BabeWatch's lower line does not carry the lane any
+ * higher: above that the channel is pinched shut and the lane continues on the
+ * UPPER line — see `playfield-levels.ts`, which is the whole reason this table
+ * needed a hand-off before it could be played at all. 384 is unchanged by the
+ * reframe, as every row-indexed measurement is.
+ */
+export const BABEWATCH_SHOOTER_LANE: ShooterLane = Object.freeze({
+  minCentreX: 321,
+  maxCentreX: 323,
+  topY: 384,
+  bottomY: 552,
+  confidence: "measured",
+});
+
+/**
+ * Extreme Sports' shooter lane, measured the same way.
+ *
+ * Lower-line walls at x=310..313 and x=333..335, floor at y=561, free centres
+ * x=322..324 — one column right of BabeWatch's, which is why the serve column
+ * is derived from the span rather than shared. `topY` is 330 for the same
+ * reason as BabeWatch's 384: the lower line loses the lane above that and the
+ * upper line carries it on.
+ */
+export const EXTREME_SPORTS_SHOOTER_LANE: ShooterLane = Object.freeze({
+  minCentreX: 322,
+  maxCentreX: 324,
+  topY: 330,
+  bottomY: 552,
   confidence: "measured",
 });
 
@@ -94,15 +190,19 @@ export const LAW_N_JUSTICE_SHOOTER_LANE: ShooterLane = Object.freeze({
 export const SERVE_INSET_PIXELS = 8;
 
 /**
- * Per-table lanes. Only Law 'n Justice has been measured off the map; the other
- * two carry the same geometry marked `assumed` rather than a fabricated
- * measurement, so a wrong serve position is visible in the data instead of
- * hidden in a constant. Callers that care can refuse to serve on an assumption.
+ * Per-table lanes, all three now measured off their own shipped map rather than
+ * copied from Law 'n Justice.
+ *
+ * The copy used to be marked `assumed`, and the assumption was very nearly
+ * right — every one of the three lanes sits in the same place, with its floor on
+ * the same row (561) — but "very nearly" was enough to matter: BabeWatch's free
+ * centres are x=321..323 and Extreme Sports' are x=322..324, so the serve column
+ * derived from Law 'n Justice's span was a pixel off on one of them.
  */
 export const SHOOTER_LANE_BY_TABLE: Readonly<Record<TableId, ShooterLane>> = Object.freeze({
   "law-n-justice": LAW_N_JUSTICE_SHOOTER_LANE,
-  babewatch: Object.freeze({ ...LAW_N_JUSTICE_SHOOTER_LANE, confidence: "assumed" as const }),
-  "extreme-sports": Object.freeze({ ...LAW_N_JUSTICE_SHOOTER_LANE, confidence: "assumed" as const }),
+  babewatch: BABEWATCH_SHOOTER_LANE,
+  "extreme-sports": EXTREME_SPORTS_SHOOTER_LANE,
 });
 
 export function shooterLaneFor(tableId: TableId): ShooterLane {
@@ -132,15 +232,108 @@ export const MIN_LAUNCH_SPEED = pixelsToQ10(1);
 /**
  * Fastest launch, six pixels per tick.
  *
- * With gravity applied before each integration step, a launch at v rises
- * v^2/(2g) - v/2 units before stalling. Reaching the top of Law 'n Justice's
- * lane from the serve point — about 540 pixels, or 552,960 Q10 — needs v = 5164
- * against g = 24. Six pixels per tick clears that with room to spare, so a full
- * plunge leaves the lane still moving and feeds the playfield instead of dying
- * at the mouth. It is also well inside the signed-16-bit velocity range and
- * only two substeps of the anti-tunnelling limit, so nothing clips a wall.
+ * DERIVED, not chosen — but the derivation written here used to name the wrong
+ * target, and this is the corrected one.
+ *
+ * ---------------------------------------------------------------------------
+ * THE OLD DERIVATION MEASURED THE LANE. THE SHOT IS NOT THE LANE
+ * ---------------------------------------------------------------------------
+ * It said: with gravity applied before each integration step a launch at v rises
+ * v^2/(2g) - v/2 units, so reaching the top of Law 'n Justice's lane — 536 px
+ * from the serve point — needs v >= 5145 against g = 24, and 6144 is the
+ * smallest whole pixel per tick above that. Every step of that is true and the
+ * conclusion is still 6144, which is exactly why the error survived: the ball
+ * does not merely have to reach the top of the lane. It has to cross the top
+ * arch, on the upper collision line, rubbing both rails, and still be moving
+ * when it starts down the far side. A ballistic climb up an empty column is a
+ * LOWER BOUND on that, not the requirement.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT THE SHOT ACTUALLY COSTS, MEASURED
+ * ---------------------------------------------------------------------------
+ * Swept in the real game loop — one plunge of N ticks, no flippers, no nudge, on
+ * the shipped map — the launch shot first completes at:
+ *
+ *   law-n-justice   hold 28 of 32   launch 5504 Q10 (5.375 px/tick)   87.5% pull
+ *   babewatch       hold 22 of 32   launch 4544 Q10 (4.437 px/tick)   68.75% pull
+ *   extreme-sports  hold 26 of 32   launch 5184 Q10 (5.062 px/tick)   81.25% pull
+ *
+ * and what the ball does one step below each threshold is the evidence that the
+ * threshold is the arch rather than the lane: Law 'n Justice at hold 27 crests
+ * the crown and comes to rest on its outer shoulder at (214,20) with the channel
+ * beside it; BabeWatch at hold 21 reaches (294,276), the `ramp-end` gate's own
+ * row, and fails the strict `toY < gate.y` by one pixel; Extreme Sports at hold
+ * 25 crosses the crown and ends in the (302,162) cup. None of the three is short
+ * of the top of its lane.
+ *
+ * So the binding requirement is Law 'n Justice's 5504 Q10, and six pixels per
+ * tick — 6144 — is still the smallest whole pixel per tick above it, with 11.6%
+ * of margin. The number does not move; the reason it is that number does.
+ *
+ * The consequence is worth stating plainly rather than leaving to be rediscovered:
+ * on Law 'n Justice only the top 12.5% of the pull completes the shot, so an
+ * under-plunge is common. That is not a fault as long as an under-plunge gives
+ * the ball back — it dribbles down the lane, `game-loop.ts` re-pins it on the rod
+ * and the player shoots again — and `tests/plays.test.ts` proves exactly that for
+ * every starting pull on every table.
+ *
+ * IT WAS RAISED TO SEVEN, AND THAT WAS A SYMPTOM. The argument for seven was
+ * that the lane hands the ball to the top arch and "the ball rubs the arch's
+ * rails the whole way, losing about 18% of its speed at every contact", so a
+ * six-pixel launch stalled just short of the apex at (186, 21). That 18% was the
+ * friction bug in `reflectVelocity` — a flat percentage of the ball's whole
+ * tangential speed taken on every tick of contact, rather than a Coulomb impulse
+ * bounded by the normal force. With that corrected a ball no longer pays a
+ * tariff for touching a rail it is rolling along, the arch costs what an arch
+ * costs, and the launch speed goes back to the number the lane climb implies.
+ *
+ * The same applies to BabeWatch, whose ten pixels a tick were bought entirely to
+ * pay for two contacts in the bend above y=400 (measured then: in at 6664 Q10,
+ * out at 2492). Under the corrected model all three tables complete their launch
+ * shot on six, so the per-table override table below has one value in it rather
+ * than three, and the reason for that is a physics fix rather than a coincidence.
+ *
+ * It is deliberately not raised further. The plunger is an aiming device: a full
+ * pull has to finish the shot and a two-thirds pull must not, or pull length
+ * stops meaning anything — and the measured thresholds above are 87.5%, 68.75%
+ * and 81.25%, all of them above two thirds, on all three tables. It is also well
+ * inside the signed-16-bit velocity range and under two substeps of the
+ * anti-tunnelling limit, so nothing clips a wall.
  */
 export const MAX_LAUNCH_SPEED = pixelsToQ10(6);
+
+/**
+ * The speed a FULL pull gives, per table.
+ *
+ * The table is kept — the three lanes are separately measured and a future
+ * per-table measurement has to have somewhere to land — but it now holds ONE
+ * value, because the differences it used to carry were all paying for the
+ * friction bug rather than for anything on the tables.
+ *
+ * What that looked like before: Law 'n Justice and Extreme Sports were on seven
+ * pixels a tick and BabeWatch on ten, and BabeWatch's extra three were bought
+ * entirely to survive the staircase bend above y=400 (it entered at 6664 Q10 and
+ * left at 2492). Under the Coulomb model in `ball-physics.ts` a ball rolling
+ * along a rail no longer pays 15% of its speed per tick of contact, and all
+ * three tables complete their launch shot on six — measured over plunge holds of
+ * 32..91 ticks, i.e. every hold that reaches a full pull, on the shipped maps.
+ *
+ * The value is still per-table configuration in shape, and it is still checked
+ * the same way: a full pull completes the shot and a two-thirds pull does not,
+ * so pull length still aims. It is inside the signed-16-bit velocity range and
+ * under two substeps of the anti-tunnelling limit, so it cannot clip a wall.
+ *
+ * MEASURED AGAIN AFTER THE MAP REFRAME, per table, by sweeping the plunge hold
+ * through the real loop on the corrected maps. One value still serves all three:
+ * the shot completes at hold 28 / 22 / 26 of 32 and the ceiling is above all of
+ * them. See MAX_LAUNCH_SPEED for the sweep and for what each table does one step
+ * below its own threshold.
+ */
+export const FULL_PLUNGE_SPEED_BY_TABLE: Readonly<Record<TableId, number>> = Object.freeze({
+  "law-n-justice": MAX_LAUNCH_SPEED,
+  babewatch: MAX_LAUNCH_SPEED,
+  "extreme-sports": MAX_LAUNCH_SPEED,
+});
 
 export interface PlungerConfig {
   /** Q10 charge gained per tick while pulling. */
@@ -163,7 +356,10 @@ export interface PlungerConfig {
  * the ball is clear of both lane walls whichever side the channel is measured
  * from.
  */
-export function plungerConfigForLane(lane: ShooterLane): PlungerConfig {
+export function plungerConfigForLane(
+  lane: ShooterLane,
+  maxLaunchSpeed: number = MAX_LAUNCH_SPEED,
+): PlungerConfig {
   if (lane.minCentreX > lane.maxCentreX || lane.topY > lane.bottomY) {
     throw new RangeError("shooter lane bounds are inverted");
   }
@@ -175,7 +371,7 @@ export function plungerConfigForLane(lane: ShooterLane): PlungerConfig {
   return {
     chargeRate: PLUNGER_CHARGE_RATE,
     minLaunchSpeed: MIN_LAUNCH_SPEED,
-    maxLaunchSpeed: MAX_LAUNCH_SPEED,
+    maxLaunchSpeed,
     serveX: pixelsToQ10(centreX),
     serveY: pixelsToQ10(serveRow),
     laneConfidence: lane.confidence,
@@ -183,7 +379,7 @@ export function plungerConfigForLane(lane: ShooterLane): PlungerConfig {
 }
 
 export function plungerConfigFor(tableId: TableId): PlungerConfig {
-  return plungerConfigForLane(shooterLaneFor(tableId));
+  return plungerConfigForLane(shooterLaneFor(tableId), FULL_PLUNGE_SPEED_BY_TABLE[tableId]);
 }
 
 export const DEFAULT_PLUNGER_CONFIG: PlungerConfig = plungerConfigFor("law-n-justice");

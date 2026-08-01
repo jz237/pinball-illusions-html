@@ -4,11 +4,16 @@ import { fileURLToPath } from "node:url";
 import type {
   MaterialIndex,
   SimulationForces,
+  TableId,
   TableMap,
   TableMapDocument,
 } from "../src/game/contracts.js";
 import { PLAYFIELD_HEIGHT, PLAYFIELD_WIDTH } from "../src/game/contracts.js";
-import { SOLID_BORDER_INDEX, materialTableFor } from "../src/game/materials.js";
+import {
+  LEVEL1_SOLID_BIT,
+  SOLID_BORDER_INDEX,
+  materialTableFor,
+} from "../src/game/materials.js";
 import { parseTableMapDocument } from "../src/game/table-map.js";
 import { pixelsToQ10, q10ToPixel } from "../src/core/fixed-point.js";
 import {
@@ -16,8 +21,10 @@ import {
   PROBE_RING,
   PROBE_RING_SIZE,
   numberAt,
+  passabilityOf,
   probeContacts,
 } from "../src/game/collision-probe.js";
+import { shooterLaneFor } from "../src/game/plunger.js";
 import {
   BALL_RADIUS_PIXELS,
   DEFAULT_SIMULATION_OPTIONS,
@@ -28,6 +35,7 @@ import {
   createBallSet,
   integerSqrt,
   playfieldViewFor,
+  reflectVelocity,
   resolveBallCollisions,
   spawnBall,
   stepBalls,
@@ -195,6 +203,35 @@ describe("gravity", () => {
     const set = setWith({ x: 100, y: 100 }, { x: 200, y: 100 });
     stepBalls(set, EMPTY_MAP, MATERIALS, { gravityY: 0, nudgeX: -300, nudgeY: 0 });
     for (const ball of set.balls) expect(ball.velocityX).toBe(-300);
+  });
+
+  it("does not shove a ball that is inside a ramp", () => {
+    // A habitrail is a tube and the cabinet does not reach into it; see
+    // `nudgeReachesLevel`. Without this one shove was forty times the speed of a
+    // ball coasting round Law 'n Justice's top arch, and it replaced the shot
+    // rather than perturbing it.
+    const set = setWith({ x: 100, y: 100 }, { x: 200, y: 100 });
+    const [playfield, ramp] = set.balls;
+    if (playfield === undefined || ramp === undefined) throw new Error("expected two balls");
+    ramp.level = 1;
+
+    stepBalls(set, EMPTY_MAP, MATERIALS, { gravityY: 0, nudgeX: -300, nudgeY: -400 });
+
+    expect(playfield.velocityX).toBe(-300);
+    expect(playfield.velocityY).toBe(-400);
+    expect(ramp.velocityX).toBe(0);
+    expect(ramp.velocityY).toBe(0);
+  });
+
+  it("still pulls a ball inside a ramp downhill", () => {
+    // Only the shove is withheld. Gravity applies on every level, or a ball
+    // would never come back off a ramp at all.
+    const set = setWith({ x: 100, y: 100 });
+    const ball = only(set);
+    ball.level = 1;
+    stepBalls(set, EMPTY_MAP, MATERIALS, { gravityY: 24, nudgeX: -300, nudgeY: 0 });
+    expect(ball.velocityY).toBe(24);
+    expect(ball.velocityX).toBe(0);
   });
 });
 
@@ -722,12 +759,18 @@ describe("integerSqrt", () => {
 // The virtual top wall, on the table that needs it
 // ---------------------------------------------------------------------------
 
-const LAW_MAP_PATH = fileURLToPath(
-  new URL("../public/generated/tables/law-n-justice.map.json", import.meta.url),
-);
-const LAW_MAP: TableMap = parseTableMapDocument(
-  JSON.parse(readFileSync(LAW_MAP_PATH, "utf8")) as TableMapDocument,
-);
+function mapForTable(tableId: TableId): TableMap {
+  return parseTableMapDocument(
+    JSON.parse(
+      readFileSync(
+        fileURLToPath(new URL(`../public/generated/tables/${tableId}.map.json`, import.meta.url)),
+        "utf8",
+      ),
+    ) as TableMapDocument,
+  );
+}
+
+const LAW_MAP: TableMap = mapForTable("law-n-justice");
 const LAW_MATERIALS = materialTableFor("law-n-justice");
 const LAW_TOP_WALL = VIRTUAL_TOP_WALL_ROWS["law-n-justice"];
 
@@ -1008,17 +1051,27 @@ describe("no tick is a no-op", () => {
   }
 
   it("brings a ball wedged in a channel narrower than itself to a full stop", () => {
-    // Law 'n Justice has a slot at (54, 156) that is 13 px of clear width — a
-    // 16 px ball that finds its way in cannot get out again. It used to drift one
-    // Q10 unit down, bounce, drift back up and end every tick on the pixel it
-    // started on carrying vy = -1: position and velocity both unchanged, speed
-    // still non-zero, forever.
+    // Law 'n Justice has a slot at (86, 156) between rails at x=76..78 and
+    // x=94..96 — 15 px of clear width, and a 16 px ball that finds its way in
+    // cannot get out again. It used to drift one Q10 unit down, bounce, drift
+    // back up and end every tick on the pixel it started on carrying vy = -1:
+    // position and velocity both unchanged, speed still non-zero, forever.
+    //
+    // The site read (54, 156) until the maps were re-exported on the correct
+    // 32 px frame. It is the same slot, 32 columns right; the ROW is untouched,
+    // and so is every expectation below, because what this test is about was
+    // never about where on the table the slot happens to be.
     const set = createBallSet();
-    const ball = spawnBall(set, 55296, 159742, 0, -1);
+    const ball = spawnBall(set, 88064, 159742, 0, -1);
     for (let tick = 0; tick < 10; tick += 1) stepBalls(set, LAW_MAP, LAW_MATERIALS, GRAVITY);
     expect(ball.velocityX).toBe(0);
     expect(ball.velocityY).toBe(0);
-    expect(ball.y).toBe(159742);
+    // One Q10 unit — a thousandth of a pixel — below the spawn row, and it stays
+    // there. It used to settle exactly on the spawn row; under the Coulomb
+    // friction rule in `reflectVelocity` it drops that last unit into the slot
+    // first. Same pixel, same full stop, one unit of settling.
+    expect(ball.y).toBe(159743);
+    expect(ball.y >> 10).toBe(155);
   });
 
   it("finds no fixed point anywhere across the real playfield", () => {
@@ -1036,5 +1089,171 @@ describe("no tick is a no-op", () => {
       }
     }
     expect(launches).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Friction is an impulse, not a percentage
+// ---------------------------------------------------------------------------
+
+describe("contact friction", () => {
+  /** A plain wall's coefficients, straight out of materials.ts. */
+  const wall = MATERIALS.behaviourFor(WALL);
+  const REST = DEFAULT_SIMULATION_OPTIONS.restThreshold;
+
+  it("costs a resting contact no more than the friction times one tick of gravity", () => {
+    // The bug this replaced took a flat 15% of the ball's WHOLE tangential
+    // speed on every tick it was in contact, which for a ball merely lying on a
+    // surface is every tick, since `stepBalls` adds gravity before integrating.
+    // Coulomb's rule bounds the tangential loss by the normal impulse, and for a
+    // resting ball that impulse is one tick of gravity and nothing else.
+    const sliding = 4000;
+    const ball = createBall(0, 0, 0, sliding, GRAVITY.gravityY);
+    // Flat floor: outward normal points straight up.
+    reflectVelocity(ball, wall, 0, -1024, REST);
+
+    const lost = sliding - ball.velocityX;
+    expect(lost).toBeGreaterThan(0);
+    // friction 154/1024 of a 24-unit impulse is 3.6 units, and the loss is
+    // applied as a Q10 scale so it can round up by one quantum of that scale.
+    // Ten units is generous room for both; the percentage model took 600.
+    expect(lost).toBeLessThanOrEqual(10);
+    expect(lost).toBeLessThan(sliding / 100);
+  });
+
+  it("still scrubs a real impact, in proportion to how hard it lands", () => {
+    const soft = createBall(0, 0, 0, 8000, 400);
+    const hard = createBall(1, 0, 0, 8000, 12000);
+    reflectVelocity(soft, wall, 0, -1024, REST);
+    reflectVelocity(hard, wall, 0, -1024, REST);
+    expect(8000 - soft.velocityX).toBeGreaterThan(0);
+    expect(8000 - hard.velocityX).toBeGreaterThan(8000 - soft.velocityX);
+  });
+
+  it("never drives the tangential speed past zero into a reversal", () => {
+    // A loss bounded by the sliding speed itself. A huge normal impulse against
+    // a barely-sliding ball must stop it, not push it backwards.
+    const ball = createBall(0, 0, 0, 5, 30000);
+    reflectVelocity(ball, wall, 0, -1024, REST);
+    expect(ball.velocityX).toBe(0);
+  });
+
+  it("always costs at least one unit, so a sliding contact cannot idle forever", () => {
+    // Below about seven units of normal impulse `friction * impulse` truncates
+    // to nothing, and a ball wedged in a corner sits exactly there: on Law 'n
+    // Justice one held v = (-1, 1) for seven hundred consecutive ticks, moving
+    // one Q10 unit a tick — half a pixel per ball-search window, which is why
+    // the search wrote off a ball that the model said was still moving.
+    const ball = createBall(0, 0, 0, 40, 1);
+    reflectVelocity(ball, wall, 0, -1024, REST);
+    expect(ball.velocityX).toBeLessThan(40);
+  });
+
+  it("lets a ball on a slope accelerate instead of settling into a crawl", () => {
+    // The whole point. Under the percentage model a ball on any slope reached a
+    // terminal `g * sin(theta) * (1 - f) / f` — about 135 * sin(theta) Q10 per
+    // tick, a pixel every few seconds — and stayed there for ever. Under
+    // Coulomb it keeps gaining speed as long as the slope beats the friction
+    // angle. A 45-degree ramp: floor at y = x, so the outward normal is up-left.
+    const ramp = makeMap((x, y) => (y >= 300 + (x - 100) ? WALL : OPEN));
+    const set = setWith({ x: 100, y: 280 });
+    const ball = only(set);
+
+    const speeds: number[] = [];
+    for (let tick = 0; tick < 120; tick += 1) {
+      stepBalls(set, ramp, MATERIALS, GRAVITY);
+      if (tick >= 40 && tick % 20 === 0) {
+        speeds.push(Math.abs(ball.velocityX) + Math.abs(ball.velocityY));
+      }
+    }
+    for (let i = 1; i < speeds.length; i += 1) {
+      expect(speeds[i], `speeds ${speeds.join(",")}`).toBeGreaterThan(speeds[i - 1] ?? 0);
+    }
+    // And it is a real roll, not a crawl: the ball search wants 8 px in 500
+    // ticks, i.e. 16 Q10 per tick, and this is orders past that.
+    expect(speeds[speeds.length - 1] ?? 0).toBeGreaterThan(1000);
+  });
+});
+
+describe("the virtual left wall, which was deleted", () => {
+  // `VIRTUAL_LEFT_WALL_COLUMNS` sealed nine columns down the left of Extreme
+  // Sports. It is gone, and this block is what stops it coming back by feel:
+  // both halves of its derivation are re-checked against the CORRECTED maps, and
+  // both fail. If either of these tests ever flips, the wall deserves another
+  // look — which is the whole reason they are still here.
+
+  it("has no rail at x=0..8 on any table to be named after", () => {
+    // The stated derivation was "bit 1 is solid at x=6..8 on EVERY row from
+    // y=50 to y=390" on Extreme Sports, i.e. nine columns IS the upper line's
+    // own border. On the corrected map that rail is at x=38..40, and there is a
+    // second continuous bit-1 line at x=16..18. Neither is inside x=0..8, so
+    // there is no continuous upper-line border in the sealed strip at all.
+    const longestRun = (map: TableMap, column: number, bit: number): number => {
+      let best = 0;
+      let current = 0;
+      for (let y = 0; y < map.height; y += 1) {
+        current = (map.materialAt(column, y) & bit) !== 0 ? current + 1 : 0;
+        if (current > best) best = current;
+      }
+      return best;
+    };
+    const extreme = mapForTable("extreme-sports");
+    for (let column = 0; column <= 8; column += 1) {
+      expect(longestRun(extreme, column, LEVEL1_SOLID_BIT), `bit1 column ${column}`)
+        .toBeLessThan(100);
+    }
+    // While the two rails that DO run the height of the table are where the
+    // reframe says they are, 32 px right of the columns the wall was named for.
+    expect(longestRun(extreme, 17, LEVEL1_SOLID_BIT)).toBeGreaterThan(340);
+    expect(longestRun(extreme, 39, LEVEL1_SOLID_BIT)).toBeGreaterThan(340);
+  });
+
+  it("is not needed to keep a ball out of the strip, because none goes there", () => {
+    // The behavioural half. Over the write-off census in `plays.test.ts` — thirty
+    // scripted games a table at every plunge strength — the results with the wall
+    // at 0, at 9 and at 19 are identical, and no ball ends anywhere in x<32 on
+    // any table. What that census cannot show is whether the strip is reachable
+    // at all, so this asserts the stronger thing directly: on Law 'n Justice and
+    // BabeWatch the lower-level region a served ball can walk to does not touch
+    // the left of the table, so a wall there could never have done anything.
+    for (const tableId of ["law-n-justice", "babewatch"] as const) {
+      const map = mapForTable(tableId);
+      const materials = materialTableFor(tableId);
+      const lane = shooterLaneFor(tableId);
+      const seedX = (lane.minCentreX + lane.maxCentreX) >> 1;
+      const seedY = lane.bottomY - 8;
+      const view = playfieldViewFor(map, VIRTUAL_TOP_WALL_ROWS[tableId]);
+      const passable = passabilityOf(materials);
+      const free = (x: number, y: number): boolean => {
+        for (let i = 0; i < PROBE_RING.size; i += 1) {
+          const py = y + numberAt(PROBE_RING.dy, i);
+          if (py >= view.height) continue;
+          if (!passable[view.materialAt(x + numberAt(PROBE_RING.dx, i), py)]) return false;
+        }
+        return true;
+      };
+      expect(free(seedX, seedY), `${tableId} serve point`).toBe(true);
+      const seen = new Set<number>([seedY * map.width + seedX]);
+      const stack: [number, number][] = [[seedX, seedY]];
+      let inStrip = 0;
+      while (stack.length > 0) {
+        const [x, y] = stack.pop() as [number, number];
+        if (x < 32) inStrip += 1;
+        for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]] as const) {
+          const nx = x + dx;
+          const ny = y + dy;
+          if (nx < 0 || nx >= map.width || ny < 0 || ny >= map.height) continue;
+          const key = ny * map.width + nx;
+          if (seen.has(key) || !free(nx, ny)) continue;
+          seen.add(key);
+          stack.push([nx, ny]);
+        }
+      }
+      expect({ tableId, inStrip }).toEqual({ tableId, inStrip: 0 });
+    }
+  });
+
+  it("returns the map itself when no wall is asked for", () => {
+    expect(playfieldViewFor(EMPTY_MAP, 0)).toBe(EMPTY_MAP);
   });
 });

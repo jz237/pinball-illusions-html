@@ -1,85 +1,65 @@
 /**
- * Procedural playfield renderer.
+ * Playfield renderer.
  *
  * ---------------------------------------------------------------------------
  * WHAT THIS DRAWS, AND FROM WHAT
  * ---------------------------------------------------------------------------
- * There is no extracted artwork in this project and there is not going to be.
- * The only table data that exists is the four-layer material map out of slot 2
- * — 336x600 pixels, four one-bit layers OR'd into an index 0..15 — and this
- * module turns that, and only that, into the picture of the table.
+ * The picture on screen is the 1995 artwork out of slot 3 of the table package:
+ * a 336x600 256-colour AGA playfield, decoded off the operator's own disks by
+ * `scripts/export-table-art.mjs`, shipped as `<table-id>.art.png`, and loaded by
+ * `src/game/table-art.ts`. This module blits those pixels and nothing else.
  *
- * The rule that makes it work: DRAW BY BIT MEANING, NEVER BY RAW INDEX. The 16
- * indices are not 16 materials, they are the 16 combinations of four
- * independent layers, so switching on the index would mean sixteen unrelated
- * cases where there are really four overlapping ones. Concretely:
+ * It used to draw the collision map instead — a procedural wireframe of cyan and
+ * yellow lines on near-black, invented here out of the four material bits. That
+ * looked nothing like Pinball Illusions, and it shipped, because the tests only
+ * ever asserted that the output was DETERMINISTIC. A wrong picture is perfectly
+ * deterministic. `tests/playfield-renderer.test.ts` now compares the rendered
+ * pixels against the exported artwork itself; keep it that way.
  *
- *   bit 2 (4)  lower structure  -> a filled body: the furniture on the deck
- *   bit 0 (1)  lower collision  -> the lit edge drawn around those bodies
- *   bit 3 (8)  upper structure  -> the raised deck, which OCCLUDES the above
- *   bit 1 (2)  upper collision  -> the rail running along that raised deck
- *   none       -> bare playfield
- *
- * Painter's order is therefore lower body, lower edge, ramp drop shadow, raised
- * deck, upper rail. The occlusion is not a stylistic choice: bit 3 is used by
- * the original as an AND-NOT mask in the ball blitter (main +0x00bf3c), i.e. it
- * is precisely the region where the upper level is drawn *over* whatever is
- * beneath, ball included. Honouring that is what makes a ramp read as a ramp.
+ * THE COLLISION MAP IS NOT DRAWN. Slot 2 is physics and only physics. Nothing in
+ * this file reads `materialAt`, and if something here ever does again, the
+ * picture has started disagreeing with the disk.
  *
  * ---------------------------------------------------------------------------
- * WHY IT LOOKS CHUNKY ON PURPOSE
+ * REGISTRATION
  * ---------------------------------------------------------------------------
- * Everything is rasterised once at 336x600 logical pixels — one raster pixel per
- * map pixel, no supersampling, no anti-aliasing — and the caller blits it with
- * an INTEGER scale factor and `imageSmoothingEnabled = false`. Bilinear
- * upscaling would smear the 1-pixel collision outlines into mush and lose the
- * one thing that dates the look correctly. `integerScaleFor()` and
- * `drawPlayfield()` exist so no call site has to remember that.
+ * The artwork and the collision geometry are two independent rasters of one
+ * table and they must line up, or the ball bounces off walls the player cannot
+ * see. `ART_REGISTRATION_OFFSET_X/Y` is the single place that relationship is
+ * expressed — see the constants for the measurement and for the outstanding
+ * discrepancy in the shipped maps.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY IT IS CHUNKY ON PURPOSE
+ * ---------------------------------------------------------------------------
+ * The raster is one pixel per source pixel — no supersampling, no resampling —
+ * and the caller blits it at an INTEGER magnification with
+ * `imageSmoothingEnabled = false`. Bilinear upscaling would smear a 336-pixel
+ * AGA playfield into mush and lose the one thing that dates the look correctly.
+ * `integerScaleFor()` and `drawPlayfield()` exist so no call site has to
+ * remember that.
  *
  * ---------------------------------------------------------------------------
  * WHY IT IS CACHED
  * ---------------------------------------------------------------------------
- * The map never changes during play, so the 201,600-pixel raster is built once
- * per table and blitted per frame. `invalidatePlayfieldRaster()` drops it, for
- * live palette tuning.
+ * The artwork never changes during play, so the 201,600-pixel raster is built
+ * once per table and blitted per frame. `invalidatePlayfieldRaster()` drops it.
  *
  * ---------------------------------------------------------------------------
  * WHY IT DOES NOT REQUIRE A CANVAS
  * ---------------------------------------------------------------------------
- * The pixel-producing half takes a plain `{ width, height, data }` target rather
- * than a real `ImageData`, so the entire look is assertable in node with no DOM.
- * Only the small blit half at the bottom of the file touches canvas APIs.
+ * The pixel-producing half takes and returns a plain `{ width, height, data }`
+ * target rather than a real `ImageData`, and the artwork arrives as decoded
+ * pixels rather than as something only a browser can open, so the whole picture
+ * is assertable in node with no DOM. Only the small blit half at the bottom of
+ * the file touches canvas APIs.
  */
 
 import { PLAYFIELD_HEIGHT, PLAYFIELD_WIDTH } from "../game/contracts.js";
 import type { TableMap } from "../game/contracts.js";
-import {
-  LEVEL0_SOLID_BIT,
-  LEVEL0_STRUCTURE_BIT,
-  LEVEL1_SOLID_BIT,
-  LEVEL1_STRUCTURE_BIT,
-} from "../game/materials.js";
 import { VIEWPORT_HEIGHT, clampScroll, toViewportSize } from "./camera.js";
 import type { CameraState } from "./camera.js";
-import {
-  DECK_DARK,
-  DECK_LIGHT,
-  LOWER_EDGE_DIM,
-  LOWER_EDGE_LIT,
-  RAMP_BODY,
-  RAMP_DARK,
-  RAMP_LIGHT,
-  RAMP_SHADOW_OFFSET_X,
-  RAMP_SHADOW_OFFSET_Y,
-  RAMP_SHADOW_STRENGTH,
-  STRUCTURE_BODY,
-  STRUCTURE_DARK,
-  STRUCTURE_LIGHT,
-  UPPER_RAIL_DIM,
-  UPPER_RAIL_LIT,
-  shade,
-} from "./palette.js";
-import type { Rgb } from "./palette.js";
+import { CABINET_BLACK } from "./palette.js";
 
 /** RGBA, matching `ImageData`. */
 export const BYTES_PER_PIXEL = 4;
@@ -87,9 +67,10 @@ export const BYTES_PER_PIXEL = 4;
 /**
  * The slice of `ImageData` the rasteriser needs.
  *
- * A real `ImageData` satisfies this, and so does a plain object, which is the
- * point: node tests construct one with `createPixelTarget()` and read colours
- * straight back out. `data` is row-major RGBA, length width*height*4.
+ * A real `ImageData` satisfies this, and so does a plain object, and so does the
+ * `TableArt` the loader produces — which is the point: node tests build one,
+ * pass it in, and read colours straight back out. `data` is row-major RGBA,
+ * length width*height*4.
  */
 export interface PixelTarget {
   readonly width: number;
@@ -110,158 +91,95 @@ export function createPixelTarget(width: number, height: number): PixelTarget {
 }
 
 // ---------------------------------------------------------------------------
-// Deck dithering
+// Registration
 // ---------------------------------------------------------------------------
 
 /**
- * Ordered 4x4 Bayer thresholds, flattened.
+ * How far the artwork has to move, in playfield pixels, to sit over the
+ * collision geometry the physics reads. Positive x is right, positive y is down.
  *
- * A two-colour ordered dither is how a 1990s Amiga artist drew a gradient on a
- * tight palette, and it is stable under integer scaling in a way that a noise
- * dither is not — the pattern stays a pattern instead of turning into grain.
- * Flat rather than nested so `noUncheckedIndexedAccess` costs one `?? 0`
- * instead of two.
- */
-const BAYER_4X4: readonly number[] = [
-  0, 8, 2, 10,
-  12, 4, 14, 6,
-  3, 11, 1, 9,
-  15, 7, 13, 5,
-];
-
-/**
- * Bare playfield tone at a point.
+ * ZERO, and measured rather than assumed. Slot 2 and slot 3 are stored as two
+ * separate rasters with no shared origin, so "they line up" is a claim that has
+ * to be tested. The test: take the boundary of the structure layer (bit 2 of the
+ * map — the drawn edge of every body on the table, and the one probe with no
+ * ball-radius bias), and measure the mean colour-gradient magnitude of the
+ * artwork under it, as a multiple of the gradient over the whole playfield. A
+ * probe sitting on drawn edges scores well above 1; a probe sitting on flat
+ * paint scores 1. Swept over dx in -40..+40 against the shipped maps, the peak
+ * is at dx = 0 on all three tables and it is sharp: lift 2.31 / 2.53 / 2.15 at
+ * zero, 1.88..2.13 one pixel either side, and down to about 1.2 by two pixels.
+ * Three independently exported tables agreeing to the pixel is not a
+ * coincidence.
  *
- * Darkens toward the top of the table, so the bottom third — where the ball
- * spends its life and where the flippers are — is the brightest part of the
- * deck. Purely a function of (x, y, height): no state, no randomness.
+ * WHY THIS IS MEASURED AND NOT ASSUMED. That sweep used to peak at dx = +32,
+ * because `scripts/export-table-maps.mjs` read the slot-2 payload from byte 8
+ * when the segment's four unused bytes are at the END of the file, not after the
+ * length word (Table002's slot-2 payload has real data — 0xFFFFFFFF, the top
+ * border line — at bytes 4..7 and four zero bytes at the end). Four bytes of a
+ * 1-bpp row is exactly 32 pixels, so every wall on every table sat 32 px left of
+ * the paint. That is the same phase mistake documented at the top of
+ * `scripts/export-table-art.mjs`, and it was fixed in the exporter — the right
+ * place — rather than compensated for here: a -32 in this file would have drawn
+ * a correct picture in the wrong place and buried the bug in the geometry the
+ * physics reads. If this constant is ever non-zero, treat it as evidence that
+ * something upstream is framed wrong again.
  */
-function deckToneAt(x: number, y: number, height: number): Rgb {
-  const span = height > 1 ? height - 1 : 1;
-  const threshold = BAYER_4X4[(y & 3) * 4 + (x & 3)] ?? 0;
-  // 16 levels across the table; `>` rather than `>=` keeps row 0 fully dark.
-  return (y * 16) / span > threshold ? DECK_LIGHT : DECK_DARK;
-}
-
-// ---------------------------------------------------------------------------
-// Per-pixel classification
-// ---------------------------------------------------------------------------
-
-function bitsAt(map: TableMap, x: number, y: number): number {
-  // `materialAt` is the contract's accessor and already answers out-of-bounds
-  // reads with the solid border material, so bodies that run off the edge of the
-  // bitmap get bevelled against it instead of needing a special case here.
-  return map.materialAt(x, y);
-}
-
-/** True when the raised deck is overhead at this exact pixel. */
-function isRamp(map: TableMap, x: number, y: number): boolean {
-  return (bitsAt(map, x, y) & LEVEL1_STRUCTURE_BIT) !== 0;
-}
-
-/**
- * Simple two-face bevel for a filled body.
- *
- * The body gets its light tone on the row where it meets open space above, its
- * dark tone where it meets open space below, and its body tone in between. Top
- * and bottom only, no side faces: at 336 pixels wide most of these bodies are a
- * few pixels across, and a four-sided bevel would leave no body tone at all.
- */
-function bevel(map: TableMap, x: number, y: number, bit: number, light: Rgb, body: Rgb, dark: Rgb): Rgb {
-  if ((bitsAt(map, x, y - 1) & bit) === 0) return light;
-  if ((bitsAt(map, x, y + 1) & bit) === 0) return dark;
-  return body;
-}
-
-/** Everything that counts as "inside the shape" on each level, for `lineTone`. */
-const LEVEL0_MASS = LEVEL0_SOLID_BIT | LEVEL0_STRUCTURE_BIT;
-const LEVEL1_MASS = LEVEL1_SOLID_BIT | LEVEL1_STRUCTURE_BIT;
-
-/**
- * Two-tone shading for a collision line.
- *
- * A collision line is one pixel wide, so it cannot be bevelled like a body: both
- * of its vertical neighbours are usually outside it. What decides whether a
- * given pixel of the line is a lit top edge or a shaded underside is which side
- * the SHAPE is on, and the structure layer is what says where the shape is. So:
- * dim only where the mass sits above the line and open space below it — the
- * bottom of a slingshot, the underside of a lane guide. Everything else,
- * including a free-standing line with nothing either side of it, stays lit,
- * because these outlines are the most important thing on the table to see.
- */
-function lineTone(map: TableMap, x: number, y: number, mask: number, lit: Rgb, dim: Rgb): Rgb {
-  const massAbove = (bitsAt(map, x, y - 1) & mask) !== 0;
-  const massBelow = (bitsAt(map, x, y + 1) & mask) !== 0;
-  return massAbove && !massBelow ? dim : lit;
-}
-
-/**
- * The colour of one playfield pixel.
- *
- * Pure: same map and coordinates always give the same colour, which is what
- * lets the raster be cached forever and compared byte-for-byte in tests.
- */
-export function playfieldColourAt(map: TableMap, x: number, y: number): Rgb {
-  const bits = bitsAt(map, x, y);
-
-  // Upper level first, because it is drawn over everything below it.
-  if ((bits & LEVEL1_SOLID_BIT) !== 0) {
-    return lineTone(map, x, y, LEVEL1_MASS, UPPER_RAIL_LIT, UPPER_RAIL_DIM);
-  }
-  if ((bits & LEVEL1_STRUCTURE_BIT) !== 0) {
-    return bevel(map, x, y, LEVEL1_STRUCTURE_BIT, RAMP_LIGHT, RAMP_BODY, RAMP_DARK);
-  }
-
-  // Lower level: edge over body over bare deck.
-  let colour: Rgb;
-  if ((bits & LEVEL0_SOLID_BIT) !== 0) {
-    colour = lineTone(map, x, y, LEVEL0_MASS, LOWER_EDGE_LIT, LOWER_EDGE_DIM);
-  } else if ((bits & LEVEL0_STRUCTURE_BIT) !== 0) {
-    colour = bevel(map, x, y, LEVEL0_STRUCTURE_BIT, STRUCTURE_LIGHT, STRUCTURE_BODY, STRUCTURE_DARK);
-  } else {
-    colour = deckToneAt(x, y, map.height);
-  }
-
-  // The raised deck throws a hard offset shadow onto whatever is under it.
-  if (isRamp(map, x - RAMP_SHADOW_OFFSET_X, y - RAMP_SHADOW_OFFSET_Y)) {
-    colour = shade(colour, RAMP_SHADOW_STRENGTH);
-  }
-  return colour;
-}
+export const ART_REGISTRATION_OFFSET_X = 0;
+export const ART_REGISTRATION_OFFSET_Y = 0;
 
 // ---------------------------------------------------------------------------
 // Rasterising
 // ---------------------------------------------------------------------------
 
 /**
- * Draws the whole static playfield into `target`, which must match the map's
- * dimensions exactly — one raster pixel per map pixel is the entire basis of
- * the chunky look, so a size mismatch is a bug, not something to scale around.
+ * Draws the artwork into `target`, registered onto the playfield's coordinates.
  *
- * Returns the target for convenience. Alpha is forced opaque: this is the
- * bottom layer of the frame and there is nothing behind it.
+ * `target` must be exactly playfield-sized — one raster pixel per playfield
+ * pixel is the entire basis of the chunky look, so a size mismatch is a bug, not
+ * something to scale around. Any part of the target the artwork does not cover
+ * (only possible with a non-zero registration offset) is left cabinet black
+ * rather than transparent: this is the bottom layer of the frame and there is
+ * nothing behind it.
+ *
+ * Returns the target for convenience.
  */
-export function renderPlayfieldInto(map: TableMap, target: PixelTarget): PixelTarget {
-  if (target.width !== map.width || target.height !== map.height) {
+export function renderPlayfieldInto(artwork: PixelTarget, target: PixelTarget): PixelTarget {
+  if (target.width !== RASTER_WIDTH || target.height !== RASTER_HEIGHT) {
     throw new RangeError(
-      `render target is ${target.width}x${target.height} but the map is ${map.width}x${map.height}; the playfield rasterises 1:1`,
+      `render target is ${target.width}x${target.height} but the playfield is ${RASTER_WIDTH}x${RASTER_HEIGHT}; it rasterises 1:1`,
     );
   }
-  const expected = map.width * map.height * BYTES_PER_PIXEL;
+  const expected = target.width * target.height * BYTES_PER_PIXEL;
   if (target.data.length !== expected) {
     throw new RangeError(
-      `render target has ${target.data.length} bytes, expected ${expected} for ${map.width}x${map.height} RGBA`,
+      `render target has ${target.data.length} bytes, expected ${expected} for ${target.width}x${target.height} RGBA`,
+    );
+  }
+  const artBytes = artwork.width * artwork.height * BYTES_PER_PIXEL;
+  if (artwork.data.length !== artBytes) {
+    throw new RangeError(
+      `artwork is ${artwork.width}x${artwork.height} but carries ${artwork.data.length} bytes, expected ${artBytes} for RGBA`,
     );
   }
 
   const data = target.data;
+  const source = artwork.data;
   let offset = 0;
-  for (let y = 0; y < map.height; y += 1) {
-    for (let x = 0; x < map.width; x += 1) {
-      const colour = playfieldColourAt(map, x, y);
-      data[offset] = colour[0];
-      data[offset + 1] = colour[1];
-      data[offset + 2] = colour[2];
+  for (let y = 0; y < target.height; y += 1) {
+    const sourceY = y - ART_REGISTRATION_OFFSET_Y;
+    const rowInside = sourceY >= 0 && sourceY < artwork.height;
+    for (let x = 0; x < target.width; x += 1) {
+      const sourceX = x - ART_REGISTRATION_OFFSET_X;
+      if (rowInside && sourceX >= 0 && sourceX < artwork.width) {
+        const from = (sourceY * artwork.width + sourceX) * BYTES_PER_PIXEL;
+        data[offset] = source[from] ?? 0;
+        data[offset + 1] = source[from + 1] ?? 0;
+        data[offset + 2] = source[from + 2] ?? 0;
+      } else {
+        data[offset] = CABINET_BLACK[0];
+        data[offset + 1] = CABINET_BLACK[1];
+        data[offset + 2] = CABINET_BLACK[2];
+      }
       data[offset + 3] = 255;
       offset += BYTES_PER_PIXEL;
     }
@@ -269,19 +187,47 @@ export function renderPlayfieldInto(map: TableMap, target: PixelTarget): PixelTa
   return target;
 }
 
-/** Rasterises a map into a freshly allocated target. */
-export function renderPlayfield(map: TableMap): PixelTarget {
-  return renderPlayfieldInto(map, createPixelTarget(map.width, map.height));
+/** Registers artwork into a freshly allocated playfield-sized target. */
+export function renderPlayfield(artwork: PixelTarget): PixelTarget {
+  return renderPlayfieldInto(artwork, createPixelTarget(RASTER_WIDTH, RASTER_HEIGHT));
 }
 
 // ---------------------------------------------------------------------------
-// The static cache
+// The artwork a map is drawn with
 // ---------------------------------------------------------------------------
 
-// Keyed by map identity rather than table id: a reloaded or re-exported map is a
-// different object and must not silently reuse the previous table's pixels.
+// All three keyed by map identity rather than by table id: a reloaded or
+// re-exported map is a different object and must not silently inherit the
+// previous one's pixels.
+let artworkByMap = new WeakMap<TableMap, PixelTarget>();
 let rasterCache = new WeakMap<TableMap, PixelTarget>();
 let sourceCache = new WeakMap<TableMap, CanvasImageSource>();
+
+/**
+ * Tells the renderer which decoded artwork belongs to a map.
+ *
+ * Separate from the map loader because the two files are loaded independently
+ * and because the pixels have to be injectable: tests decode the shipped PNG
+ * themselves and hand it in here, with no canvas and no network anywhere.
+ * Re-registering different artwork drops the cached raster, so live-swapping a
+ * decode takes effect on the next frame.
+ */
+export function setPlayfieldArtwork(map: TableMap, artwork: PixelTarget): void {
+  if (artwork.width !== RASTER_WIDTH || artwork.height !== RASTER_HEIGHT) {
+    throw new RangeError(
+      `artwork for ${map.tableId} is ${artwork.width}x${artwork.height}, expected ${RASTER_WIDTH}x${RASTER_HEIGHT}`,
+    );
+  }
+  if (artworkByMap.get(map) !== artwork) {
+    invalidatePlayfieldRaster(map);
+  }
+  artworkByMap.set(map, artwork);
+}
+
+/** The artwork registered for a map, or null. */
+export function playfieldArtwork(map: TableMap): PixelTarget | null {
+  return artworkByMap.get(map) ?? null;
+}
 
 /**
  * The cached raster for a map, built on first use.
@@ -289,13 +235,24 @@ let sourceCache = new WeakMap<TableMap, CanvasImageSource>();
  * Returns the same object every time, so callers may compare by identity. The
  * buffer is shared — treat it as read-only; mutate it and every later frame
  * inherits the damage.
+ *
+ * Throws when no artwork has been registered. There is deliberately no
+ * procedural fallback: drawing something invented here when the real picture is
+ * missing is precisely the failure this renderer was rewritten to end, and a
+ * blank table would hide a broken asset path behind a plausible-looking screen.
  */
 export function playfieldRaster(map: TableMap): PixelTarget {
   const cached = rasterCache.get(map);
   if (cached !== undefined) {
     return cached;
   }
-  const raster = renderPlayfield(map);
+  const artwork = artworkByMap.get(map);
+  if (artwork === undefined) {
+    throw new Error(
+      `no playfield artwork registered for ${map.tableId}; load ${map.tableId}.art.png with loadTableArt() and call setPlayfieldArtwork() before rendering`,
+    );
+  }
+  const raster = renderPlayfield(artwork);
   rasterCache.set(map, raster);
   return raster;
 }
@@ -303,11 +260,12 @@ export function playfieldRaster(map: TableMap): PixelTarget {
 /**
  * Drops cached pixels so the next frame rebuilds them.
  *
- * With no argument it clears everything, which is the palette-tuning path: edit
- * a constant, call this, and the new look appears without a reload.
+ * With no argument it clears everything, including the registered artwork, which
+ * is what a test wants between cases.
  */
 export function invalidatePlayfieldRaster(map?: TableMap): void {
   if (map === undefined) {
+    artworkByMap = new WeakMap<TableMap, PixelTarget>();
     rasterCache = new WeakMap<TableMap, PixelTarget>();
     sourceCache = new WeakMap<TableMap, CanvasImageSource>();
     return;
@@ -379,15 +337,6 @@ export function playfieldBlitGeometry(map: TableMap, camera: CameraState, scale:
   };
 }
 
-/**
- * Uploads a raster to a canvas of its own.
- *
- * `OffscreenCanvas` when the runtime has it — the raster is a background asset
- * and has no business being in the document — falling back to a detached
- * `<canvas>` element, which is what Safari needed for most of this project's
- * life. The two canvas types have incompatible `getContext` overloads, so each
- * branch keeps its own concrete type instead of unioning them first.
- */
 /** The two context methods the upload needs, shared by both canvas flavours. */
 interface RasterUploadContext {
   createImageData(sw: number, sh: number): ImageData;
@@ -408,6 +357,19 @@ function uploadRaster(context: RasterUploadContext, raster: PixelTarget): void {
   context.putImageData(image, 0, 0);
 }
 
+/**
+ * Uploads a raster to a canvas of its own.
+ *
+ * `OffscreenCanvas` when the runtime has it — the raster is a background asset
+ * and has no business being in the document — falling back to a detached
+ * `<canvas>` element, which is what Safari needed for most of this project's
+ * life. The two canvas types have incompatible `getContext` overloads, so each
+ * branch keeps its own concrete type instead of unioning them first.
+ *
+ * `putImageData`, not `drawImage` of the PNG: the pixels go up exactly as the
+ * palette produced them, with no chance of a colour-managed decode changing a
+ * 1995 artist's RGB values on the way past.
+ */
 function rasterToCanvas(raster: PixelTarget): CanvasImageSource {
   if (typeof OffscreenCanvas !== "undefined") {
     const canvas = new OffscreenCanvas(raster.width, raster.height);

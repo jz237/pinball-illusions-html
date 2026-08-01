@@ -32,7 +32,7 @@
  * ---------------------------------------------------------------------------
  * WHY THE LANE BALL IS PINNED
  * ---------------------------------------------------------------------------
- * The shipped collision layer has no floor under the shooter lane — column 290
+ * The shipped collision layer has no floor under the shooter lane — column 322
  * of Law 'n Justice is free all the way to the last row — because on the real
  * machine the ball rests on the plunger rod, and the rod is no more present in
  * the playfield bitmap than the flippers are. A served ball therefore has to be
@@ -40,6 +40,23 @@
  * `laneBallId` is set the loop restores that ball to the serve point after the
  * step, and the moment the plunger fires the id is cleared and the ball becomes
  * an ordinary ball with an upward velocity.
+ *
+ * The same fact runs the other way too. A plunge too weak to carry the ball round
+ * the top arch drops back down the lane, and since the lane floor IS the rod, the
+ * ball ends up back on it: `ballBackOnTheRod` re-pins it and re-arms the plunger
+ * so the player may shoot again. Without that an under-plunge would leave a live
+ * ball resting in the lane with no way to move it and no way to lose it.
+ *
+ * ---------------------------------------------------------------------------
+ * THE BALL SEARCH
+ * ---------------------------------------------------------------------------
+ * `runBallSearch` writes off balls that have stayed inside a box of one ball
+ * radius for `ballSearchTicks`. It is a real mechanism — every machine has one —
+ * but it is also load-bearing here in a way it should not stay: the device layer
+ * does not exist yet, so nothing empties the playfield's kicker holes, and a ball
+ * that finds one would otherwise end the game silently. It is deliberately
+ * position-based rather than velocity-based; see `ballsLeftTheBox` for the two
+ * bugs that taught the current shape.
  *
  * ---------------------------------------------------------------------------
  * WHY `resolveFlipperContacts` IS CALLED WITHOUT A PUSH CLAMP
@@ -66,7 +83,23 @@ import {
   viewScale,
 } from "./camera.js";
 import { drawPlayfield } from "./playfield-renderer.js";
-import type { BallState, MaterialTable, SimulationForces, TableMap } from "../game/contracts.js";
+import {
+  BALL_FILL,
+  BALL_HIGHLIGHT,
+  BALL_SHADE,
+  FLIPPER_EDGE,
+  FLIPPER_FILL,
+  HUD_ALERT,
+  HUD_TEXT,
+  SURROUND,
+} from "./palette.js";
+import type {
+  BallState,
+  MaterialTable,
+  PlayfieldLevel,
+  SimulationForces,
+  TableMap,
+} from "../game/contracts.js";
 import { PLAYFIELD_WIDTH } from "../game/contracts.js";
 import type { Q10 } from "../core/fixed-point.js";
 import { q10ToPixel } from "../core/fixed-point.js";
@@ -102,6 +135,7 @@ import {
   resetPlunger,
   serveBall,
   servePosition,
+  shooterLaneFor,
   tickPlunger,
 } from "../game/plunger.js";
 import type { NudgeConfig, NudgeDirection, TiltState } from "../game/tilt.js";
@@ -138,6 +172,69 @@ export const SERVE_DELAY_TICKS = 50;
 /** Shorter for the first ball of a game — the player is already waiting. */
 export const FIRST_SERVE_DELAY_TICKS = 25;
 
+/**
+ * Ticks of a completely motionless table before the machine gives up on the
+ * ball — ten seconds at 50 Hz.
+ *
+ * Every real machine has this. It is called a ball search: when no switch has
+ * closed for long enough the machine pulses its coils, and if that does not
+ * shift anything it writes the ball off and serves the next one, because a ball
+ * that has settled somewhere the playfield cannot return it from would otherwise
+ * end the game silently. This reconstruction needs it for the same reason and
+ * one more: the device layer is not built yet. Law 'n Justice's playfield has
+ * places a ball legitimately arrives at and cannot leave under gravity alone —
+ * the spiral around the left spinner at about (86, 155) is the clearest — and on
+ * the real machine a kicker empties them. Until those devices exist, this is
+ * what stops the game hanging.
+ *
+ * (Every column named in this file is 32 larger than it was recorded as. The
+ * measurements were taken against maps exported a word out of phase, so each
+ * site was written down 32 px left of the geometry it names; the maps have since
+ * been re-exported and these are the same sites on the corrected frame. The rows
+ * are untouched, which is what makes it a translation rather than a fresh
+ * measurement — a horizontal reframe cannot move a row.)
+ *
+ * Ten seconds is long enough that nothing in normal play comes close: a ball is
+ * motionless only when it is wedged, since `stepBalls` zeroes the velocity of a
+ * ball that could not move rather than letting it grind on. Deliberately NOT
+ * applied to the ball sitting on the plunger rod, which is motionless on
+ * purpose and for as long as the player likes.
+ */
+export const BALL_SEARCH_TICKS = 500;
+
+/**
+ * How far a ball has to get from where the search's clock started before the
+ * machine counts it as something happening. One ball radius.
+ *
+ * The clock used to be reset by ANY change to the whole-pixel position of any
+ * live ball, and that made the search defeatable by a disturbance shorter than
+ * its own window. Measured on the real map: a ball wedged in the spiral at
+ * (86, 155) with the player nudging every 700 ticks is shoved a maximum of SEVEN
+ * pixels and comes back to the same pixel about 200 ticks later, so `stillTicks`
+ * climbed to exactly 493 and was reset — seven ticks short of the threshold —
+ * every 700 ticks for eighteen thousand consecutive ticks. The ball was never
+ * written off, `ballsServed` stalled on ball one and the game could not end.
+ * Nudging every 400 ticks held it under 70.
+ *
+ * A radius is the right size because it is the smallest displacement that could
+ * plausibly close a switch: a ball that has not moved by its own radius has not
+ * left the target, lane or hole it is sitting in, and the real mechanism watches
+ * switches, not micrometres. It also has honest margin at both ends, measured
+ * over thirty scripted games on Law 'n Justice:
+ *
+ *   - Wedged balls never leave the box at all (max excursion 7 px under repeated
+ *     nudging), so the clock runs uninterrupted to 500.
+ *   - The slowest legitimate motion on the table is a ball creeping round the top
+ *     arch at about a pixel every twenty ticks. Its longest stay inside a box
+ *     this size is 208 ticks, and the longest for any non-wedged ball anywhere on
+ *     the table is 205. Both are under half the threshold.
+ *
+ * Exact pixel equality had no margin at either end: 1 px of jitter reset it, and
+ * the arch crawl needed a position test rather than a velocity test to survive at
+ * all.
+ */
+export const BALL_SEARCH_BOX_PIXELS = BALL_RADIUS_PIXELS;
+
 export interface GameOptions {
   readonly ballsPerGame: number;
   /**
@@ -150,6 +247,8 @@ export interface GameOptions {
   readonly gravityY: Q10;
   readonly serveDelayTicks: number;
   readonly firstServeDelayTicks: number;
+  /** Motionless ticks before a ball is written off. See BALL_SEARCH_TICKS. */
+  readonly ballSearchTicks: number;
   readonly simulation: Partial<SimulationOptions>;
   readonly camera: CameraOptions;
 }
@@ -159,6 +258,7 @@ export const DEFAULT_GAME_OPTIONS: GameOptions = Object.freeze({
   gravityY: PLUNGER_REFERENCE_GRAVITY,
   serveDelayTicks: SERVE_DELAY_TICKS,
   firstServeDelayTicks: FIRST_SERVE_DELAY_TICKS,
+  ballSearchTicks: BALL_SEARCH_TICKS,
   simulation: Object.freeze({}),
   camera: DEFAULT_CAMERA_OPTIONS,
 });
@@ -178,6 +278,7 @@ function resolveGameOptions(options?: Partial<GameOptions>): GameOptions {
     gravityY: options?.gravityY ?? DEFAULT_GAME_OPTIONS.gravityY,
     serveDelayTicks: options?.serveDelayTicks ?? DEFAULT_GAME_OPTIONS.serveDelayTicks,
     firstServeDelayTicks: options?.firstServeDelayTicks ?? DEFAULT_GAME_OPTIONS.firstServeDelayTicks,
+    ballSearchTicks: options?.ballSearchTicks ?? DEFAULT_GAME_OPTIONS.ballSearchTicks,
     simulation: options?.simulation ?? DEFAULT_GAME_OPTIONS.simulation,
     camera: options?.camera ?? DEFAULT_GAME_OPTIONS.camera,
   };
@@ -210,6 +311,10 @@ export interface Game {
   /** The ball sitting on the plunger rod, or null once it has been launched. */
   laneBallId: number | null;
   serveCountdown: number;
+  /** Consecutive ticks with every live ball inside its box and none on the rod. */
+  stillTicks: number;
+  /** Where each live ball was when that run of ticks began. See `runBallSearch`. */
+  stillAnchors: readonly BallAnchor[];
   plunger: PlungerState;
   tilt: TiltState;
   flippers: FlipperBank;
@@ -251,6 +356,8 @@ export function createGame(map: TableMap, options?: Partial<GameOptions>): Game 
     ballsServed: 0,
     laneBallId: null,
     serveCountdown: 0,
+    stillTicks: 0,
+    stillAnchors: [],
     plunger: INITIAL_PLUNGER,
     tilt: INITIAL_TILT,
     flippers: createFlipperBank(map.tableId),
@@ -274,6 +381,8 @@ export function startGame(game: Game): void {
   game.ballsServed = 0;
   game.laneBallId = null;
   game.serveCountdown = game.options.firstServeDelayTicks;
+  game.stillTicks = 0;
+  game.stillAnchors = [];
   game.plunger = resetPlunger();
   game.tilt = resetTiltForNewBall();
   game.flippers = createFlipperBank(game.map.tableId);
@@ -421,6 +530,19 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     restThresholdOf(game),
   );
 
+  // A plunge too weak to clear the arch drops back down the lane, and the lane
+  // floor IS the plunger rod, so the ball ends up back on it and may be shot
+  // again. That is how the real machine behaves and it is why the shipped
+  // collision layer has no floor under the lane to begin with; without it, an
+  // under-plunge would strand the ball and end the game.
+  if (game.laneBallId === null) {
+    const returned = ballBackOnTheRod(game);
+    if (returned !== null) {
+      game.laneBallId = returned.id;
+      game.plunger = resetPlunger();
+    }
+  }
+
   // The plunger rod, which the collision layer does not contain. See the header.
   if (game.laneBallId !== null) {
     const ball = ballById(game.balls, game.laneBallId);
@@ -430,13 +552,18 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
       ball.y = home.y;
       ball.velocityX = 0;
       ball.velocityY = 0;
+      ball.level = 0;
     }
   }
 
+  // ---- ball search -------------------------------------------------------
+  const lost = runBallSearch(game);
+
   // ---- drain -------------------------------------------------------------
   let gameOver = false;
-  if (step.drained.length > 0) {
-    if (game.laneBallId !== null && step.drained.includes(game.laneBallId)) {
+  const drained = lost.length === 0 ? step.drained : [...step.drained, ...lost];
+  if (drained.length > 0) {
+    if (game.laneBallId !== null && drained.includes(game.laneBallId)) {
       game.laneBallId = null;
     }
     pruneInactiveBalls(game.balls);
@@ -459,10 +586,135 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     stepped: true,
     served,
     launched,
-    drained: step.drained,
+    drained,
     justTilted,
     gameOver,
   };
+}
+
+/**
+ * True when a ball is going nowhere.
+ *
+ * The test is the simulation's own rest threshold rather than exactly zero,
+ * because a wedged ball rarely comes to a dead stop: it keeps a unit or two of
+ * velocity that the contact resolution hands straight back every tick. Measured
+ * on the real map, a ball jammed in the spiral at (86, 155) sits there forever
+ * with velocity (-1, 1), and one settling at the foot of the shooter lane
+ * oscillates for hundreds of ticks at under a tenth of a pixel. Both are at
+ * rest by any standard a player would use; neither is at zero.
+ */
+function isAtRest(ball: BallState, threshold: number): boolean {
+  return Math.abs(ball.velocityX) <= threshold && Math.abs(ball.velocityY) <= threshold;
+}
+
+/**
+ * The ball that has rolled back onto the plunger rod, if there is one.
+ *
+ * "On the rod" is: exactly one ball in play, motionless, on the playfield level,
+ * and inside the shooter lane below the point where the lane hands over to the
+ * arch. The single-ball condition matters — during multiball a ball parked in
+ * the lane is a locked ball, not a served one, and re-arming the plunger for it
+ * would fire a ball the player never asked to serve.
+ */
+function ballBackOnTheRod(game: Game): BallState | null {
+  const live = activeBalls(game.balls);
+  const ball = live.length === 1 ? live[0] : undefined;
+  if (ball === undefined) return null;
+  if (ball.level !== 0) return null;
+  if (!isAtRest(ball, restThresholdOf(game))) return null;
+
+  const lane = shooterLaneFor(game.map.tableId);
+  const x = q10ToPixel(ball.x);
+  const y = q10ToPixel(ball.y);
+  if (x < lane.minCentreX || x > lane.maxCentreX) return null;
+  // Below the serve point, i.e. settled at the foot of the lane rather than
+  // hung up somewhere in the middle of it.
+  if (y < q10ToPixel(game.plungerConfig.serveY) - BALL_RADIUS_PIXELS) return null;
+  return ball;
+}
+
+/** Where one ball was when the ball search's clock last started. */
+interface BallAnchor {
+  readonly id: number;
+  readonly x: number;
+  readonly y: number;
+}
+
+function anchorsFor(balls: readonly BallState[]): BallAnchor[] {
+  return balls.map((ball) => ({ id: ball.id, x: q10ToPixel(ball.x), y: q10ToPixel(ball.y) }));
+}
+
+/**
+ * True when something has happened: the population changed, or some ball has
+ * left the box it was in when the clock started.
+ *
+ * The ball search's "has anything happened" test, and the reason it is POSITION
+ * rather than velocity, and a BOX rather than a pixel.
+ *
+ * A velocity test looked right and was wrong. A ball creeping along the top arch
+ * under gravity carries 14 to 70 Q10 per tick — well under the simulation's rest
+ * threshold of 160, and therefore "motionless" by that measure — but it is
+ * crossing the table at about a pixel every twenty ticks and takes several
+ * hundred to finish the shot. Judging by velocity wrote that ball off in the
+ * middle of a legitimate, if unhurried, orbit.
+ *
+ * Exact pixel equality against the PREVIOUS tick was the second wrong answer, and
+ * a worse one, because it made the search defeatable: any disturbance that moved
+ * a wedged ball by one pixel more often than every `ballSearchTicks` reset the
+ * clock forever, and a player nudging is exactly such a disturbance. See
+ * BALL_SEARCH_BOX_PIXELS for the measurements. The anchor is therefore held for
+ * the whole window rather than replaced every tick, and the comparison is against
+ * a box the size of the ball.
+ */
+function ballsLeftTheBox(
+  balls: readonly BallState[],
+  anchors: readonly BallAnchor[],
+  box: number,
+): boolean {
+  if (balls.length !== anchors.length) return true;
+  for (let i = 0; i < balls.length; i += 1) {
+    const ball = balls[i];
+    const anchor = anchors[i];
+    if (ball === undefined || anchor === undefined) return true;
+    if (ball.id !== anchor.id) return true;
+    if (Math.abs(q10ToPixel(ball.x) - anchor.x) > box) return true;
+    if (Math.abs(q10ToPixel(ball.y) - anchor.y) > box) return true;
+  }
+  return false;
+}
+
+/**
+ * Writes off balls the playfield has stopped returning. See BALL_SEARCH_TICKS.
+ *
+ * The clock only runs while every live ball has stayed inside a box one ball
+ * radius across and none is on the rod; real movement resets it, so a ball
+ * rattling in a lane or inching round a ramp is never written off. Returns the
+ * ids given up on, which the caller merges into the tick's drains so a lost ball
+ * goes through exactly the same lifecycle as one that went down the middle.
+ */
+function runBallSearch(game: Game): number[] {
+  const live = activeBalls(game.balls);
+  if (
+    live.length === 0 ||
+    game.laneBallId !== null ||
+    ballsLeftTheBox(live, game.stillAnchors, BALL_SEARCH_BOX_PIXELS)
+  ) {
+    game.stillTicks = 0;
+    game.stillAnchors = anchorsFor(live);
+    return [];
+  }
+
+  game.stillTicks += 1;
+  if (game.stillTicks < game.options.ballSearchTicks) return [];
+
+  game.stillTicks = 0;
+  game.stillAnchors = [];
+  const lost: number[] = [];
+  for (const ball of live) {
+    ball.active = false;
+    lost.push(ball.id);
+  }
+  return lost;
 }
 
 // ---------------------------------------------------------------------------
@@ -600,6 +852,8 @@ export interface BallDebugState {
   readonly velocityX: number;
   readonly velocityY: number;
   readonly active: boolean;
+  /** Which collision line the ball is riding: 0 the playfield, 1 the ramps. */
+  readonly level: PlayfieldLevel;
 }
 
 export interface GameDebugState {
@@ -615,6 +869,8 @@ export interface GameDebugState {
   readonly laneBallId: number | null;
   readonly serveCountdown: number;
   readonly plungerCharge: number;
+  /** Consecutive motionless ticks counted toward the ball search. */
+  readonly stillTicks: number;
   readonly tilt: TiltState;
   readonly flippersLive: boolean;
   readonly camera: CameraState;
@@ -646,6 +902,7 @@ export function debugSnapshot(game: Game): GameDebugState {
     laneBallId: game.laneBallId,
     serveCountdown: game.serveCountdown,
     plungerCharge: chargeLevel(game.plunger),
+    stillTicks: game.stillTicks,
     tilt: { ...game.tilt },
     flippersLive: flippersLive(game.tilt),
     camera: { ...game.camera },
@@ -659,6 +916,7 @@ export function debugSnapshot(game: Game): GameDebugState {
       velocityX: ball.velocityX,
       velocityY: ball.velocityY,
       active: ball.active,
+      level: ball.level,
     })),
     flippers: game.flippers.configs.map((config) => ({
       id: config.id,
@@ -675,15 +933,6 @@ export function debugSnapshot(game: Game): GameDebugState {
 export function canvasSizeFor(scale: number): { readonly width: number; readonly height: number } {
   return { width: PLAYFIELD_WIDTH * scale, height: VIEWPORT_HEIGHT * scale };
 }
-
-const BALL_FILL = "#e8eef6";
-const BALL_SHADE = "#7d8797";
-const BALL_HIGHLIGHT = "#ffffff";
-const FLIPPER_FILL = "#d8452f";
-const FLIPPER_EDGE = "#f7c948";
-const HUD_TEXT = "#9fb4cc";
-const HUD_ALERT = "#ff6b5a";
-const SURROUND = "#05070c";
 
 function screenPoint(
   game: Game,

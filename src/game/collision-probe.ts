@@ -382,6 +382,70 @@ export function moreDeflecting(candidate: MaterialBehaviour, incumbent: Material
 export interface RingProbe extends ContactResult {
   /** Ring index of the mean contact direction, or -1 when nothing was touched. */
   readonly contactIndex: number;
+  /**
+   * Outward surface normal as a Q10 unit vector — the mean contact direction
+   * reversed, WITHOUT being snapped to the ring. Zero when nothing was touched.
+   *
+   * See `outwardNormalOf` for why the snapped version is not good enough to
+   * reflect with.
+   */
+  readonly normalX: number;
+  readonly normalY: number;
+}
+
+/**
+ * The outward surface normal, as an exact Q10 unit vector rather than a ring
+ * entry.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY THE SNAPPED NORMAL IS NOT GOOD ENOUGH TO REFLECT WITH
+ * ---------------------------------------------------------------------------
+ * `meanContactIndex` rounds the mean contact direction onto one of the ring's
+ * 44 entries, and those entries are not evenly spaced: near the axes they are
+ * 7.1 degrees apart, because the closest neighbours of (0, 8) are (+-1, 8). So a
+ * surface whose true normal is 10.6 degrees off vertical is reflected off as
+ * though it were 7.1 — an error of up to about 4 degrees, which is HALF the
+ * whole static-friction angle the contact model works with. `WALL_FRICTION` is
+ * 154/1024, so a ball is held on anything shallower than atan(0.150) = 8.55
+ * degrees; the rounding therefore decides, on its own, whether a ball on a
+ * shallow ramp rolls or sticks.
+ *
+ * Measured, on the shipped Law 'n Justice map: a ball coasting up the top orbit
+ * comes to rest at (214.95, 20.93) on the upper collision line, touching the
+ * inner arc at (212, 28) and (213, 28). The mean of those two ring directions is
+ * 10.6 degrees off vertical, and the arc's own face there falls one row every
+ * four columns — a 14 degree slope, which is what a ball actually rolls down.
+ * Snapped, it reads 7.1 degrees, the friction budget of 3 Q10/tick exactly
+ * cancels the 3 Q10/tick of gravity along the surface, and the ball stops dead
+ * with velocity (0, 0) for the rest of the game. Fifteen of two hundred and
+ * seventy balls in an aggressive-player census ended on that single pixel.
+ *
+ * The reported `normalAngle` is deliberately left snapped: it is a contact
+ * RECORD for the scoring and device layers, it is one of the tabulated angles by
+ * construction, and every test that reads it is asserting that property. This is
+ * the vector the physics reflects about, and nothing about it is less
+ * deterministic — one integer square root and two integer divides, no
+ * trigonometry and no `Math.sqrt`.
+ *
+ * Falls back to the ring entry when the contacts cancel out exactly, which is
+ * the same degenerate case `meanContactIndex` handles: a ball wedged in a
+ * corridor touching both walls has no mean direction at all.
+ */
+export function outwardNormalOf(
+  ring: RingOffsets,
+  contactIndex: number,
+  sumX: number,
+  sumY: number,
+): { readonly x: number; readonly y: number } {
+  const lengthSquared = sumX * sumX + sumY * sumY;
+  if (lengthSquared === 0) {
+    const fallback = outwardNormalIndex(ring, contactIndex);
+    return { x: numberAt(ring.unitX, fallback), y: numberAt(ring.unitY, fallback) };
+  }
+  return {
+    x: unitComponent(-sumX, lengthSquared),
+    y: unitComponent(-sumY, lengthSquared),
+  };
 }
 
 /**
@@ -436,11 +500,19 @@ export function probeRing(
   }
 
   if (contacts.length === 0) {
-    return { contacts, normalAngle: null, dominant: null, contactIndex: -1 };
+    return { contacts, normalAngle: null, dominant: null, contactIndex: -1, normalX: 0, normalY: 0 };
   }
 
   const contactIndex = meanContactIndex(ring, contacts, sumX, sumY);
-  return { contacts, normalAngle: numberAt(ring.angle, contactIndex), dominant, contactIndex };
+  const normal = outwardNormalOf(ring, contactIndex, sumX, sumY);
+  return {
+    contacts,
+    normalAngle: numberAt(ring.angle, contactIndex),
+    dominant,
+    contactIndex,
+    normalX: normal.x,
+    normalY: normal.y,
+  };
 }
 
 /**

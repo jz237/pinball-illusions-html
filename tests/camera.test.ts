@@ -16,7 +16,9 @@ import type { BallState } from "../src/game/contracts.js";
 import { pixelsToQ10 } from "../src/core/fixed-point.js";
 
 function ball(id: number, y: number, active = true): BallState {
-  return { id, x: pixelsToQ10(168), y: pixelsToQ10(y), velocityX: 0, velocityY: 0, active };
+  // The camera frames a ball by its y alone, so which collision level it rides
+  // is irrelevant here; 0 is the playfield.
+  return { id, x: pixelsToQ10(168), y: pixelsToQ10(y), velocityX: 0, velocityY: 0, active, level: 0 };
 }
 
 const OPTIONS: CameraOptions = { ...DEFAULT_CAMERA_OPTIONS, maxScrollStep: 1000 };

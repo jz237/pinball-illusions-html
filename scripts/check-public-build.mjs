@@ -7,8 +7,9 @@
 // script is the mechanical check that keeps that true even when someone forgets.
 
 import { readdir, readFile, stat } from "node:fs/promises";
-import { join, relative, extname } from "node:path";
+import { join, relative, extname, dirname } from "node:path";
 import { existsSync } from "node:fs";
+import { createHash } from "node:crypto";
 
 const root = process.argv[2];
 if (!root || !existsSync(root)) {
@@ -40,6 +41,12 @@ const FORBIDDEN_TEXT = [
 
 const TEXT_EXT = new Set([
   ".js", ".mjs", ".cjs", ".css", ".html", ".json", ".map", ".svg", ".txt", ".webmanifest",
+]);
+
+// Raster images cannot carry provenance inside themselves, so every one of them
+// has to be accounted for by a manifest. See the artwork block near the bottom.
+const IMAGE_EXT = new Set([
+  ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".bmp", ".tif", ".tiff",
 ]);
 
 async function* walk(dir) {
@@ -81,31 +88,112 @@ for await (const file of walk(root)) {
   }
 }
 
-// Disk-derived collision geometry is permitted, but only deliberately. The maps
-// are functional geometry decoded from the operator's own disks — no artwork,
-// audio or executable code — and shipping them is an explicit decision rather
-// than something that happens because a file was copied into public/.
+// Disk-derived assets are permitted, but only deliberately. The maps are
+// functional collision geometry and the artwork is the playfield picture, both
+// decoded from the operator's own disks, and shipping either is an explicit
+// decision rather than something that happens because a file was copied into
+// public/.
+//
+// A JSON document declares its own class in a `sourceClass` field, so the maps
+// and the art manifests are found by scanning text. A PNG cannot: there is
+// nowhere in it to put a provenance block that this script could trust. So the
+// artwork is gated through its manifest, and — because a gate you can walk
+// around is not a gate — every raster image in the build must be claimed by a
+// manifest and match the digest that manifest records. An image nobody claims is
+// a violation whether or not the authorization variable is set: an unaccounted
+// picture in a build derived from someone's disks is exactly the thing this
+// script exists to stop.
 const AUTHORIZATION_ENV = "PINBALL_ILLUSIONS_DERIVED_AUTHORIZED";
-const DERIVED_MARKER = '"sourceClass":"disk-derived-collision-geometry"';
+const DERIVED_MARKERS = [
+  { class: "disk-derived-collision-geometry", noun: "collision map" },
+  { class: "disk-derived-playfield-artwork", noun: "playfield artwork" },
+];
+
+/** Tolerates both `"sourceClass":"x"` and the spaced form a formatter might emit. */
+function declaresClass(text, sourceClass) {
+  return new RegExp(`"sourceClass"\\s*:\\s*"${sourceClass}"`).test(text);
+}
 
 const derived = [];
+/** rel path of an image -> { manifest, sha256 } that claims it. */
+const claimed = new Map();
+const images = [];
+
 for await (const file of walk(root)) {
-  if (extname(file).toLowerCase() !== ".json") continue;
+  const rel = relative(root, file);
+  const ext = extname(file).toLowerCase();
+
+  if (IMAGE_EXT.has(ext)) images.push({ rel, file });
+  if (ext !== ".json") continue;
+
   const text = await readFile(file, "utf8");
-  if (text.includes(DERIVED_MARKER) || text.includes(DERIVED_MARKER.replaceAll('"', '" '))) {
-    derived.push(relative(root, file));
+  const marker = DERIVED_MARKERS.find((m) => declaresClass(text, m.class));
+  if (marker === undefined) continue;
+  derived.push({ rel, noun: marker.noun });
+
+  // An artwork manifest must also account for the image it ships beside.
+  if (marker.class !== "disk-derived-playfield-artwork") continue;
+  let doc;
+  try {
+    doc = JSON.parse(text);
+  } catch {
+    violations.push(`${rel}: declares disk-derived artwork but is not valid JSON`);
+    continue;
+  }
+  const name = doc?.image?.file;
+  const digest = doc?.image?.sha256;
+  if (typeof name !== "string" || !/^[A-Za-z0-9._-]+$/.test(name)) {
+    violations.push(`${rel}: artwork manifest does not name its image in image.file`);
+    continue;
+  }
+  if (typeof digest !== "string" || !/^[0-9a-f]{64}$/.test(digest)) {
+    violations.push(`${rel}: artwork manifest ${name} carries no sha256 digest`);
+    continue;
+  }
+  const target = join(dirname(rel), name);
+  if (claimed.has(target)) {
+    violations.push(`${rel}: ${target} is already claimed by ${claimed.get(target).manifest}`);
+    continue;
+  }
+  claimed.set(target, { manifest: rel, sha256: digest });
+}
+
+// Every image must be claimed, and must be the image that was claimed.
+for (const { rel, file } of images) {
+  const claim = claimed.get(rel);
+  if (claim === undefined) {
+    violations.push(
+      `${rel}: raster image with no manifest — nothing in this build says where it came from`,
+    );
+    continue;
+  }
+  const actual = createHash("sha256").update(await readFile(file)).digest("hex");
+  if (actual !== claim.sha256) {
+    violations.push(
+      `${rel}: sha256 ${actual.slice(0, 16)} does not match the ${claim.sha256.slice(0, 16)} ` +
+        `recorded in ${claim.manifest}`,
+    );
+    continue;
+  }
+  derived.push({ rel, noun: "playfield artwork" });
+}
+
+// A manifest that ships without its image is a broken build, not a safe one.
+for (const [target, claim] of claimed) {
+  if (!images.some((image) => image.rel === target)) {
+    violations.push(`${claim.manifest}: claims ${target}, which is not in the build`);
   }
 }
 
 if (derived.length > 0 && process.env[AUTHORIZATION_ENV] !== "1") {
   console.error(
-    `guard:public — REFUSING BUILD: ${derived.length} disk-derived map(s) present ` +
+    `guard:public — REFUSING BUILD: ${derived.length} disk-derived asset(s) present ` +
       `without ${AUTHORIZATION_ENV}=1`,
   );
-  for (const d of derived) console.error(`  - ${d}`);
+  for (const d of derived) console.error(`  - ${d.rel} (${d.noun})`);
   console.error(
-    `\n  These are collision geometry decoded from the original disks. Set ` +
-      `${AUTHORIZATION_ENV}=1 to confirm you intend to publish them.`,
+    `\n  These are collision geometry and playfield artwork decoded from the original ` +
+      `disks. Set ${AUTHORIZATION_ENV}=1 to confirm you intend to publish them.`,
   );
   process.exit(1);
 }
@@ -116,5 +204,5 @@ if (violations.length > 0) {
   process.exit(1);
 }
 
-const note = derived.length > 0 ? `, ${derived.length} authorized derived map(s)` : "";
+const note = derived.length > 0 ? `, ${derived.length} authorized derived asset(s)` : "";
 console.log(`guard:public — clean (${root}${note})`);

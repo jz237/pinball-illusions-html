@@ -27,38 +27,78 @@ collision map for all three tables has been decoded and shipped:
 ### What runs today
 
 A Q10 fixed-point N-ball simulation, a 50 Hz fixed-step scheduler, ring-based
-collision against the decoded map, three flippers, a plunger, nudge and tilt, a
-scrolling camera that reframes to the whole table during multiball, a procedural
-Canvas2D renderer in period style, and a game loop — 557 vitest cases, strict
-`tsc` clean, `npm run build` green.
+collision against the decoded map on BOTH of its collision levels, three
+flippers, a plunger, nudge and tilt, a scrolling camera that reframes to the
+whole table during multiball, a Canvas2D renderer that blits the decoded 336x600
+playfield artwork at integer scale with smoothing off, and a game loop — strict
+`tsc` clean and `npm run build` green.
 
-A ball serves in the shooter lane, the plunger launches it, the flippers send it
-back up the table, tilt kills the flippers, nothing escapes the playfield, and an
-identical input sequence reproduces byte for byte.
+A ball serves in the shooter lane, a full plunge carries it up the lane and round
+the top arch onto the playfield, the flippers send it back up the table, it
+drains, the next ball is served, and after three the game ends. Tilt kills the
+flippers, nothing escapes the playfield, and an identical input sequence
+reproduces byte for byte.
 
-### The one thing standing between this and playable
+**All three tables play a three-ball game, and all three drain every ball down
+the middle.** Extreme Sports was the last holdout: it used to end every single
+ball as a ball-search write-off on one pixel, (302,163), and its apparent
+30-in-30 completion rate was entirely the search retiring stuck balls. Its crown
+ramp does not stop there — it continues on the UPPER collision line, down a
+wireform to y=380 and back onto the playfield — and `crown-mouth` and
+`crown-end` in `src/game/playfield-levels.ts` are that pair of hand-offs, both
+read off the shipped map.
 
-**A game cannot reach ball two.** Law 'n Justice's map carries no collision line
-in its top rows, so there is no arch to turn the vertical launch into a lateral
-entry onto the playfield. A full-charge launch peaks at y=34 against a ceiling at
-y=34: the ball rises up the shooter lane, meets a flat soffit dead-on with no
-sideways velocity, falls back down the lane and rests there. No ball ever drains.
+**Balls are no longer written off while they are still moving.** Friction used
+to be a flat 15% of the ball's whole along-surface speed, taken on every tick of
+contact: not Coulomb friction but a viscous damper. It gave a ball on a slope a
+terminal crawl of 0.001-0.036 px/tick instead of letting it accelerate, and
+since the ball search asks for 8 px in 500 ticks, balls that were visibly
+rolling were being retired as lost. `reflectVelocity` now takes a tangential
+impulse bounded by the normal impulse, which is the real rule.
 
-A synthesised sloped arch was tried and reverted — it did free the ball but
-measurably degraded the flipper return, at which point the numbers were being
-fitted to tests rather than to the original. The likelier explanation is that the
-arch is not missing at all: slots 1 and 3 of each table package are still
-unidentified, and slot 3 is a raster of identical size on all three tables.
-Decoding those comes before inventing anything.
+### The arch, and why a ball used to be stuck in the lane
 
-`tests/plays.test.ts` records this with an `it.fails` characterisation test, so
-the suite stays green while the gap exists and starts failing the moment real
-geometry makes a ball drain.
+For a long time a game could not reach ball two: Law 'n Justice's LOWER collision
+line stops dead at the top of the shooter lane — no bit-0 pixel anywhere in
+columns 281..300 above y=560, and none at all in rows 0..34 — so a launched ball
+met a flat virtual ceiling, fell back down the lane and rested there forever.
+
+The arch was never missing. It is on the UPPER collision line (map bit 1), which
+the engine correctly treated as passable for a ball on the playfield and had no
+other use for. The lane's two walls are upper-only up to y=126, carry BOTH lines
+through y=127..175, and are lower-only from y=176 down; above that hand-off they
+curve left as two concentric arcs that cap the whole table, forming a channel
+about 21 px wide — a 16 px ball and no more.
+
+So the ball now carries a level, `src/game/playfield-levels.ts` supplies the
+upper-level view of the map and the hand-off lines, and a full plunge rides the
+real, authored ramp. The earlier synthesised sloped arch is gone.
+
+That hand-off is not Law 'n Justice's alone, and it is no longer hand-tuned.
+`src/game/level-scan.ts` derives it from any map: walk the shooter lane's centre
+column, take the free-ball-centre run on each collision line, and a **hand-off
+band** is a run of rows where both lines carry the same channel — over which the
+probe ring reads identically, so a level change there cannot be felt. Which way
+the gate points comes from which line still carries the channel beyond the band.
+Run against the shipped maps it finds Law 'n Justice's 49-row band on its own,
+plus BabeWatch's (whose lower line otherwise seals the served ball in a 577-cell
+box) and Extreme Sports' two (whose lane changes line twice). `tests/level-scan.test.ts`
+re-runs the derivation on every build and asserts the shipped gates are what it
+produces, so those constants stay checkably derived rather than merely asserted.
+
+Two things there are honest about their status. The row at which the ramp puts
+the ball back on the playfield is **inferred, not read** — the ramp's outboard
+rail runs off the edge of the bitmap and the channel pinches shut below y=91, so
+the ball must leave somewhere, but nothing in the data says where. And the ball
+search — a real machine's "nothing has moved, write the ball off" timeout — is
+currently doing more work than it should, because the playfield has kicker holes
+that the undecoded device layer would empty. Both are documented at the point of
+use with the measurements that constrain them.
 
 ### Not started
 
 Devices, rules and scoring; table select, options and high-score screens; audio;
-BabeWatch and Extreme Sports beyond their shared engine support.
+BabeWatch and Extreme Sports beyond geometry and the shared engine.
 
 See [docs/DISK_ANALYSIS.md](docs/DISK_ANALYSIS.md) and
 [docs/GAMEPLAY_PARITY.md](docs/GAMEPLAY_PARITY.md).
@@ -91,8 +131,8 @@ from *recovering the filesystem* to *understanding the table packages*.
 
 What does carry over is the architecture proven in the sibling projects: Q10
 fixed-point deterministic physics on a fixed-step scheduler, declarative table
-geometry compiled to material maps, a procedural Canvas2D renderer that draws from
-those maps rather than from extracted sprites, Web Audio synthesis, and a build
+geometry compiled to material maps, an unsmoothed integer-scaled Canvas2D
+renderer, Web Audio synthesis, and a build
 that refuses to ship preservation media.
 
 ## Development
@@ -115,10 +155,17 @@ this project draws is between **functional geometry** and **creative content**:
   records where the walls, rails and devices are — the facts the physics needs — and
   contains no artwork, audio or executable code. This is the same approach the
   Pinball Dreams reconstruction shipped with.
-- **Everything visible or audible is newly created.** Playfield artwork is drawn
-  fresh in period style rather than extracted; audio is synthesised or independently
-  recreated. No disk image, ROM, Amiga executable, ripped bitmap or ripped sample
-  enters this repository or any build.
+- **Playfield artwork is disk-derived too, and gated the same way.** The 256-colour
+  336x600 picture and its palette are decoded from the operator's own disks and
+  shipped as `public/generated/tables/*.art.png`, each beside a manifest carrying the
+  `disk-derived-playfield-artwork` provenance marker and the image's sha256. It is a
+  still image: no audio, no executable code. Shipping it is an explicit decision by
+  the operator, and `npm run guard:public` refuses a build that contains it — or any
+  raster image no manifest accounts for, or one whose bytes do not match the digest
+  its manifest records — unless the authorization variable is set.
+- **Audio is newly created.** Synthesised or independently recreated rather than
+  sampled. No disk image, ROM, Amiga executable or ripped sample enters this
+  repository or any build.
 
 Publishing the derived maps is a deliberate act, not an accident of file layout.
 `npm run guard:public` refuses the build if a map carrying the

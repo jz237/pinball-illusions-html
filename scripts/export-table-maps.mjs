@@ -11,6 +11,27 @@
 //   bit 2 (4)  level-0 structure area     offset  52080   600 rows
 //   bit 3 (8)  level-1 structure area     offset  77280   600 rows
 //
+// THE PHASE MATTERS, exactly as it does for slot 3 in export-table-art.mjs.
+// The segment file is 102,488 bytes and the big-endian u32 at offset 0 reads
+// 102,480, so there are 8 bytes that are not payload. The natural guess is that
+// all 8 sit at the front (length word + 4 unused) and that is WRONG: the payload
+// begins at byte 4, immediately after the length word, and the 4 spare bytes sit
+// at the END. Reading from byte 8 takes the right number of bytes four too late,
+// which slides every 42-byte layer row by 4 bytes — exactly 32 pixels at 1 bpp —
+// and wraps the leftmost 32 px of each row round onto the end of the row above.
+//
+// The proof is in the bytes. Table002.seg02.bin bytes 4..7 are FF FF FF FF, the
+// map's top border line and unmistakably data, while its last 4 bytes are
+// 00 00 00 00; Table003 likewise ends 07 FF FF FF 00 00 00 00. Independently,
+// sweeping the decoded map against the slot-3 artwork's edge field peaks at
+// dx=0, dy=0 with the payload framed at 4 (lift 2.17 / 2.06 / 2.02) and is flat
+// near zero when framed at 8, where the same peak reappears out at dx=+32.
+// See _pinball_research/illusions/reg_phase.py, which runs both framings side by
+// side, and the matching header note in export-table-art.mjs: BOTH slots put
+// their spare 4 bytes at the end. `assertAlignment` below cannot catch this —
+// the 32 px slide is horizontal and hits every layer equally, so containment
+// stays high. Only the artwork sweep catches it.
+//
 // Every layer is 42 bytes (336 px) per row. An earlier decode read this as four
 // equal 610-row planes at 0 / 25620 / 51240 / 76860, which slides bit 2 twenty
 // rows low and bits 1 and 3 ten rows low and makes the 16 union values mean
@@ -44,8 +65,15 @@ const HEIGHT = 600;
 /** Bytes per layer row: 336 pixels at 1 bit per pixel. */
 const STRIDE = WIDTH / 8;
 
-/** Slot 2 opens with a big-endian u32 payload length and 4 unused bytes. */
-const PREAMBLE = 8;
+/**
+ * Slot 2 opens with a big-endian u32 payload length and NOTHING else; the
+ * segment's 4 spare bytes are at the END, not here. 4, not 8 — see the header
+ * comment. This matches PHASE in export-table-art.mjs.
+ */
+const PREAMBLE = 4;
+
+/** Bytes of slack after the payload. Present, and must be exactly this many. */
+const TRAILER = 4;
 
 /** The four layers, in bit order. `bit` is the value ORed into the pixel index. */
 const LAYERS = [
@@ -109,10 +137,30 @@ function assertLayout(payloadLength) {
 function decode(bytes) {
   const declared =
     (bytes[0] << 24 >>> 0) + (bytes[1] << 16) + (bytes[2] << 8) + bytes[3];
-  const payload = bytes.subarray(PREAMBLE);
-  if (declared !== payload.length) {
-    throw new Error(`preamble declares ${declared} payload bytes, file carries ${payload.length}`);
+  if (bytes.length !== PREAMBLE + declared + TRAILER) {
+    throw new Error(
+      `segment is ${bytes.length} bytes; the length word declares ${declared}, so with a ` +
+        `${PREAMBLE}-byte preamble and a ${TRAILER}-byte trailer it should be ` +
+        `${PREAMBLE + declared + TRAILER}`,
+    );
   }
+  const payload = bytes.subarray(PREAMBLE, PREAMBLE + declared);
+
+  // The slack is at the end and is zero there. This is a genuine phase check on
+  // two of the three tables: framed one word too late, the four bytes treated as
+  // slack would be bytes 4..7, which on Table002 are FF FF FF FF (the map's top
+  // border) and on Table003 are part of a run of set bits. It is NOT sufficient
+  // on its own — Table001's bytes 4..7 happen to be zero too — which is why the
+  // artwork registration sweep, not this, is the authority. See the header.
+  for (let i = PREAMBLE + declared; i < bytes.length; i += 1) {
+    if (bytes[i] !== 0) {
+      throw new Error(
+        `trailing slack byte ${i} is 0x${bytes[i].toString(16)}, not zero; the payload does not ` +
+          `end where PREAMBLE=${PREAMBLE} says it does`,
+      );
+    }
+  }
+
   assertLayout(payload.length);
 
   const pixels = new Uint8Array(WIDTH * HEIGHT);

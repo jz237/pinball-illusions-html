@@ -1,131 +1,388 @@
+/**
+ * ---------------------------------------------------------------------------
+ * WHAT THESE TESTS ARE FOR
+ * ---------------------------------------------------------------------------
+ * The renderer this file covers previously drew a procedural wireframe of the
+ * collision map — cyan and yellow lines on near-black — and shipped it to a live
+ * URL. Twenty-six tests were green the whole time, because every one of them
+ * asserted that the output was DETERMINISTIC. A wrong picture is perfectly
+ * deterministic.
+ *
+ * So the load-bearing test in this file is `the playfield IS the original
+ * artwork`: it decodes the shipped `<table>.art.png` with its own reader — node
+ * `zlib`, not the `DecompressionStream` path the source uses — applies the PLTE
+ * itself, and demands that every pixel the renderer produces is that colour.
+ * Not "stable", not "plausible": the same bytes as the disk. Everything else
+ * here is scaffolding around that.
+ */
+
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
+import { inflateSync } from "node:zlib";
 import {
+  ART_REGISTRATION_OFFSET_X,
+  ART_REGISTRATION_OFFSET_Y,
   BYTES_PER_PIXEL,
+  RASTER_HEIGHT,
+  RASTER_WIDTH,
   createPixelTarget,
   drawPlayfield,
   integerScaleFor,
   invalidatePlayfieldRaster,
+  playfieldArtwork,
   playfieldBlitGeometry,
-  playfieldColourAt,
   playfieldRaster,
   renderPlayfield,
   renderPlayfieldInto,
+  setPlayfieldArtwork,
 } from "../src/browser/playfield-renderer.js";
-import type { BlitContext } from "../src/browser/playfield-renderer.js";
-import {
-  DECK_TONES,
-  LOWER_EDGE_DIM,
-  LOWER_EDGE_LIT,
-  RAMP_BODY,
-  RAMP_DARK,
-  RAMP_LIGHT,
-  RAMP_SHADOW_OFFSET_X,
-  RAMP_SHADOW_OFFSET_Y,
-  RAMP_SHADOW_STRENGTH,
-  STRUCTURE_BODY,
-  STRUCTURE_DARK,
-  STRUCTURE_LIGHT,
-  UPPER_RAIL_DIM,
-  UPPER_RAIL_LIT,
-  shade,
-  toHex,
-} from "../src/browser/palette.js";
-import type { Rgb } from "../src/browser/palette.js";
+import type { BlitContext, PixelTarget } from "../src/browser/playfield-renderer.js";
+import { CABINET_BLACK } from "../src/browser/palette.js";
+import { loadTableArt } from "../src/game/table-art.js";
+import type { TableArtFetch } from "../src/game/table-art.js";
+import { parseTableMapDocument } from "../src/game/table-map.js";
 import { VIEWPORT_HEIGHT } from "../src/browser/camera.js";
 import type { CameraState } from "../src/browser/camera.js";
-import { PLAYFIELD_HEIGHT, PLAYFIELD_WIDTH } from "../src/game/contracts.js";
-import type { MaterialIndex, TableMap } from "../src/game/contracts.js";
-import { OUT_OF_BOUNDS_MATERIAL } from "../src/game/table-map.js";
+import { PLAYFIELD_HEIGHT, PLAYFIELD_WIDTH, TABLE_IDS } from "../src/game/contracts.js";
+import type { TableId, TableMap, TableMapDocument } from "../src/game/contracts.js";
 
-/**
- * A hand-painted playfield.
- *
- * Real maps are 200,000 pixels of overlapping layers and prove nothing about
- * *which* rule produced a given colour. These fixtures are full-size — so the
- * dither and the camera see the real geometry — but carry a handful of isolated
- * rectangles, far enough apart that no test pixel is accidentally inside
- * another shape's bevel or drop shadow.
- */
-interface Rect {
-  readonly x0: number;
-  readonly y0: number;
-  readonly x1: number;
-  readonly y1: number;
-  readonly index: MaterialIndex;
+// ---------------------------------------------------------------------------
+// The shipped assets
+// ---------------------------------------------------------------------------
+
+const TABLES_DIR = fileURLToPath(new URL("../public/generated/tables/", import.meta.url));
+
+function assetBytes(name: string): Buffer {
+  return readFileSync(`${TABLES_DIR}${name}`);
 }
 
-function buildMap(rects: readonly Rect[]): TableMap {
-  const pixels = new Uint8Array(PLAYFIELD_WIDTH * PLAYFIELD_HEIGHT);
-  for (const rect of rects) {
-    for (let y = rect.y0; y <= rect.y1; y += 1) {
-      pixels.fill(rect.index, y * PLAYFIELD_WIDTH + rect.x0, y * PLAYFIELD_WIDTH + rect.x1 + 1);
+/** Three colour bytes per pixel, row-major. What the artwork "really is". */
+interface ReferenceImage {
+  readonly width: number;
+  readonly height: number;
+  readonly rgb: Uint8Array;
+  readonly indices: Uint8Array;
+  readonly palette: Uint8Array;
+}
+
+/**
+ * A second, independent PNG reader.
+ *
+ * Deliberately not the one in `src/game/table-art.ts`: this one uses node's
+ * synchronous `zlib` rather than `DecompressionStream`, walks the chunks with
+ * its own loop, and does its own palette lookup. Two implementations that agree
+ * on 201,600 pixels are evidence; one implementation compared against itself is
+ * not. Assumes filter 0 on every row, and asserts it rather than handling the
+ * other four — the exporter writes filter 0, and a file that suddenly did not
+ * should fail loudly here.
+ */
+function decodePngIndependently(bytes: Buffer): ReferenceImage {
+  const signature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+  for (let i = 0; i < signature.length; i += 1) {
+    if (bytes[i] !== signature[i]) throw new Error("reference decode: not a PNG");
+  }
+
+  let offset = signature.length;
+  let width = 0;
+  let height = 0;
+  let palette: Buffer | null = null;
+  const idat: Buffer[] = [];
+
+  while (offset + 8 <= bytes.length) {
+    const length = bytes.readUInt32BE(offset);
+    const tag = bytes.toString("latin1", offset + 4, offset + 8);
+    const payload = bytes.subarray(offset + 8, offset + 8 + length);
+    if (tag === "IHDR") {
+      width = payload.readUInt32BE(0);
+      height = payload.readUInt32BE(4);
+      if (payload[8] !== 8 || payload[9] !== 3 || payload[12] !== 0) {
+        throw new Error("reference decode: not an 8-bit non-interlaced indexed PNG");
+      }
+    } else if (tag === "PLTE") {
+      palette = Buffer.from(payload);
+    } else if (tag === "IDAT") {
+      idat.push(Buffer.from(payload));
+    } else if (tag === "IEND") {
+      break;
+    }
+    offset += 12 + length;
+  }
+
+  if (palette === null) throw new Error("reference decode: no PLTE");
+  const raw = inflateSync(Buffer.concat(idat));
+  const indices = new Uint8Array(width * height);
+  for (let y = 0; y < height; y += 1) {
+    const at = y * (1 + width);
+    if (raw[at] !== 0) throw new Error(`reference decode: row ${y} uses filter ${String(raw[at])}`);
+    indices.set(raw.subarray(at + 1, at + 1 + width), y * width);
+  }
+
+  const rgb = new Uint8Array(width * height * 3);
+  for (let i = 0; i < indices.length; i += 1) {
+    const entry = (indices[i] ?? 0) * 3;
+    rgb[i * 3] = palette[entry] ?? 0;
+    rgb[i * 3 + 1] = palette[entry + 1] ?? 0;
+    rgb[i * 3 + 2] = palette[entry + 2] ?? 0;
+  }
+
+  return { width, height, rgb, indices, palette: new Uint8Array(palette) };
+}
+
+interface ArtManifest {
+  readonly schema: string;
+  readonly width: number;
+  readonly height: number;
+  readonly image: { readonly file: string; readonly sha256: string };
+  readonly palette: { readonly indicesUsed: number };
+  readonly provenance: { readonly sourceClass: string; readonly authorizationRequired: boolean };
+}
+
+function manifestFor(tableId: TableId): ArtManifest {
+  return JSON.parse(assetBytes(`${tableId}.art.json`).toString("utf8")) as ArtManifest;
+}
+
+function referenceFor(tableId: TableId): ReferenceImage {
+  return decodePngIndependently(assetBytes(`${tableId}.art.png`));
+}
+
+function realMap(tableId: TableId): TableMap {
+  const doc = JSON.parse(assetBytes(`${tableId}.map.json`).toString("utf8")) as TableMapDocument;
+  return parseTableMapDocument(doc);
+}
+
+/**
+ * The production loader, pointed at the files on disk instead of the network.
+ *
+ * The point of routing through `loadTableArt` rather than reading the PNG
+ * straight into the renderer is that the URL it builds, the decode it performs
+ * and the size check it applies are all on the path under test — the browser
+ * runs the same code with a real `fetch`.
+ */
+const fileFetch: TableArtFetch = async (url) => {
+  const name = url.slice(url.lastIndexOf("/") + 1);
+  const bytes = assetBytes(name);
+  return {
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    arrayBuffer: async () =>
+      bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer,
+  };
+};
+
+async function loadShippedArt(tableId: TableId): Promise<PixelTarget> {
+  return await loadTableArt(tableId, fileFetch, "");
+}
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+type Rgb = readonly [number, number, number];
+
+function pixelAt(target: PixelTarget, x: number, y: number): Rgb {
+  const at = (y * target.width + x) * BYTES_PER_PIXEL;
+  return [target.data[at] ?? 0, target.data[at + 1] ?? 0, target.data[at + 2] ?? 0];
+}
+
+function referencePixelAt(image: ReferenceImage, x: number, y: number): Rgb {
+  const at = (y * image.width + x) * 3;
+  return [image.rgb[at] ?? 0, image.rgb[at + 1] ?? 0, image.rgb[at + 2] ?? 0];
+}
+
+/**
+ * Artwork that is obviously not a playfield, for the plumbing tests.
+ *
+ * Every pixel a different value derived from its coordinates and the seed, so a
+ * raster built from one is distinguishable from a raster built from another at
+ * any single pixel — which is what the cache-isolation tests need.
+ */
+function syntheticArtwork(seed: number): PixelTarget {
+  const target = createPixelTarget(PLAYFIELD_WIDTH, PLAYFIELD_HEIGHT);
+  for (let y = 0; y < PLAYFIELD_HEIGHT; y += 1) {
+    for (let x = 0; x < PLAYFIELD_WIDTH; x += 1) {
+      const at = (y * PLAYFIELD_WIDTH + x) * BYTES_PER_PIXEL;
+      target.data[at] = (x + seed) & 0xff;
+      target.data[at + 1] = (y + seed) & 0xff;
+      target.data[at + 2] = (x ^ y ^ seed) & 0xff;
+      target.data[at + 3] = 255;
     }
   }
+  return target;
+}
+
+function mapFixture(tableId: TableId = "law-n-justice"): TableMap {
+  const pixels = new Uint8Array(PLAYFIELD_WIDTH * PLAYFIELD_HEIGHT);
   return {
-    tableId: "law-n-justice",
+    tableId,
     displayName: "Fixture",
     width: PLAYFIELD_WIDTH,
     height: PLAYFIELD_HEIGHT,
     pixels,
-    materialAt(x: number, y: number): MaterialIndex {
-      const px = Math.floor(x);
-      const py = Math.floor(y);
-      if (px < 0 || px >= PLAYFIELD_WIDTH || py < 0 || py >= PLAYFIELD_HEIGHT) {
-        return OUT_OF_BOUNDS_MATERIAL;
-      }
-      return (pixels[py * PLAYFIELD_WIDTH + px] ?? 0) as MaterialIndex;
-    },
+    materialAt: () => 0,
   };
 }
 
-/** Lower-level furniture: a bit-2 body ringed by its bit-0 collision line. */
-const BODY: Rect[] = [
-  { x0: 40, y0: 100, x1: 70, y1: 140, index: 5 }, // bit 0 + bit 2 — the outline
-  { x0: 41, y0: 101, x1: 69, y1: 139, index: 4 }, // bit 2 alone — the fill
-];
+// ---------------------------------------------------------------------------
+// The correctness test. This is the one that matters.
+// ---------------------------------------------------------------------------
 
-/** Upper level: a ramp deck with a rail down its left edge. */
-const RAMP: Rect[] = [
-  { x0: 150, y0: 200, x1: 190, y1: 260, index: 8 }, // bit 3 — the raised deck
-  { x0: 150, y0: 200, x1: 150, y1: 260, index: 10 }, // bit 3 + bit 1 — its rail
-];
+describe("the playfield IS the original artwork", () => {
+  for (const tableId of TABLE_IDS) {
+    it(`draws ${tableId} pixel for pixel as the exported playfield artwork`, async () => {
+      invalidatePlayfieldRaster();
+      const reference = referenceFor(tableId);
+      const map = realMap(tableId);
+      setPlayfieldArtwork(map, await loadShippedArt(tableId));
+      const raster = playfieldRaster(map);
 
-/** The raised deck lying over lower-level furniture and a lower-level wall. */
-const OVERPASS: Rect[] = [
-  { x0: 240, y0: 400, x1: 280, y1: 440, index: 12 }, // bit 2 + bit 3
-  { x0: 250, y0: 410, x1: 270, y1: 420, index: 13 }, // bit 0 + bit 2 + bit 3
-];
+      expect(reference.width).toBe(RASTER_WIDTH);
+      expect(reference.height).toBe(RASTER_HEIGHT);
 
-const FIXTURE = buildMap([...BODY, ...RAMP, ...OVERPASS]);
+      // Compared through the declared registration offset rather than at 0,0, so
+      // this test still states the truth if the offset ever becomes non-zero.
+      let compared = 0;
+      let matched = 0;
+      let firstMiss: string | null = null;
+      for (let y = 0; y < RASTER_HEIGHT; y += 1) {
+        const sourceY = y - ART_REGISTRATION_OFFSET_Y;
+        if (sourceY < 0 || sourceY >= reference.height) continue;
+        for (let x = 0; x < RASTER_WIDTH; x += 1) {
+          const sourceX = x - ART_REGISTRATION_OFFSET_X;
+          if (sourceX < 0 || sourceX >= reference.width) continue;
+          compared += 1;
+          const drawn = pixelAt(raster, x, y);
+          const original = referencePixelAt(reference, sourceX, sourceY);
+          if (drawn[0] === original[0] && drawn[1] === original[1] && drawn[2] === original[2]) {
+            matched += 1;
+          } else if (firstMiss === null) {
+            firstMiss = `at (${x}, ${y}) the renderer drew ${drawn.join()} where the disk says ${original.join()}`;
+          }
+        }
+      }
 
-function colour(map: TableMap, x: number, y: number): Rgb {
-  return playfieldColourAt(map, x, y);
-}
+      expect(compared).toBe(RASTER_WIDTH * RASTER_HEIGHT);
+      expect(firstMiss).toBeNull();
+      expect(matched / compared).toBeGreaterThanOrEqual(0.9999);
+      expect(matched).toBe(compared);
+    });
 
-function isSame(a: Rgb, b: Rgb): boolean {
-  return a[0] === b[0] && a[1] === b[1] && a[2] === b[2];
-}
+    it(`draws ${tableId} as a full-colour picture, not a drawing of the collision map`, async () => {
+      invalidatePlayfieldRaster();
+      const map = realMap(tableId);
+      setPlayfieldArtwork(map, await loadShippedArt(tableId));
+      const raster = playfieldRaster(map);
 
-function isOneOf(value: Rgb, options: readonly Rgb[]): boolean {
-  return options.some((option) => isSame(value, option));
-}
+      // The procedural renderer this replaced had thirteen colours in the whole
+      // table and exactly TWO over bare deck, because it painted by material
+      // bit. Real artwork cannot be described that way: the paint varies where
+      // the collision map is uniform, which is the difference between a picture
+      // of the table and a diagram of it.
+      const everywhere = new Set<number>();
+      const overBareDeck = new Set<number>();
+      let bareDeckPixels = 0;
+      for (let y = 0; y < RASTER_HEIGHT; y += 1) {
+        for (let x = 0; x < RASTER_WIDTH; x += 1) {
+          const [r, g, b] = pixelAt(raster, x, y);
+          const key = (r << 16) | (g << 8) | b;
+          everywhere.add(key);
+          if (map.materialAt(x, y) === 0) {
+            overBareDeck.add(key);
+            bareDeckPixels += 1;
+          }
+        }
+      }
 
-/** Reads a pixel back out of a rasterised target. */
-function pixelAt(target: { width: number; data: Uint8ClampedArray }, x: number, y: number): Rgb {
-  const offset = (y * target.width + x) * BYTES_PER_PIXEL;
-  return [target.data[offset] ?? 0, target.data[offset + 1] ?? 0, target.data[offset + 2] ?? 0];
-}
+      expect(everywhere.size).toBeGreaterThanOrEqual(150);
+      expect(bareDeckPixels).toBeGreaterThan(50_000);
+      expect(overBareDeck.size).toBeGreaterThanOrEqual(100);
+    });
+  }
+
+  it("ships artwork that still matches the manifest it was exported with", () => {
+    for (const tableId of TABLE_IDS) {
+      const manifest = manifestFor(tableId);
+      const png = assetBytes(`${tableId}.art.png`);
+      const reference = referenceFor(tableId);
+
+      expect(manifest.schema).toBe("pinball-illusions/table-art/v1");
+      expect(manifest.image.file).toBe(`${tableId}.art.png`);
+      expect(createHash("sha256").update(png).digest("hex")).toBe(manifest.image.sha256);
+      expect(manifest.width).toBe(RASTER_WIDTH);
+      expect(manifest.height).toBe(RASTER_HEIGHT);
+      expect(new Set(reference.indices).size).toBe(manifest.palette.indicesUsed);
+
+      // The artwork is disk-derived and gated by the same marker as the maps.
+      // A build guard that can be walked around by deleting a field is not a
+      // guard, so the field is asserted here as well as in the build script.
+      expect(manifest.provenance.sourceClass).toBe("disk-derived-playfield-artwork");
+      expect(manifest.provenance.authorizationRequired).toBe(true);
+    }
+  });
+
+  it("keeps the collision map out of the picture entirely", async () => {
+    // Two different maps, one artwork: the pixels must be identical. If anything
+    // in the renderer ever consults `materialAt` again, this fails.
+    invalidatePlayfieldRaster();
+    const artwork = await loadShippedArt("law-n-justice");
+    const lawMap = realMap("law-n-justice");
+    const babeMap = realMap("babewatch");
+    setPlayfieldArtwork(lawMap, artwork);
+    setPlayfieldArtwork(babeMap, artwork);
+    expect(playfieldRaster(babeMap).data).toEqual(playfieldRaster(lawMap).data);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Registration
+// ---------------------------------------------------------------------------
+
+describe("registration", () => {
+  it("states a whole-pixel offset between the artwork and the map", () => {
+    expect(Number.isInteger(ART_REGISTRATION_OFFSET_X)).toBe(true);
+    expect(Number.isInteger(ART_REGISTRATION_OFFSET_Y)).toBe(true);
+    // Sub-pixel registration would mean resampling, which would destroy the
+    // chunky 1:1 look the whole renderer exists to preserve.
+    expect(Math.abs(ART_REGISTRATION_OFFSET_X)).toBeLessThan(RASTER_WIDTH);
+    expect(Math.abs(ART_REGISTRATION_OFFSET_Y)).toBeLessThan(RASTER_HEIGHT);
+  });
+
+  it("places the artwork at exactly that offset", () => {
+    const artwork = syntheticArtwork(7);
+    const raster = renderPlayfield(artwork);
+    for (const [x, y] of [
+      [0, 0],
+      [17, 3],
+      [200, 401],
+      [RASTER_WIDTH - 1, RASTER_HEIGHT - 1],
+    ] as const) {
+      const sourceX = x - ART_REGISTRATION_OFFSET_X;
+      const sourceY = y - ART_REGISTRATION_OFFSET_Y;
+      const inside =
+        sourceX >= 0 && sourceX < artwork.width && sourceY >= 0 && sourceY < artwork.height;
+      expect(pixelAt(raster, x, y)).toEqual(
+        inside ? pixelAt(artwork, sourceX, sourceY) : [...CABINET_BLACK],
+      );
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Raster shape
+// ---------------------------------------------------------------------------
 
 describe("raster shape", () => {
-  it("rasterises exactly one pixel per map pixel", () => {
-    const raster = renderPlayfield(FIXTURE);
+  it("rasterises exactly one pixel per playfield pixel", () => {
+    const raster = renderPlayfield(syntheticArtwork(1));
     expect(raster.width).toBe(PLAYFIELD_WIDTH);
     expect(raster.height).toBe(PLAYFIELD_HEIGHT);
     expect(raster.data.length).toBe(PLAYFIELD_WIDTH * PLAYFIELD_HEIGHT * BYTES_PER_PIXEL);
   });
 
   it("leaves every pixel fully opaque", () => {
-    const raster = renderPlayfield(FIXTURE);
+    const raster = renderPlayfield(syntheticArtwork(2));
     let transparent = 0;
     for (let i = 3; i < raster.data.length; i += BYTES_PER_PIXEL) {
       if (raster.data[i] !== 255) transparent += 1;
@@ -133,175 +390,108 @@ describe("raster shape", () => {
     expect(transparent).toBe(0);
   });
 
-  it("refuses a target that is not the map's size, rather than scaling", () => {
+  it("refuses a target that is not the playfield's size, rather than scaling", () => {
     const wrong = createPixelTarget(PLAYFIELD_WIDTH, PLAYFIELD_HEIGHT - 1);
-    expect(() => renderPlayfieldInto(FIXTURE, wrong)).toThrow(/1:1/);
+    expect(() => renderPlayfieldInto(syntheticArtwork(3), wrong)).toThrow(/1:1/);
   });
 
   it("fills the target it was given", () => {
+    const artwork = syntheticArtwork(4);
     const target = createPixelTarget(PLAYFIELD_WIDTH, PLAYFIELD_HEIGHT);
-    expect(renderPlayfieldInto(FIXTURE, target)).toBe(target);
-    expect(pixelAt(target, 10, 10)).toEqual(colour(FIXTURE, 10, 10));
+    expect(renderPlayfieldInto(artwork, target)).toBe(target);
+    expect(pixelAt(target, 10, 10)).toEqual(pixelAt(artwork, 10, 10));
   });
 });
 
-describe("bare playfield", () => {
-  it("renders index 0 as a deck tone", () => {
-    // (10, 10) is far from every fixture shape, so nothing can be shading it.
-    expect(FIXTURE.materialAt(10, 10)).toBe(0);
-    expect(isOneOf(colour(FIXTURE, 10, 10), DECK_TONES)).toBe(true);
+// ---------------------------------------------------------------------------
+// Supplying the artwork
+// ---------------------------------------------------------------------------
+
+describe("the artwork a map is drawn with", () => {
+  it("refuses to invent a playfield when no artwork has been loaded", () => {
+    invalidatePlayfieldRaster();
+    const map = mapFixture();
+    expect(playfieldArtwork(map)).toBeNull();
+    // No procedural fallback and no blank table: an unloaded asset has to be
+    // loud, because a plausible-looking substitute is how the wrong picture
+    // shipped in the first place.
+    expect(() => playfieldRaster(map)).toThrow(/no playfield artwork registered/);
   });
 
-  it("dithers the deck between exactly two tones and nothing else", () => {
-    const empty = buildMap([]);
-    const seen = new Set<string>();
-    for (let y = 0; y < PLAYFIELD_HEIGHT; y += 7) {
-      for (let x = 0; x < PLAYFIELD_WIDTH; x += 5) {
-        seen.add(toHex(colour(empty, x, y)));
-      }
-    }
-    expect([...seen].sort()).toEqual([...DECK_TONES].map(toHex).sort());
+  it("refuses artwork that is not the playfield's size", () => {
+    invalidatePlayfieldRaster();
+    const map = mapFixture();
+    const small = createPixelTarget(PLAYFIELD_WIDTH, PLAYFIELD_HEIGHT - 1);
+    expect(() => setPlayfieldArtwork(map, small)).toThrow(/expected 336x600/);
   });
 
-  it("shades the deck darker toward the top of the table", () => {
-    const empty = buildMap([]);
-    let topLight = 0;
-    let bottomLight = 0;
-    for (let x = 0; x < PLAYFIELD_WIDTH; x += 1) {
-      if (isSame(colour(empty, x, 5), DECK_TONES[1] ?? [0, 0, 0])) topLight += 1;
-      if (isSame(colour(empty, x, PLAYFIELD_HEIGHT - 5), DECK_TONES[1] ?? [0, 0, 0])) bottomLight += 1;
-    }
-    expect(bottomLight).toBeGreaterThan(topLight);
-  });
-});
-
-describe("lower-level structure (bit 2)", () => {
-  it("renders a bit-2 pixel as furniture, not as background", () => {
-    const inside = colour(FIXTURE, 55, 120);
-    expect(FIXTURE.materialAt(55, 120)).toBe(4);
-    expect(isSame(inside, STRUCTURE_BODY)).toBe(true);
-    expect(isOneOf(inside, DECK_TONES)).toBe(false);
+  it("hands back the artwork it was given", () => {
+    invalidatePlayfieldRaster();
+    const map = mapFixture();
+    const artwork = syntheticArtwork(5);
+    setPlayfieldArtwork(map, artwork);
+    expect(playfieldArtwork(map)).toBe(artwork);
   });
 
-  it("bevels the body: lit where it meets open space above, shaded below", () => {
-    // Column 55 crosses the fill between the outline rows at y=100 and y=140.
-    expect(isSame(colour(FIXTURE, 55, 101), STRUCTURE_LIGHT)).toBe(false);
-    const strip = buildMap([{ x0: 100, y0: 300, x1: 120, y1: 320, index: 4 }]);
-    expect(isSame(colour(strip, 110, 300), STRUCTURE_LIGHT)).toBe(true);
-    expect(isSame(colour(strip, 110, 320), STRUCTURE_DARK)).toBe(true);
-    expect(isSame(colour(strip, 110, 310), STRUCTURE_BODY)).toBe(true);
-  });
-});
-
-describe("lower-level collision line (bit 0)", () => {
-  it("renders a bit-0 pixel as an edge colour", () => {
-    expect(FIXTURE.materialAt(55, 100)).toBe(5);
-    expect(isOneOf(colour(FIXTURE, 55, 100), [LOWER_EDGE_LIT, LOWER_EDGE_DIM])).toBe(true);
-  });
-
-  it("lights the top of the outline and dims its underside", () => {
-    expect(isSame(colour(FIXTURE, 55, 100), LOWER_EDGE_LIT)).toBe(true);
-    expect(isSame(colour(FIXTURE, 55, 140), LOWER_EDGE_DIM)).toBe(true);
-  });
-
-  it("draws the edge over the body it rings, never the other way round", () => {
-    // Index 5 is bit 0 AND bit 2; the collision line must win.
-    const both = buildMap([{ x0: 100, y0: 300, x1: 120, y1: 320, index: 5 }]);
-    expect(isOneOf(colour(both, 110, 310), [LOWER_EDGE_LIT, LOWER_EDGE_DIM])).toBe(true);
-    expect(isSame(colour(both, 110, 310), STRUCTURE_BODY)).toBe(false);
-  });
-});
-
-describe("upper level (bits 1 and 3)", () => {
-  it("renders the raised deck in its own colours", () => {
-    expect(FIXTURE.materialAt(170, 230)).toBe(8);
-    expect(isOneOf(colour(FIXTURE, 170, 230), [RAMP_LIGHT, RAMP_BODY, RAMP_DARK])).toBe(true);
-    expect(isSame(colour(FIXTURE, 170, 200), RAMP_LIGHT)).toBe(true);
-    expect(isSame(colour(FIXTURE, 170, 260), RAMP_DARK)).toBe(true);
-  });
-
-  it("renders a bit-1 rail in the upper-level colour, distinct from the lower edge", () => {
-    expect(FIXTURE.materialAt(150, 230)).toBe(10);
-    expect(isOneOf(colour(FIXTURE, 150, 230), [UPPER_RAIL_LIT, UPPER_RAIL_DIM])).toBe(true);
-    expect(isOneOf(colour(FIXTURE, 150, 230), [LOWER_EDGE_LIT, LOWER_EDGE_DIM])).toBe(false);
-  });
-
-  it("occludes the lower level, the way the original's ball blitter does", () => {
-    // 12 = lower structure under a raised deck; 13 = a lower wall under one.
-    expect(FIXTURE.materialAt(245, 430)).toBe(12);
-    expect(isOneOf(colour(FIXTURE, 245, 430), [RAMP_LIGHT, RAMP_BODY, RAMP_DARK])).toBe(true);
-    expect(FIXTURE.materialAt(260, 415)).toBe(13);
-    expect(isOneOf(colour(FIXTURE, 260, 415), [LOWER_EDGE_LIT, LOWER_EDGE_DIM])).toBe(false);
-  });
-
-  it("casts an offset shadow onto the deck below, so ramps read as raised", () => {
-    // Just past the bottom-right corner of the ramp block, inside the offset.
-    const x = 190 + RAMP_SHADOW_OFFSET_X;
-    const y = 260 + RAMP_SHADOW_OFFSET_Y;
-    expect(FIXTURE.materialAt(x, y)).toBe(0);
-
-    // The same coordinates on an empty table give the unshadowed deck tone.
-    // Comparing against a neighbouring pixel instead would compare across the
-    // dither and prove nothing.
-    const unshadowed = colour(buildMap([]), x, y);
-    expect(isOneOf(unshadowed, DECK_TONES)).toBe(true);
-
-    const shadowed = colour(FIXTURE, x, y);
-    expect(isOneOf(shadowed, DECK_TONES)).toBe(false);
-    expect(isSame(shadowed, shade(unshadowed, RAMP_SHADOW_STRENGTH))).toBe(true);
+  it("rebuilds when different artwork is registered for the same map", () => {
+    invalidatePlayfieldRaster();
+    const map = mapFixture();
+    setPlayfieldArtwork(map, syntheticArtwork(6));
+    const before = pixelAt(playfieldRaster(map), 40, 40);
+    setPlayfieldArtwork(map, syntheticArtwork(9));
+    const after = pixelAt(playfieldRaster(map), 40, 40);
+    expect(after).not.toEqual(before);
   });
 });
 
 describe("the static cache", () => {
   it("returns the identical raster twice", () => {
     invalidatePlayfieldRaster();
-    const first = playfieldRaster(FIXTURE);
-    const second = playfieldRaster(FIXTURE);
-    expect(second).toBe(first);
+    const map = mapFixture();
+    setPlayfieldArtwork(map, syntheticArtwork(10));
+    const first = playfieldRaster(map);
+    expect(playfieldRaster(map)).toBe(first);
   });
 
   it("rebuilds byte-for-byte identical pixels after invalidation", () => {
     invalidatePlayfieldRaster();
-    const before = playfieldRaster(FIXTURE);
+    const map = mapFixture();
+    setPlayfieldArtwork(map, syntheticArtwork(11));
+    const before = playfieldRaster(map);
     const snapshot = Uint8ClampedArray.from(before.data);
-    invalidatePlayfieldRaster(FIXTURE);
-    const after = playfieldRaster(FIXTURE);
+    invalidatePlayfieldRaster(map);
+    const after = playfieldRaster(map);
     expect(after).not.toBe(before);
     expect(after.data).toEqual(snapshot);
   });
 
   it("does not hand one map's pixels to another", () => {
     invalidatePlayfieldRaster();
-    const other = buildMap([{ x0: 0, y0: 0, x1: 335, y1: 599, index: 4 }]);
-    expect(playfieldRaster(other)).not.toBe(playfieldRaster(FIXTURE));
-    expect(pixelAt(playfieldRaster(other), 10, 10)).not.toEqual(pixelAt(playfieldRaster(FIXTURE), 10, 10));
+    const one = mapFixture("law-n-justice");
+    const other = mapFixture("babewatch");
+    setPlayfieldArtwork(one, syntheticArtwork(12));
+    setPlayfieldArtwork(other, syntheticArtwork(13));
+    expect(playfieldRaster(other)).not.toBe(playfieldRaster(one));
+    expect(pixelAt(playfieldRaster(other), 10, 10)).not.toEqual(pixelAt(playfieldRaster(one), 10, 10));
+  });
+
+  it("forgets the artwork too when everything is invalidated", () => {
+    invalidatePlayfieldRaster();
+    const map = mapFixture();
+    setPlayfieldArtwork(map, syntheticArtwork(14));
+    invalidatePlayfieldRaster();
+    expect(playfieldArtwork(map)).toBeNull();
   });
 });
 
-describe("determinism", () => {
-  it("renders the same bytes on every run", () => {
-    expect(renderPlayfield(FIXTURE).data).toEqual(renderPlayfield(FIXTURE).data);
-  });
-
-  it("agrees pixel for pixel with the per-pixel colour function", () => {
-    const raster = renderPlayfield(FIXTURE);
-    for (const [x, y] of [
-      [0, 0],
-      [55, 100],
-      [55, 120],
-      [150, 230],
-      [170, 230],
-      [245, 430],
-      [335, 599],
-    ] as const) {
-      expect(pixelAt(raster, x, y)).toEqual(colour(FIXTURE, x, y));
-    }
-  });
-});
+// ---------------------------------------------------------------------------
+// Blitting
+// ---------------------------------------------------------------------------
 
 describe("blitting", () => {
   const scrolling: CameraState = { scrollY: 200, mode: "scrolling" };
   const fullTable: CameraState = { scrollY: 0, mode: "full-table" };
+  const map = mapFixture();
 
   it("picks the largest whole magnification that fits, never below 1", () => {
     expect(integerScaleFor(PLAYFIELD_WIDTH * 3, VIEWPORT_HEIGHT * 3)).toBe(3);
@@ -311,7 +501,7 @@ describe("blitting", () => {
   });
 
   it("reads a viewport-sized window at the camera's scroll position", () => {
-    const geometry = playfieldBlitGeometry(FIXTURE, scrolling, 2);
+    const geometry = playfieldBlitGeometry(map, scrolling, 2);
     expect(geometry.sourceY).toBe(200);
     expect(geometry.sourceWidth).toBe(PLAYFIELD_WIDTH);
     expect(geometry.sourceHeight).toBe(VIEWPORT_HEIGHT);
@@ -320,12 +510,12 @@ describe("blitting", () => {
   });
 
   it("clamps a scroll position that never went through the camera", () => {
-    const geometry = playfieldBlitGeometry(FIXTURE, { scrollY: 9999, mode: "scrolling" }, 1);
+    const geometry = playfieldBlitGeometry(map, { scrollY: 9999, mode: "scrolling" }, 1);
     expect(geometry.sourceY).toBe(PLAYFIELD_HEIGHT - VIEWPORT_HEIGHT);
   });
 
   it("shows the whole table in multiball, scaled to the viewport height", () => {
-    const geometry = playfieldBlitGeometry(FIXTURE, fullTable, 1);
+    const geometry = playfieldBlitGeometry(map, fullTable, 1);
     expect(geometry.sourceY).toBe(0);
     expect(geometry.sourceHeight).toBe(PLAYFIELD_HEIGHT);
     expect(geometry.destHeight).toBeCloseTo(VIEWPORT_HEIGHT);
@@ -333,6 +523,9 @@ describe("blitting", () => {
   });
 
   it("turns smoothing off every frame, because the context is shared", () => {
+    invalidatePlayfieldRaster();
+    const target = mapFixture();
+    setPlayfieldArtwork(target, syntheticArtwork(15));
     let drawn = 0;
     const context: BlitContext = {
       imageSmoothingEnabled: true,
@@ -342,7 +535,7 @@ describe("blitting", () => {
     };
     // Uploading the raster needs a canvas, which node has not got. The flag is
     // set before the upload is attempted, which is what this asserts.
-    expect(() => drawPlayfield(context, FIXTURE, scrolling, 2)).toThrow();
+    expect(() => drawPlayfield(context, target, scrolling, 2)).toThrow(/canvas/);
     expect(context.imageSmoothingEnabled).toBe(false);
     expect(drawn).toBe(0);
   });

@@ -5,7 +5,7 @@
  * Everything it touches — the router, the loop, the simulation — was written to
  * run without one, and this module supplies the four things they cannot get for
  * themselves: a canvas, a keyboard, a clock, and the table data over the
- * network.
+ * network — both halves of it, the collision map and the playfield artwork.
  *
  * Law 'n Justice is loaded because it is the table whose geometry has actually
  * been measured — its shooter lane, its flipper pivots and its 26-row virtual
@@ -26,8 +26,9 @@ import {
 } from "./browser/game-loop.js";
 import type { Game, GameDebugState } from "./browser/game-loop.js";
 import type { Control } from "./browser/input.js";
-import { integerScaleFor } from "./browser/playfield-renderer.js";
+import { integerScaleFor, setPlayfieldArtwork } from "./browser/playfield-renderer.js";
 import { loadTableMap } from "./game/table-map.js";
+import { loadTableArt } from "./game/table-art.js";
 import type { TableId } from "./game/contracts.js";
 
 const TABLE: TableId = "law-n-justice";
@@ -124,7 +125,13 @@ async function boot(): Promise<void> {
   const context = requireContext(canvas);
   const router = new InputRouter();
 
-  const map = await loadTableMap(TABLE);
+  // Two files per table, and both are required. The map is the collision
+  // geometry the physics reads; the artwork is the picture the player sees.
+  // Fetched together because neither depends on the other, and awaited before
+  // the loop starts because the renderer refuses to draw a table whose artwork
+  // is missing rather than inventing a substitute for it.
+  const [map, artwork] = await Promise.all([loadTableMap(TABLE), loadTableArt(TABLE)]);
+  setPlayfieldArtwork(map, artwork);
   const game = createGame(map);
 
   let scale = fitCanvas(canvas);

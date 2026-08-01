@@ -38,6 +38,15 @@ export const TABLE_IDS = ["law-n-justice", "babewatch", "extreme-sports"] as con
 export type TableId = (typeof TABLE_IDS)[number];
 
 /**
+ * Which of the two collision lines a ball is riding.
+ *
+ * 0 is the playfield (bit 0), 1 is the ramp and habitrail network (bit 1). The
+ * original engine held exactly this as a plane pointer and tested one plane at
+ * a time; `playfield-levels.ts` has the geometry and the hand-off rules.
+ */
+export type PlayfieldLevel = 0 | 1;
+
+/**
  * How a material behaves when a ball touches it.
  *
  * `passable` materials are surfaces the ball rolls over; everything else
@@ -108,6 +117,16 @@ export interface BallState {
   velocityY: number;
   /** False once drained; kept in the list so ids stay stable during multiball. */
   active: boolean;
+  /**
+   * Which collision line this ball is riding: 0 the playfield, 1 the ramps.
+   *
+   * The map carries two independent collision lines and a pixel that blocks on
+   * one may be open on the other — Law 'n Justice's top arch exists only on
+   * line 1, its shooter-lane floor only on line 0 — so "solid" is not a
+   * property of the map alone. See `playfield-levels.ts` for the two views and
+   * for where a ball changes between them.
+   */
+  level: PlayfieldLevel;
 }
 
 /** A contact detected between a ball's probe ring and a non-passable pixel. */

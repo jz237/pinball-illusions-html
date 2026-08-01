@@ -363,12 +363,19 @@ export interface FlipperConfig {
  *     shifted 28 px right on BabeWatch and Extreme Sports. Every wall run in
  *     rows 538..556 matches Law 'n Justice's exactly under that shift.
  *   * The two inlane guide rails end in rounded tips whose last blocking pixels
- *     are at x = 43..44 and x = 175..176 on row 556 (Law 'n Justice), so the
- *     bottom of the table is symmetric about x = 109.5.
+ *     are at x = 75..76 and x = 207..208 on row 556 (Law 'n Justice), so the
+ *     bottom of the table is symmetric about x = 141.5.
  *   * Row 558 is the first row below those tips, and the free ball-CENTRE span
- *     across it — computed with the real 8 px radius — is exactly 52..167 on
- *     Law 'n Justice and exactly 80..195 on the other two. Those endpoints are
+ *     across it — computed with the real 8 px radius — is exactly 84..199 on
+ *     Law 'n Justice and exactly 112..227 on the other two. Those endpoints are
  *     symmetric about the same axis to the pixel.
+ *
+ * Every column in that paragraph is 32 px right of where it used to read, and
+ * the reason is not a re-derivation: the shipped collision maps were exported a
+ * word out of phase and have been re-exported (see `plunger.ts` for the byte
+ * evidence). The measurement is the same measurement, run again on the corrected
+ * bitmap. The ROW numbers — 556, 558 — are untouched, because a horizontal
+ * reframe cannot move a row.
  *
  * The pivots are placed on those endpoints. That puts the boss 3.7 px clear of
  * the guide tip, far less than the 16 px a ball needs, so no ball can pass
@@ -409,9 +416,9 @@ export const LOWER_FLIPPER_PIVOT_ROW = 558;
 export const LOWER_FLIPPER_PIVOT_COLUMNS: Readonly<
   Record<TableId, { readonly left: number; readonly right: number }>
 > = Object.freeze({
-  "law-n-justice": Object.freeze({ left: 52, right: 167 }),
-  babewatch: Object.freeze({ left: 80, right: 195 }),
-  "extreme-sports": Object.freeze({ left: 80, right: 195 }),
+  "law-n-justice": Object.freeze({ left: 84, right: 199 }),
+  babewatch: Object.freeze({ left: 112, right: 227 }),
+  "extreme-sports": Object.freeze({ left: 112, right: 227 }),
 });
 
 function lowerFlipper(
