@@ -53,13 +53,39 @@ Illusions is the first in the series to have it, and it is the reason the engine
 cannot simply be lifted from the Dreams or Fantasies reconstructions — both of those
 simulate exactly one ball.
 
-- Sources disagree on the ceiling: some say up to three balls, others up to six.
-  **The `.opt` record previously offered as a cap is not one** — record 7 is the view
-  mode (see Options). What the engine says instead: balls in play is a word at
-  `$DBC(a5)` derived by *counting occupied slots* in the 8-byte array at `$EE2(a5)`
-  (`main.seg00` `0x4ADC–0x4B0C`) and clamped to a maximum of **8** at `0x4B10` — never
-  read from a constant. So the engine's hard ceiling is 8; the per-mode ball count is
-  still **[open]**. **[disk]**
+- **The ceiling is THREE, and this is now settled.** Sources disagreed (three versus
+  six) and this document previously said eight, reading the 8-entry array at
+  `$EE2(a5)` / count at `$DBC(a5)` as balls. That array is the **players**, not the
+  balls. The ball array is built at `main.seg00` data `0x3536`:
+  `lea $f92(a5),a0 / lea $f9e(a5),a1 / lea $faa(a5),a4 / move.w #$2,d7` then a `dbra`
+  with `adda.w #$6e,a4` — exactly **three** objects of 110 bytes, and
+  `$FAA + 3*0x6E = $10F4` with the next live global at `$10F6`, so there is no room
+  for a fourth. Corroborated twice more, by the per-ball render-buffer init at
+  `0x34C0` (`move.w #$3,d0`) and the reset-all loop at `0x3E84`. And the multiball
+  opcode itself refuses more: handler data `0x5BCC` starts
+  `move.w $2(a1),d1 / cmpi.w #$3,d1 / bhi` — a request for four falls straight through
+  and does nothing. **[disk]**
+- **Multiball is a TOP-UP, not a fixed count.** Opcode `$6C` takes the target ball
+  count as a word parameter and loops `while (live + queued < N) queued++`, so two-ball
+  and three-ball multiballs are both expressible; which one a given table asks for is
+  per-table script data and is still **[open]**. A locked ball is released by opcode
+  `$68` (data `0x5B4E`), which does *not* kick it out of the saucer — it clears the
+  held flag, re-initialises the ball object and increments the serve queue `$D86(a5)`.
+  Locked balls come back out of the **plunger lane**, one at a time, gated by
+  `$D88/$D89(a5)`. **[disk]**
+- **A held ball is frozen, not removed.** Capture is zone type 4, handler data
+  `0x552A`: it refuses if the ball is already held or the saucer occupied, records the
+  ball id at `device+$01`, sets bit 7 of the ball's flag byte
+  (`ori.b #$80,$1(a4)`), awards score and bonus, and never touches the position. The
+  integrator then skips any ball carrying that bit — `tst.b $1(a4)` / `bmi` at
+  `0xA684`, `0xA6CE`, `0xA718`. **[disk]**
+- **How many locks light multiball is NOT in the shared engine, and that is a result.**
+  The engine keeps two lock counters — per device at `+$03` and global at `$23E4(a5)` —
+  and reads **neither**; `$23E4` is written at exactly one site (`0x5554`) and read at
+  zero sites across `main.seg00` and `main.seg01`. Worse, `device+$02`, the byte that
+  gates those increments, is **zero on every type-4 device on all three tables as
+  shipped**, so the counting path is dead at load time. The rule lives in per-table
+  script data and the script streams have not been located. **[open]**
 - The display switches to a high-resolution full-screen mode while multiball is
   active so every ball stays visible; toggleable by the player. **[src]** — the
   mechanism is now identified as option record 7 with its two display configurations
@@ -73,6 +99,17 @@ Engineering consequence: the simulation must be N-ball from the start — ball l
 ball-to-ball collision, per-ball state, drain handling while others remain live, and
 a camera policy that changes when ball count exceeds one. Retrofitting this later
 would mean rewriting the physics core.
+
+**Implemented**, in `src/game/ball-locks.ts` and the lock section of
+`src/browser/game-loop.ts`. The ten decoded capture rectangles, capture, freeze,
+release-to-serve-queue, the three-ball ceiling and the top-up are all as above. Two
+things are **reconstruction and are labelled as such in the code**: that two balls
+locked lights multiball (BabeWatch's own string `LOCK 2 BALLS 4 M-BALL`, and the only
+value that fills the three-ball ceiling without exceeding it), and that a capture
+which leaves nothing rolling buys the player a replacement ball. Balls the machine
+owes itself are auto-launched after half a second, because a player already flipping
+two balls cannot also be winding a spring; a ball the *player* was given is never
+auto-launched.
 
 ## Options — SETTLED
 
@@ -428,11 +465,19 @@ under emulation as the cheapest way to get it.
   BCD ramps from one list on one tick, selected by bit 0 of object`+0x01`, so an
   up-ramping bonus and a down-ramping timer are literally the same loop on the same
   frame. **Which ramp object is the bonus is [open].** **[disk]**
-- An "Iron Man" mode described as a **four-ball** multiball. **NOT ESTABLISHED.** No
-  literal 4 is used as a ball count anywhere; the mode object is referenced by exactly
-  four award records, three of which look like locks, which *would* give four balls —
-  but that is an inference from record counts, not a decoded constant. The table's own
-  menu blurb says "Iron Man **Races**". **[open]**
+- An "Iron Man" mode described as a **four-ball** multiball. **REFUTED as literally
+  four balls.** The engine's ball array is three objects long and the multiball opcode
+  refuses any count above three outright (see "Defining feature: multiball"), so
+  whatever Iron Man is, this engine cannot put four balls on the playfield. No literal
+  4 is used as a ball count anywhere either; the mode object is referenced by exactly
+  four award records, and that is an inference from record counts rather than a decoded
+  constant. The table's own menu blurb says "Iron Man **Races**". What the mode
+  actually does remains **[open]**.
+- Extreme Sports carries **no lock or multiball string at all** in `Table003.seg04` —
+  60 printable strings, none matching lock/multi/ball N/kick/saucer/hole — yet its zone
+  list has **two type-4 capture devices**, one per level, at (249,159)-(269,179) on
+  level 0 and (65,10)-(105,50) on level 1, both awarding 250,000. So the devices are
+  there and the wording is not. **[disk]**
 - Named awards: **`GET THE SUPER` / `IRON MAN JACKPOT` confirmed**; **no "Maniac Skier"
   string exists** — the nearest are the four ski-trick names `SPLIT`, `DUFFY`, `KOSAK`,
   `LOOP` and `GO OFF PISTE MANIA FOR` / `WHITE POWDER JACKPOT`. **[disk]**

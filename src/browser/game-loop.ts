@@ -52,11 +52,38 @@
  * ---------------------------------------------------------------------------
  * `runBallSearch` writes off balls that have stayed inside a box of one ball
  * radius for `ballSearchTicks`. It is a real mechanism — every machine has one —
- * but it is also load-bearing here in a way it should not stay: the device layer
- * does not exist yet, so nothing empties the playfield's kicker holes, and a ball
- * that finds one would otherwise end the game silently. It is deliberately
- * position-based rather than velocity-based; see `ballsLeftTheBox` for the two
- * bugs that taught the current shape.
+ * but it is also load-bearing here in a way it should not stay: most of the
+ * device layer does not exist yet, so nothing empties the playfield's kicker
+ * holes, and a ball that finds one would otherwise end the game silently. It is
+ * deliberately position-based rather than velocity-based; see `ballsLeftTheBox`
+ * for the two bugs that taught the current shape. It watches only balls IN PLAY:
+ * a ball in a lock is motionless on purpose and for as long as the rules like.
+ *
+ * ---------------------------------------------------------------------------
+ * BALL LOCKS, AND THE TWO SERVE QUEUES THAT ARE REALLY ONE
+ * ---------------------------------------------------------------------------
+ * `ball-locks.ts` owns capture and release; this file owns what the machine does
+ * about them. Two counters, and the distinction between them is the whole of it:
+ *
+ *   `ballsServed`    balls the PLAYER has been given. `ballsPerGame` of these
+ *                    ends the game.
+ *   `pendingServes`  balls the MACHINE owes the lane and which cost the player
+ *                    nothing: the replacement for a ball a lock just swallowed,
+ *                    and the balls a multiball puts into play.
+ *
+ * Both come out of the same plunger lane through the same countdown, one at a
+ * time and never while a ball is already sitting on the rod — which is the
+ * original's rule too. Its server at data 0x65EE decrements the queue at
+ * `$D86(a5)` and then sets `$D88/$D89(a5)`, and those are cleared only by the
+ * shooter-lane zone at data 0x54C2, so the next queued ball cannot be fed until
+ * the previous one has left the lane.
+ *
+ * End of ball is `no ball in play and nothing owed`, NOT "no active balls": a
+ * held ball is active. Getting that wrong is a silent hang — the last ball drains
+ * while a saucer still holds one, the drain path sees a non-zero active count,
+ * never ends the ball, and the ball search cannot help because the only ball left
+ * is one it is right to ignore. So the end-of-ball path gives the locks' balls
+ * back to the trough first.
  *
  * ---------------------------------------------------------------------------
  * WHY `resolveFlipperContacts` IS CALLED WITHOUT A PUSH CLAMP
@@ -107,13 +134,24 @@ import { FixedStepScheduler, millisecondsToNanos } from "../core/fixed-step-sche
 import type { BallSet, SimulationOptions } from "../game/ball-physics.js";
 import {
   DEFAULT_SIMULATION_OPTIONS,
-  activeBallCount,
   activeBalls,
   ballById,
   createBallSet,
+  freeBallCount,
+  freeBalls,
   pruneInactiveBalls,
   stepBalls,
 } from "../game/ball-physics.js";
+import type { LockBank } from "../game/ball-locks.js";
+import {
+  LOCKS_TO_LIGHT_MULTIBALL,
+  MULTIBALL_BALL_COUNT,
+  ballsToTopUp,
+  captureBalls,
+  createLockBank,
+  heldBallCount,
+  releaseHeldBalls,
+} from "../game/ball-locks.js";
 import { BALL_RADIUS_PIXELS, DEFAULT_PROBE_RADIUS } from "../game/collision-probe.js";
 import type { FlipperBank } from "../game/flippers.js";
 import {
@@ -131,6 +169,7 @@ import type { PlungerConfig, PlungerState } from "../game/plunger.js";
 import {
   INITIAL_PLUNGER,
   PLUNGER_REFERENCE_GRAVITY,
+  autoLaunchOutcome,
   chargeLevel,
   launchBall,
   plungerConfigFor,
@@ -189,6 +228,50 @@ export const FIRST_SERVE_DELAY_TICKS = 25;
  * the real machine a kicker empties them. Until those devices exist, this is
  * what stops the game hanging.
  *
+ * ---------------------------------------------------------------------------
+ * THE ONE SITE THAT IS STILL LOAD-BEARING, MEASURED AND WRITTEN DOWN
+ * ---------------------------------------------------------------------------
+ * Law 'n Justice, (8,388) and its neighbours (8,389), (9,387), (7,389),
+ * (19,378). Every remaining write-off on that table is in one place and it is
+ * not a friction problem, an acceleration problem or a level problem. It was
+ * measured rather than guessed and the answer is a negative, so here is the
+ * negative:
+ *
+ *   - WHAT THE BALL IS RESTING ON. The 9x9 wire-support post at (12,400), on
+ *     its left shoulder, jammed against the table's left edge. The probe reads
+ *     ZERO contacts at (8,388) itself and the ring's straight-down sample at
+ *     (8,397) is solid, so the contact normal is exactly vertical, the
+ *     tangential velocity is exactly zero, and the ball is at rest for a
+ *     completely correct reason. Traced tick by tick it arrives with
+ *     v = (-1850, 934), rattles between the post and the edge for ninety ticks
+ *     and settles at v = (0,0).
+ *   - WHY IT CANNOT ROLL OFF. The gap between the post's left edge (x=8) and the
+ *     playfield's left edge (x=0) is 8 px and the ball is 16. The gap between
+ *     that post and the next one at (22,391) is 4.5 px. There is no way past on
+ *     either side.
+ *   - WHY THE PLACE IS A TRAP AND NOT A DIP. The far-left strip it sits at the
+ *     bottom of runs from y=150 to y=388 between the table's left edge and the
+ *     left spiral's outer wall, and it is a SEALED POCKET on the lower line: its
+ *     free ball-centre runs go [8-19] at y=150, [8-13] at 300, [8-32] at 345,
+ *     [8-10] at 387, [8-8] at 388 and NOTHING at 389, and its only opening is
+ *     the top-left bowl above it. Below the posts the lower line reopens at
+ *     y=397, but not connected to it.
+ *   - WHY THE OTHER LINE DOES NOT HELP. The upper line carries the left
+ *     habitrail through the same strip, but on its own columns: [12-13] from
+ *     y=264 to 377, then [16-17] at 388 while the lower line has [8-8]. There is
+ *     no row where the two lines agree across the columns a ball rolling down
+ *     the strip actually occupies, so the `left-apron` / `crown-mouth` hand-off
+ *     pattern has nothing to attach to. A gate at the columns the ball uses
+ *     would drop it inside the habitrail's rail.
+ *   - AND IT IS NOT MISSING DRIVE. The original's own acceleration map carries
+ *     (0,0) in every block of the strip and of the left ramp above it, on BOTH
+ *     levels. It has no zone there because it never has a ball there.
+ *
+ * So the ball search is doing the only thing available, and this comment is here
+ * so the next person does not spend the afternoon re-deriving it. What would
+ * close it is a device — a kicker, or whatever the original puts at the foot of
+ * that strip — and no such device appears in any table module decoded so far.
+ *
  * (Every column named in this file is 32 larger than it was recorded as. The
  * measurements were taken against maps exported a word out of phase, so each
  * site was written down 32 px left of the geometry it names; the maps have since
@@ -236,6 +319,18 @@ export const BALL_SEARCH_TICKS = 500;
  * all.
  */
 export const BALL_SEARCH_BOX_PIXELS = BALL_RADIUS_PIXELS;
+
+/**
+ * Ticks a ball the MACHINE served sits in the lane before the auto-launcher
+ * fires it — half a second at 50 Hz.
+ *
+ * Long enough to see a ball appear in the lane and understand where the extra
+ * balls are coming from; short enough that a three-ball multiball is fully on
+ * the playfield inside two seconds. It is not a physical constant and nothing
+ * derives from it. Only balls the player never asked for are auto-launched; see
+ * `autoLaunchOutcome`.
+ */
+export const AUTO_LAUNCH_DELAY_TICKS = 25;
 
 export interface GameOptions {
   readonly ballsPerGame: number;
@@ -315,6 +410,23 @@ export interface Game {
   balls: BallSet;
   /** Balls served so far this game; `ballsPerGame` of them ends it. */
   ballsServed: number;
+  /** Which saucer is holding which ball. See `ball-locks.ts`. */
+  locks: LockBank;
+  /**
+   * Balls the machine owes the lane that do NOT cost the player one: the
+   * replacement for a ball a lock swallowed, and the balls a multiball starts.
+   * The original's `$D86(a5)`.
+   */
+  pendingServes: number;
+  /** True from the moment a multiball starts until it is back down to one ball. */
+  multiball: boolean;
+  /**
+   * Ticks until the auto-launcher fires the ball in the lane, or 0 when it is
+   * not armed. Armed only for balls the machine owes itself.
+   */
+  autoLaunchCountdown: number;
+  /** Locks captured so far this ball, for the presentation. */
+  ballsLocked: number;
   /** The ball sitting on the plunger rod, or null once it has been launched. */
   laneBallId: number | null;
   serveCountdown: number;
@@ -339,6 +451,10 @@ export interface GameTickReport {
   readonly served: boolean;
   readonly launched: boolean;
   readonly drained: readonly number[];
+  /** Ids a lock swallowed this tick, in device order. */
+  readonly locked: readonly number[];
+  /** True on the tick a multiball was lit and the saucers gave their balls back. */
+  readonly multiballStarted: boolean;
   readonly justTilted: boolean;
   readonly gameOver: boolean;
 }
@@ -372,6 +488,11 @@ export function createGame(map: TableMap, options?: Partial<GameOptions>): Game 
     tick: 0,
     balls: createBallSet(),
     ballsServed: 0,
+    locks: createLockBank(map.tableId),
+    pendingServes: 0,
+    multiball: false,
+    autoLaunchCountdown: 0,
+    ballsLocked: 0,
     laneBallId: null,
     serveCountdown: 0,
     stillTicks: 0,
@@ -397,6 +518,13 @@ export function startGame(game: Game): void {
   game.phase = "in-play";
   game.balls = createBallSet();
   game.ballsServed = 0;
+  // A fresh bank rather than a cleared one: the ball set is new, so any id the
+  // old bank still held would name a ball that no longer exists.
+  game.locks = createLockBank(game.map.tableId);
+  game.pendingServes = 0;
+  game.multiball = false;
+  game.autoLaunchCountdown = 0;
+  game.ballsLocked = 0;
   game.laneBallId = null;
   game.serveCountdown = game.options.firstServeDelayTicks;
   game.stillTicks = 0;
@@ -451,8 +579,11 @@ function cameraOptionsFor(game: Game): CameraOptions {
  * The order below is the behaviour. Serve before input so a ball that arrives
  * this tick can still be plunged; nudge before the step so the impulse joins
  * gravity in the same integration; flippers after the step because the bats
- * guard the drain and must meet the ball where it actually got to; drain last,
- * so a ball saved by a bat on the tick it crossed the line is still in play.
+ * guard the drain and must meet the ball where it actually got to; LOCKS after
+ * the rod is pinned, so the ball waiting on the plunger can never be swallowed
+ * by a saucer and so a capture is judged on where the ball finished the tick;
+ * drain last, so a ball saved by a bat on the tick it crossed the line is still
+ * in play.
  */
 export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport {
   game.tick += 1;
@@ -473,6 +604,8 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     served: false,
     launched: false,
     drained: [],
+    locked: [],
+    multiballStarted: false,
     justTilted: false,
     gameOver: false,
   };
@@ -480,19 +613,38 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
   if (game.phase !== "in-play" || game.paused) return idle;
 
   // ---- serve -------------------------------------------------------------
+  //
+  // One lane, one countdown, and never two balls on the rod: the machine's own
+  // debt (`pendingServes`) is paid first, and only when nothing is in play and
+  // nothing is owed does the player get charged a ball. Without locks the two
+  // conditions collapse into the old `activeBallCount === 0` exactly, because
+  // then every active ball is in play and the lane ball is one of them.
   let served = false;
-  if (activeBallCount(game.balls) === 0) {
-    if (game.serveCountdown > 0) {
-      game.serveCountdown -= 1;
-      // Still run the rest of the tick: the camera has to keep easing and the
-      // flippers have to keep falling back to rest while the lane is empty.
-    } else {
-      const ball = serveBall(game.balls, game.plungerConfig);
-      game.laneBallId = ball.id;
-      game.ballsServed += 1;
-      game.plunger = resetPlunger();
-      game.tilt = resetTiltForNewBall();
-      served = true;
+  if (game.laneBallId === null) {
+    const owed = game.pendingServes > 0;
+    if (owed || freeBallCount(game.balls) === 0) {
+      if (game.serveCountdown > 0) {
+        game.serveCountdown -= 1;
+        // Still run the rest of the tick: the camera has to keep easing and the
+        // flippers have to keep falling back to rest while the lane is empty.
+      } else {
+        const ball = serveBall(game.balls, game.plungerConfig);
+        game.laneBallId = ball.id;
+        game.plunger = resetPlunger();
+        if (owed) {
+          // A ball the machine owes: a lock's replacement or a multiball ball.
+          // It costs the player nothing and it does NOT reset the tilt, because
+          // the same ball is still in play and a tilt earned on it still stands.
+          game.pendingServes -= 1;
+          game.autoLaunchCountdown = AUTO_LAUNCH_DELAY_TICKS;
+          if (game.pendingServes > 0) game.serveCountdown = game.options.serveDelayTicks;
+        } else {
+          game.ballsServed += 1;
+          game.tilt = resetTiltForNewBall();
+          game.ballsLocked = 0;
+        }
+        served = true;
+      }
     }
   }
 
@@ -522,7 +674,26 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
       // Cleared BEFORE the step, so the pin below does not immediately drag the
       // ball it just fired back down onto the rod.
       game.laneBallId = null;
+      game.autoLaunchCountdown = 0;
       launched = true;
+    }
+  }
+
+  // The auto-launcher, for balls the machine served itself. It is disarmed the
+  // moment the lane empties, so a player who shoots first keeps the shot.
+  if (game.autoLaunchCountdown > 0) {
+    if (game.laneBallId === null) {
+      game.autoLaunchCountdown = 0;
+    } else {
+      game.autoLaunchCountdown -= 1;
+      if (game.autoLaunchCountdown === 0) {
+        const ball = ballById(game.balls, game.laneBallId);
+        if (ball !== undefined && launchBall(ball, autoLaunchOutcome(game.plungerConfig))) {
+          game.laneBallId = null;
+          game.plunger = resetPlunger();
+          launched = true;
+        }
+      }
     }
   }
 
@@ -564,6 +735,11 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     if (returned !== null) {
       game.laneBallId = returned.id;
       game.plunger = resetPlunger();
+      // During multiball the player's hands are on the bats, so a ball that came
+      // back down the lane goes out again on the auto-launcher rather than
+      // waiting for a plunge that is not coming. With one ball in play it is the
+      // player's shot, exactly as before.
+      if (freeBallCount(game.balls) > 1) game.autoLaunchCountdown = AUTO_LAUNCH_DELAY_TICKS;
     }
   }
 
@@ -580,6 +756,9 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     }
   }
 
+  // ---- ball locks and multiball ------------------------------------------
+  const lockTick = runLocks(game);
+
   // ---- ball search -------------------------------------------------------
   const lost = runBallSearch(game);
 
@@ -591,7 +770,16 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
       game.laneBallId = null;
     }
     pruneInactiveBalls(game.balls);
-    if (activeBallCount(game.balls) === 0) {
+    // "Nothing in play and nothing owed", not "no active balls": a held ball is
+    // active. See the header — testing the active count here is a silent hang.
+    if (freeBallCount(game.balls) === 0 && game.pendingServes === 0) {
+      // The ball in play is over, so a ball a saucer is still holding is not in
+      // play either: it goes back to the trough. A physical lock that held its
+      // ball across the end of a ball would leave the machine one short on the
+      // next one, and this reconstruction has no rule saying which tables do that.
+      releaseHeldBalls(game.locks, game.balls.balls);
+      pruneInactiveBalls(game.balls);
+      game.multiball = false;
       game.plunger = resetPlunger();
       game.tilt = resetTiltForNewBall();
       game.serveCountdown = game.options.serveDelayTicks;
@@ -600,6 +788,13 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
         gameOver = true;
       }
     }
+  }
+
+  // Multiball is over when it is back down to one ball, counting the ones still
+  // queued for the lane. The original checks exactly this every frame at data
+  // 0x5794: `move.w $d86(a5),d0 / add.w $d7e(a5),d0 / cmpi.w #$1,d0 / bhi`.
+  if (game.multiball && freeBallCount(game.balls) + game.pendingServes <= 1) {
+    game.multiball = false;
   }
 
   // ---- camera ------------------------------------------------------------
@@ -611,9 +806,84 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     served,
     launched,
     drained,
+    locked: lockTick.locked,
+    multiballStarted: lockTick.multiballStarted,
     justTilted,
     gameOver,
   };
+}
+
+/**
+ * Owes the lane `count` more balls, and starts the clock if it is not running.
+ *
+ * The countdown is only armed when the lane is free and nothing is already
+ * counting: a serve in progress must not be restarted, and a ball on the rod
+ * blocks the queue until the player shoots it, which is the original's rule
+ * (`$D88/$D89(a5)`, set by the server at data 0x65EE and cleared only by the
+ * shooter-lane zone at data 0x54C2).
+ */
+function oweServes(game: Game, count: number): void {
+  if (count <= 0) return;
+  game.pendingServes += count;
+  if (game.laneBallId === null && game.serveCountdown === 0) {
+    game.serveCountdown = game.options.serveDelayTicks;
+  }
+}
+
+/**
+ * Captures balls into saucers, and lights multiball when enough are locked.
+ *
+ * Two decisions live here and only one of them is decoded.
+ *
+ * DECODED: capture freezes the ball where it is and takes it out of the
+ * simulation; release does not kick it out of the saucer but puts it back in the
+ * serve queue; multiball is a top-up to a requested count with a hard ceiling of
+ * three. See `ball-locks.ts` for the instructions.
+ *
+ * RECONSTRUCTION: `LOCKS_TO_LIGHT_MULTIBALL` balls held lights it, and a capture
+ * that leaves nothing rolling buys the player a replacement ball. The engine has
+ * no rule for either — it keeps two lock counters and reads neither — so both are
+ * this reconstruction's, and the replacement is the one that keeps the promise
+ * that a game always ends: without it, locking the last ball in play would leave
+ * the table empty with a non-zero active count and no way forward.
+ */
+function runLocks(game: Game): {
+  readonly locked: readonly number[];
+  readonly multiballStarted: boolean;
+} {
+  const captured = captureBalls(game.locks, game.balls.balls);
+  if (captured.length === 0) return { locked: [], multiballStarted: false };
+
+  game.ballsLocked += captured.length;
+  const locked = captured.map((capture) => capture.ballId);
+
+  if (heldBallCount(game.locks) >= LOCKS_TO_LIGHT_MULTIBALL) {
+    startMultiball(game);
+    return { locked, multiballStarted: true };
+  }
+  if (freeBallCount(game.balls) === 0) oweServes(game, 1);
+  return { locked, multiballStarted: false };
+}
+
+/**
+ * Gives every saucer's ball back and fills the table to `MULTIBALL_BALL_COUNT`.
+ *
+ * This is opcode `$68` (release, data 0x5B4E) run over the whole bank followed by
+ * opcode `$6C` (top-up, data 0x5BCC). The released balls go into the queue rather
+ * than back onto the playfield, so the balls come out of the plunger lane one
+ * after another exactly as they do in the original; `ballsToTopUp` then adds
+ * however many more the target needs, and refuses to exceed the engine's ceiling
+ * of three.
+ */
+function startMultiball(game: Game): void {
+  const freed = releaseHeldBalls(game.locks, game.balls.balls);
+  pruneInactiveBalls(game.balls);
+  oweServes(game, freed.length);
+  oweServes(
+    game,
+    ballsToTopUp(MULTIBALL_BALL_COUNT, freeBallCount(game.balls), game.pendingServes),
+  );
+  game.multiball = true;
 }
 
 /**
@@ -634,27 +904,43 @@ function isAtRest(ball: BallState, threshold: number): boolean {
 /**
  * The ball that has rolled back onto the plunger rod, if there is one.
  *
- * "On the rod" is: exactly one ball in play, motionless, on the playfield level,
- * and inside the shooter lane below the point where the lane hands over to the
- * arch. The single-ball condition matters — during multiball a ball parked in
- * the lane is a locked ball, not a served one, and re-arming the plunger for it
- * would fire a ball the player never asked to serve.
+ * "On the rod" is: motionless, on the playfield level, inside the shooter lane
+ * and below the point where the lane hands over to the arch.
+ *
+ * The condition used to be "and it is the only live ball on the table", which
+ * was right when there was no way to have two. It is wrong now, and it was the
+ * first thing multiball broke: an under-plunged multiball ball fell back down
+ * the lane, failed this test because two other balls were rolling, was never
+ * re-pinned, never re-armed the plunger and never auto-launched, and simply sat
+ * in the lane until the ball search wrote it off. The census showed it at once —
+ * write-offs appeared in a cluster at x 320..325, y 490..560, which is the lane
+ * itself, on a table that had never lost a ball there.
+ *
+ * What the old condition was really protecting against is still guarded, and
+ * more precisely: the test is now scoped to the LANE, and the ball taken is the
+ * LOWEST at-rest ball in it. Two balls stacked in the lane resolve one at a
+ * time, lowest first, which is the order the rod would hand them over in
+ * anyway; and a ball anywhere else on the table is simply irrelevant to whether
+ * the rod has one on it.
  */
 function ballBackOnTheRod(game: Game): BallState | null {
-  const live = activeBalls(game.balls);
-  const ball = live.length === 1 ? live[0] : undefined;
-  if (ball === undefined) return null;
-  if (ball.level !== 0) return null;
-  if (!isAtRest(ball, restThresholdOf(game))) return null;
-
   const lane = shooterLaneFor(game.map.tableId);
-  const x = q10ToPixel(ball.x);
-  const y = q10ToPixel(ball.y);
-  if (x < lane.minCentreX || x > lane.maxCentreX) return null;
-  // Below the serve point, i.e. settled at the foot of the lane rather than
-  // hung up somewhere in the middle of it.
-  if (y < q10ToPixel(game.plungerConfig.serveY) - BALL_RADIUS_PIXELS) return null;
-  return ball;
+  const footY = q10ToPixel(game.plungerConfig.serveY) - BALL_RADIUS_PIXELS;
+  const threshold = restThresholdOf(game);
+
+  let lowest: BallState | null = null;
+  for (const ball of freeBalls(game.balls)) {
+    if (ball.level !== 0) continue;
+    if (!isAtRest(ball, threshold)) continue;
+    const x = q10ToPixel(ball.x);
+    const y = q10ToPixel(ball.y);
+    if (x < lane.minCentreX || x > lane.maxCentreX) continue;
+    // Below the serve point, i.e. settled at the foot of the lane rather than
+    // hung up somewhere in the middle of it.
+    if (y < footY) continue;
+    if (lowest === null || y > q10ToPixel(lowest.y)) lowest = ball;
+  }
+  return lowest;
 }
 
 /** Where one ball was when the ball search's clock last started. */
@@ -715,9 +1001,14 @@ function ballsLeftTheBox(
  * rattling in a lane or inching round a ramp is never written off. Returns the
  * ids given up on, which the caller merges into the tick's drains so a lost ball
  * goes through exactly the same lifecycle as one that went down the middle.
+ *
+ * It watches only balls IN PLAY. A ball in a saucer is motionless on purpose and
+ * for as long as the rules like — writing it off after ten seconds would make
+ * every lock a slow drain — and it is exempt for the same reason the ball on the
+ * plunger rod is.
  */
 function runBallSearch(game: Game): number[] {
-  const live = activeBalls(game.balls);
+  const live = freeBalls(game.balls);
   if (
     live.length === 0 ||
     game.laneBallId !== null ||
@@ -876,6 +1167,8 @@ export interface BallDebugState {
   readonly velocityX: number;
   readonly velocityY: number;
   readonly active: boolean;
+  /** The lock holding this ball, or null when it is in play. */
+  readonly heldBy: string | null;
   /** Which collision line the ball is riding: 0 the playfield, 1 the ramps. */
   readonly level: PlayfieldLevel;
 }
@@ -892,6 +1185,12 @@ export interface GameDebugState {
   readonly ballsPerGame: number;
   readonly laneBallId: number | null;
   readonly serveCountdown: number;
+  /** Balls the machine owes the lane that cost the player nothing. */
+  readonly pendingServes: number;
+  readonly multiball: boolean;
+  readonly ballsLocked: number;
+  /** Device id to ball id for every occupied saucer, in table order. */
+  readonly locks: readonly { readonly deviceId: string; readonly ballId: number }[];
   readonly plungerCharge: number;
   /** Consecutive motionless ticks counted toward the ball search. */
   readonly stillTicks: number;
@@ -925,6 +1224,15 @@ export function debugSnapshot(game: Game): GameDebugState {
     ballsPerGame: game.options.ballsPerGame,
     laneBallId: game.laneBallId,
     serveCountdown: game.serveCountdown,
+    pendingServes: game.pendingServes,
+    multiball: game.multiball,
+    ballsLocked: game.ballsLocked,
+    // Built from the bank's declared device order, never from the map's
+    // iteration order, so this stays a determinism digest.
+    locks: game.locks.locks.flatMap((device) => {
+      const ballId = game.locks.held.get(device.id);
+      return ballId === undefined ? [] : [{ deviceId: device.id, ballId }];
+    }),
     plungerCharge: chargeLevel(game.plunger),
     stillTicks: game.stillTicks,
     tilt: { ...game.tilt },
@@ -940,6 +1248,7 @@ export function debugSnapshot(game: Game): GameDebugState {
       velocityX: ball.velocityX,
       velocityY: ball.velocityY,
       active: ball.active,
+      heldBy: ball.heldBy,
       level: ball.level,
     })),
     flippers: game.flippers.configs.map((config) => ({
@@ -1054,6 +1363,9 @@ export function renderGame(context: CanvasRenderingContext2D, game: Game, scale:
 
   drawPlayfield(context, game.map, game.camera, scale);
   drawFlippers(context, game, scale);
+  // Every ball on the table, INCLUDING the ones sitting in saucers: a locked
+  // ball is still a steel ball the player can see, and drawing only the ones in
+  // play would make a lock look like a drain.
   for (const ball of activeBalls(game.balls)) {
     drawBall(context, game, scale, ball);
   }

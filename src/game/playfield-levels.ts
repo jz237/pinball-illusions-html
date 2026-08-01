@@ -612,6 +612,97 @@ function crownMouthGates(): readonly LevelGate[] {
  *   pixel the cup sits on. With `crown-mouth` alone the write-offs simply move
  *   to (276,380), the closed bottom end of the wireform. Both are needed, and
  *   both are read off the map.
+ *
+ * ---------------------------------------------------------------------------
+ * BABEWATCH `spinner-lane` AND `habitrail-inlane`: THE SAME PAIR AGAIN
+ * ---------------------------------------------------------------------------
+ * The pattern Extreme Sports taught — the lower line's route runs out, the upper
+ * line's carries on, and the two agree over a band in between — turns out to be
+ * BabeWatch's remaining ball trap as well, and the census site this project had
+ * recorded as (91,167..174) is exactly it.
+ *
+ * THE CUP. Three parallel level-0 channels run down the left of BabeWatch's
+ * roulette grid. The MIDDLE one is a wedge that closes:
+ *
+ *     y=137  L0 [82-90]   y=143  [88-90]   y=151  [89-90]
+ *     y=158  L0 [90-90]   y=162  [90-90]   y=163  NONE
+ *
+ * Its right edge holds at column 90 while its left edge climbs from 82 to 90, so
+ * the WALLS converge rather than the floor flattening: at y=171 they stand at
+ * x=81..83 and x=99..101, a 15 px gap a 16 px ball cannot occupy. The ball rides
+ * down from the wide mouth at y=137 and jams a few rows below the last free
+ * centre, which is the (90..91, 167..174) cluster. No acceleration helps here and
+ * the original carries no drive block in those blocks; a stronger push would only
+ * wedge it harder.
+ *
+ * THE CONTINUATION, on the other line, overlapping the cup:
+ *
+ *     y=152  L0 [89-90]  L1 [89-89]
+ *     y=155  L0 [89-90]  L1 [89-93]
+ *     y=158  L0 [90-90]  L1 [90-98]
+ *     y=162  L0 [90-90]  L1 [90-105]
+ *     y=163  L0 NONE     L1 [91-107]
+ *
+ * The upper line's channel OPENS at (89,152), exactly where the lower line's is
+ * closing, and widens away down and to the right without a break. Over rows
+ * 152..162 the two share columns 89..90, so a ball there cannot tell which line
+ * it is on. `spinner-lane` sits at y=155, the middle of that band, and is
+ * two-way for the same reason `lane-mouth` is: it is a ramp mouth, and a ball
+ * coming back up it belongs on the lower line's lane again.
+ *
+ * Columns 88..92 rather than the 89..90 free run, for the reason `crown-mouth`
+ * needed 289: a ball rolling in CONTACT with a wall sits a column outside the
+ * free-centre run. Every column in 88..92 is safe in the falling direction
+ * because level 1 is the MORE open line there — 89..93 free against the lower
+ * line's 89..90 — so this hand-off can only ever release a ball from a wall,
+ * never place one in it.
+ *
+ * `habitrail-inlane` is the far end of the same route, and it is the plain band
+ * rule with no interpretation at all: rows 448..456 carry the BYTE-IDENTICAL run
+ * [36-38] on both lines. The upper line's channel there runs y=443..463 and stops
+ * dead at 464, while the lower line's [36-38] carries on down into the left
+ * inlane. It is the habitrail delivery the surface map names — upper surface id
+ * 11, "level change to lower", drawn as short bars across the inlane mouths on
+ * every table. Falling only: a ball climbing the inlane is not entering a
+ * habitrail backwards.
+ *
+ * Measured over the ninety-game aggressive census with nothing else changed:
+ * BabeWatch write-offs 12 -> 7 with `spinner-lane` alone and the whole
+ * (90..91, 167..174) cluster gone, then 7 -> 6 with `habitrail-inlane`, which
+ * removes the one level-1 write-off the first gate created at (36,463).
+ *
+ * ---------------------------------------------------------------------------
+ * LAW 'N JUSTICE `left-apron`: A LEVEL-1 CUP, FOUND BY MULTIBALL
+ * ---------------------------------------------------------------------------
+ * A hand-off OUT of a cup rather than into a ramp, and it exists because
+ * multiball found it. The upper line carries a teardrop left of the left ramp —
+ * the metal apron plate the artwork draws at about (4..27, 197..235) — which
+ * merges with the ramp channel at y=214 and then closes:
+ *
+ *     y=214  L1 [8-29]   y=225  [8-18]   y=230  [8-13]   y=235  [8-8]
+ *     y=236  L1 nothing at all left of the ramp channel
+ *
+ * Its floor slopes down-LEFT, so a ball that spills off the ramp into it is
+ * funnelled into the bottom-left corner and stops. Nothing reached it until balls
+ * could be up there in pairs: with one ball in play the census recorded no
+ * level-1 write-off anywhere on this table, and with multiball it recorded
+ * fourteen, at (7,237), (19,225) and (8,236). Ball-to-ball on the upper level is
+ * what puts a ball into the sliver.
+ *
+ * Below it the LOWER line is open and continuous — [8-19] at y=230 against the
+ * upper line's [8-13] — which is what an apron discharging onto the playfield
+ * looks like, so the gate is one-way downward at y=230. Its columns are 0..24
+ * rather than the free run 8..13 because the whole point is to catch a ball in
+ * contact with the converging walls rather than clear of them, and there is
+ * nothing else on that row to catch: the ramp's own channel is at x >= 39 and is
+ * untouched. Measured: level-1 write-offs on Law 'n Justice go from fourteen to
+ * ZERO and completions stay at 90 of 90.
+ *
+ * It does not reduce the TOTAL, and that is stated here rather than buried.
+ * Those balls now roll on down the far-left strip and end at (8,388) instead.
+ * That strip is a genuine sealed pocket on the shipped lower line and closing it
+ * needs something this pass did not find; see `BALL_SEARCH_TICKS` in
+ * `game-loop.ts` for what is known about it.
  */
 export const LEVEL_GATES_BY_TABLE: Readonly<Record<TableId, readonly LevelGate[]>> = Object.freeze({
   "law-n-justice": Object.freeze([
@@ -628,6 +719,14 @@ export const LEVEL_GATES_BY_TABLE: Readonly<Record<TableId, readonly LevelGate[]
       minX: 34,
       maxX: 36,
       y: 207,
+      whenRising: null,
+      whenFalling: 0 as const,
+    }),
+    Object.freeze({
+      id: "left-apron",
+      minX: 0,
+      maxX: 24,
+      y: 230,
       whenRising: null,
       whenFalling: 0 as const,
     }),
@@ -656,6 +755,22 @@ export const LEVEL_GATES_BY_TABLE: Readonly<Record<TableId, readonly LevelGate[]
       y: 276,
       whenRising: 0 as const,
       whenFalling: null,
+    }),
+    Object.freeze({
+      id: "spinner-lane",
+      minX: 88,
+      maxX: 92,
+      y: 155,
+      whenRising: 0 as const,
+      whenFalling: 1 as const,
+    }),
+    Object.freeze({
+      id: "habitrail-inlane",
+      minX: 36,
+      maxX: 38,
+      y: 452,
+      whenRising: null,
+      whenFalling: 0 as const,
     }),
   ]),
   "extreme-sports": Object.freeze([

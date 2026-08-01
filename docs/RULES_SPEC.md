@@ -26,17 +26,20 @@ rules dump and nothing here is sufficient to write mode logic from.
 | Option records 1–7 | **A** | All seven identified positionally from consuming code; layout corrected |
 | Mode/mission inventory | **B** | Counted and named from strings; the *rules* of each mode are unknown |
 | Message/display format | **A** | Format proven against the engine's own printer |
-| Which trigger fires which award | **F** | **Not established.** No link from a material index to an award record |
+| Which trigger fires which award | **B** | **Link found.** Two of them, both structural — see §11 |
 | Mode timer values | **F** | The countdown *mechanism* is decoded; not one duration constant was found |
 | Combo windows, hurry-up rates | **F** | Not found |
 | Script/bytecode grammar | **D** | Two opcodes out of ~24 proven; record lengths not solved |
 
-**The single most important negative:** we can now say what an award is *worth* but not
-what *causes* it. The 98–123 award records per table are unordered with respect to the
-playfield — nothing found in this pass connects award record *n* to a material index, a
-lamp, a switch or a coordinate. Until that link exists, these values cannot be wired
-into the reconstruction; they are a table with no keys. Section 9 says what would close
-it, and why emulation is probably the cheaper route.
+~~**The single most important negative:** we can now say what an award is *worth* but not
+what *causes* it.~~ **SUPERSEDED — see §11.** The award values are not a table at all;
+they are inline fields of the trigger and device records themselves, which is why
+searching for an award table found nothing. And there are two independent
+geometry-to-award keys: the per-pixel surface-id map in slot 1, whose ids ≥ 32 index a
+per-level array of device records; and the 14-byte zone rectangles in each table
+module, whose type-1 and type-4 records carry the award inline. Both are decoded below.
+The remaining gap is the per-table SCRIPT — which mode a device starts, and how many
+locks light multiball — and that has not been located.
 
 Four independent investigators produced the underlying work. **Two of them contradicted
 each other on the most load-bearing number in the document** (award magnitudes, by a
@@ -950,3 +953,119 @@ C reported Table001 `0x2936` n=16, Table002 `0x29BA` n=13, Table003 `0x292C` n=1
 A independently reported Table001 n=16 and warned it becomes "17" if the preceding NULL
 is miscounted. **Both confirmed by direct measurement** — and the miscount warning turns
 out to be the most likely origin of the "17 missions" figure. See §4.1.
+
+
+---
+
+## 11. The geometry-to-award link, and the ball locks
+
+Both halves of what §0 used to grade F. Data offsets throughout, per §1.
+
+### 11.1 Slot 1 is the per-pixel SURFACE-ID map
+
+Not a "cell coverage index" — it is the collision outline's id map, one block per
+playfield level. Layout, after the 4-byte declared-length preamble:
+
+```
+block A (LOWER level)              block B (UPPER level), immediately after A
+2400 x u16 offset table (4800 B)   2400 x u16 offset table (4800 B)
+(col, id) byte pairs               (col, id) byte pairs
+```
+
+Offsets are **pair indices**: list *i* occupies bytes `base + 2*offs[i] .. base +
+2*offs[i+1]` where `base = blockStart + 4800`. List index *i* → `y = i / 4`,
+`band = i % 4`; column *c* → `x = c + 84*band`. Block sizes check to the byte on
+Table002 and Table003 and leave 2 slack bytes on Table001. **[disk]**
+
+The consumer is `main.seg00` data `0x00AD42..0x00AE3E` and it implements the format
+literally: `move.w (a2,d1.w*8),d2` reads `offs[y*4 + band]`,
+`lea.l $12c0(a2,d2.l*2),a2` skips the 4800-byte table and doubles the pair index,
+`cmp.b (a2),d0 / addq.l #2,a2` scans for the column, `move.b $1(a2),d2` takes the id.
+Then `cmpi.w #$1f,d2 / jsr $ae40(pc,d2.w)` for ids 0–31 and
+`subi.w #$20,d2 / move.w d2,$6c(a4)` for ids ≥ 32. **[disk]**
+
+Independent check before the consumer was found: block A covers **100.0000 %** of the
+slot-2 bit-0 pixels on all three tables and block B **100.0000 %** of bit-1. Block A's
+surplus over bit 0 is exactly the flipper ids 1–4 — the swept footprints of moving
+parts. Every rejected alternative scored at chance. **[disk]**
+
+Id vocabulary, straight out of the 32-entry jump table at `0x00AE40`:
+
+| id | meaning |
+|---|---|
+| 0, 5–9, 12–15 | passive; behaviour is only the 4 words of physics constants at `id*8` |
+| 1–4 | flippers 0–3, record stride 506 bytes |
+| 10 / 11 | move ball to upper / lower level, zero its velocity, sound `$68` |
+| 16–21 | bumpers 1–6 (`$4(a4) = id - 15`) |
+| 22–31 | slingshots 1–5 (`$5(a4) = ((id-22)>>1)+1`; even ids kick +400, odd −400) |
+| ≥ 32 | **device index = id − 32** |
+
+**This is the first key.** Device index → the per-level NULL-terminated array of device
+record pointers at `$60(a4)` → the record → its inline award. The dispatch on the
+record's word 0 is at `0x0055A0` and has three handlers: `0x55CE` target/trigger,
+`0x564C` mode start, `0x56B0` kicker (overwrites the ball velocity from `$6(rec)`).
+**[disk]**
+
+Notable per-table findings: Law 'n Justice carries a **third flipper** (id 1, swept
+footprint x29–84, y295–348) that this reconstruction does not yet place; BabeWatch has a
+**kickback** at (13,529) sitting on its own `KICK BACK` insert, matching the string
+`KICKBACK ENABLED`; Extreme Sports has **four** bumpers where the others have three.
+**[disk]**
+
+### 11.2 The awards are inline, not tabulated
+
+Three call sites, each passing `a3` = one past the end of a 16-byte value block:
+
+| site | primitive | fields |
+|---|---|---|
+| `0x545E` | `0x6B96` score+bonus | trigger `+$10..$15` score, `+$18..$1D` bonus (first hit) |
+| `0x5448` | `0x6BCC` score only | trigger `+$20..$25` score (repeat hit) |
+| `0x5564` | `0x6B96` score+bonus | lock `+$1E..$23` score, `+$26..$2B` bonus |
+
+Every recovered value is BCD-clean, which is the check. Law 'n Justice's five bottom
+rollovers pay 100000 / 20000 / 20000 / 20000 / 100000 first-hit and nothing on repeat;
+its two upper triggers pay 250000. **[disk]**
+
+### 11.3 Ball locks — zone type 4
+
+Zones are 14-byte records `{u16 x0,y0,x1,y1; u16 type; u32 object}` in a per-level list
+at `$64(a4)`, walked once per live ball per frame from `0x52E6` against the ball's
+**centre**. Five types: 0 shooter lane, 1 scoring trigger, 2 up a level, 3 down a level,
+4 **capture**. List offsets: Table001 `0x25E6` / `0x26B2`, Table002 `0x25DE` / `0x2728`,
+Table003 `0x25EC` / `0x26D4`. **[disk]**
+
+| table | level | rectangle | award |
+|---|---|---|---|
+| Law 'n Justice | 0 | (85,60)–(145,100) | 250,000 |
+| Law 'n Justice | 0 | (235,165)–(260,190) | 500,000 |
+| Law 'n Justice | 0 | (55,170)–(85,200) | 100,000 |
+| BabeWatch | 0 | (66,48)–(86,68) | 500,000 |
+| BabeWatch | 0 | (152,110)–(172,130) | 500,000 |
+| BabeWatch | 0 | (145,14)–(165,34) | 500,000 |
+| BabeWatch | 0 | (200,250)–(230,295) | 500,000 |
+| BabeWatch | 1 | (70,40)–(110,80) | 500,000 |
+| Extreme Sports | 0 | (249,159)–(269,179) | 250,000 |
+| Extreme Sports | 1 | (65,10)–(105,50) | 250,000 |
+
+Capture (`0x552A`) refuses a ball already held and a saucer already occupied, sets bit 7
+of `$1(a4)`, and never moves the ball. The integrator skips any ball with that bit
+(`0xA684` / `0xA6CE` / `0xA718`). Release is opcode `$68` (`0x5B4E`) and puts the ball in
+the **serve queue** `$D86(a5)`, not back on the playfield. Multiball is opcode `$6C`
+(`0x5BCC`), a top-up to a requested count with a hard `cmpi.w #$3` refusal above three.
+**[disk]**
+
+**Explicit negative, unchanged by all of the above:** the lock counters at `device+$03`
+and `$23E4(a5)` are written and never read, and `device+$02` — the byte gating those
+increments — is zero on every type-4 device on all three tables as shipped. "N locks
+light multiball" is per-table script data and the script streams are still **[open]**.
+
+### 11.4 The script VM, decoded
+
+Fetch at `0x58E8`. The opcode word stored in the stream **is** the byte offset into the
+dispatch table: `opcode = 4 + 4k`. Table base data `$5912`, entries `$5916 + 4k` of
+`(handler_offset.w, length.w)`, handler `= $5916 + entry[0]`, length in bytes including
+the opcode word. 31 entries; opcode 0 terminates. Known so far: `$2C` set ball save,
+`$64` option-record-7 test, `$68` lock release, `$6C` multiball. A second, structurally
+identical VM lives at `0x66A4` (code at `object+$06`, table base `$6748`, 26 entries)
+and is undecoded. No byte range in any table module has yet been found that parses as a
+valid stream for either. **[disk]** / **[open]**

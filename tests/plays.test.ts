@@ -770,7 +770,7 @@ const HISTORIC_STRAND_SITES: Readonly<Record<TableId, readonly (readonly [number
     ],
   });
 
-describe("the two deterministic ball traps", () => {
+describe("the deterministic ball traps", () => {
   /** Steps one hand-placed ball on the real geometry, with nothing else in play. */
   function settle(
     tableId: TableId,
@@ -864,6 +864,54 @@ describe("the two deterministic ball traps", () => {
     const views = levelViewsOf(mapFor("extreme-sports"), materialTableFor("extreme-sports"));
     expect(freeCentre(views, 0, 302, 162)).toBe(true);
     for (let x = 260; x <= 320; x += 1) expect(freeCentre(views, 0, x, 163)).toBe(false);
+  });
+
+  it("babewatch: every ball that enters the roulette lane gets out of it", () => {
+    // TRAP THREE, and the third of the same kind. The middle of the three
+    // channels running down the left of BabeWatch's roulette grid is a wedge
+    // whose two WALLS converge: 9 free centre columns at y=137, one at y=158,
+    // none at y=163, and at y=171 a 15 px gap between walls at x=81..83 and
+    // x=99..101 that a 16 px ball cannot occupy. The census recorded it as
+    // (90..91, 167..174), the largest remaining site on any table.
+    //
+    // It is not a slope and no drive would clear it — the original carries no
+    // acceleration block there and a harder push only wedges the ball tighter.
+    // The upper line's channel opens at (89,152) exactly where the lower one
+    // closes, which is the `crown-mouth` pattern again; `spinner-lane` in
+    // playfield-levels.ts has the row-by-row measurement.
+    //
+    // The assertion is the physical one and it is exhaustive over the lane's
+    // mouth: a ball put anywhere across it must be well clear of the pinch
+    // within a ball-search window, not merely stopped somewhere tidy.
+    const views = levelViewsOf(mapFor("babewatch"), materialTableFor("babewatch"));
+    let entered = 0;
+    // Rows above the hand-off only. A gate is a line the ball CROSSES, so a ball
+    // conjured below it has not entered the lane and cannot be expected to take
+    // it; on the real table nothing arrives in a 2 px wide slot from the side.
+    for (const y of [138, 143, 148, 152]) {
+      for (let x = 80; x <= 100; x += 1) {
+        // Every centre a ball can legally occupy on this row of the lane, and
+        // only those: starting one inside a wall would be asking the recovery
+        // pass a question rather than the hand-off.
+        if (!freeCentre(views, 0, x, y)) continue;
+        entered += 1;
+        const end = settle("babewatch", x, y, 0, BALL_SEARCH_TICKS);
+        expect(
+          end.y,
+          `babewatch: a ball entering the roulette lane at (${x},${y}) ended at ` +
+            `(${end.x.toFixed(1)},${end.y.toFixed(1)}) on level ${end.level}`,
+        ).toBeGreaterThan(220);
+      }
+    }
+    // Every row of the lane really did have somewhere to start from.
+    expect(entered).toBeGreaterThanOrEqual(4);
+
+    // And the cup is still exactly what it was measured to be, so a re-export
+    // that moved it fails here rather than quietly reopening the trap.
+    expect(freeCentre(views, 0, 90, 162)).toBe(true);
+    for (let x = 80; x <= 100; x += 1) expect(freeCentre(views, 0, x, 163)).toBe(false);
+    // ... while the upper line carries straight on past it.
+    expect(freeCentre(views, 1, 91, 163)).toBe(true);
   });
 });
 
@@ -1079,7 +1127,7 @@ describe("all three tables", () => {
     // 115% longer and therefore visits far more of the playfield. Run over
     // thirty games a table at every integer pull from 8 to 97 (270 balls a
     // table) it found two deterministic traps this census never reached, both
-    // fixed and both now pinned by "the two deterministic ball traps" above:
+    // fixed and both now pinned by "the deterministic ball traps" above:
     //
     //   law-n-justice   (214,20) on the ramp line, 15 of 270 balls, only at
     //                   starting pulls 11/15/19/23/27 and always all three balls
@@ -1094,18 +1142,47 @@ describe("all three tables", () => {
     //   babewatch       90/90 -> 90/90   46 -> 30      (90,171) 18 -> 7
     //   extreme-sports  89/90 -> 89/90    1 ->  5      (302,16x) 0 -> 0
     //
-    // What is left is NOT the two traps and is written down rather than hidden:
-    // Law 'n Justice's spiral at (86,155) and the closed foot of its left-edge
-    // chute at (8,388), and BabeWatch's (91,171) and (72,99). The first three
-    // are cups the geometry has no gravity-driven exit from and the real machine
-    // empties with a coil — the device layer this reconstruction does not have
-    // yet. (8,388) is a THIRD trap of the same kind as the two fixed here, fully
-    // characterised — a chute down the left of the table whose free centres run
-    // [8-30] from y=300 and close to [8-8] at y=388 with nothing at y=389 — but
-    // its continuation, an upper-line wireform running x=12..13 from y=265 to
-    // y=378 and ending at (35,456) over open lower-line space, has NOT been
-    // derived to the standard the other hand-offs are held to, so no gate has
-    // been invented for it.
+    // SINCE THEN, WITH BALL LOCKS AND MULTIBALL IN (see src/game/ball-locks.ts),
+    // and the aggressive census re-run at 40,000 ticks a game because balls that
+    // get locked and given back keep the ball in play longer:
+    //
+    //                   completed   written off   worst site
+    //   law-n-justice   90/90       26 (9.0%)     (8,388) 7
+    //   babewatch       90/90        6 (2.0%)     (287,393) 5
+    //   extreme-sports  90/90        3 (1.1%)     (75,210) 1
+    //
+    // BabeWatch's (91,167..174) is GONE, and it was a cup of exactly the same
+    // kind as the two fixed above rather than anything to do with acceleration:
+    // its lane's two WALLS converge to a 15 px gap a 16 px ball cannot occupy,
+    // and the upper line's channel opens at (89,152) precisely where the lower
+    // one closes. `spinner-lane` and `habitrail-inlane` in playfield-levels.ts
+    // have the row-by-row measurement. So is (72,99), which was a ball parked in
+    // the shooter lane that `ballBackOnTheRod` refused to re-pin.
+    //
+    // WHAT IS LEFT, written down rather than hidden. Law 'n Justice's spiral at
+    // (86,155), and the foot of its far-left strip at (8,388) with its
+    // neighbours (8,389)/(9,387)/(19,378) — twenty of that table's twenty-six.
+    // The strip is now fully characterised and the answer is a negative:
+    //
+    //   - the ball rests on the LEFT SHOULDER of the 9x9 wire-support post at
+    //     (12,400), jammed against the table's left edge. Zero probe contacts at
+    //     the resting centre, the ring's straight-down sample solid, so the
+    //     normal is exactly vertical and the tangential speed exactly zero;
+    //   - it cannot roll off: 8 px to the table edge, 4.5 px to the next post,
+    //     against a 16 px ball;
+    //   - the strip is a SEALED POCKET on the lower line — free centres [8-19]
+    //     at y=150, [8-32] at 345, [8-8] at 388, nothing at 389 — whose only
+    //     opening is the top-left bowl above it;
+    //   - the upper line's habitrail runs through the same strip but on columns
+    //     12..13, never on the columns a ball rolling down it occupies, so there
+    //     is no row where the two lines agree and nothing for a hand-off to
+    //     attach to;
+    //   - and the original's own acceleration map is (0,0) in every block of the
+    //     strip and of the ramp above it, on both levels. It has no zone there
+    //     because it never has a ball there.
+    //
+    // That needs a device this reconstruction has not found in any table module,
+    // so the budget stays where it is rather than being invented around.
     const budget: Readonly<Record<TableId, number>> = {
       "law-n-justice": 0.05,
       babewatch: 0.05,

@@ -500,6 +500,30 @@ export function launchSpeedFor(charge: Q10, config: PlungerConfig): number {
 }
 
 /**
+ * A full-strength launch the machine gives itself, for a ball the player never
+ * asked to serve.
+ *
+ * Multiball feeds its balls out of this one lane, one after another, and a
+ * player already flipping two balls cannot also be winding a spring. Every
+ * machine that does this has an auto-launcher, and this is it. Full charge, so
+ * the ball always clears the lane; and the returned `state` is the IDLE plunger,
+ * because the player's spring was never touched and must not come back part
+ * wound — a launch the machine performed cannot leave charge behind for the
+ * player's next shot.
+ *
+ * Used only by the game loop, and only for balls it owes itself. A ball the
+ * player was given is always the player's to shoot.
+ */
+export function autoLaunchOutcome(config: PlungerConfig = DEFAULT_PLUNGER_CONFIG): PlungerOutcome {
+  return {
+    state: INITIAL_PLUNGER,
+    fired: true,
+    launchVelocityY: -launchSpeedFor(PLUNGER_FULL_CHARGE, config),
+    launchCharge: PLUNGER_FULL_CHARGE,
+  };
+}
+
+/**
  * Advances the plunger one tick.
  *
  * Order matters and is the whole behaviour of this function: a press begins a

@@ -141,6 +141,22 @@ export interface BallState {
   /** False once drained; kept in the list so ids stay stable during multiball. */
   active: boolean;
   /**
+   * The ball lock holding this ball, or null when it is in play.
+   *
+   * A held ball is still `active` — it is on the table and the player can see it
+   * sitting in the saucer — but it takes no part in the physics at all: no
+   * gravity, no ramp drive, no contact, no ball-to-ball, no drain. That is what
+   * the original does. Its capture handler sets bit 7 of the ball record's flag
+   * byte (main.seg00 data 0x555E, `ori.b #$80,$1(a4)`) and the integrator skips
+   * any ball carrying it — `tst.b $1(a4)` / `bmi` at data 0xA684, 0xA6CE and
+   * 0xA718, one test per sub-step group.
+   *
+   * `ball-locks.ts` owns the capture and release rules; `stepBalls` only honours
+   * the flag. It is a device id rather than a boolean so a held ball says WHICH
+   * saucer has it, which is what release needs and what a debug dump wants.
+   */
+  heldBy: string | null;
+  /**
    * Which collision line this ball is riding: 0 the playfield, 1 the ramps.
    *
    * The map carries two independent collision lines and a pixel that blocks on

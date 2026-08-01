@@ -39,7 +39,24 @@ import { TABLE_IDS } from "../src/game/contracts.js";
 import { parseTableAccelDocument, registerTableAcceleration } from "../src/game/table-accel.js";
 import type { TableAccelDocument, TableId, TableMapDocument } from "../src/game/contracts.js";
 
-const CENSUS_TICKS = 20_000;
+/**
+ * Ticks a census game is given. Forty thousand, thirteen minutes of play at
+ * 50 Hz, and it was twenty thousand until multiball arrived.
+ *
+ * That change is a measurement, not a convenience. At 20,000 ticks Extreme
+ * Sports scored 88/90 and reported two "stalls" — pull 8 with the ball at
+ * (56,327) and pull 9 at (205,486), both mid-third-ball. Re-running the SAME
+ * code at 40,000 gives 90/90 with the write-off rate unchanged at 1.1% and the
+ * same three sites, so nothing was stuck: the games were simply still being
+ * played when the clock ran out. Balls that get locked and given back keep the
+ * ball in play longer, and the ball counts moved with it — Law 'n Justice from
+ * 270 ball ends to 290 and BabeWatch from 270 to 311 — so a budget tuned to a
+ * game without multiball now cuts games off in the middle.
+ *
+ * A stall reported here therefore means what it says again: the playfield
+ * stopped giving the ball back.
+ */
+const CENSUS_TICKS = 40_000;
 const BALLS_PER_GAME = 3;
 /** Plunge holds swept, inclusive. 90 games a table. */
 const FIRST_PULL = 8;

@@ -64,8 +64,18 @@ export function clampScroll(scrollY: number): number {
   return Math.round(scrollY);
 }
 
+/**
+ * The balls the camera has to keep on screen.
+ *
+ * A ball sitting in a lock is drawn but does not count here. It never moves, so
+ * following it is meaningless, and counting it would throw the view into the
+ * whole-table multiball frame the moment the first ball was locked — while the
+ * player still has exactly one ball rolling and wants the close view. Multiball
+ * proper is when the locks give the balls back, and then every one of them is in
+ * play and every one is counted. See `ball-locks.ts`.
+ */
 function activeBalls(balls: readonly BallState[]): BallState[] {
-  return balls.filter((ball) => ball.active);
+  return balls.filter((ball) => ball.active && ball.heldBy === null);
 }
 
 /**

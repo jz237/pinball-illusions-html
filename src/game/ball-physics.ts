@@ -451,6 +451,9 @@ export function createBall(
     velocityX: clampVelocity(velocityX),
     velocityY: clampVelocity(velocityY),
     active: true,
+    // Nothing is ever created already held: being held is something a ball earns
+    // by rolling into a saucer during a tick. See `ball-locks.ts`.
+    heldBy: null,
     // Balls start on the playfield. Nothing is served onto a ramp: a ball
     // reaches the upper level by driving through a hand-off, never by being
     // placed there, so the level is always something the run earned.
@@ -493,6 +496,33 @@ export function activeBallCount(set: BallSet): number {
   let count = 0;
   for (const ball of set.balls) {
     if (ball.active) count += 1;
+  }
+  return count;
+}
+
+/**
+ * True when a ball is on the table AND in play — not drained and not sitting in
+ * a lock.
+ *
+ * The distinction matters everywhere a rule asks "is there still a ball to
+ * play": a held ball is on the table and drawn, but it will never move, never
+ * drain and never close a switch, so counting it as in play stalls the serve,
+ * feeds the ball search a ball that can never satisfy it, and pins the camera to
+ * the whole-table view for a single rolling ball. See `ball-locks.ts`.
+ */
+export function ballIsInPlay(ball: BallState): boolean {
+  return ball.active && ball.heldBy === null;
+}
+
+/** The balls actually in play: active, and not held by a lock. */
+export function freeBalls(set: BallSet): BallState[] {
+  return set.balls.filter(ballIsInPlay);
+}
+
+export function freeBallCount(set: BallSet): number {
+  let count = 0;
+  for (const ball of set.balls) {
+    if (ballIsInPlay(ball)) count += 1;
   }
   return count;
 }
@@ -1041,7 +1071,12 @@ export function stepBalls(
   const drained: number[] = [];
 
   for (const ball of balls.balls) {
-    if (!ball.active) continue;
+    // A ball in a lock is out of the simulation entirely — no gravity, no drive,
+    // no contact — exactly as the original's integrator skips any ball whose
+    // flag byte has bit 7 set (`tst.b $1(a4)` / `bmi` at data 0xA684, 0xA6CE,
+    // 0xA718). Not merely frozen in place: nothing is read from it either, so a
+    // saucer that happens to sit over a wall cannot push it anywhere.
+    if (!ballIsInPlay(ball)) continue;
 
     // A shove moves the cabinet, and the cabinet does not reach into a habitrail:
     // see `nudgeReachesLevel` for the arch measurements that forced this. Gravity
@@ -1101,9 +1136,11 @@ export function stepBalls(
   }
 
   // Drained last, so a ball knocked back above the drain line by another ball
-  // on the very tick it fell out is correctly still in play.
+  // on the very tick it fell out is correctly still in play. A held ball is
+  // exempt: the drain is a place on the table and a ball in a saucer is not on
+  // the table, so a lock below the drain line would otherwise eat it.
   for (const ball of balls.balls) {
-    if (!ball.active) continue;
+    if (!ballIsInPlay(ball)) continue;
     if (ball.y >= resolved.drainY) {
       ball.active = false;
       drained.push(ball.id);
@@ -1437,11 +1474,14 @@ export function resolveBallCollisions(
 
   for (let i = 0; i < balls.length; i += 1) {
     const a = balls[i];
-    if (a === undefined || !a.active) continue;
+    // Held balls are out of the simulation, so they neither push nor are pushed:
+    // a ball rolling over a saucer that already has one in it must not be
+    // deflected by a ball that is, physically, below the playfield surface.
+    if (a === undefined || !ballIsInPlay(a)) continue;
 
     for (let j = i + 1; j < balls.length; j += 1) {
       const b = balls[j];
-      if (b === undefined || !b.active) continue;
+      if (b === undefined || !ballIsInPlay(b)) continue;
       // Different levels are different heights: a ball on the top arch passes
       // over one on the playfield, and overlapping their 2D circles is an
       // artefact of the projection rather than a collision.

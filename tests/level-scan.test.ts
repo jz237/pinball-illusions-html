@@ -69,6 +69,35 @@ function gateOf(tableId: TableId, id: string): LevelGate {
   return found;
 }
 
+/**
+ * The maximal free ball-centre run on one line inside a column window, or null.
+ *
+ * A window rather than the whole row, because every measurement below is about
+ * ONE channel and a row of a pinball table has several. Deliberately not
+ * `channelRunAt`: that one takes a point and refuses runs wider than a channel,
+ * and these assertions want the run whatever its width so a re-export that
+ * widens one shows up as a failure rather than as a null.
+ */
+function runOf(
+  views: LevelViews,
+  level: 0 | 1,
+  y: number,
+  fromX: number,
+  toX: number,
+): { readonly from: number; readonly to: number } | null {
+  let from: number | null = null;
+  let to = -1;
+  for (let x = fromX; x <= toX; x += 1) {
+    if (!freeCentre(views, level, x, y)) {
+      if (from !== null) break;
+      continue;
+    }
+    if (from === null) from = x;
+    to = x;
+  }
+  return from === null ? null : { from, to };
+}
+
 function bandContaining(bands: readonly HandoffBand[], y: number): HandoffBand {
   const found = bands.find((band) => y >= band.topY && y <= band.bottomY);
   if (found === undefined) {
@@ -511,5 +540,112 @@ describe("Law 'n Justice's arch ramp ends where the wireform does", () => {
     expect(channelReachBeyond(views, 0, gate.minX, gate.y, 1)).toBeGreaterThan(
       channelReachBeyond(views, 1, gate.minX, gate.y, 1),
     );
+  });
+});
+
+describe("babewatch's roulette-lane cup, and the wireform under it", () => {
+  const views = VIEWS.babewatch;
+
+  it("re-measures the cup the lower line closes on the ball", () => {
+    // The site the census recorded as (91,167..174). It is not a shallow slope
+    // and no drive would clear it: the WALLS converge, from a 9-column channel
+    // at y=137 to a single free centre at y=158..162 and nothing at all at 163.
+    expect(runOf(views, 0, 137, 80, 100)).toEqual({ from: 82, to: 90 });
+    expect(runOf(views, 0, 151, 80, 100)).toEqual({ from: 89, to: 90 });
+    expect(runOf(views, 0, 158, 80, 100)).toEqual({ from: 90, to: 90 });
+    expect(runOf(views, 0, 162, 80, 100)).toEqual({ from: 90, to: 90 });
+    expect(runOf(views, 0, 163, 80, 100)).toBeNull();
+    // And the gap really is narrower than a ball where the ball ends up.
+    for (let x = 84; x <= 98; x += 1) expect(freeCentre(views, 0, x, 171)).toBe(false);
+  });
+
+  it("opens the upper line's channel exactly where the lower one closes", () => {
+    // Nothing on level 1 above y=152 in these columns, then it appears and
+    // widens away downward without a break.
+    expect(runOf(views, 1, 151, 80, 110)).toBeNull();
+    expect(runOf(views, 1, 152, 80, 110)).toEqual({ from: 89, to: 89 });
+    expect(runOf(views, 1, 158, 80, 110)?.from).toBe(90);
+    expect(runOf(views, 1, 163, 80, 110)?.from).toBe(91);
+    // Wider every row, which is what a ramp mouth looks like from inside.
+    const at158 = runOf(views, 1, 158, 80, 130)!;
+    const at170 = runOf(views, 1, 170, 80, 130)!;
+    expect(at170.to - at170.from).toBeGreaterThan(at158.to - at158.from);
+  });
+
+  it("hands over on a row where the ball cannot tell the two lines apart", () => {
+    const gate = gateOf("babewatch", "spinner-lane");
+    expect(gate.whenFalling).toBe(1);
+    expect(gate.whenRising).toBe(0);
+    // The shared columns at the gate row, which the gate must contain.
+    for (const x of [89, 90]) {
+      expect(freeCentre(views, 0, x, gate.y), `lower at (${x},${gate.y})`).toBe(true);
+      expect(freeCentre(views, 1, x, gate.y), `upper at (${x},${gate.y})`).toBe(true);
+      expect(x).toBeGreaterThanOrEqual(gate.minX);
+      expect(x).toBeLessThanOrEqual(gate.maxX);
+    }
+    // The gate is wider than the shared run on purpose, and every extra column
+    // is safe in the falling direction because level 1 is the MORE open line
+    // there: a hand-off can release a ball from a wall but never place it in one.
+    for (let x = gate.minX; x <= gate.maxX; x += 1) {
+      if (freeCentre(views, 0, x, gate.y)) {
+        expect(freeCentre(views, 1, x, gate.y), `upper must be open at (${x},${gate.y})`).toBe(
+          true,
+        );
+      }
+    }
+  });
+
+  it("returns the habitrail to the inlane on a byte-identical band", () => {
+    // The plain band rule. The upper line holds [36-38] for nine rows straight
+    // and the lower line covers it on every one of them, so the hand-off is
+    // unobservable anywhere in the band; the gate row itself is byte-identical.
+    const gate = gateOf("babewatch", "habitrail-inlane");
+    expect(gate.whenFalling).toBe(0);
+    expect(gate.whenRising).toBeNull();
+    for (let y = 448; y <= 456; y += 1) {
+      expect(runOf(views, 1, y, 30, 45), `upper row ${y}`).toEqual({ from: 36, to: 38 });
+      const lower = runOf(views, 0, y, 30, 45);
+      expect(lower?.from, `lower row ${y}`).toBeLessThanOrEqual(36);
+      expect(lower?.to, `lower row ${y}`).toBeGreaterThanOrEqual(38);
+    }
+    expect(runOf(views, 0, gate.y, 30, 45), "the gate row itself").toEqual({ from: 36, to: 38 });
+    expect(gate.y).toBeGreaterThanOrEqual(448);
+    expect(gate.y).toBeLessThanOrEqual(456);
+    expect(gate.minX).toBe(36);
+    expect(gate.maxX).toBe(38);
+    // The upper line stops just below; the lower one carries on into the inlane.
+    expect(runOf(views, 1, 463, 30, 45)).not.toBeNull();
+    expect(runOf(views, 1, 464, 30, 45)).toBeNull();
+    expect(runOf(views, 0, 470, 30, 45)).not.toBeNull();
+  });
+});
+
+describe("law-n-justice's left apron, which only multiball reaches", () => {
+  const views = VIEWS["law-n-justice"];
+
+  it("re-measures the upper-line teardrop that funnels down-left into nothing", () => {
+    expect(runOf(views, 1, 214, 0, 32)).toEqual({ from: 8, to: 29 });
+    expect(runOf(views, 1, 225, 0, 32)).toEqual({ from: 8, to: 18 });
+    expect(runOf(views, 1, 230, 0, 32)).toEqual({ from: 8, to: 13 });
+    expect(runOf(views, 1, 235, 0, 32)).toEqual({ from: 8, to: 8 });
+    expect(runOf(views, 1, 236, 0, 32)).toBeNull();
+    // Its right edge closes on its left one, so the floor leads into the corner.
+  });
+
+  it("hands the ball down onto the lower line, which is open underneath", () => {
+    const gate = gateOf("law-n-justice", "left-apron");
+    expect(gate.whenFalling).toBe(0);
+    expect(gate.whenRising).toBeNull();
+    // Everything the upper line still has at the gate row is open on the lower
+    // one, so the hand-off cannot put a ball in a wall.
+    const upper = runOf(views, 1, gate.y, 0, 32)!;
+    const lower = runOf(views, 0, gate.y, 0, 32)!;
+    expect(lower.from).toBeLessThanOrEqual(upper.from);
+    expect(lower.to).toBeGreaterThanOrEqual(upper.to);
+    expect(gate.minX).toBeLessThanOrEqual(upper.from);
+    expect(gate.maxX).toBeGreaterThanOrEqual(upper.to);
+    // And it does not reach the ramp's own channel, which is well to the right
+    // and must keep using `ramp-end`.
+    expect(gate.maxX).toBeLessThan(runOf(views, 1, gate.y, 33, 60)!.from);
   });
 });

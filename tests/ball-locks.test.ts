@@ -1,0 +1,640 @@
+/**
+ * BALL LOCKS AND MULTIBALL.
+ *
+ * The feature this whole engine was written N-ball for, and the last one to
+ * arrive. Three things are asserted here and they are deliberately different in
+ * kind:
+ *
+ *   1. THE DEVICE RULES, against `ball-locks.ts` alone: a saucer takes one ball,
+ *      refuses a second, freezes what it holds, and gives it back to the trough
+ *      rather than to the playfield. These are decoded from the original and the
+ *      assertions are literal.
+ *   2. THE MACHINE, against the assembled game on real geometry: a captured ball
+ *      stops moving and stops draining, the player gets a replacement, two locks
+ *      light multiball, three balls come out of the lane one after another, the
+ *      camera reframes to the whole table and back, and the game still ends.
+ *   3. THAT IT CANNOT HANG. The zero-deadlock guarantee, restated for every path
+ *      a lock adds: locking the last ball, locking during a multiball, and
+ *      draining out of a multiball with a saucer still full.
+ *
+ * The rectangles are driven by placing a ball inside them rather than by playing
+ * a game into them, because whether a scripted player happens to hit a saucer is
+ * a fact about the player. `tests/plays.test.ts` covers the played case.
+ */
+
+import { describe, expect, it } from "vitest";
+import {
+  AUTO_LAUNCH_DELAY_TICKS,
+  createGame,
+  debugSnapshot,
+  runTicks,
+  startGame,
+} from "../src/browser/game-loop.js";
+import type { Game, InputSource } from "../src/browser/game-loop.js";
+import { CONTROLS, IDLE_SNAPSHOT } from "../src/browser/input.js";
+import type { Control, ControlEdges, ControlSnapshot } from "../src/browser/input.js";
+import { resolveMode } from "../src/browser/camera.js";
+import { DEFAULT_CAMERA_OPTIONS } from "../src/browser/camera.js";
+import { mapFor } from "./table-fixtures.js";
+import { pixelsToQ10, q10ToPixel } from "../src/core/fixed-point.js";
+import { TABLE_IDS } from "../src/game/contracts.js";
+import type { BallState, TableId } from "../src/game/contracts.js";
+import { materialTableFor } from "../src/game/materials.js";
+import {
+  BALL_LOCKS_BY_TABLE,
+  BALL_LOCK_RULES_NOTE,
+  LOCKS_TO_LIGHT_MULTIBALL,
+  MAX_SIMULTANEOUS_BALLS,
+  MULTIBALL_BALL_COUNT,
+  ballLocksFor,
+  ballsToTopUp,
+  captureBalls,
+  createLockBank,
+  heldBallCount,
+  heldBallIn,
+  lockCovers,
+  releaseHeldBalls,
+} from "../src/game/ball-locks.js";
+import type { BallLock } from "../src/game/ball-locks.js";
+import { createBallSet, freeBallCount, spawnBall, stepBalls } from "../src/game/ball-physics.js";
+import { PLUNGER_REFERENCE_GRAVITY } from "../src/game/plunger.js";
+import { freeCentre, levelViewsOf } from "../src/game/level-scan.js";
+
+function idleInput(): InputSource {
+  return { sample: () => IDLE_SNAPSHOT };
+}
+
+/**
+ * A player who shoots and swings, because most of what is asserted below only
+ * happens once the ball is off the rod: the machine's serve queue is blocked
+ * while the PLAYER's ball is sitting on it, exactly as a real lane is, so an
+ * idle player never sees a second ball at all.
+ */
+function playingInput(): InputSource {
+  let sequence = 0;
+  let previous = new Set<Control>();
+  return {
+    sample(): ControlSnapshot {
+      const wanted = new Set<Control>();
+      const phase = sequence % 400;
+      if (phase >= 20 && phase < 80) wanted.add("plunger");
+      if (sequence % 23 < 3) {
+        wanted.add("leftFlipper");
+        wanted.add("rightFlipper");
+      }
+      const was = previous;
+      previous = wanted;
+      sequence += 1;
+      const controls = {} as Record<Control, ControlEdges>;
+      for (const control of CONTROLS) {
+        const down = wanted.has(control);
+        const before = was.has(control);
+        controls[control] = {
+          down,
+          pressed: down && !before,
+          released: !down && before,
+          pressCount: down && !before ? 1 : 0,
+          releaseCount: !down && before ? 1 : 0,
+        };
+      }
+      return { sequence, controls };
+    },
+  };
+}
+
+/**
+ * Steers a ball the player already has into a saucer's mouth.
+ *
+ * Different from `dropInto` on purpose. `dropInto` adds a ball, which is right
+ * for driving one device in isolation but wrong for a whole game: a test that
+ * conjures a fresh ball every time a saucer empties is a test with an infinite
+ * supply of balls, and the game correctly never ends. This moves a ball that is
+ * already in play, which is what a shot to the saucer does.
+ */
+function steerIntoLock(game: Game, device: BallLock): boolean {
+  const state = debugSnapshot(game);
+  const ball = game.balls.balls.find(
+    (one) => one.active && one.heldBy === null && one.id !== state.laneBallId,
+  );
+  if (ball === undefined) return false;
+  const at = centreOf(device);
+  ball.x = pixelsToQ10(at.x);
+  ball.y = pixelsToQ10(at.y);
+  ball.velocityX = 0;
+  ball.velocityY = 0;
+  ball.level = device.level;
+  return true;
+}
+
+/** Runs until the player's served ball has left the rod, or gives up. */
+function clearTheLane(game: Game, input: InputSource): void {
+  for (let tick = 0; tick < 600; tick += 1) {
+    runTicks(game, input, 1);
+    if (debugSnapshot(game).laneBallId === null) return;
+  }
+  throw new Error("the player never got the ball out of the lane");
+}
+
+function started(tableId: TableId): Game {
+  const game = createGame(mapFor(tableId));
+  startGame(game);
+  return game;
+}
+
+/** Centre of a lock's rectangle, in whole pixels. */
+function centreOf(device: BallLock): { readonly x: number; readonly y: number } {
+  return {
+    x: Math.floor((device.minX + device.maxX) / 2),
+    y: Math.floor((device.minY + device.maxY) / 2),
+  };
+}
+
+/**
+ * Drops a ball into a saucer's mouth by hand and runs one tick.
+ *
+ * Placed rather than played: which saucers a scripted player reaches is a fact
+ * about the player, and every one of them has to work.
+ */
+function dropInto(game: Game, device: BallLock): BallState {
+  const at = centreOf(device);
+  const ball = spawnBall(
+    game.balls,
+    pixelsToQ10(at.x),
+    pixelsToQ10(at.y),
+    0,
+    0,
+    device.level,
+  );
+  return ball;
+}
+
+// ---------------------------------------------------------------------------
+// 1. The device rules
+// ---------------------------------------------------------------------------
+
+describe("the decoded lock rectangles", () => {
+  it("gives every table at least one lock, and none more than the ball ceiling can use", () => {
+    for (const tableId of TABLE_IDS) {
+      const locks = ballLocksFor(tableId);
+      expect(locks.length, `${tableId} locks`).toBeGreaterThan(0);
+      // Two is enough to light multiball, so a table with two devices can reach
+      // it without any device having to hold two balls at once.
+      expect(locks.length, `${tableId} locks`).toBeGreaterThanOrEqual(LOCKS_TO_LIGHT_MULTIBALL);
+    }
+  });
+
+  it("names every lock uniquely, and gives each a rectangle a ball fits in", () => {
+    for (const tableId of TABLE_IDS) {
+      const seen = new Set<string>();
+      for (const device of ballLocksFor(tableId)) {
+        expect(seen.has(device.id), `${tableId} repeats lock id ${device.id}`).toBe(false);
+        seen.add(device.id);
+        expect(device.maxX, `${tableId} ${device.id}`).toBeGreaterThan(device.minX);
+        expect(device.maxY, `${tableId} ${device.id}`).toBeGreaterThan(device.minY);
+        expect(device.minX, `${tableId} ${device.id}`).toBeGreaterThanOrEqual(0);
+        expect(device.maxX, `${tableId} ${device.id}`).toBeLessThan(336);
+        expect(device.maxY, `${tableId} ${device.id}`).toBeLessThan(600);
+      }
+    }
+  });
+
+  it("puts every lock somewhere a ball can actually stand", () => {
+    // A rectangle whose centre is inside a wall would be a saucer that swallows
+    // nothing, and the decode would be wrong rather than merely unused. Checked
+    // against the collision line the device declares, with the engine's own ring.
+    for (const tableId of TABLE_IDS) {
+      const views = levelViewsOf(mapFor(tableId), materialTableFor(tableId));
+      for (const device of ballLocksFor(tableId)) {
+        let standable = 0;
+        for (let x = device.minX; x <= device.maxX; x += 1) {
+          for (let y = device.minY; y <= device.maxY; y += 1) {
+            if (freeCentre(views, device.level, x, y)) standable += 1;
+          }
+        }
+        expect(
+          standable,
+          `${tableId} ${device.id} has no free ball centre anywhere in its rectangle`,
+        ).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it("matches the ball centre against the rectangle, and only on the device's own level", () => {
+    const device = ballLocksFor("law-n-justice")[0]!;
+    const at = centreOf(device);
+    const set = createBallSet();
+    const inside = spawnBall(set, pixelsToQ10(at.x), pixelsToQ10(at.y), 0, 0, device.level);
+    expect(lockCovers(device, inside)).toBe(true);
+
+    // One pixel outside each edge.
+    for (const [x, y] of [
+      [device.minX - 1, at.y],
+      [device.maxX + 1, at.y],
+      [at.x, device.minY - 1],
+      [at.x, device.maxY + 1],
+    ] as const) {
+      const outside = spawnBall(set, pixelsToQ10(x), pixelsToQ10(y), 0, 0, device.level);
+      expect(lockCovers(device, outside), `(${x},${y}) should be outside ${device.id}`).toBe(false);
+    }
+
+    const wrongLevel = spawnBall(set, pixelsToQ10(at.x), pixelsToQ10(at.y), 0, 0, 1);
+    expect(lockCovers(device, wrongLevel)).toBe(false);
+  });
+});
+
+describe("capture", () => {
+  it("takes one ball, freezes it where it stood, and leaves it active", () => {
+    const bank = createLockBank("law-n-justice");
+    const device = bank.locks[0]!;
+    const at = centreOf(device);
+    const set = createBallSet();
+    const ball = spawnBall(set, pixelsToQ10(at.x), pixelsToQ10(at.y), 500, -700, device.level);
+
+    const captured = captureBalls(bank, set.balls);
+    expect(captured).toEqual([{ deviceId: device.id, ballId: ball.id }]);
+    expect(ball.heldBy).toBe(device.id);
+    expect(ball.active).toBe(true);
+    // The original's capture handler never touches the position, so nor does this.
+    expect(q10ToPixel(ball.x)).toBe(at.x);
+    expect(q10ToPixel(ball.y)).toBe(at.y);
+    expect(ball.velocityX).toBe(0);
+    expect(ball.velocityY).toBe(0);
+    expect(heldBallIn(bank, device.id)).toBe(ball.id);
+  });
+
+  it("refuses a second ball into an occupied saucer", () => {
+    const bank = createLockBank("law-n-justice");
+    const device = bank.locks[0]!;
+    const at = centreOf(device);
+    const set = createBallSet();
+    const first = spawnBall(set, pixelsToQ10(at.x), pixelsToQ10(at.y), 0, 0, device.level);
+    const second = spawnBall(set, pixelsToQ10(at.x), pixelsToQ10(at.y), 0, 0, device.level);
+
+    expect(captureBalls(bank, set.balls).map((one) => one.ballId)).toEqual([first.id]);
+    expect(captureBalls(bank, set.balls)).toEqual([]);
+    expect(second.heldBy).toBe(null);
+    expect(heldBallCount(bank)).toBe(1);
+  });
+
+  it("never takes a ball a saucer already has", () => {
+    const bank = createLockBank("babewatch");
+    const [a, b] = [bank.locks[0]!, bank.locks[1]!];
+    const set = createBallSet();
+    const atA = centreOf(a);
+    const ball = spawnBall(set, pixelsToQ10(atA.x), pixelsToQ10(atA.y), 0, 0, a.level);
+    captureBalls(bank, set.balls);
+
+    // Teleport the held ball into the OTHER saucer's rectangle. It is already
+    // held, so nothing may happen — the engine's first refusal.
+    const atB = centreOf(b);
+    ball.x = pixelsToQ10(atB.x);
+    ball.y = pixelsToQ10(atB.y);
+    ball.level = b.level;
+    expect(captureBalls(bank, set.balls)).toEqual([]);
+    expect(ball.heldBy).toBe(a.id);
+  });
+
+  it("ignores drained balls", () => {
+    const bank = createLockBank("law-n-justice");
+    const device = bank.locks[0]!;
+    const at = centreOf(device);
+    const set = createBallSet();
+    const ball = spawnBall(set, pixelsToQ10(at.x), pixelsToQ10(at.y), 0, 0, device.level);
+    ball.active = false;
+    expect(captureBalls(bank, set.balls)).toEqual([]);
+  });
+});
+
+describe("release", () => {
+  it("empties every saucer and sends the balls to the trough, not the playfield", () => {
+    const bank = createLockBank("babewatch");
+    const set = createBallSet();
+    const held: BallState[] = [];
+    for (const device of bank.locks.slice(0, 2)) {
+      const at = centreOf(device);
+      held.push(spawnBall(set, pixelsToQ10(at.x), pixelsToQ10(at.y), 0, 0, device.level));
+    }
+    captureBalls(bank, set.balls);
+    expect(heldBallCount(bank)).toBe(2);
+
+    const freed = releaseHeldBalls(bank, set.balls);
+    expect(freed).toEqual(held.map((ball) => ball.id));
+    expect(heldBallCount(bank)).toBe(0);
+    for (const ball of held) {
+      expect(ball.heldBy).toBe(null);
+      // Deactivated, because opcode $68 re-initialises the ball object and puts
+      // it back in the serve queue. It comes out of the plunger lane.
+      expect(ball.active).toBe(false);
+    }
+  });
+});
+
+describe("the top-up, which is what the multiball opcode really is", () => {
+  it("asks for the shortfall, not for the whole target", () => {
+    expect(ballsToTopUp(3, 0, 0)).toBe(3);
+    expect(ballsToTopUp(3, 1, 0)).toBe(2);
+    expect(ballsToTopUp(3, 0, 2)).toBe(1);
+    expect(ballsToTopUp(3, 2, 1)).toBe(0);
+    expect(ballsToTopUp(3, 3, 0)).toBe(0);
+    // Already over the target: still nothing, never negative.
+    expect(ballsToTopUp(2, 3, 0)).toBe(0);
+  });
+
+  it("refuses outright above the engine's ceiling of three", () => {
+    // `cmpi.w #$3,d1 / bhi` at main.seg00 data 0x5BD0 — a request for four does
+    // not clamp to three, it does nothing at all.
+    expect(MAX_SIMULTANEOUS_BALLS).toBe(3);
+    expect(ballsToTopUp(4, 0, 0)).toBe(0);
+    expect(ballsToTopUp(6, 0, 0)).toBe(0);
+    expect(MULTIBALL_BALL_COUNT).toBeLessThanOrEqual(MAX_SIMULTANEOUS_BALLS);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2. The machine
+// ---------------------------------------------------------------------------
+
+describe("a lock in a running game", () => {
+  it("takes the ball out of the physics entirely", () => {
+    const tableId: TableId = "law-n-justice";
+    const device = ballLocksFor(tableId)[0]!;
+    const at = centreOf(device);
+    const map = mapFor(tableId);
+    const materials = materialTableFor(tableId);
+    const set = createBallSet();
+    const ball = spawnBall(set, pixelsToQ10(at.x), pixelsToQ10(at.y), 0, 0, device.level);
+    ball.heldBy = "some-saucer";
+
+    for (let tick = 0; tick < 200; tick += 1) {
+      stepBalls(set, map, materials, {
+        gravityY: PLUNGER_REFERENCE_GRAVITY,
+        nudgeX: 0,
+        nudgeY: 0,
+      });
+    }
+    // Two hundred ticks of gravity and it has not moved a Q10 unit.
+    expect(q10ToPixel(ball.x)).toBe(at.x);
+    expect(q10ToPixel(ball.y)).toBe(at.y);
+    expect(ball.velocityY).toBe(0);
+    expect(ball.active).toBe(true);
+  });
+
+  it("does not drain a held ball even below the drain line", () => {
+    const map = mapFor("law-n-justice");
+    const materials = materialTableFor("law-n-justice");
+    const set = createBallSet();
+    const held = spawnBall(set, pixelsToQ10(168), pixelsToQ10(599), 0, 4000, 0);
+    held.heldBy = "some-saucer";
+    const rolling = spawnBall(set, pixelsToQ10(168), pixelsToQ10(599), 0, 4000, 0);
+
+    const step = stepBalls(set, map, materials, {
+      gravityY: PLUNGER_REFERENCE_GRAVITY,
+      nudgeX: 0,
+      nudgeY: 0,
+    });
+    expect(step.drained).toEqual([rolling.id]);
+    expect(held.active).toBe(true);
+  });
+
+  for (const tableId of TABLE_IDS) {
+    it(`${tableId} swallows a ball, replaces it, and lights multiball on the second lock`, () => {
+      const game = started(tableId);
+      const locks = ballLocksFor(tableId);
+      runTicks(game, idleInput(), 60);
+
+      // First lock. Drop a ball into the saucer and step once.
+      const first = dropInto(game, locks[0]!);
+      const firstReport = runTicks(game, idleInput(), 1)[0];
+      expect(firstReport?.locked, `${tableId} first capture`).toContain(first.id);
+      expect(firstReport?.multiballStarted).toBe(false);
+
+      let state = debugSnapshot(game);
+      expect(state.locks.map((one) => one.deviceId)).toEqual([locks[0]!.id]);
+      expect(state.multiball).toBe(false);
+      expect(state.balls.find((one) => one.id === first.id)?.heldBy).toBe(locks[0]!.id);
+      // The player's ball count is untouched: a lock is not a drain.
+      const servedBefore = state.ballsServed;
+
+      // Second lock lights it. Everything held comes back, and the machine tops
+      // the table up to three.
+      const second = dropInto(game, locks[1]!);
+      const secondReport = runTicks(game, idleInput(), 1)[0];
+      expect(secondReport?.locked, `${tableId} second capture`).toContain(second.id);
+      expect(secondReport?.multiballStarted, `${tableId} multiball`).toBe(true);
+
+      state = debugSnapshot(game);
+      expect(state.multiball).toBe(true);
+      expect(state.locks, `${tableId} saucers after release`).toEqual([]);
+      expect(
+        freeBallCount(game.balls) + state.pendingServes,
+        `${tableId} balls promised`,
+      ).toBe(MULTIBALL_BALL_COUNT);
+      expect(state.ballsServed, `${tableId} player charged for a lock`).toBe(servedBefore);
+    });
+  }
+
+  it("feeds the multiball balls out of the lane one at a time and gets three rolling", () => {
+    const game = started("law-n-justice");
+    const locks = ballLocksFor("law-n-justice");
+    const input = playingInput();
+    clearTheLane(game, input);
+
+    dropInto(game, locks[0]!);
+    runTicks(game, input, 1);
+    dropInto(game, locks[1]!);
+    runTicks(game, input, 1);
+    expect(debugSnapshot(game).multiball).toBe(true);
+
+    let peak = 0;
+    for (let tick = 0; tick < 900; tick += 1) {
+      runTicks(game, input, 1);
+      const state = debugSnapshot(game);
+      // Never two balls on the rod at once, whatever else happens: one lane, one
+      // ball, exactly as the original's `$D88/$D89(a5)` interlock enforces.
+      const onRod = state.balls.filter(
+        (ball) => ball.active && ball.id === state.laneBallId,
+      ).length;
+      expect(onRod).toBeLessThanOrEqual(1);
+      peak = Math.max(peak, freeBallCount(game.balls));
+      if (peak >= MULTIBALL_BALL_COUNT) break;
+    }
+    expect(peak, "balls simultaneously in play").toBe(MULTIBALL_BALL_COUNT);
+    expect(peak).toBeLessThanOrEqual(MAX_SIMULTANEOUS_BALLS);
+  });
+
+  it("auto-launches the balls it served itself, and only those", () => {
+    const patient = started("law-n-justice");
+    // The player's own ball is never auto-launched: it sits on the rod for as
+    // long as the player likes, which is the whole point of a plunger.
+    runTicks(patient, idleInput(), 60 + AUTO_LAUNCH_DELAY_TICKS * 6);
+    expect(
+      debugSnapshot(patient).laneBallId,
+      "the player's ball was fired for them",
+    ).not.toBeNull();
+
+    // The machine's own do go, and nothing on the input has to ask for it: the
+    // count below is taken while the player holds no control at all.
+    const game = started("law-n-justice");
+    const locks = ballLocksFor("law-n-justice");
+    clearTheLane(game, playingInput());
+    dropInto(game, locks[0]!);
+    runTicks(game, idleInput(), 1);
+    dropInto(game, locks[1]!);
+    runTicks(game, idleInput(), 1);
+
+    let launches = 0;
+    for (let tick = 0; tick < 900; tick += 1) {
+      if (runTicks(game, idleInput(), 1)[0]?.launched === true) launches += 1;
+    }
+    expect(launches, "machine-served balls left the lane on their own").toBeGreaterThanOrEqual(2);
+  });
+
+  it("reframes the camera to the whole table for multiball, and not for a locked ball", () => {
+    const rolling = (id: number, y: number): BallState => ({
+      id,
+      x: pixelsToQ10(168),
+      y: pixelsToQ10(y),
+      velocityX: 0,
+      velocityY: 0,
+      active: true,
+      heldBy: null,
+      level: 0,
+    });
+    const held = (id: number, y: number): BallState => ({ ...rolling(id, y), heldBy: "saucer" });
+
+    // One rolling ball and one in a saucer is not multiball, and the close view
+    // is what the player wants.
+    expect(resolveMode([rolling(0, 400), held(1, 100)], DEFAULT_CAMERA_OPTIONS)).toBe("scrolling");
+    // Give it back and it is.
+    expect(resolveMode([rolling(0, 400), rolling(1, 100)], DEFAULT_CAMERA_OPTIONS)).toBe(
+      "full-table",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 3. It cannot hang
+// ---------------------------------------------------------------------------
+
+describe("the zero-deadlock guarantee, restated for locks", () => {
+  for (const tableId of TABLE_IDS) {
+    it(`${tableId} keeps playing when a lock swallows the only ball on the table`, () => {
+      const game = started(tableId);
+      runTicks(game, idleInput(), 60);
+      // Get rid of the served ball so the locked one is genuinely the last.
+      for (const ball of game.balls.balls) ball.active = false;
+      game.laneBallId = null;
+
+      const device = ballLocksFor(tableId)[0]!;
+      dropInto(game, device);
+      runTicks(game, idleInput(), 1);
+      expect(heldBallCount(game.locks), `${tableId} capture`).toBe(1);
+      expect(freeBallCount(game.balls), `${tableId} table emptied`).toBe(0);
+
+      // The machine owes a replacement and pays it.
+      expect(debugSnapshot(game).pendingServes, `${tableId} replacement queued`).toBe(1);
+      runTicks(game, idleInput(), 400);
+      const state = debugSnapshot(game);
+      expect(state.phase, `${tableId} phase`).toBe("in-play");
+      expect(
+        freeBallCount(game.balls),
+        `${tableId} never got its replacement ball`,
+      ).toBeGreaterThan(0);
+    });
+
+    it(`${tableId} ends the ball when the last one drains with a saucer still full`, () => {
+      // The hang this is here to stop: a held ball is ACTIVE, so an end-of-ball
+      // test written against the active count never fires, no serve is ever
+      // queued, and the ball search is right to ignore the only ball left.
+      const game = started(tableId);
+      runTicks(game, idleInput(), 60);
+
+      const device = ballLocksFor(tableId)[0]!;
+      dropInto(game, device);
+      runTicks(game, idleInput(), 1);
+      expect(heldBallCount(game.locks)).toBe(1);
+
+      // Drain everything that is not held, and cancel what the machine owes, so
+      // the only thing left on the table is the ball in the saucer.
+      for (const ball of game.balls.balls) {
+        if (ball.heldBy === null) ball.active = false;
+      }
+      game.laneBallId = null;
+      game.pendingServes = 0;
+      game.serveCountdown = 0;
+
+      // One tick with a drain in it takes the end-of-ball path.
+      const spare = spawnBall(game.balls, pixelsToQ10(168), pixelsToQ10(599), 0, 4000, 0);
+      expect(spare.active).toBe(true);
+      runTicks(game, idleInput(), 1);
+
+      expect(heldBallCount(game.locks), `${tableId} saucer not emptied at end of ball`).toBe(0);
+      // And the machine moves on rather than sitting there.
+      runTicks(game, idleInput(), 400);
+      const state = debugSnapshot(game);
+      expect(
+        state.phase === "game-over" || freeBallCount(game.balls) > 0,
+        `${tableId} neither served nor ended`,
+      ).toBe(true);
+    });
+
+    it(`${tableId} still finishes a three-ball game with every saucer used`, () => {
+      // The whole lifecycle end to end: lock, replace, multiball, drain out of
+      // it, and reach game over inside a generous budget.
+      const game = createGame(mapFor(tableId), { ballsPerGame: 3 });
+      startGame(game);
+      const input = playingInput();
+      let overflow = 0;
+      for (let tick = 0; tick < 40_000; tick += 1) {
+        runTicks(game, input, 1);
+        // Drop a ball into a saucer whenever one is free, so the locks are
+        // exercised over and over rather than once.
+        if (tick % 500 === 250) {
+          const empty = ballLocksFor(tableId).find(
+            (device) => heldBallIn(game.locks, device.id) === null,
+          );
+          if (empty !== undefined) steerIntoLock(game, empty);
+        }
+        overflow = Math.max(overflow, freeBallCount(game.balls));
+        if (debugSnapshot(game).phase === "game-over") break;
+      }
+      expect(debugSnapshot(game).phase, `${tableId} never finished`).toBe("game-over");
+      expect(
+        overflow,
+        `${tableId} put ${overflow} balls on the playfield at once`,
+      ).toBeLessThanOrEqual(MAX_SIMULTANEOUS_BALLS);
+    });
+  }
+});
+
+describe("what is decoded and what is not", () => {
+  it("says so out loud", () => {
+    // A reader has to be able to find out which half of this is measured without
+    // reading the disassembly, so the note is part of the module's interface.
+    expect(BALL_LOCK_RULES_NOTE).toMatch(/reconstruction, not decoded fact/);
+    expect(LOCKS_TO_LIGHT_MULTIBALL).toBe(2);
+  });
+
+  it("keeps the rectangles exactly as they were read off the table modules", () => {
+    // A change-detector on purpose, and the only one in this file: these numbers
+    // came out of `Table00N.seg04`'s zone lists and nothing in this repository
+    // may quietly adjust them to make a ball behave. Re-decode the module if they
+    // need to move.
+    expect(BALL_LOCKS_BY_TABLE["law-n-justice"].map((one) => [one.id, one.level, one.minX, one.minY, one.maxX, one.maxY])).toEqual([
+      ["jail-top", 0, 85, 60, 145, 100],
+      ["right-crater", 0, 235, 165, 260, 190],
+      ["jail-throat", 0, 55, 170, 85, 200],
+    ]);
+    expect(BALL_LOCKS_BY_TABLE["babewatch"].map((one) => [one.id, one.level, one.minX, one.minY, one.maxX, one.maxY])).toEqual([
+      ["grid-top", 0, 66, 48, 86, 68],
+      ["grid-mid", 0, 152, 110, 172, 130],
+      ["top-lane", 0, 145, 14, 165, 34],
+      ["lower-bowl", 0, 200, 250, 230, 295],
+      ["upper-deck", 1, 70, 40, 110, 80],
+    ]);
+    expect(BALL_LOCKS_BY_TABLE["extreme-sports"].map((one) => [one.id, one.level, one.minX, one.minY, one.maxX, one.maxY])).toEqual([
+      ["bowl", 0, 249, 159, 269, 179],
+      ["upper-orbit", 1, 65, 10, 105, 50],
+    ]);
+  });
+});
