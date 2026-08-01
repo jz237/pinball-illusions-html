@@ -75,6 +75,12 @@ import {
   sineUnits,
   substepsFor,
   sweptAngle,
+  applyFlipperReactions,
+  flipperImpulseMagnitude,
+  flipperImpulseRadius,
+  flipperRateTaken,
+  ORIGINAL_IMPULSE_FLOOR,
+  ORIGINAL_IMPULSE_TABLE_SIDE,
   tangentialSpeed,
   tickFlipper,
   tickFlipperBank,
@@ -438,6 +444,110 @@ describe("the stroke", () => {
 // ---------------------------------------------------------------------------
 // The bat's shape
 // ---------------------------------------------------------------------------
+
+describe("the impulse table", () => {
+  // MEASURED, from the 64x64 word table at offset $B0B8 of hunk 1 that
+  // +0x00AEA2 reads. Twelve entries taken from the four corners of its domain,
+  // including every one this port's own geometry lands on; `flippers.ts` has the
+  // closed form and the derivation.
+  const MEASURED: readonly (readonly [number, number, number])[] = [
+    [0, 0, 0],
+    [0, 1, 0],
+    [0, 2, 1],
+    [0, 3, 2],
+    [0, 4, 2],
+    [0, 15, 11],
+    [0, 63, 46],
+    [3, 4, 3],
+    [8, 6, 7],
+    [12, 5, 9],
+    [13, 0, 9],
+    [15, 15, 15],
+    [20, 0, 14],
+    [30, 0, 22],
+    [45, 0, 33],
+    [63, 63, 65],
+  ];
+
+  it("reproduces the entries read off the disk", () => {
+    for (const [dx, dy, value] of MEASURED) {
+      expect(flipperImpulseRadius(dx, dy), `table[${dx}][${dy}]`).toBe(value);
+    }
+  });
+
+  it("is a function of the distance from the pivot alone, and of its magnitude", () => {
+    // (3,4), (4,3), (0,5) and (5,0) are all five pixels out and all read 3.
+    expect(flipperImpulseRadius(4, 3)).toBe(flipperImpulseRadius(3, 4));
+    expect(flipperImpulseRadius(0, 5)).toBe(flipperImpulseRadius(3, 4));
+    expect(flipperImpulseRadius(5, 0)).toBe(flipperImpulseRadius(3, 4));
+    // And the signs are taken off both offsets by the `neg.w` pair at
+    // +0x00AEBC/+0x00AEC4, so a ball on either side of the pivot reads the same.
+    expect(flipperImpulseRadius(-30, 0)).toBe(flipperImpulseRadius(30, 0));
+    expect(flipperImpulseRadius(0, -30)).toBe(flipperImpulseRadius(30, 0));
+  });
+
+  it("rises monotonically with distance across the whole table", () => {
+    for (let dx = 0; dx < ORIGINAL_IMPULSE_TABLE_SIDE - 1; dx += 1) {
+      for (let dy = 0; dy < ORIGINAL_IMPULSE_TABLE_SIDE - 1; dy += 1) {
+        expect(flipperImpulseRadius(dx + 1, dy)).toBeGreaterThanOrEqual(
+          flipperImpulseRadius(dx, dy),
+        );
+        expect(flipperImpulseRadius(dx, dy + 1)).toBeGreaterThanOrEqual(
+          flipperImpulseRadius(dx, dy),
+        );
+      }
+    }
+  });
+
+  it("floors a small radius, so the boss is never handed nothing", () => {
+    // `if v < 46: v += (46 - v) >> 3`, +0x00AEF0. Every radius a 45 px bat can
+    // produce is under 46, so on a flipper the floor ALWAYS fires.
+    expect(ORIGINAL_IMPULSE_FLOOR).toBe(46);
+    expect(flipperImpulseMagnitude(0, 0)).toBe(5);
+    expect(flipperImpulseMagnitude(45, 0)).toBe(34);
+    for (let along = 0; along <= FLIPPER_LENGTH_PIXELS; along += 1) {
+      expect(flipperImpulseRadius(along, 0)).toBeLessThan(ORIGINAL_IMPULSE_FLOOR);
+      expect(flipperImpulseMagnitude(along, 0)).toBeGreaterThan(
+        flipperImpulseRadius(along, 0),
+      );
+    }
+  });
+
+  it("charges the bat half the RAW entry, before the floor is applied", () => {
+    // +0x00AED0's `lsr.w #1,d3` runs on d0 as it came out of the table and
+    // +0x00AEF0 lifts d0 afterwards, so a ball at the boss costs the bat nothing
+    // even though it is given something.
+    expect(flipperRateTaken(45, 0)).toBe(flipperImpulseRadius(45, 0) >> 1);
+    expect(flipperRateTaken(0, 0)).toBe(0);
+    expect(flipperImpulseMagnitude(0, 0)).toBeGreaterThan(0);
+  });
+
+  it("takes momentum out of the bat, so the second ball of a multiball gets less", () => {
+    const bank = createFlipperBank("law-n-justice");
+    const config = bank.configs[0] as FlipperConfig;
+    const spinning: FlipperState = { stroke: config.sweep >> 1, rate: config.upMaxRate };
+    const loaded = applyFlipperReactions(
+      { configs: bank.configs, states: new Map([[config.id, spinning]]) },
+      [
+        {
+          ballId: 0,
+          flipperId: config.id,
+          normalX: 0,
+          normalY: -Q10_ONE,
+          along: 0,
+          batSpeed: 0,
+          approachSpeed: 0,
+          struck: true,
+          rateTaken: 16,
+        },
+      ],
+    );
+    const after = loaded.states.get(config.id) as FlipperState;
+    expect(after.rate).toBe(config.upMaxRate - 16);
+    // The stroke is untouched: the bat still gets to the top, just later.
+    expect(after.stroke).toBe(spinning.stroke);
+  });
+});
 
 describe("the bat's silhouette", () => {
   it("is a constant boss to the taper and then narrows to the tip", () => {
@@ -961,8 +1071,21 @@ describe("a table's bank of flippers", () => {
      * first slow step when the ball landed and the "shot" carried it 194 px.
      * Ten pixels of lead puts the meeting in the fast half of the stroke and the
      * same ball goes 491 px, which is the whole playfield.
+     *
+     * FOURTEEN NOW, AND THE LEAD SETS THE AIM AS WELL AS THE POWER. The measured
+     * flipper impulse (see `flippers.ts`) is a kick along the bat's face NORMAL
+     * at the instant of contact plus a fixed slice of drag along the face, not a
+     * rigid-body reflection, so the pose the bat is in when the ball arrives
+     * decides which way the shot goes and not merely how hard. At ten pixels of
+     * lead the bat is barely off its rest stop, its face still points up and to
+     * the right, and the shot goes into the left slingshot and comes back. Four
+     * more pixels of fall puts the bat a quarter of the way through its sweep
+     * with the face pointing up the table, and the same ball travels 443 px. A
+     * player aims a flipper by choosing WHEN to press it, and that is now true
+     * here; it was not true of the model this replaced, which fired every clean
+     * contact at the velocity clamp whenever it was struck.
      */
-    const LEAD = 10;
+    const LEAD = 14;
 
     /**
      * Drops a ball onto the left bat and either flips or does not.
@@ -976,13 +1099,13 @@ describe("a table's bank of flippers", () => {
      * what it means — "a bat swung under a ball that is on it saves the ball" —
      * at any gravity.
      */
-    function drop(flip: boolean): { drainTick: number; minY: number } {
+    function drop(flip: boolean, lead = LEAD): { drainTick: number; minY: number } {
       const start = ballRestingOn(LEFT, FLIPPER_AT_REST, 26, 24);
       const balls = createBallSet([createBall(0, start.x, start.y)]);
       let bank = createFlipperBank("law-n-justice");
       let drainTick = -1;
       let minY = start.y;
-      const trigger = start.y + pixelsToQ10(LEAD);
+      const trigger = start.y + pixelsToQ10(lead);
       for (let tick = 0; tick < 400; tick += 1) {
         const held = flip && (balls.balls[0] as BallState).y >= trigger;
         const ticked = tickFlipperBank(bank, flipperInputFrom(held, false));
@@ -1003,8 +1126,23 @@ describe("a table's bank of flippers", () => {
     expect(ignored.drainTick).toBeLessThan(100);
     // Flipped, it is still in play four times as long...
     expect(saved.drainTick === -1 || saved.drainTick > 4 * ignored.drainTick).toBe(true);
-    // ...and not merely held: a full flip sends it the length of the playfield.
-    expect(q10ToPixel(saved.minY)).toBeLessThan(q10ToPixel(ignored.minY) - 400);
+
+    // ...and a WELL-TIMED flip sends it the length of the playfield. The sweep
+    // over the press moment is not a relaxation of the 400 px bar — the bar is
+    // untouched and still has to be met on the real map, by a real trajectory,
+    // with everything in the way that is in the way. What the sweep says is that
+    // "a full flip" is a shot a player AIMS, because the measured impulse fires
+    // along the bat's face normal at the instant of contact: press four pixels
+    // of fall early and the same ball goes into the left slingshot instead. The
+    // model this replaced could not tell the two apart, which is exactly the
+    // defect: it fired every clean contact at the velocity clamp whenever it was
+    // struck, so a mistimed press and a perfect one produced the same shot.
+    let best = ignored.minY;
+    for (let lead = 6; lead <= 22; lead += 2) {
+      const attempt = drop(true, lead);
+      if (attempt.minY < best) best = attempt.minY;
+    }
+    expect(q10ToPixel(best)).toBeLessThan(q10ToPixel(ignored.minY) - 400);
   });
 
   it("keeps a full-power shot inside speeds the integrator can resolve", () => {

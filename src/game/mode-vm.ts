@@ -121,7 +121,25 @@ const OP_ANIMATE = 19;
 const OP_NATIVE = 20;
 const OP_JMP_IF_UNLIT = 23;
 const OP_PUSH_LINKED = 24;
-const OP_IF_TWO_PLAYER = 25;
+/**
+ * Opcode 25: GO TO THE WIDE VIEW, if option record 6 allows it.
+ *
+ * MEASURED, and it used to be called OP_IF_TWO_PLAYER on nothing more than the
+ * shape of its handler. +0x005A26 is `cmpi.w #2,$e90(a5) / bne -> rts /
+ * jsr $3c52`, where $3C52 is the wide-screen setup (BPLCON0 $8214: HIRES, LACE,
+ * eight planes; BPLxMOD $2D0 = 2*384-48, so each displayed line steps two
+ * playfield rows) and $E90 is option record 6, the view mode. Its table entry is
+ * at 0x5912 + 4*25 with a length word of 2, so it takes no operands; the
+ * numbering is anchored by opcode 27 at 0x5BCC, which this file already knows as
+ * OP_BALLS_UP_TO.
+ *
+ * It is the multiball camera switch this project has been carrying as [src], and
+ * it is script-driven rather than a ball-count rule. Still routed to
+ * `unimplemented`: this port reframes to the whole table on ball count (see
+ * `camera.ts`), which is documented behaviour, and swapping that for a scripted
+ * mode change needs the wide view's 462-row interlaced geometry first.
+ */
+const OP_VIEW_WIDE = 25;
 const OP_BALL_REMOVE = 26;
 const OP_BALLS_UP_TO = 27;
 const OP_WAIT = 28;
@@ -658,12 +676,12 @@ function step(
       return next;
 
     case OP_PUSH_LINKED:
-    case OP_IF_TWO_PLAYER:
+    case OP_VIEW_WIDE:
     case OP_ANIMATE:
     case OP_NATIVE:
-      // PUSH_LINKED needs the undecoded stack; IF_TWO_PLAYER is a second-player
-      // branch and this reconstruction has one player; ANIMATE and NATIVE reach
-      // graphics and per-table 68k code that is not being emulated.
+      // PUSH_LINKED needs the undecoded stack; VIEW_WIDE asks for a screen mode
+      // this port does not have; ANIMATE and NATIVE reach graphics and per-table
+      // 68k code that is not being emulated.
       out.unimplemented += 1;
       return next;
 

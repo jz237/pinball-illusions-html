@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   INITIAL_TILT,
-  NUDGE_ALLOWANCE_BY_TABLE,
+  NUDGE_COOLDOWN_TICKS,
+  ORIGINAL_TILT_SENSITIVITY_DEFAULT,
+  ORIGINAL_TILT_SENSITIVITY_MAX,
+  ORIGINAL_TILT_SENSITIVITY_MIN,
+  ORIGINAL_TILT_THRESHOLD,
+  TILT_DECAY_PER_TICK,
+  TILT_SENSITIVITY_BY_TABLE,
   flippersLive,
   nudge,
   nudgeConfigFor,
@@ -10,30 +16,81 @@ import {
   tickTilt,
 } from "../src/game/tilt.js";
 import type { NudgeConfig, TiltState } from "../src/game/tilt.js";
+import { TABLE_IDS } from "../src/game/contracts.js";
+import { TICKS_PER_SECOND } from "../src/game/timebase.js";
 
 const CONFIG: NudgeConfig = nudgeConfigFor("law-n-justice");
 
-/** Nudges n times, skipping past the cooldown between each. */
-function nudgeTimes(times: number, config: NudgeConfig = CONFIG): TiltState {
+/** Shoves `times`, `gap` ticks apart, and reports where the counter ended up. */
+function shove(times: number, gap: number, config: NudgeConfig = CONFIG): TiltState {
   let state = INITIAL_TILT;
   for (let i = 0; i < times; i += 1) {
     state = nudge(state, "left", config).state;
-    for (let t = 0; t < config.cooldownTicks; t += 1) state = tickTilt(state, config);
+    for (let t = 0; t < gap; t += 1) state = tickTilt(state, config);
   }
   return state;
 }
 
-describe("per-table allowance", () => {
-  it("matches the values decoded from the original option files", () => {
-    expect(NUDGE_ALLOWANCE_BY_TABLE["law-n-justice"]).toBe(5);
-    expect(NUDGE_ALLOWANCE_BY_TABLE.babewatch).toBe(5);
-    // The one genuine per-table difference found on the disks.
-    expect(NUDGE_ALLOWANCE_BY_TABLE["extreme-sports"]).toBe(10);
+describe("the measured rule", () => {
+  it("is a sensitivity against a fixed threshold, not a per-table nudge count", () => {
+    // THE CORRECTION. This project spent eleven commits believing the tilt
+    // allowance was 5 / 5 / 10 and that Extreme Sports tolerated twice as many
+    // shoves as the others, tagged [disk]. Those are option record 5's default,
+    // a duration in whole SECONDS. Record 3 is the tilt option and it is
+    // byte-identical on all three tables.
+    for (const id of TABLE_IDS) {
+      expect(TILT_SENSITIVITY_BY_TABLE[id]).toBe(ORIGINAL_TILT_SENSITIVITY_DEFAULT);
+    }
+    expect(ORIGINAL_TILT_SENSITIVITY_MIN).toBe(0);
+    expect(ORIGINAL_TILT_SENSITIVITY_MAX).toBe(200);
+    expect(ORIGINAL_TILT_SENSITIVITY_DEFAULT).toBe(100);
+    expect(ORIGINAL_TILT_THRESHOLD).toBe(200);
   });
 
-  it("gives Extreme Sports twice the tolerance of the others", () => {
-    expect(nudgeTimes(6, nudgeConfigFor("law-n-justice")).tilted).toBe(true);
-    expect(nudgeTimes(6, nudgeConfigFor("extreme-sports")).tilted).toBe(false);
+  it("decays four counts a tick, one per collision pass", () => {
+    // The number that turns "the second nudge tilts" into "the third inside half
+    // a second tilts". `$BE90` is the tail of `$BC24` and `$BC24` runs once per
+    // collision pass, four times a frame.
+    expect(TILT_DECAY_PER_TICK).toBe(4);
+    // Which is to say a single shove is forgiven in half a second exactly.
+    const oneShove = ORIGINAL_TILT_SENSITIVITY_DEFAULT / TILT_DECAY_PER_TICK;
+    expect(oneShove / TICKS_PER_SECOND).toBeCloseTo(0.5);
+  });
+
+  it("cannot be tilted by two shoves, however fast they are made", () => {
+    // 100 + (100 - 4) is 196 at the very best, one short of 200 twice over.
+    for (let gap = NUDGE_COOLDOWN_TICKS; gap < 30; gap += 1) {
+      expect(shove(2, gap).tilted, `two shoves ${gap} ticks apart`).toBe(false);
+    }
+  });
+
+  it("tilts on the third shove inside half a second, and not outside it", () => {
+    expect(shove(3, NUDGE_COOLDOWN_TICKS).tilted).toBe(true);
+    // Spread the same three shoves over more than the counter's memory and the
+    // table forgives every one of them.
+    expect(shove(3, 26).tilted).toBe(false);
+    expect(shove(20, 26).tilted).toBe(false);
+  });
+
+  it("never tilts at sensitivity 0 and tilts on the first shove at 200", () => {
+    const deaf: NudgeConfig = { ...CONFIG, sensitivity: ORIGINAL_TILT_SENSITIVITY_MIN };
+    expect(shove(40, NUDGE_COOLDOWN_TICKS, deaf).tilted).toBe(false);
+    expect(shove(40, NUDGE_COOLDOWN_TICKS, deaf).warning).toBe(0);
+
+    const jumpy: NudgeConfig = { ...CONFIG, sensitivity: ORIGINAL_TILT_SENSITIVITY_MAX };
+    expect(nudge(INITIAL_TILT, "left", jumpy).state.tilted).toBe(true);
+    expect(nudge(INITIAL_TILT, "left", jumpy).justTilted).toBe(true);
+  });
+
+  it("refuses a second shove only while the cabinet is still recentring", () => {
+    // Seven passes at +600 to saturation and -200 back, so two ticks. It was ten
+    // and chosen; the number is now the accumulator's own.
+    expect(NUDGE_COOLDOWN_TICKS).toBe(2);
+    const first = nudge(INITIAL_TILT, "left", CONFIG);
+    expect(nudge(first.state, "left", CONFIG).accepted).toBe(false);
+    let state = first.state;
+    for (let t = 0; t < NUDGE_COOLDOWN_TICKS; t += 1) state = tickTilt(state, CONFIG);
+    expect(nudge(state, "left", CONFIG).accepted).toBe(true);
   });
 });
 
@@ -52,47 +109,41 @@ describe("nudging", () => {
     expect(forward.impulseX).toBe(0);
   });
 
-  it("counts a warning each time", () => {
-    expect(nudge(INITIAL_TILT, "left", CONFIG).state.warnings).toBe(1);
-    expect(nudgeTimes(3).warnings).toBe(3);
+  it("adds the sensitivity to the counter each time", () => {
+    expect(nudge(INITIAL_TILT, "left", CONFIG).state.warning).toBe(CONFIG.sensitivity);
+    // Two shoves back to back, with the cooldown's decay between them.
+    expect(shove(2, NUDGE_COOLDOWN_TICKS).warning).toBe(
+      2 * CONFIG.sensitivity - 2 * NUDGE_COOLDOWN_TICKS * TILT_DECAY_PER_TICK,
+    );
   });
 
-  it("refuses a second nudge during cooldown, and does not count it", () => {
+  it("does not count a nudge it refused", () => {
     const first = nudge(INITIAL_TILT, "left", CONFIG);
     const second = nudge(first.state, "left", CONFIG);
     expect(second.accepted).toBe(false);
     expect(second.impulseX).toBe(0);
-    expect(second.state.warnings).toBe(1);
-  });
-
-  it("accepts again once the cooldown expires", () => {
-    let state = nudge(INITIAL_TILT, "left", CONFIG).state;
-    for (let t = 0; t < CONFIG.cooldownTicks; t += 1) state = tickTilt(state, CONFIG);
-    expect(nudge(state, "left", CONFIG).accepted).toBe(true);
+    expect(second.state.warning).toBe(CONFIG.sensitivity);
   });
 });
 
 describe("tilting", () => {
-  it("tilts on reaching the allowance, not before", () => {
-    expect(nudgeTimes(CONFIG.allowance - 1).tilted).toBe(false);
-    expect(nudgeTimes(CONFIG.allowance).tilted).toBe(true);
-  });
-
   it("reports the moment of tilt exactly once", () => {
-    let state = nudgeTimes(CONFIG.allowance - 1);
+    const state = shove(2, NUDGE_COOLDOWN_TICKS);
+    expect(state.tilted).toBe(false);
     const tipping = nudge(state, "left", CONFIG);
     expect(tipping.justTilted).toBe(true);
-    state = tipping.state;
-    expect(nudge(state, "left", CONFIG).justTilted).toBe(false);
+    expect(nudge(tipping.state, "left", CONFIG).justTilted).toBe(false);
   });
 
   it("still shoves the table on the tilting nudge", () => {
-    const tipping = nudge(nudgeTimes(CONFIG.allowance - 1), "left", CONFIG);
+    const tipping = nudge(shove(2, NUDGE_COOLDOWN_TICKS), "left", CONFIG);
+    expect(tipping.justTilted).toBe(true);
     expect(tipping.impulseX).not.toBe(0);
   });
 
   it("kills flippers and scoring once tilted", () => {
-    const tilted = nudgeTimes(CONFIG.allowance);
+    const tilted = shove(3, NUDGE_COOLDOWN_TICKS);
+    expect(tilted.tilted).toBe(true);
     expect(flippersLive(tilted)).toBe(false);
     expect(scoringLive(tilted)).toBe(false);
     expect(flippersLive(INITIAL_TILT)).toBe(true);
@@ -100,15 +151,15 @@ describe("tilting", () => {
   });
 
   it("refuses all further nudges once tilted", () => {
-    const tilted = nudgeTimes(CONFIG.allowance);
+    const tilted = shove(3, NUDGE_COOLDOWN_TICKS);
     const after = nudge(tilted, "right", CONFIG);
     expect(after.accepted).toBe(false);
     expect(after.impulseX).toBe(0);
   });
 
   it("does not decay out of a tilt — it lasts the rest of the ball", () => {
-    let state = nudgeTimes(CONFIG.allowance);
-    for (let t = 0; t < CONFIG.decayTicks * 5; t += 1) state = tickTilt(state, CONFIG);
+    let state = shove(3, NUDGE_COOLDOWN_TICKS);
+    for (let t = 0; t < 5 * TICKS_PER_SECOND; t += 1) state = tickTilt(state, CONFIG);
     expect(state.tilted).toBe(true);
   });
 
@@ -118,25 +169,23 @@ describe("tilting", () => {
 });
 
 describe("warning decay", () => {
-  it("forgives one warning after the decay period", () => {
-    let state = nudgeTimes(2);
-    expect(state.warnings).toBe(2);
-    for (let t = 0; t < CONFIG.decayTicks; t += 1) state = tickTilt(state, CONFIG);
-    expect(state.warnings).toBe(1);
+  it("drains a single shove to nothing in half a second", () => {
+    let state = nudge(INITIAL_TILT, "left", CONFIG).state;
+    const ticks = Math.ceil(CONFIG.sensitivity / CONFIG.decayPerTick);
+    for (let t = 0; t < ticks - 1; t += 1) state = tickTilt(state, CONFIG);
+    expect(state.warning).toBeGreaterThan(0);
+    state = tickTilt(state, CONFIG);
+    expect(state.warning).toBe(0);
+    expect(ticks).toBe(25);
   });
 
-  it("means spaced-out nudging never tilts", () => {
+  it("never drops below zero", () => {
     let state = INITIAL_TILT;
-    for (let i = 0; i < CONFIG.allowance * 3; i += 1) {
-      state = nudge(state, "left", CONFIG).state;
-      for (let t = 0; t < CONFIG.decayTicks; t += 1) state = tickTilt(state, CONFIG);
-    }
-    expect(state.tilted).toBe(false);
+    for (let t = 0; t < 200; t += 1) state = tickTilt(state, CONFIG);
+    expect(state.warning).toBe(0);
   });
 
-  it("never drops below zero warnings", () => {
-    let state = INITIAL_TILT;
-    for (let t = 0; t < CONFIG.decayTicks * 3; t += 1) state = tickTilt(state, CONFIG);
-    expect(state.warnings).toBe(0);
+  it("returns the same state object when nothing changed, so a quiet tick is free", () => {
+    expect(tickTilt(INITIAL_TILT, CONFIG)).toBe(INITIAL_TILT);
   });
 });

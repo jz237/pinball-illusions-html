@@ -35,9 +35,13 @@ import {
   ORIGINAL_GRAVITY_MIN,
   ORIGINAL_SUBSTEPS_PER_FRAME,
   ORIGINAL_VELOCITY_CLAMP,
+  ORIGINAL_X_TILT_DEFAULT,
+  ORIGINAL_X_TILT_MAX,
+  ORIGINAL_X_TILT_MIN,
   Q10_PER_ORIGINAL_ACCEL_UNIT,
   Q10_PER_ORIGINAL_VELOCITY_UNIT,
   SIMULATION_GRAVITY,
+  SIMULATION_X_TILT,
   TICKS_PER_SECOND,
   VELOCITY_CLAMP_Q10,
   gravityForOption,
@@ -57,12 +61,16 @@ import type { BallState } from "../src/game/contracts.js";
 import { pixelsToQ10, q10ToPixel } from "../src/core/fixed-point.js";
 import {
   FLIPPER_AT_REST,
+  FLIPPER_LENGTH_PIXELS,
+  ORIGINAL_IMPULSE_TANGENT,
   batRadiusAt,
   cosineUnits,
   createFlipperBank,
   flipperAngle,
   flipperConfigsFor,
+  flipperImpulseMagnitude,
   flipperInputFrom,
+  flipperRateTaken,
   resolveFlipperContacts,
   sineUnits,
   tickFlipper,
@@ -197,6 +205,44 @@ describe("the timebase", () => {
     // Sixteen pixels a tick, 800 px a second, over the whole frame.
     expect(VELOCITY_CLAMP_Q10 / ORIGINAL_SUBSTEPS_PER_FRAME).toBe(2047.5);
     expect(VELOCITY_CLAMP_Q10).toBeLessThan(pixelsToQ10(16));
+  });
+
+  it("applies option record 4, the table x-tilt, on the same footing as gravity", () => {
+    // MEASURED at +0x00B758: the ramp drive, the x-tilt and gravity are resolved
+    // into ONE acceleration and added to the ball's velocity in the same pair of
+    // instructions, so the x-tilt takes the same unit bridge gravity does. The
+    // shipped value is 0 on all three tables, which is why this asserts the
+    // WIRING rather than an effect: an option measured and then left
+    // unconnected reads exactly like an option that was never measured.
+    expect(ORIGINAL_X_TILT_MIN).toBe(-3);
+    expect(ORIGINAL_X_TILT_MAX).toBe(3);
+    expect(ORIGINAL_X_TILT_DEFAULT).toBe(0);
+    expect(SIMULATION_X_TILT).toBe(0);
+    // Full scale is three quarters of gravity of permanent lateral lean.
+    expect(ORIGINAL_X_TILT_MAX * Q10_PER_ORIGINAL_ACCEL_UNIT).toBe(96);
+    expect(ORIGINAL_X_TILT_MAX * Q10_PER_ORIGINAL_ACCEL_UNIT / SIMULATION_GRAVITY).toBe(0.75);
+
+    const balls = createBallSet([createBall(0, pixelsToQ10(168), pixelsToQ10(200))]);
+    const ball = balls.balls[0] as BallState;
+    const leaning: SimulationForces = {
+      gravityY: SIMULATION_GRAVITY,
+      tiltX: ORIGINAL_X_TILT_MAX * Q10_PER_ORIGINAL_ACCEL_UNIT,
+      nudgeX: 0,
+      nudgeY: 0,
+    };
+    for (let tick = 0; tick < 10; tick += 1) stepBalls(balls, EMPTY, MATERIALS, leaning);
+    expect(ball.velocityX).toBe(10 * (leaning.tiltX ?? 0));
+
+    // ...and the shipped default really is inert.
+    const shipped = createBallSet([createBall(0, pixelsToQ10(168), pixelsToQ10(200))]);
+    const upright: SimulationForces = {
+      gravityY: SIMULATION_GRAVITY,
+      tiltX: SIMULATION_X_TILT,
+      nudgeX: 0,
+      nudgeY: 0,
+    };
+    for (let tick = 0; tick < 10; tick += 1) stepBalls(shipped, EMPTY, MATERIALS, upright);
+    expect((shipped.balls[0] as BallState).velocityX).toBe(0);
   });
 });
 
@@ -359,48 +405,106 @@ describe("how fast a flipper shot travels", () => {
   });
 
   it("sends a ball off the bat across 400 px of playfield in under a second", () => {
-    // The rate a player feels. A ball dropped onto the left bat and flipped with
-    // ten pixels of lead — the stroke takes 3.5 ticks, so a shot is made by
-    // starting it before the ball arrives — crosses the playfield.
+    // The rate a player feels. A ball dropped onto the left bat and flipped
+    // crosses the playfield - the stroke takes 3.5 ticks, so a shot is made by
+    // starting it before the ball arrives.
     //
     // WHY THIS IS A RATE TEST AND NOT A REACHABILITY ONE: at the port's old
     // constant-rate stroke the tip moved 9.4 px a tick, which after the gravity
     // correction would have made a full flipper shot WEAKER than a scoop kicker
     // and taken it 0.9 s to cross the table. It would still have reached the top,
     // and every existing flipper test would still have passed.
+    //
+    // WHY IT SWEEPS THE PRESS MOMENT. The bar - 400 px on the real map inside a
+    // second, and not instantly either - is exactly as it was. What has changed
+    // under it is that the measured flipper impulse (see `flippers.ts`) fires
+    // along the bat's face NORMAL at the instant of contact, so WHEN the button
+    // goes down decides where the shot goes as well as how hard. A single fixed
+    // lead therefore measures Law 'n Justice's lower-playfield geometry as much
+    // as it measures the flipper. The fastest shot a player can time is the rate
+    // this file is about, and it is 31 ticks: 0.62 s for 400 px, an average of
+    // 645 px a second against a machine limit of 800.
     const map = mapFor("law-n-justice");
     const materials = materialTableFor("law-n-justice");
     const forces: SimulationForces = { gravityY: SIMULATION_GRAVITY, nudgeX: 0, nudgeY: 0 };
     const left = flipperConfigsFor("law-n-justice")[0]!;
 
-    // On the bat's striking face, 26 px out along it and 24 px clear of it —
-    // the same placement `tests/flippers.test.ts` uses, so the two agree about
-    // where a ball sits on a bat.
-    const start = restingOn(left, 26, 24);
-    const balls = createBallSet([createBall(0, start.x, start.y)]);
-    const ball = balls.balls[0] as BallState;
-    let bank = createFlipperBank("law-n-justice");
-    const trigger = start.y + pixelsToQ10(10);
+    function shoot(lead: number): number {
+      // On the bat's striking face, 26 px out along it and 24 px clear of it -
+      // the same placement `tests/flippers.test.ts` uses, so the two agree about
+      // where a ball sits on a bat.
+      const start = restingOn(left, 26, 24);
+      const balls = createBallSet([createBall(0, start.x, start.y)]);
+      const ball = balls.balls[0] as BallState;
+      let bank = createFlipperBank("law-n-justice");
+      const trigger = start.y + pixelsToQ10(lead);
 
-    let crossedAt = -1;
-    let launchedAt = -1;
-    for (let tick = 0; tick < 400; tick += 1) {
-      const ticked = tickFlipperBank(bank, flipperInputFrom(ball.y >= trigger, false));
-      bank = ticked.bank;
-      stepBalls(balls, map, materials, forces);
-      resolveFlipperContacts(balls.balls, ticked.sweeps);
-      if (!ball.active) break;
-      if (launchedAt < 0 && ball.velocityY < -2000) launchedAt = tick;
-      if (launchedAt >= 0 && crossedAt < 0 && q10ToPixel(ball.y) < q10ToPixel(start.y) - 400) {
-        crossedAt = tick;
+      let crossedAt = -1;
+      let launchedAt = -1;
+      for (let tick = 0; tick < 400; tick += 1) {
+        const ticked = tickFlipperBank(bank, flipperInputFrom(ball.y >= trigger, false));
+        bank = ticked.bank;
+        stepBalls(balls, map, materials, forces);
+        resolveFlipperContacts(balls.balls, ticked.sweeps);
+        if (!ball.active) break;
+        if (launchedAt < 0 && ball.velocityY < -2000) launchedAt = tick;
+        if (launchedAt >= 0 && crossedAt < 0 && q10ToPixel(ball.y) < q10ToPixel(start.y) - 400) {
+          crossedAt = tick;
+        }
       }
+      // Every lead must at least get the ball off the bat; only the aim varies.
+      expect(launchedAt, `lead ${lead}: the bat never launched the ball`).toBeGreaterThanOrEqual(0);
+      return crossedAt < 0 ? -1 : crossedAt - launchedAt;
     }
 
-    expect(launchedAt, "the bat never launched the ball").toBeGreaterThanOrEqual(0);
-    expect(crossedAt, "the ball never crossed 400 px").toBeGreaterThanOrEqual(0);
-    const flight = crossedAt - launchedAt;
-    expect(flight).toBeGreaterThan(10);
-    expect(flight).toBeLessThan(50);
+    let fastest = -1;
+    for (let lead = 6; lead <= 22; lead += 2) {
+      const flight = shoot(lead);
+      if (flight >= 0 && (fastest < 0 || flight < fastest)) fastest = flight;
+    }
+
+    expect(fastest, "no timing of the press crossed 400 px").toBeGreaterThanOrEqual(0);
+    expect(fastest).toBeGreaterThan(10);
+    expect(fastest).toBeLessThan(50);
+  });
+
+  it("cannot reach the machine's own velocity clamp from anywhere on the bat", () => {
+    // THE FINDING THIS FILE WAS WRITTEN TO CATCH, stated as arithmetic rather
+    // than as a trajectory. The impulse the port used to apply was a rigid-body
+    // reflection whose size was the bat's angular velocity times the lever arm,
+    // and from 30 px out along a 45 px bat it saturated the +-4095 clamp at every
+    // rate: a shot struck at the boss and a shot struck at the tip left at the
+    // same 800 px a second, so the flipper had no dynamic range at all and no
+    // amount of tuning could give it any.
+    //
+    // The measured impulse is bounded by construction. Its size is a 64x64 table
+    // of the ball's distance from the pivot, at three quarters scale, times the
+    // bat's rate AFTER the ball has taken its share of the bat's momentum. The
+    // largest value the whole product can take, anywhere on the bat at the
+    // coil's cap, is under the clamp, and only the very tip approaches it.
+    const config = flipperConfigsFor("law-n-justice")[0]!;
+    const reach = FLIPPER_LENGTH_PIXELS + 8;
+    let worst = 0;
+    let worstAt = "";
+    for (let dx = 0; dx <= reach; dx += 1) {
+      for (let dy = 0; dy <= reach; dy += 1) {
+        if (dx * dx + dy * dy > reach * reach) continue;
+        const driven = config.upMaxRate - flipperRateTaken(dx, dy);
+        const normal = originalVelocityToQ10(flipperImpulseMagnitude(dx, dy) * driven);
+        const tangent = originalVelocityToQ10(ORIGINAL_IMPULSE_TANGENT * driven);
+        const size = Math.hypot(normal, tangent);
+        if (size > worst) {
+          worst = size;
+          worstAt = `${dx},${dy}`;
+        }
+      }
+    }
+    expect(worst, `largest impulse was at ${worstAt}`).toBeLessThan(VELOCITY_CLAMP_Q10);
+    // And it is a real spread, not a flat one: the boss gives under half of it.
+    const boss = originalVelocityToQ10(
+      flipperImpulseMagnitude(0, 13) * (config.upMaxRate - flipperRateTaken(0, 13)),
+    );
+    expect(boss).toBeLessThan(worst / 2);
   });
 });
 

@@ -246,7 +246,7 @@ export const GAMEPAD_AXIS_BINDINGS: readonly GamepadAxisBinding[] = Object.freez
  *
  * A single threshold makes a stick resting near it chatter, emitting a press and
  * a release every poll; against a control with a cooldown, like the nudge, that
- * burns the player's whole tilt allowance without them moving their thumb.
+ * runs the tilt counter straight to its threshold without them moving a thumb.
  */
 export const GAMEPAD_AXIS_PRESS_THRESHOLD = 0.5;
 export const GAMEPAD_AXIS_RELEASE_THRESHOLD = 0.3;

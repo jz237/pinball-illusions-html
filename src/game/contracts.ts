@@ -261,6 +261,19 @@ export interface ContactResult {
 export interface SimulationForces {
   /** Downward acceleration in Q10 per tick, scaled by the slope option. */
   readonly gravityY: Q10;
+  /**
+   * Sideways acceleration in Q10 per tick squared: option record 4, the TABLE
+   * X-TILT. Optional, and zero on every shipped table.
+   *
+   * MEASURED and wired for completeness rather than for effect. $E8C(a5) is
+   * added to the X acceleration at +0x00B758 in the same instruction pair that
+   * adds gravity to the Y, so it takes the same unit bridge — one option unit is
+   * 32 Q10 per tick squared — and its +-3 range is three quarters of gravity of
+   * permanent lateral lean. All three `tableNNN.opt` files ship it at 0, so
+   * applying it faithfully changes nothing about how the game plays; leaving it
+   * unapplied would have left a measured option with no home. See `timebase.ts`.
+   */
+  readonly tiltX?: Q10;
   /** Nudge impulse applied this tick, if the player nudged. */
   readonly nudgeX: Q10;
   readonly nudgeY: Q10;

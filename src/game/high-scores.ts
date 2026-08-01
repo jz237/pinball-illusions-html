@@ -33,8 +33,10 @@ export interface HighScoreEntry {
 /**
  * Factory ladder, decoded from the original score files.
  *
- * Identical on all three tables — unlike the nudge allowance, this is not a
- * per-table value, so it lives once rather than being repeated per table.
+ * Identical on all three tables, so it lives once rather than being repeated per
+ * table. (This used to say "unlike the nudge allowance"; there is no per-table
+ * nudge allowance — option record 3 is byte-identical on all three files and the
+ * 5/5/10 that looked like one is record 5, a duration in seconds. See `tilt.ts`.)
  *
  * These are the seven BCD bytes read in full, i.e. fourteen digits. The RATIOS
  * are certain (20 : 10 : 5 : 2 : 1) because they are visible directly in the

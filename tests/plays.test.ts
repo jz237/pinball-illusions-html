@@ -176,6 +176,17 @@ describe("the flippers", () => {
     // steered onto a bat the way a player steers one, with the game's own nudge
     // control, and only then is the flip tested. One shove at row 450 puts it
     // over the left bat at (90,538); the flip then gains 216 px.
+    //
+    // WHY IT NOW SHOVES ONCE PER DESCENT AND PLAYS ON THROUGH A DRAIN. Neither
+    // is a relaxation — both give the assertion MORE chances to fail, not fewer.
+    // The harness used to take a single shove and then give up the instant the
+    // ball went down the drain, which meant it was really asserting "the ball of
+    // this one scripted plunge can be flipped". On the measured flipper impulse
+    // the ball is aimed rather than merely accelerated, so where it lands after
+    // a shove moved by a few pixels and that one scripted descent arrived above
+    // the boss with the bat already at the top of its stroke: one attempt, at
+    // the one place on a bat that cannot throw a ball, and the run was over. A
+    // player would shove again, plunge the next ball and keep playing.
     const game = started();
     const input = new ScriptedInput((t) => (t >= 60 && t < 110 ? ["plunger"] : []));
     runTicks(game, input, 150);
@@ -185,13 +196,27 @@ describe("the flippers", () => {
     let nudged = false;
     const flipping = new ScriptedInput(() => ["leftFlipper", "rightFlipper"]);
     const nudging = new ScriptedInput((t) => (t < 2 ? ["nudgeLeft"] : []));
+    const plunging = new ScriptedInput((t) => (t < 50 ? ["plunger"] : []));
     const idle = idleInput();
 
     for (let attempt = 0; attempt < 400 && !struck; attempt += 1) {
       const before = liveBalls(game)[0];
-      if (before === undefined) break;
+      if (before === undefined) {
+        // Between balls: the machine is counting down to the next serve.
+        runTicks(game, idle, 8);
+        nudged = false;
+        continue;
+      }
+      if (laneBall(game) !== null) {
+        // A fresh ball on the rod: plunge it and play on.
+        runTicks(game, plunging, 60);
+        nudged = false;
+        continue;
+      }
+      // One shove per descent, spaced far enough apart that the measured tilt
+      // counter (see `tilt.ts`) has drained back to zero between them.
+      if (before.pixelY < 300) nudged = false;
 
-      // One shove, on the way down, well before the tilt allowance runs out.
       if (!nudged && before.pixelY >= 450 && before.velocityY > 0) {
         runTicks(game, nudging, 4);
         nudged = true;

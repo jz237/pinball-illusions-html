@@ -2,15 +2,22 @@ import { describe, expect, it } from "vitest";
 import {
   DEFAULT_CAMERA_OPTIONS,
   INITIAL_CAMERA,
+  ORIGINAL_CAMERA_ANCHOR_ROWS,
+  ORIGINAL_NARROW_WINDOW_ROWS,
+  ORIGINAL_SCROLL_DIVISOR_DEFAULT,
+  ORIGINAL_TOP_EASE_ROWS,
   VIEWPORT_HEIGHT,
   clampScroll,
+  followRow,
   resolveMode,
   toViewport,
   toViewportSize,
   updateCamera,
   viewScale,
 } from "../src/browser/camera.js";
-import type { CameraOptions } from "../src/browser/camera.js";
+import { VELOCITY_CLAMP_Q10 } from "../src/game/timebase.js";
+import { Q10_ONE } from "../src/core/fixed-point.js";
+import type { CameraOptions, CameraState } from "../src/browser/camera.js";
 import { PLAYFIELD_HEIGHT } from "../src/game/contracts.js";
 import type { BallState } from "../src/game/contracts.js";
 import { pixelsToQ10 } from "../src/core/fixed-point.js";
@@ -30,7 +37,21 @@ function ball(id: number, y: number, active = true, heldBy: string | null = null
   };
 }
 
-const OPTIONS: CameraOptions = { ...DEFAULT_CAMERA_OPTIONS, maxScrollStep: 1000 };
+const OPTIONS: CameraOptions = DEFAULT_CAMERA_OPTIONS;
+
+/**
+ * The scroll step the camera takes for a ball sitting `row` rows down the
+ * screen, well away from either stop.
+ *
+ * The follower is a function of that offset alone — error = row - anchor — so a
+ * fixed point can be asserted as arithmetic instead of by running a simulation
+ * to convergence, which on a 600 px playfield does not always have room.
+ */
+function stepAtRow(row: number, options: CameraOptions = OPTIONS): number {
+  const scrollY = 200;
+  const camera: CameraState = { scrollY, mode: "scrolling" };
+  return updateCamera(camera, [ball(0, scrollY + row)], options).scrollY - scrollY;
+}
 
 describe("scroll clamping", () => {
   it("never shows anything above or below the playfield", () => {
@@ -68,28 +89,124 @@ describe("mode selection", () => {
 });
 
 describe("following a ball", () => {
-  it("does not move while the ball stays inside the dead zone", () => {
+  // The measured law: step = (ballRow - scroll - anchor) / divisor, truncated;
+  // halved on the way down always and on the way up inside the top 32 rows.
+  // See the header of `src/browser/camera.ts` for the disassembly.
+
+  it("closes one part in the divisor of the error, and nothing caps the step", () => {
+    // The chosen `maxScrollStep` of 8 px a tick this replaces would have clipped
+    // every one of these, and it was never raised when the ball's top speed
+    // doubled on the measured timebase.
     const camera = { scrollY: 300, mode: "scrolling" as const };
-    const centre = 300 + VIEWPORT_HEIGHT / 2;
-    expect(updateCamera(camera, [ball(0, centre)], OPTIONS).scrollY).toBe(300);
+    for (const error of [50, 100, 200, 250]) {
+      const row = 300 + ORIGINAL_CAMERA_ANCHOR_ROWS + error;
+      const next = updateCamera(camera, [ball(0, row)], OPTIONS);
+      // Downward is always half rate: `asr.w #1` at +0x006D90.
+      expect(next.scrollY - 300).toBe(Math.trunc(error / ORIGINAL_SCROLL_DIVISOR_DEFAULT) >> 1);
+    }
   });
 
-  it("scrolls down when the ball drops below the dead zone", () => {
-    const camera = { scrollY: 200, mode: "scrolling" as const };
-    const next = updateCamera(camera, [ball(0, 200 + VIEWPORT_HEIGHT)], OPTIONS);
-    expect(next.scrollY).toBeGreaterThan(200);
+  it("goes up at the full rate outside the top 32 rows, and half inside them", () => {
+    const low = { scrollY: 300, mode: "scrolling" as const };
+    const error = -100;
+    const next = updateCamera(low, [ball(0, 300 + ORIGINAL_CAMERA_ANCHOR_ROWS + error)], OPTIONS);
+    expect(next.scrollY - 300).toBe(Math.trunc(error / ORIGINAL_SCROLL_DIVISOR_DEFAULT));
+
+    const high = { scrollY: ORIGINAL_TOP_EASE_ROWS, mode: "scrolling" as const };
+    const eased = updateCamera(
+      high,
+      [ball(0, ORIGINAL_TOP_EASE_ROWS + ORIGINAL_CAMERA_ANCHOR_ROWS + error)],
+      OPTIONS,
+    );
+    expect(eased.scrollY - ORIGINAL_TOP_EASE_ROWS).toBe(
+      Math.trunc(error / ORIGINAL_SCROLL_DIVISOR_DEFAULT) >> 1,
+    );
   });
 
-  it("scrolls up when the ball rises above the dead zone", () => {
-    const camera = { scrollY: 300, mode: "scrolling" as const };
-    const next = updateCamera(camera, [ball(0, 300)], OPTIONS);
-    expect(next.scrollY).toBeLessThan(300);
+  it("holds a falling ball at anchor + 2 x divisor x speed, which is the fixed point", () => {
+    // Two truncations — `divs.w` toward zero and `asr.w #1` toward minus
+    // infinity — leave the fixed point a BAND rather than a point, one whole
+    // divisor step wide in each direction. The bracket below is that band and
+    // not a tolerance: a step cap or a dead zone would put the ball tens of
+    // pixels outside it, which is what this is here to catch.
+    const band = 2 * ORIGINAL_SCROLL_DIVISOR_DEFAULT;
+    for (const v of [4, 8, 12, 14, 16]) {
+      const row = ORIGINAL_CAMERA_ANCHOR_ROWS + band * v;
+      expect(stepAtRow(row), `falling at ${v}`).toBe(v);
+      // And it really is the point the follower converges ON, not merely a
+      // point it passes through: one row higher it moves slower than the ball.
+      expect(stepAtRow(row - band), `falling at ${v}`).toBeLessThan(v);
+    }
   });
 
-  it("eases rather than snapping, bounded by maxScrollStep", () => {
+  it("holds a rising ball at anchor - divisor x speed", () => {
+    // Upward there is only the one truncation outside the top 32 rows, so the
+    // slope is twice as steep: a rising ball is carried toward the top of the
+    // window rather than merely followed.
+    const band = ORIGINAL_SCROLL_DIVISOR_DEFAULT;
+    for (const v of [4, 8, 12, 14]) {
+      const row = ORIGINAL_CAMERA_ANCHOR_ROWS - band * v;
+      expect(stepAtRow(row), `rising at ${v}`).toBe(-v);
+      expect(stepAtRow(row + band), `rising at ${v}`).toBeGreaterThan(-v);
+    }
+    // A full plunge is 14 px a tick, and 70 - 5*14 is exactly row 0: the
+    // original's anchor and divisor put a plunged ball precisely on the top edge
+    // of its window and no further.
+    expect(ORIGINAL_CAMERA_ANCHOR_ROWS - band * 14).toBe(0);
+  });
+
+  it("keeps a ball at the machine's own velocity clamp inside the original window", () => {
+    // THE REASON THE SHIPPED DIVISOR IS 5. The clamp is 4095 units = 16 px a
+    // tick, and 70 + 2*5*16 is exactly the 230 rows the original's narrow view
+    // shows. A divisor of 6 puts the ball off the bottom of that window, so 5 is
+    // the largest setting that keeps a ball at the engine's own speed limit on
+    // screen -- which is what a default is for.
+    const clampPixels = Math.round(VELOCITY_CLAMP_Q10 / Q10_ONE);
+    expect(clampPixels).toBe(16);
+
+    /** The screen row a ball moving at `v` settles on for a given divisor. */
+    function restingRow(divisor: number): number {
+      const options = { ...OPTIONS, scrollDivisor: divisor };
+      for (let row = 0; row <= PLAYFIELD_HEIGHT; row += 1) {
+        if (stepAtRow(row, options) >= clampPixels) return row;
+      }
+      return PLAYFIELD_HEIGHT;
+    }
+
+    expect(restingRow(ORIGINAL_SCROLL_DIVISOR_DEFAULT)).toBe(ORIGINAL_NARROW_WINDOW_ROWS);
+    for (let divisor = ORIGINAL_SCROLL_DIVISOR_DEFAULT + 1; divisor <= 7; divisor += 1) {
+      expect(restingRow(divisor), `divisor ${divisor}`).toBeGreaterThan(
+        ORIGINAL_NARROW_WINDOW_ROWS,
+      );
+    }
+  });
+
+  it("has no dead zone: any error at all moves the view", () => {
+    // Truncation leaves a band of (-divisor, +2*divisor) where the step rounds
+    // to nothing, and that band is an artefact of the integer divide rather than
+    // the 64 px band this used to carry.
     const camera = { scrollY: 300, mode: "scrolling" as const };
-    const slow = updateCamera(camera, [ball(0, 0)], DEFAULT_CAMERA_OPTIONS);
-    expect(300 - slow.scrollY).toBe(DEFAULT_CAMERA_OPTIONS.maxScrollStep);
+    const row = 300 + ORIGINAL_CAMERA_ANCHOR_ROWS;
+    for (const error of [2 * ORIGINAL_SCROLL_DIVISOR_DEFAULT, 20, 33]) {
+      expect(updateCamera(camera, [ball(0, row + error)], OPTIONS).scrollY).toBeGreaterThan(300);
+    }
+    for (const error of [-ORIGINAL_SCROLL_DIVISOR_DEFAULT, -20, -33]) {
+      expect(updateCamera(camera, [ball(0, row + error)], OPTIONS).scrollY).toBeLessThan(300);
+    }
+  });
+
+  it("refuses to scroll further down once it is at the bottom stop", () => {
+    const maximum = PLAYFIELD_HEIGHT - VIEWPORT_HEIGHT;
+    const camera: CameraState = { scrollY: maximum, mode: "scrolling" };
+    const next = updateCamera(camera, [ball(0, PLAYFIELD_HEIGHT - 1)], OPTIONS);
+    expect(next.scrollY).toBe(maximum);
+  });
+
+  it("follows the LOWEST ball, not the first one listed", () => {
+    expect(followRow([ball(0, 120), ball(1, 480), ball(2, 300)])).toBe(480);
+    // A ball at or below the playfield's own last row is not followed at all.
+    expect(followRow([ball(0, 120), ball(1, PLAYFIELD_HEIGHT)])).toBe(120);
+    expect(followRow([])).toBeNull();
   });
 
   it("holds position when every ball has drained", () => {
@@ -98,13 +215,15 @@ describe("following a ball", () => {
   });
 
   it("stays within the playfield when the ball is at the very bottom", () => {
-    const camera = { scrollY: 300, mode: "scrolling" as const };
-    const next = updateCamera(camera, [ball(0, PLAYFIELD_HEIGHT)], OPTIONS);
-    expect(next.scrollY).toBeLessThanOrEqual(PLAYFIELD_HEIGHT - VIEWPORT_HEIGHT);
+    let camera: CameraState = { scrollY: 300, mode: "scrolling" };
+    for (let tick = 0; tick < 60; tick += 1) {
+      camera = updateCamera(camera, [ball(0, PLAYFIELD_HEIGHT - 1)], OPTIONS);
+    }
+    expect(camera.scrollY).toBeLessThanOrEqual(PLAYFIELD_HEIGHT - VIEWPORT_HEIGHT);
   });
 
   it("is deterministic — identical inputs give identical output", () => {
-    const camera = { scrollY: 123, mode: "scrolling" as const };
+    const camera: CameraState = { scrollY: 123, mode: "scrolling" };
     const balls = [ball(0, 420)];
     expect(updateCamera(camera, balls, OPTIONS)).toEqual(updateCamera(camera, balls, OPTIONS));
   });
@@ -170,16 +289,21 @@ describe("mapping points into the viewport", () => {
   });
 
   it("agrees with the camera it was fed, over a whole follow", () => {
-    // OPTIONS lifts maxScrollStep so the camera reaches its target in one tick;
-    // with the default easing a teleporting fixture ball would simply outrun it.
+    // A REAL descent AND a real climb, at the machine's own top speed, rather
+    // than the teleporting fixture list this used to walk. The measured follower
+    // has no step cap to lift, so the only way to outrun it is to move a ball
+    // faster than the engine can move one — which is a statement about the
+    // fixture, not about the camera. 16 px a tick IS the engine's clamp.
     let camera = INITIAL_CAMERA;
-    for (const y of [500, 480, 400, 300, 200, 100, 40, 120, 300, 560, 600]) {
-      camera = updateCamera(camera, [ball(0, y)], OPTIONS);
-      const mapped = toViewport(camera, 168, y);
-      // The dead zone keeps the ball on screen; the point of the assertion is
-      // that the mapping and the scroll agree, not that they are generous.
-      expect(mapped.y).toBeGreaterThanOrEqual(0);
-      expect(mapped.y).toBeLessThanOrEqual(VIEWPORT_HEIGHT);
+    let y = PLAYFIELD_HEIGHT - VIEWPORT_HEIGHT + ORIGINAL_CAMERA_ANCHOR_ROWS;
+    for (const leg of [-14, -12, 16, 12, -8, 8]) {
+      for (let tick = 0; tick < 45; tick += 1) {
+        y = Math.min(PLAYFIELD_HEIGHT - 1, Math.max(0, y + leg));
+        camera = updateCamera(camera, [ball(0, y)], OPTIONS);
+        const mapped = toViewport(camera, 168, y);
+        expect(mapped.y, `leg ${leg} tick ${tick} row ${y}`).toBeGreaterThanOrEqual(0);
+        expect(mapped.y).toBeLessThanOrEqual(VIEWPORT_HEIGHT);
+      }
     }
   });
 

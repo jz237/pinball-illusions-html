@@ -226,9 +226,14 @@ describe("nudge and tilt", () => {
   });
 
   it("kills the flippers once the table tilts", () => {
-    // Five nudges is the Law 'n Justice allowance; eleven ticks apart clears the
-    // ten-tick cooldown, so every one of them is accepted.
-    const nudgeTicks = new Set([5, 16, 27, 38, 49]);
+    // THREE shoves inside half a second, which is the measured rule: option
+    // record 3 adds 100 to a warning counter that trips at 200 and drains four a
+    // tick. This used to be five shoves eleven ticks apart, against a chosen
+    // allowance of five and a chosen ten-tick cooldown; the machine is roughly
+    // twice as touchy than the port used to be, and `src/game/tilt.ts` has the
+    // disassembly for why. Three ticks apart clears the measured two-tick
+    // recentring window, so every one of them is accepted.
+    const nudgeTicks = new Set([5, 8, 11]);
     const game = startedGame();
     const input = new ScriptedInput((tick, router) => {
       if (nudgeTicks.has(tick)) router.tap("nudgeLeft");
@@ -267,7 +272,11 @@ describe("nudge and tilt", () => {
     runTicks(game, input, 1);
 
     expect(game.balls.balls[0]?.velocityX).toBeGreaterThan(0);
-    expect(game.tilt.warnings).toBe(1);
+    // One shove's worth of warning, less the one tick of decay the loop has
+    // already run: the game loop shoves and then ticks the counter down.
+    expect(game.tilt.warning).toBe(
+      game.nudgeConfig.sensitivity - game.nudgeConfig.decayPerTick,
+    );
   });
 });
 

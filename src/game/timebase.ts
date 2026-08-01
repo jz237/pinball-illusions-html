@@ -260,12 +260,19 @@ export function gravityForOption(setting: number): Q10 {
 /**
  * The TABLE X-TILT option, `tableNNN.opt` record 4: (min -3, max +3, DEFAULT 0).
  *
- * MEASURED and deliberately not applied. $E8C(a5) is added to the X acceleration
- * beside gravity at +0x00B754 and read nowhere else except +0x0034FC, where it
- * seeds a new ball. It DOES NOT SCALE GRAVITY — full scale is +-96 Q10 per tick
- * squared of sideways drift, up to three quarters of gravity — and the shipped
- * default is zero on all three tables, so the simulation runs with no lateral
- * lean and this constant records the range rather than steering anything.
+ * MEASURED, and now applied. $E8C(a5) is added to the X acceleration beside
+ * gravity at +0x00B758 — `movem.w (a2,d0.w*4),d0-d1 / add.w $e8c(a5),d0 /
+ * add.w $e86(a5),d1 / movem.w d0-d1,$3c(a4)`, the ramp drive for the block and
+ * the two option leans resolved into one acceleration — and read nowhere else
+ * except +0x003500, where it seeds a new ball's cached acceleration. It DOES NOT
+ * SCALE GRAVITY: full scale is +-96 Q10 per tick squared of sideways drift, up
+ * to three quarters of gravity of permanent lateral lean.
+ *
+ * The shipped default is zero on all three tables, so wiring it through
+ * `SimulationForces.tiltX` changes nothing about how the game plays. It is wired
+ * anyway, because an option that is measured and then left with nowhere to go is
+ * how a measurement rots: the next reader has no way to tell "zero because the
+ * disk says zero" from "zero because nobody connected it".
  */
 export const ORIGINAL_X_TILT_MIN = -3;
 export const ORIGINAL_X_TILT_MAX = 3;

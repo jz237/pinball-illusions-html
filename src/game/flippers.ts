@@ -58,22 +58,67 @@
  * other rather than approximate ones.
  *
  * ---------------------------------------------------------------------------
- * WHY THE BAT MUST BE MOVING
+ * WHY THE BAT MUST BE MOVING, AND WHAT IT GIVES THE BALL WHEN IT DOES
  * ---------------------------------------------------------------------------
- * A flipper that merely reflected would make every shot the same shot. The
- * response is computed in the BAT'S frame: the bat's surface velocity at the
- * contact point is subtracted from the ball's velocity, the normal impulse is
- * applied to what is left, and the surface velocity is added back. A ball
- * resting on a still bat therefore gets `elasticity` and settles; the same ball
- * caught by a bat sweeping under it leaves at roughly (1 + elasticity) times the
- * bat's surface speed there. That is also why `elasticity` is deliberately low
- * (400, against 612 for the measured rubber row): a live flipper should be dead
- * enough to trap a ball on, and take its power from the swing instead.
+ * MEASURED, and this whole model used to be this port's own invention. The
+ * original's bat-versus-ball handler is at main.seg00 +0x00AEA2, reached from
+ * the surface-id entries for ids 1..4 at +0x00AE80/86/90/9A (`adda.w` of 0,
+ * $1FA, $3F4, $5EE onto $2346(a5) — the 506-byte flipper record stride). It does
+ * five things and this file now does the same five:
  *
- * The lever arm is the real one — the vector from the pivot to the point on the
- * bat's SURFACE that the ball touches, not the axial distance — so a ball caught
- * near the tip leaves faster than one caught near the boss, which is the whole
- * skill of aiming with a flipper.
+ *   1. `move.w $10(a0),d2 / beq -> rts`. The bat's angular RATE is a GATE. A bat
+ *      that is not turning imparts nothing at all, however it is placed.
+ *   2. `d0 = |ballX - $2(a0)|`, `d1 = |ballY - $4(a0)|`, `d0 = (d0<<6)+d1`,
+ *      `move.w (a1,d0.w*2),d0` off a 64x64 word table. The table is at offset
+ *      $B0B8 of HUNK 1 — the `lea.l $b0b8.l,a1` at +0x00AEA2 carries a hunk-1
+ *      relocation, which is why reading it as a hunk-0 address lands inside the
+ *      impulse sub-handlers and why it has been reported as undecodable. All
+ *      4096 entries are exactly `isqrt((dx*dx + dy*dy) * 35810 >> 16)`, i.e.
+ *      `floor(0.7392 * distance)`: the table is the ball's DISTANCE FROM THE
+ *      PIVOT, three quarters scale. See `flipperImpulseRadius`.
+ *   3. `d3 = d0>>1` is SUBTRACTED from the bat's rate toward zero at +0x00AED2..
+ *      +0x00AEE0 and written back to $10(a0). The ball takes angular momentum
+ *      out of the bat: the impulse is computed from the REDUCED rate, and a
+ *      second ball on the same stroke gets less.
+ *   4. Small radii are floored: `if d0 < $2E: d0 += ($2E - d0) >> 3`, so a ball
+ *      struck at the boss still leaves with something.
+ *   5. One of eight sub-handlers at $B036 + 0x3C*n, chosen by the record's byte
+ *      $1(a0), writes `$1c(a4) = magnitude * 2 * rate` and `$1a(a4) = 8 * 2 *
+ *      rate`. Those two are consumed at +0x00B528: $1C is added to the NORMAL
+ *      component and $1A to the TANGENTIAL component of the ball's velocity
+ *      after it has been rotated into the contact frame by $28(a4). Each
+ *      sub-handler also carries an eight-byte mask indexed by `$28(a4)>>8` — the
+ *      contact normal's octant — and the eight masks are the same four-of-eight
+ *      pattern rotated one byte per handler: the bat only imparts to a ball on
+ *      the face it is sweeping toward.
+ *
+ * So the impulse is NOT a reflection and it is NOT a rigid-body frame change. It
+ * is an additive kick along the contact normal whose size is
+ * `magnitude(radius) * 2 * rate`, with `8 * 2 * rate` of drag along the surface,
+ * and the reflection that follows is skipped outright when the kick has already
+ * sent the ball outward (`tst.w d0 / ble` at +0x00B54C, which is exactly what
+ * `reflectVelocity`'s own "not approaching, return" does).
+ *
+ * WHAT THE PORT HAD, AND WHY IT WAS THE DEFECT. This file used to reflect the
+ * ball in the bat's instantaneous rigid-body frame with an elasticity of 400.
+ * That scales the whole impulse by the bat's angular velocity times the lever
+ * arm and nothing else, which under-drives the boss — 367 px/s where the
+ * original gives about 590 — and over-drives everything past about 30 px out
+ * into the engine's own +-4095 velocity clamp, so every clean shot left at
+ * 798..810 px/s no matter where or when it was struck. Three contact points out
+ * of five in the previous agent's harness did not send the ball up the table at
+ * all. The original's law is bounded by construction (the table is a distance,
+ * and the rate deduction is a self-limiter), and its spread lives in the STROKE:
+ * a ball met at rate 20 leaves at a tenth of the speed of one met at rate 120.
+ *
+ * A bat standing still is unchanged: rate zero closes the gate and all that is
+ * left is `elasticity` (400, against 612 for the measured rubber row), which is
+ * what lets a ball be trapped on a raised flipper.
+ *
+ * The radius is the ball CENTRE's distance from the pivot, because that is what
+ * +0x00AEB4 measures — `movem.w $2(a0),d3-d4` is the pivot and d0/d1 arrive as
+ * the ball's whole-pixel position. It is not the lever arm to the touched point
+ * on the surface.
  *
  * ---------------------------------------------------------------------------
  * WHY THE TICK IS SUBDIVIDED
@@ -86,6 +131,15 @@
  * one that touches is the one that resolves. The sample count is derived from
  * the configuration, not guessed, so a slower or shorter flipper automatically
  * uses fewer.
+ *
+ * The subdivision is now the ORIGINAL'S OWN, which it used not to be: the four
+ * steps of the stroke, each subdivided again if the tip could still outrun a
+ * ball inside one of them (on the shipped bats it cannot — 4.4 px against a
+ * radius of 8, so the count is unchanged at four). That matters beyond tidiness,
+ * because the bat's RATE is what sizes the impulse and the rate changes at every
+ * one of those four steps: a fresh stroke runs at 20, 40, 60 and 80 bat units
+ * inside a single frame. Sampling a pose without the rate that belongs to it is
+ * what would collapse the flipper's timing gradient.
  *
  * ---------------------------------------------------------------------------
  * ON DETERMINISM
@@ -116,6 +170,7 @@ import {
   ORIGINAL_ANGLE_UNITS_PER_TURN,
   ORIGINAL_FLIPPER_STEPS_PER_FRAME,
   VELOCITY_CLAMP_Q10,
+  originalVelocityToQ10,
 } from "./timebase.js";
 
 // ---------------------------------------------------------------------------
@@ -365,6 +420,86 @@ export const FLIPPER_UP_TICKS = 3.5;
 
 /** Ticks from fully flipped back to rest: 6.25. Also a result. */
 export const FLIPPER_DOWN_TICKS = 6.25;
+
+// ---------------------------------------------------------------------------
+// The impulse, MEASURED — this whole block used to be a rigid-body reflection
+// ---------------------------------------------------------------------------
+
+/**
+ * Side of the original's impulse table, in whole pixels: 64.
+ *
+ * MEASURED. `+0x00AEC6` builds the index as `(|dx| << 6) + |dy|` and reads a
+ * word, so both offsets are taken modulo nothing at all — a ball more than 63 px
+ * from the pivot on either axis would read off the end of the row. It cannot
+ * happen on a 45 px bat with an 8 px ball, and the port clamps rather than
+ * reproducing the overrun.
+ */
+export const ORIGINAL_IMPULSE_TABLE_SIDE = 64;
+
+/**
+ * The scale the impulse table applies to the pivot distance, as a 16-bit
+ * fraction of the SQUARE: 35810 / 65536.
+ *
+ * MEASURED, and it reproduces all 4096 entries exactly:
+ *
+ *     table[dx][dy] === isqrt(((dx*dx + dy*dy) * 35810) >> 16)
+ *
+ * sqrt(35810/65536) is 0.7392005, and the table pins the linear constant to
+ * [0.73919716, 0.73920458) — a bracket seven parts in a million wide, which is
+ * the tightest any constant in this project has been measured to and which
+ * contains the five-digit decimal 0.7392 and essentially nothing else. Written
+ * as the squared form because that is the only shape that stays in the integers:
+ * the port must not evaluate a square root in floating point and then floor it.
+ */
+export const ORIGINAL_IMPULSE_SCALE_Q16 = 35810;
+
+/**
+ * The floor applied to a small radius: 46, one pixel past the bat's own length.
+ *
+ * MEASURED at +0x00AEF0: `subi.w #$2e,d5 / bge / neg.w d5 / lsr.w #3,d5 /
+ * add.w d5,d0`, i.e. `if v < 46: v += (46 - v) >> 3`. Every radius a 45 px bat
+ * can produce is under 46, so on a flipper the floor ALWAYS fires; it lifts the
+ * boss from 0 to 5 and the tip from 33 to 34, which is what stops a ball caught
+ * at the boss from being handed nothing.
+ */
+export const ORIGINAL_IMPULSE_FLOOR = 46;
+
+/** Surface drag: the constant `moveq #$8,d1` at +0x00AEE8, in the same units. */
+export const ORIGINAL_IMPULSE_TANGENT = 8;
+
+/**
+ * The original's raw table entry for a ball `dx`,`dy` pixels from the pivot.
+ *
+ * Whole pixels in, whole units out, integers throughout. Both offsets are taken
+ * as magnitudes (the `neg.w` pair at +0x00AEBC/+0x00AEC4) and clamped to the
+ * table's 64 px side.
+ */
+export function flipperImpulseRadius(dx: number, dy: number): number {
+  const x = Math.min(ORIGINAL_IMPULSE_TABLE_SIDE - 1, Math.abs(Math.trunc(dx)));
+  const y = Math.min(ORIGINAL_IMPULSE_TABLE_SIDE - 1, Math.abs(Math.trunc(dy)));
+  return integerSqrt(Math.trunc((x * x + y * y) * ORIGINAL_IMPULSE_SCALE_Q16 / 65536));
+}
+
+/**
+ * The same entry with the small-radius floor applied: what actually multiplies
+ * the bat's rate. See ORIGINAL_IMPULSE_FLOOR.
+ */
+export function flipperImpulseMagnitude(dx: number, dy: number): number {
+  const raw = flipperImpulseRadius(dx, dy);
+  if (raw >= ORIGINAL_IMPULSE_FLOOR) return raw;
+  return raw + ((ORIGINAL_IMPULSE_FLOOR - raw) >> 3);
+}
+
+/**
+ * Bat units per step a ball at this radius takes out of the bat: half the raw
+ * table entry, +0x00AED0's `lsr.w #1,d3`.
+ *
+ * The RAW entry, not the floored one — the floor is applied after the deduction
+ * at +0x00AEF0, so a ball caught at the boss costs the bat nothing.
+ */
+export function flipperRateTaken(dx: number, dy: number): number {
+  return flipperImpulseRadius(dx, dy) >> 1;
+}
 
 /**
  * The bat's surface, in the same shape the map's materials use so that the one
@@ -687,6 +822,17 @@ export interface FlipperSweep {
   readonly config: FlipperConfig;
   readonly from: FlipperState;
   readonly to: FlipperState;
+  /**
+   * The bat's state after each of the four steps of this tick, oldest first.
+   *
+   * Real state rather than a debugging convenience: the original resolves a
+   * collision pass BETWEEN every pair of steps, so the rate a ball meets is the
+   * rate the bat carries at that step and not the one it ends the tick with. A
+   * tick of a fresh stroke runs at 20, 40, 60 and 80 bat units, a factor of four
+   * across a single frame, and collapsing that to one number is exactly what
+   * removed the flipper's timing gradient.
+   */
+  readonly steps: readonly FlipperState[];
 }
 
 /**
@@ -714,6 +860,7 @@ export function tickFlipper(
 ): FlipperSweep {
   let stroke = state.stroke;
   let rate = state.rate;
+  const steps: FlipperState[] = [];
   for (let step = 0; step < FLIPPER_STEPS_PER_TICK; step += 1) {
     stroke += rate;
     // The far stop is INCLUSIVE going up and EXCLUSIVE coming back, which reads
@@ -727,21 +874,31 @@ export function tickFlipper(
     if (stopped) {
       stroke = config.sweep;
       rate = 0;
+      steps.push({ stroke, rate });
       continue;
     }
-    if (stroke < 0) {
+    // The near stop, and `<= 0` rather than `< 0` because of what the per-step
+    // rates made visible: a bat parked at rest with the button up used to be
+    // given -30 on every first step and clamped back on the second, so it
+    // reported a live rate while standing still. It never moved and the end of
+    // the tick was identical, but the rate is now real state that a contact
+    // reads, and a bat leaning on its own stop must not impart anything.
+    if (stroke <= 0 && !held) {
       stroke = 0;
       rate = 0;
+      steps.push({ stroke, rate });
       continue;
     }
     rate = held
       ? Math.min(config.upMaxRate, rate + config.upAcceleration)
       : Math.max(-config.downMaxRate, rate - config.downAcceleration);
+    steps.push({ stroke, rate });
   }
   return {
     config,
     from: state,
     to: stroke === state.stroke && rate === state.rate ? state : { stroke, rate },
+    steps,
   };
 }
 
@@ -880,17 +1037,33 @@ function touchAt(
 }
 
 /**
- * Poses to sample across one tick of this flipper's fastest stroke.
+ * Poses to sample inside ONE step of the stroke.
  *
- * One more than the number of ball radii the tip covers in a tick, so no gap
- * between consecutive poses is as wide as the ball is; derived rather than
- * chosen, so a shorter or slower bat costs less.
+ * The tick is already divided into the original's own four steps, and at the
+ * coil's cap of 120 bat units a step the tip covers 4.4 px — barely half a ball.
+ * So this is one on the shipped bats and exists for the same reason
+ * `substepsFor` did: a longer or faster bat must not be able to step its tip
+ * over a ball, and the count is derived from the configuration rather than
+ * chosen.
+ */
+export function substepsPerStrokeStep(
+  config: FlipperConfig,
+  ballRadius: Q10 = DEFAULT_PROBE_RADIUS,
+): number {
+  const fastest = batAngleToBearing(config.upMaxRate);
+  const tipTravel = Math.abs(tangentialSpeed(config.length, fastest));
+  return Math.max(1, Math.ceil(tipTravel / ballRadius));
+}
+
+/**
+ * Poses sampled across a whole tick: the four steps, each subdivided.
+ *
+ * The subdivision used to be derived from the tick's total turn and was not
+ * aligned to anything; it is now the original's own four collision passes, so a
+ * sampled pose and the rate that goes with it are the same pair the machine had.
  */
 export function substepsFor(config: FlipperConfig, ballRadius: Q10 = DEFAULT_PROBE_RADIUS): number {
-  // The fastest a tick can turn: the coil at its cap for all four steps.
-  const fastest = batAngleToBearing(config.upMaxRate * FLIPPER_STEPS_PER_TICK);
-  const tipTravel = Math.abs(tangentialSpeed(config.length, fastest));
-  return Math.max(1, Math.ceil(tipTravel / ballRadius) + 1);
+  return FLIPPER_STEPS_PER_TICK * substepsPerStrokeStep(config, ballRadius);
 }
 
 // ---------------------------------------------------------------------------
@@ -911,6 +1084,16 @@ export interface FlipperContact {
   readonly approachSpeed: number;
   /** True when the bat was moving into the ball rather than merely in the way. */
   readonly struck: boolean;
+  /**
+   * Bat angle units per step the ball took out of the bat, +0x00AED0's
+   * `lsr.w #1,d3`. Zero when the bat imparted nothing.
+   *
+   * Reported rather than applied here because a contact is resolved against a
+   * sweep, which is immutable; `applyFlipperReactions` is what puts it back into
+   * the bank. Without the write-back the second ball of a multiball gets the
+   * same stroke as the first, which the original does not give it.
+   */
+  readonly rateTaken: number;
 }
 
 // The original's own clamp, +-4095 of its velocity units. See `timebase.ts`.
@@ -961,51 +1144,110 @@ function resolveOne(
   restThreshold: number,
 ): FlipperContact | null {
   const { config } = sweep;
-  const turned = sweptAngle(sweep);
-  const startAngle = flipperAngle(config, sweep.from);
-  const steps = turned === 0 ? 1 : substepsFor(config, ballRadius);
+  const inner = substepsPerStrokeStep(config, ballRadius);
 
-  for (let step = 1; step <= steps; step += 1) {
-    // Truncated rather than rounded so the samples advance monotonically and the
-    // last one is exactly the end-of-tick pose.
-    const angle = normalizeAngle(startAngle + Math.trunc((turned * step) / steps));
-    const touch = touchAt(config, angle, ball.x, ball.y, ballRadius);
-    if (touch === null) continue;
+  let previous = sweep.from;
+  for (const end of sweep.steps) {
+    const span = end.stroke - previous.stroke;
+    const samples = span === 0 ? 1 : inner;
+    for (let sample = 1; sample <= samples; sample += 1) {
+      // Truncated rather than rounded so the samples advance monotonically and
+      // the last one is exactly the pose the step ended on.
+      const stroke = previous.stroke + Math.trunc((span * sample) / samples);
+      const angle = flipperAngle(config, { stroke, rate: end.rate });
+      const touch = touchAt(config, angle, ball.x, ball.y, ballRadius);
+      if (touch === null) continue;
 
-    // Rigid-body surface velocity at the touched point: omega crossed with the
-    // lever arm, which in two dimensions rotates the arm a quarter turn.
-    const surfaceX = -tangentialSpeed(touch.armY, turned);
-    const surfaceY = tangentialSpeed(touch.armX, turned);
+      // The bat's surface velocity at the touched point, in BEARING units per
+      // tick: four steps of the rate this step carried. Used for the gate and
+      // for what the contact reports, never for the impulse's size.
+      const turnPerTick = config.direction * batAngleToBearing(end.rate * FLIPPER_STEPS_PER_TICK);
+      const surfaceX = -tangentialSpeed(touch.armY, turnPerTick);
+      const surfaceY = tangentialSpeed(touch.armX, turnPerTick);
 
-    const approachSpeed =
-      q10Multiply(ball.velocityX - surfaceX, touch.normalX) +
-      q10Multiply(ball.velocityY - surfaceY, touch.normalY);
+      const approachSpeed =
+        q10Multiply(ball.velocityX - surfaceX, touch.normalX) +
+        q10Multiply(ball.velocityY - surfaceY, touch.normalY);
 
-    // Reflect in the bat's frame, so the one audited reflection routine — with
-    // its rest threshold and its Coulomb "no normal force, no friction" rule —
-    // is the only place a bounce is ever computed.
-    ball.velocityX = clampVelocity(ball.velocityX - surfaceX);
-    ball.velocityY = clampVelocity(ball.velocityY - surfaceY);
-    reflectVelocity(ball, config.surface, touch.normalX, touch.normalY, restThreshold);
-    ball.velocityX = clampVelocity(ball.velocityX + surfaceX);
-    ball.velocityY = clampVelocity(ball.velocityY + surfaceY);
+      // THE GATE, +0x00AEAC and the eight octant masks at $B036+0x3C*n: the bat
+      // imparts only when it is sweeping toward the face the ball is on. A rate
+      // of zero fails it outright, which is the `beq -> rts`.
+      const facing =
+        q10Multiply(surfaceX, touch.normalX) + q10Multiply(surfaceY, touch.normalY);
+      let rateTaken = 0;
+      if (end.rate !== 0 && facing > 0) {
+        const dx = Math.trunc(Math.abs(ball.x - config.pivotX) / Q10_ONE);
+        const dy = Math.trunc(Math.abs(ball.y - config.pivotY) / Q10_ONE);
+        rateTaken = Math.min(Math.abs(end.rate), flipperRateTaken(dx, dy));
+        // The rate AFTER the ball has taken its share, which is what the impulse
+        // is computed from: +0x00AED2..+0x00AEE4 writes the reduced rate back
+        // before +0x00AEF0 even looks at the magnitude. Signed the way the
+        // ORIGINAL signs it — the disk's left bat runs its coil at -120 and its
+        // right at +120, which this port folds into `direction`.
+        const driven = (Math.abs(end.rate) - rateTaken) * (config.direction * end.rate < 0 ? -1 : 1);
+        const magnitude = flipperImpulseMagnitude(dx, dy);
+        // WHY THERE IS NO FACTOR OF TWO HERE and the sub-handlers have one. The
+        // rotation into the contact frame at +0x00B4FE multiplies by tables
+        // scaled to 2^14 and takes `(x << 3) >> 16`, i.e. it DOUBLES both
+        // components, and the inverse at +0x00B666 halves them again. The
+        // handlers' `magnitude * 2 * rate` and `8 * 2 * rate` are written into
+        // that doubled frame, so the impulse a ball actually receives is
+        // `magnitude * rate` outward and `8 * rate` along the surface. Missing
+        // the doubling puts every flipper shot at twice the machine's own
+        // velocity clamp, where the whole bat saturates and nothing has range.
+        const normal = originalVelocityToQ10(magnitude * Math.abs(driven));
+        const tangent = originalVelocityToQ10(ORIGINAL_IMPULSE_TANGENT * driven);
+        // The normal is always outward — the sub-handlers negate `d2` on
+        // whichever branch keeps `$1c` negative, and +0x00B550's `tst.w d0 /
+        // ble` shows the frame's first axis points INTO the surface. The tangent
+        // runs along `(normalY, -normalX)` and its sign is the bat's own rotation
+        // sign and NOT a projection: the bat's surface velocity is perpendicular
+        // to the arm and the arm runs down the bat's axis, so the surface
+        // velocity is almost entirely along the NORMAL and its along-face
+        // component is numerical noise that no sign can be read off.
+        //
+        // The consequence, which is worth stating because it is testable: both
+        // bats deflect the ball toward their own pivot, by `atan(8/M)` — about
+        // 32 degrees at the boss and 13 at the tip. The two are exact mirrors,
+        // which is the check that the handedness above is not inverted.
+        ball.velocityX = clampVelocity(
+          ball.velocityX +
+            q10Multiply(normal, touch.normalX) +
+            q10Multiply(tangent, -touch.normalY),
+        );
+        ball.velocityY = clampVelocity(
+          ball.velocityY +
+            q10Multiply(normal, touch.normalY) +
+            q10Multiply(tangent, touch.normalX),
+        );
+      }
 
-    separate(ball, touch, clamp);
+      // Then the ordinary bounce, in the WORLD frame — the original has no bat
+      // frame, and `reflectVelocity` returns untouched when the ball is already
+      // leaving, which is exactly the `tst.w d0 / ble` that skips the bounce at
+      // +0x00B550 once the kick above has sent the ball outward. A bat standing
+      // still reaches this with nothing added and behaves as it always has.
+      reflectVelocity(ball, config.surface, touch.normalX, touch.normalY, restThreshold);
 
-    const batSpeed = tangentialSpeed(
-      integerSqrt(touch.armX * touch.armX + touch.armY * touch.armY),
-      turned,
-    );
-    return {
-      ballId: ball.id,
-      flipperId: config.id,
-      normalX: touch.normalX,
-      normalY: touch.normalY,
-      along: touch.along,
-      batSpeed,
-      approachSpeed,
-      struck: approachSpeed < 0 && turned !== 0,
-    };
+      separate(ball, touch, clamp);
+
+      const batSpeed = tangentialSpeed(
+        integerSqrt(touch.armX * touch.armX + touch.armY * touch.armY),
+        turnPerTick,
+      );
+      return {
+        ballId: ball.id,
+        flipperId: config.id,
+        normalX: touch.normalX,
+        normalY: touch.normalY,
+        along: touch.along,
+        batSpeed,
+        approachSpeed,
+        struck: end.rate !== 0 && facing > 0,
+        rateTaken,
+      };
+    }
+    previous = end;
   }
   return null;
 }
@@ -1076,6 +1318,44 @@ export function tickFlipperBank(bank: FlipperBank, input: FlipperInput): Flipper
     states.set(config.id, sweep.to);
   }
   return { bank: { configs: bank.configs, states }, sweeps };
+}
+
+/**
+ * Puts the angular momentum the balls took back into the bank.
+ *
+ * MEASURED: +0x00AED2..+0x00AEE4 reduces the bat's rate toward zero by half the
+ * raw impulse-table entry and writes it to $10(a0) DURING the collision pass, so
+ * the rest of the stroke really is weaker for having hit something. The stroke
+ * itself is untouched — only the rate — which is exactly what the original does
+ * and is why a bat that has been loaded still reaches the top, just later.
+ *
+ * Returns the bank unchanged, by identity, when nothing was taken: a tick that
+ * hit nothing must not allocate.
+ */
+export function applyFlipperReactions(
+  bank: FlipperBank,
+  contacts: readonly FlipperContact[],
+): FlipperBank {
+  let taken: Map<string, number> | null = null;
+  for (const contact of contacts) {
+    if (contact.rateTaken <= 0) continue;
+    taken ??= new Map<string, number>();
+    taken.set(contact.flipperId, (taken.get(contact.flipperId) ?? 0) + contact.rateTaken);
+  }
+  if (taken === null) return bank;
+
+  const states = new Map<string, FlipperState>();
+  for (const config of bank.configs) {
+    const state = bank.states.get(config.id) ?? FLIPPER_AT_REST;
+    const loss = taken.get(config.id) ?? 0;
+    if (loss === 0 || state.rate === 0) {
+      states.set(config.id, state);
+      continue;
+    }
+    const magnitude = Math.max(0, Math.abs(state.rate) - loss);
+    states.set(config.id, { stroke: state.stroke, rate: state.rate < 0 ? -magnitude : magnitude });
+  }
+  return { configs: bank.configs, states };
 }
 
 /** Button state built from the abstract control names the input layer uses. */

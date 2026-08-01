@@ -470,11 +470,11 @@ data and the file looked unread. **[disk]**
 |---:|---|---|---:|---|---|
 | 1 | **Balls per game** | 3–5 | 3 | `$E84(a5)` | `0x4558 move.w $E84(a5),$D82(a5)`; `0x508C subq.w #1,$D82(a5) ; beq $5124` |
 | 2 | **Table slope** (downhill Y acceleration) | 2–8 | 4 | `$E86(a5)` | `0xB758 add.w $E86(a5),d1` into the per-material acceleration pair; `0x3504` writes it to `ball+0x3E` at init |
-| 3 | **Camera follow divisor** | 1–7 | 5 | `$E88(a5)` | `0x6D6A divs.w $E88(a5),d0` on (target Y − camera Y − dead zone); `0x6D78 add.w d0,$DA4(a5)` |
-| 4 | **Tilt sensitivity** | 0–200 | 100 | `$E8A(a5)` | `0xBE9A add.w d0,$23F0(a5)` per nudge frame; `0xBEA2 cmpi.w #$C8,$23F0(a5)` → `st.b $23ED(a5)`; `0xBEB4 subq.w #1` decay |
+| 3 | **Camera follow divisor** | 1–7 | 5 | `$E88(a5)` | `0x6D6A divs.w $E88(a5),d0` on (target Y − camera Y − ANCHOR `$D9E`); `0x6D78 add.w d0,$DA4(a5)`. No dead zone and no per-tick cap exist; the downward branch at `0x6D90` halves the step and so does the upward one inside the top 32 rows |
+| 4 | **Tilt sensitivity** | 0–200 | 100 | `$E8A(a5)` | `0xBE9A add.w d0,$23F0(a5)` on the RISING EDGE of a nudge key (`$23EF AND $23EE`, re-armed by `0xBC28 ori.b #$7`); `0xBEA2 cmpi.w #$C8,$23F0(a5)` → `st.b $23ED(a5)`; `0xBEB4 subq.w #1` decay, **once per collision pass, so four a frame** |
 | 5 | **Lateral lean** (X acceleration bias) | −3…+3 | 0 | `$E8C(a5)` | `0xB754 add.w $E8C(a5),d0`; `0x34FC` writes it to `ball+0x3C` at init |
 | 6 | **Timed ball-save grace, in seconds** | 0–10 | 5 (**Extreme Sports 10**) | `$E8E(a5)` | `0x49AE move.w $E8E(a5),d0 ; mulu.w $50(a5),d0 ; move.w d0,$D8A(a5)`; `0x4DF2 subq.w #1`; `0x4E4E tst.w ... beq`; `0x50FA clr.w` on drain |
-| 7 | **View / screen mode** | 0–2 | 2 | `$E90(a5)` | `0x3514 cmpi.w #$1,$E90(a5)` → `$3C1E` else `$3BDC`; `0x5A26 cmpi.w #$2,$E90(a5)` → `$3C1E` |
+| 7 | **View / screen mode** | 0–2 | 2 | `$E90(a5)` | `0x3514 cmpi.w #$1,$E90(a5)` → `$3C1E` else `$3BDC`; `0x5A26 cmpi.w #$2,$E90(a5)` → `$3C1E`, which is **script opcode 25** (table entry at `0x5912 + 4×25`, length word 2, no operands) |
 
 **[disk]** — every row above was re-disassembled for this document and reproduces
 exactly.
@@ -492,10 +492,26 @@ Notes that matter:
   option is in whole **seconds**. **[disk] — refutes the previous doc.** Calling it "ball
   save" specifically is the one inferential step; the drain handler was not traced far
   enough to watch the timer veto a ball loss. **[open]** on that last hop.
+- **Record 4 does not mean "the second nudge tilts".** Two facts outside `0xBE90` decide
+  what 100-against-200 is worth, and both were missed when this row was first written.
+  `$23EE`/`$23EF` are a rising-edge latch — `0xBC28` re-arms all three bits every call and
+  the per-direction blocks clear the arm bit only when the `bset` finds `$23EF` already set
+  — so a held key counts **once**, and the key bytes `$ED2`/`$EF8`/`$EF9` are written only
+  by the keyboard handler's key-down. And `0xBE90` is the tail of `$BC24`, which is called
+  once per COLLISION PASS (`0xA65A`, `0xA6A4`, `0xA6EE`, `0xA736`, and four times over in
+  each no-ball path at `0xA750`/`0xA770`), so the decay is **four a frame, 200 a second**.
+  One shove therefore drains in half a second, **two shoves can never reach 200**
+  (100 + (100−4) = 196), and **three inside half a second tilt**. **[disk]**
+- **Record 3's default of 5 is forced, not chosen.** The follower's fixed point is
+  `anchor + 2 × divisor × v` for a ball falling at `v` px a frame, and `70 + 2×5×16` — the
+  anchor, the divisor and the engine's own ±4095 velocity clamp — is exactly the 230-row
+  narrow window `$DA0 = 370` defines. Divisor 6 gives 262 and 7 gives 294, both off the
+  bottom of the window. Upward, `70 − 5×14 = 0` and 14 px a frame is the measured full
+  plunge, so a plunge lands the ball precisely on the top edge. **[disk]**
 - **Record 7 is not a multiball cap.** `$3C1E` (wide): display words `$9CA=$50`,
-  `$9CE=$A0`, `$9D2=$8214`, `$9E2=$80`, `$9DA=$9DE=$2D0`; camera dead-zone `$D9E=$C8`,
+  `$9CE=$A0`, `$9D2=$8214`, `$9E2=$80`, `$9DA=$9DE=$2D0`; camera anchor `$D9E=$C8`,
   camera max-Y `$DA0=$8A` (138). `$3BDC` (narrow): `$9CA=$30`, `$9CE=$D0`, `$9D2=$210`,
-  `$9E2=$40`, `$9DA=$9DE=$150`; `$D9E=$46`, `$DA0=$172` (370). Against a 600-row
+  `$9E2=$40`, `$9DA=$9DE=$150`; anchor `$D9E=$46` (70), max-Y `$DA0=$172` (370). Against a 600-row
   playfield that is ~462 visible rows versus ~230 — exactly 2×. `$D9A(a5)` then selects
   drawing paths at `0x7708` (X snapped to even), `0x773A`, `0xC09A`. So **0 = always
   narrow, 1 = always wide, 2 = narrow but the table script may switch to wide at run

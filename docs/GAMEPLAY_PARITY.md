@@ -127,8 +127,8 @@ were right and the first word of every record was not.
 |---:|---|---|---:|---|---|
 | 1 | Balls per game | 3–5 | 3 | `$E84(a5)` | confirmed |
 | 2 | **Table slope** — downhill (Y) acceleration | 2–8 | 4 | `$E86(a5)` | **was "players" — refuted** |
-| 3 | **Camera follow divisor** — `divs.w` on (ball Y − camera Y − dead zone) | 1–7 | 5 | `$E88(a5)` | **was [open] — closed** |
-| 4 | **Tilt sensitivity** — units added per nudge frame against a hard-coded threshold of 200 | 0–200 | 100 | `$E8A(a5)` | **was [open] — closed** |
+| 3 | **Camera follow divisor** — `divs.w` on (ball Y − camera Y − ANCHOR); there is no dead zone | 1–7 | 5 | `$E88(a5)` | **was [open] — closed** |
+| 4 | **Tilt sensitivity** — counts added per nudge KEY PRESS against a hard-coded threshold of 200, decaying four a frame | 0–200 | 100 | `$E8A(a5)` | **was [open] — closed** |
 | 5 | **Lateral lean** — sideways (X) acceleration bias | −3…+3 | 0 | `$E8C(a5)` | was "table slope" — it is the other axis |
 | 6 | **Timed ball-save grace, in whole seconds** (× `GfxBase.VBlankFrequency` → a frame countdown) | 0–10 | 5 (**Extreme Sports 10**) | `$E8E(a5)` | **was "nudges before tilt" — refuted** |
 | 7 | **View / screen mode**: 0 = always narrow, 1 = always wide, 2 = narrow, script may switch to wide | 0–2 | 2 | `$E90(a5)` | **was "max multiballs" — refuted** |
@@ -138,6 +138,26 @@ Consequences worth restating:
 - **Nudge tolerance is record 4, and it is identical on all three tables (100).** Extreme
   Sports' "double tolerance" was record 6 — it gets **10 seconds of ball save, not 10
   nudges**. The claim under *Extreme Sports* below is corrected accordingly.
+- **The tilt option is a sensitivity, and it is not "the second nudge".** Two details
+  outside the routine decide what 100-against-200 means, and both were read wrong when
+  this row was first closed. The add fires on the RISING EDGE of a nudge key (`$23EE` is
+  re-armed by `ori.b #$7` at +0x00BC28 and the matching bit is cleared only when the
+  `bset` finds `$23EF` already set), so holding a key counts once; and the decay runs once
+  per COLLISION PASS, four times a frame, because +0x00BE90 is the tail of `$BC24` and
+  `$BC24` is called at +0x00A65A/6A4/6EE/736. So one shove is forgiven in half a second,
+  **two shoves can never tilt** (100 + (100−4) = 196), and **three inside half a second
+  do**. `src/game/tilt.ts` implements exactly this and `DISK_ANALYSIS.md` has the listing.
+  This is roughly twice as touchy as the chosen 5/5/10 allowance it replaces.
+- **The camera is a proportional follower with no dead zone and no step cap**, and the
+  shipped divisor of 5 is *forced* rather than tuned: the follower settles a ball falling
+  at `v` px a frame on screen row `anchor + 2 x divisor x v`, and `70 + 2 x 5 x 16` — the
+  anchor, the divisor and the engine's own ±4095 velocity clamp — is exactly the 230-row
+  narrow window. Divisor 6 puts a max-speed ball off the bottom. `src/browser/camera.ts`
+  implements the law; `DISK_ANALYSIS.md` has the thirteen instructions.
+- **Record 5 (the table x-tilt) is wired but inert.** +0x00B754 adds it to the ball's X
+  acceleration in the same instruction pair that adds gravity to the Y, so it takes the
+  same 32-Q10-per-unit bridge and its ±3 range is three quarters of gravity of permanent
+  lateral lean. The shipped value is 0 on all three tables.
 - **Players are not an option.** They are chosen with F1–F8 at start
   (`PRESS ENTER OR F1-F8 TO BEGIN PLAY`); the 8-entry player array at `$DC6(a5)` is never
   sourced from the `.opt`. Multiplayer is sequential, not simultaneous. **[src]/[disk]**
@@ -145,6 +165,28 @@ Consequences worth restating:
   and it is the multiball camera switch that this document has been calling **[src]**:
   wide shows ~462 of the 600 playfield rows, narrow ~230, exactly 2×. Which of the two
   the game calls "LO-RES" is still **[open]**.
+
+### The reading this replaced, and why it lasted
+
+The day-one decode read the record as `{u16 current, u16 max, u32 default, u16 FFFF}` and
+labelled the seven as *balls, players, three unknowns, table slope, nudges before tilt, a
+multiball cap*. It reproduced every published **default** correctly — "u32 default" is
+current(=0) followed by default, so the low word of the long is the right number — and
+that is exactly what made it look verified. It was tagged **[disk]** and quoted throughout
+the project for eleven commits.
+
+Its most durable claim was **"nudges before tilt: 5 / 5 / 10 — Extreme Sports tolerates
+twice as many"**. That is record 6, a duration in whole SECONDS (+0x0049AE multiplies it by
+`VBlankFrequency` and counts frames). The same three digits, meaning something else, sitting
+on the one record that genuinely does vary between tables — so the wrong reading arrived
+with its own corroborating "parity fact", and every check anyone thought to run confirmed
+it.
+
+Two rules came out of it and the table above obeys both: **a decode that reproduces the
+values it was derived from has not been tested, only restated**, and **a record's meaning
+is established by the instruction that consumes the live word**, never by the plausibility
+of its range. Each row now names that instruction, and the count of readers in the whole
+segment is part of the claim.
 
 **There is no options screen in this release and the option labels do not exist as text
 anywhere in the shipped data** — established by exhaustive search, not merely unfound
@@ -215,6 +257,53 @@ Law 'n Justice at (37,302) sweeping 11 poses, which is the upper-left flipper th
 has been carrying as [open]**. Neither the disk pivots nor the third bat are wired in: both
 change how a table plays and want their own change with their own census. **[disk]**
 
+**The flipper IMPULSE, which is the other half and was this port's own invention.** The
+stroke above is what the bat does; what it gives the ball is +0x00AEA2, reached from the
+surface-id entries for ids 1…4. It is not a reflection and it is not a rigid-body frame
+change:
+
+1. `move.w $10(a0),d2 / beq -> rts`. The bat's angular RATE is a **gate**. A bat that is
+   not turning imparts nothing at all, however it is placed.
+2. `d0 = |ballX − pivotX|`, `d1 = |ballY − pivotY|`, `d0 = (d0<<6) + d1`, and
+   `move.w (a1,d0.w*2),d0` off a **64×64 word table**. The table is at offset `$B0B8` of
+   **hunk 1** — the `lea.l $b0b8.l,a1` carries a hunk-1 relocation, which is why reading it
+   as a hunk-0 address lands inside the impulse sub-handlers and why it has been reported
+   as undecodable. All 4096 entries are exactly `isqrt((dx² + dy²) × 35810 >> 16)`, i.e.
+   `floor(0.7392 × distance)`: **the table is the ball's distance from the pivot at three
+   quarters scale**, and the table pins that constant to [0.73919716, 0.73920458), a
+   bracket seven parts in a million wide.
+3. `d3 = d0>>1` is **subtracted from the bat's rate** toward zero and written back to
+   `$10(a0)`: the ball takes angular momentum out of the bat, the impulse is computed from
+   the reduced rate, and a second ball on the same stroke gets less.
+4. Small radii are floored — `if d0 < $2E: d0 += ($2E − d0) >> 3` — so a ball struck at the
+   boss still leaves with something. On a 45 px bat every radius is under 46, so the floor
+   always fires: it lifts the boss from 0 to 5 and the tip from 33 to 34.
+5. One of eight sub-handlers at `$B036 + 0x3C·n`, chosen by the record's byte `$1(a0)`,
+   writes `$1c(a4) = magnitude × 2 × rate` and `$1a(a4) = 8 × 2 × rate`. Those are consumed
+   at +0x00B528: `$1C` is added to the **normal** component of the ball's velocity and
+   `$1A` to the **tangential**, after +0x00B4FE has rotated the velocity into the contact
+   frame using `$28(a4)` and a pair of 16384-scaled sin/cos tables. The rotation **doubles**
+   (`asl.l #3` then `swap`, against a table scale of 2¹⁴) and the inverse halves, so the
+   real impulse is `magnitude × rate` along the outward normal and `8 × rate` along the
+   surface. Each sub-handler also carries an eight-byte mask indexed by `$28(a4)>>8` — the
+   contact normal's octant — and the eight masks are the same four-of-eight pattern rotated
+   one byte per handler: **the bat only imparts to a ball on the face it is sweeping
+   toward**. The bounce that would normally follow is skipped outright once the kick has
+   sent the ball outward (`tst.w d0 / ble` at +0x00B550).
+
+**Why this mattered.** The port reflected the ball in the bat's instantaneous rigid-body
+frame with an elasticity of 400, which scales the whole impulse by angular velocity times
+lever arm and nothing else. After the timebase correction that model **saturated the
+engine's ±4095 velocity clamp from about 30 px out along a 45 px bat, at every rate**: a
+shot struck at the boss and one struck at the tip left at the same 800 px a second, three
+of five contact points did not send the ball up the table at all, and no tuning could give
+the flipper any dynamic range because there was none left to give. The measured law is
+**bounded by construction** — the table is a distance and the rate deduction is a
+self-limiter, so the largest impulse anywhere on the bat at the coil's cap is 89% of the
+clamp — and its spread lives in the STROKE: a ball met at rate 20 leaves at a sixth of the
+speed of one met at 120. `src/game/flippers.ts` implements it and
+`tests/timebase.test.ts` asserts the bound as arithmetic. **[disk]**
+
 ## Physical layout
 
 - Three flippers per table. **[src]** — and Law 'n Justice's third is now located on the
@@ -223,7 +312,11 @@ change how a table plays and want their own change with their own census. **[dis
   only. Recorded in `flippers.ts` as `LAW_N_JUSTICE_UPPER_FLIPPER` and not wired in. **[disk]**
 - Bumpers, ball traps, ramps, multi-level playfields. **[src]**
 - Vertically scrolling playfield in normal play; full-screen hi-res during multiball. **[src]**
-- Nudge with a tilt penalty for overuse. **[src]**
+  — and the scroll itself is now **[disk]**: a proportional follower closing 1/5 of the
+  error a frame onto an anchor 70 rows from the top of a 230-row window, half rate
+  downward and inside the top 32 rows, no dead zone and no step cap. See *Options* above.
+- Nudge with a tilt penalty for overuse. **[src]** — the penalty itself is **[disk]**: a
+  warning counter that takes 100 per shove, decays four a frame and tilts at 200.
 - **Playfield is 336 x 600 pixels on all three tables**, stored as four stacked
   1-bit layers of 620 / 620 / 600 / 600 rows (offsets 0 / 26040 / 52080 / 77280),
   combined into one per-pixel index in 0–15. Measured, not guessed — see
@@ -575,7 +668,14 @@ Parity means deciding about these deliberately rather than by accident:
 
 - Graphical glitches during multiball, reported as worst on BabeWatch. **[src]**
 - Inconsistent flipper response — the ball sometimes leaving at an unexpected
-  angle. **[src]**
+  angle. **[src]** — and there is now a mechanism to point at. The measured impulse
+  (see *The flipper IMPULSE* above) fires along the contact normal with a fixed `8/M`
+  slice of drag along the bat's face, where `M` is the pivot distance at three quarters
+  scale. That deflection is `atan(8/13) ≈ 32°` at the boss and `atan(8/34) ≈ 13°` at the
+  tip, so where on the bat a ball is caught swings the shot by twenty degrees — and the
+  contact normal itself is quantised to one of eight octants for the gate. Whether the
+  reported complaint is this or something else is **[open]**, but it is no longer a
+  behaviour without a candidate cause.
 
 Both are candidates for a "faithful / fixed" toggle rather than silent correction.
 

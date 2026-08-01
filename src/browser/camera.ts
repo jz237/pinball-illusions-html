@@ -10,6 +10,68 @@
  * Pure and deterministic: the same balls and previous state always produce the
  * same camera, which keeps replays reproducible and makes this testable without
  * a canvas.
+ *
+ * ---------------------------------------------------------------------------
+ * THE FOLLOW LAW IS MEASURED. IT USED TO BE A DEAD ZONE AND A STEP CAP
+ * ---------------------------------------------------------------------------
+ * This file ran on a 64 px dead zone and a `maxScrollStep` of 8 px a tick, both
+ * chosen, and it was the one rate in the game the timebase change never reached:
+ * the ball's top speed doubled to 16 px a tick and the camera's cap stayed at 8.
+ *
+ * The original has neither a dead zone nor a step cap. It is a PROPORTIONAL
+ * follower and it is thirteen instructions, at main.seg00 +0x006D5A, called once
+ * per frame from all six game loops (+0x00489A, +0x004B1E, +0x004C08, +0x004C90,
+ * +0x00517A, +0x005244):
+ *
+ *     006D5A  move.w  $da8(a5), d0        ; the ball being followed
+ *     006D5E  move.w  $da4(a5), d1        ; the current top row
+ *     006D62  sub.w   d1, d0
+ *     006D64  sub.w   $d9e(a5), d0        ; ... minus the ANCHOR
+ *     006D68  ext.l   d0
+ *     006D6A  divs.w  $e88(a5), d0        ; step = error / DIVISOR  <- record 2
+ *     006D6E  bpl     $6d84               ; >= 0 is the downward branch
+ *     006D70  cmpi.w  #$20, d1 / bgt      ; UP: inside the top 32 rows,
+ *     006D76  asr.w   #$1, d0             ;     halve the step
+ *     006D78  add.w   d0, $da4(a5)
+ *     006D7C  bpl / clr.w $da4(a5)        ;     never above row 0
+ *     006D84  move.w  $da0(a5), d2 / sub.w d1, d2
+ *     006D8A  cmpi.w  #$ffce, d2 / bhi    ; DOWN: 1..49 rows past the stop,
+ *                                         ;       do not scroll at all
+ *     006D90  asr.w   #$1, d0             ;       and always at half rate
+ *     006D92  add.w   d0, $da4(a5)
+ *     006D96  cmp.w   $da4(a5), d2 / bhi / move.w d2, $da4(a5)   ; clamp to $DA0
+ *
+ * $DA4 is the top visible playfield ROW in whole pixels — +0x007720 uses it to
+ * index a per-row address table whose entries become the eight bitplane pointers
+ * — so this is the whole of the vertical camera. There is no horizontal one:
+ * $D96, added alongside at +0x006DB0, is the +-3 px nudge shake and nothing else.
+ *
+ * WHY THE SHIPPED DIVISOR IS PROVABLY 5, which is the finding rather than a fit.
+ * The law's fixed point, replayed in integers, puts a ball falling at v px a
+ * frame at screen row `anchor + 2*divisor*v` and a ball rising at v at
+ * `anchor - divisor*v`. The engine's own velocity clamp is 4095 units = 16 px a
+ * frame (see `timebase.ts`), and the original's narrow window is 230 rows —
+ * $DA0 = 370 of a 600 px playfield. 70 + 2*5*16 = 230 EXACTLY: a ball at the
+ * machine's top speed sits precisely on the bottom edge of the window and never
+ * leaves it. Divisor 6 gives 262 and divisor 7 gives 294, both off the bottom.
+ * Upward, 70 - 5*14 = 0 and 14 px a frame is the measured full plunge, so a
+ * plunge puts the ball precisely on the TOP edge. Four independently measured
+ * numbers — the clamp, the anchor, the window and the divisor — close on each
+ * other to the pixel.
+ *
+ * WHAT IS STILL THIS PORT'S. The WINDOW. The original's narrow mode shows 230
+ * rows and this port shows 256, which is 26 rows of margin the machine did not
+ * have; the display-window registers set beside $D9E at +0x003BDC ($9CA = 48,
+ * $9CE = 208) imply 160 lines and have not been reconciled with the 230 that
+ * $DA0 forces, so the true height is [open] and changing it is a rendering
+ * change rather than a camera one. The consequence is recorded rather than
+ * hidden: with the measured law and a 256 px window the ball is 26 px further
+ * from the bottom edge than it was on the machine.
+ *
+ * The WIDE mode is also the original's own — $D9E = 200, $DA0 = 138 at
+ * +0x003C1E, i.e. 462 scrollable rows over an interlaced screen — and this port
+ * does not reproduce it. What it has instead is the whole-table reframe below,
+ * which is documented behaviour and is kept.
  */
 
 import { PLAYFIELD_HEIGHT, PLAYFIELD_WIDTH } from "../game/contracts.js";
@@ -19,6 +81,39 @@ import { q10ToPixel } from "../core/fixed-point.js";
 /** PAL-era visible window over the playfield, in playfield pixels. */
 export const VIEWPORT_WIDTH = PLAYFIELD_WIDTH;
 export const VIEWPORT_HEIGHT = 256;
+
+/**
+ * The original's narrow window: 230 rows, from $DA0 = 370 at +0x003BDC against
+ * the 600 px playfield. Recorded, not used — see the header for why the port's
+ * window is 256.
+ */
+export const ORIGINAL_NARROW_WINDOW_ROWS = 230;
+
+/**
+ * The CAMERA SCROLL DIVISOR, `tableNNN.opt` record 2: (min 1, max 7, DEFAULT 5),
+ * byte-identical on all three tables.
+ *
+ * MEASURED. $E88(a5) has exactly one reader in the whole 53 KB segment and it is
+ * the `divs.w` at +0x006D6A. Nothing writes it after the option copy.
+ */
+export const ORIGINAL_SCROLL_DIVISOR_MIN = 1;
+export const ORIGINAL_SCROLL_DIVISOR_MAX = 7;
+export const ORIGINAL_SCROLL_DIVISOR_DEFAULT = 5;
+
+/** $D9E(a5), narrow mode: the row the followed ball is held on. +0x003C10. */
+export const ORIGINAL_CAMERA_ANCHOR_ROWS = 70;
+
+/** Rows from the top inside which the upward step is halved. +0x006D70. */
+export const ORIGINAL_TOP_EASE_ROWS = 32;
+
+/**
+ * Rows past the bottom stop within which the downward step is refused outright.
+ * +0x006D8A's `cmpi.w #$ffce,d2 / bhi`, i.e. -49..-1 of remaining room.
+ */
+export const ORIGINAL_BOTTOM_STALL_ROWS = 49;
+
+/** Rows below which a ball is not followed at all: the playfield's own height. */
+export const ORIGINAL_FOLLOW_LIMIT_ROWS = PLAYFIELD_HEIGHT;
 
 export type CameraMode = "scrolling" | "full-table";
 
@@ -35,19 +130,16 @@ export interface CameraOptions {
    * automatic switch must never override an explicit choice.
    */
   readonly forceFullTable: boolean;
-  /**
-   * Vertical band, centred in the viewport, inside which the ball moves without
-   * dragging the camera. Without it the view jitters constantly.
-   */
-  readonly deadZoneHeight: number;
-  /** Maximum scroll change per tick, so the view eases rather than snaps. */
-  readonly maxScrollStep: number;
+  /** Option record 2. The camera closes one part in `scrollDivisor` per tick. */
+  readonly scrollDivisor: number;
+  /** Rows between the top of the window and the ball it is following. */
+  readonly anchorRows: number;
 }
 
 export const DEFAULT_CAMERA_OPTIONS: CameraOptions = {
   forceFullTable: false,
-  deadZoneHeight: 64,
-  maxScrollStep: 8,
+  scrollDivisor: ORIGINAL_SCROLL_DIVISOR_DEFAULT,
+  anchorRows: ORIGINAL_CAMERA_ANCHOR_ROWS,
 };
 
 export const INITIAL_CAMERA: CameraState = {
@@ -91,7 +183,32 @@ export function resolveMode(balls: readonly BallState[], options: CameraOptions)
 }
 
 /**
- * Advances the camera one tick.
+ * The row the camera follows: the LOWEST ball in play.
+ *
+ * MEASURED at +0x00BEF0. The routine seeds $DA6/$DA8 from the first ball's
+ * $12/$14 and then walks the list keeping any ball with a LARGER y — `cmp.w
+ * $da8(a5),d1 / bcs` at +0x00BF2C — while skipping any at or below row 600
+ * (`cmpi.w #$258,d1 / bcc` at +0x00BF10). Negative coordinates are clamped to
+ * zero on the way in.
+ *
+ * "The lowest ball" and not "the first" is the multiball rule the port had
+ * backwards: the view has to stay with the ball nearest the drain, because that
+ * is the one the player can still do something about.
+ */
+export function followRow(live: readonly BallState[]): number | null {
+  const first = live[0];
+  if (first === undefined) return null;
+  let target = Math.max(0, q10ToPixel(first.y));
+  for (const ball of live) {
+    const row = Math.max(0, q10ToPixel(ball.y));
+    if (row >= ORIGINAL_FOLLOW_LIMIT_ROWS) continue;
+    if (row > target) target = row;
+  }
+  return target;
+}
+
+/**
+ * Advances the camera one tick, by the measured law in the header.
  *
  * In whole-table mode the scroll is pinned to the top, since the renderer scales
  * the entire playfield to fit and there is nothing left to scroll.
@@ -107,34 +224,33 @@ export function updateCamera(
   }
 
   const live = activeBalls(balls);
-  if (live.length === 0) {
+  const target = followRow(live);
+  if (target === null) {
     // Nothing to follow — hold position rather than lurching to a default.
     return { scrollY: clampScroll(previous.scrollY), mode };
   }
 
-  const target = live[0];
-  if (target === undefined) {
-    return { scrollY: clampScroll(previous.scrollY), mode };
+  const maximum = Math.max(0, PLAYFIELD_HEIGHT - VIEWPORT_HEIGHT);
+  const viewTop = clampScroll(previous.scrollY);
+  // `divs.w` truncates toward zero; `asr.w #1` floors. The two are deliberately
+  // different rounding and the difference is a pixel of lag at the extremes.
+  let step = Math.trunc((target - viewTop - options.anchorRows) / options.scrollDivisor);
+
+  if (step < 0) {
+    if (viewTop <= ORIGINAL_TOP_EASE_ROWS) step >>= 1;
+    const next = viewTop + step;
+    return { scrollY: next < 0 ? 0 : next, mode };
   }
 
-  const ballY = q10ToPixel(target.y);
-  const viewTop = previous.scrollY;
-  const bandTop = viewTop + (VIEWPORT_HEIGHT - options.deadZoneHeight) / 2;
-  const bandBottom = bandTop + options.deadZoneHeight;
-
-  let desired = viewTop;
-  if (ballY < bandTop) desired = viewTop - (bandTop - ballY);
-  else if (ballY > bandBottom) desired = viewTop + (ballY - bandBottom);
-
-  const delta = desired - viewTop;
-  const limited =
-    delta > options.maxScrollStep
-      ? options.maxScrollStep
-      : delta < -options.maxScrollStep
-        ? -options.maxScrollStep
-        : delta;
-
-  return { scrollY: clampScroll(viewTop + limited), mode };
+  // The overshoot guard, in the original's own unsigned word arithmetic: a
+  // window already 1..49 rows past the bottom stop does not scroll down at all.
+  const room = (maximum - viewTop) & 0xffff;
+  if (room > 0xffff - ORIGINAL_BOTTOM_STALL_ROWS) {
+    return { scrollY: viewTop, mode };
+  }
+  step >>= 1;
+  const next = viewTop + step;
+  return { scrollY: next > maximum ? maximum : next, mode };
 }
 
 /** Scale factor the renderer should apply for the current mode. */

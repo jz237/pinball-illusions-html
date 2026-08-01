@@ -115,35 +115,134 @@ porting team for the PC CD-ROM and console versions and is absent here. The
 apostrophe form is `Law 'n Justice` (no second apostrophe), and `BabeWatch` is one
 word with a medial capital.
 
-## `table00N.opt` — per-table option defaults (70 bytes each)
+## `table00N.opt` — per-table option defaults (70 bytes each) — SETTLED
 
-Seven 10-byte records. Record shape:
+Seven 10-byte records. Record shape, **measured** from the loader that consumes them:
 
 ```text
-u16 current_value
-u16 maximum
-u32 default_value
-u16 terminator (FFFF)
+s16 minimum
+s16 maximum
+u16 current      (0 in every record of every shipped file)
+u16 default
+u16 terminator   (FFFF)
 ```
 
-Decoded (values identical across all three tables except record 6):
+`main.seg00` +0x00333C reads the 70 bytes; +0x0009E6 walks the seven records writing
+`default -> current` (`move.w $6(a0),$4(a0)`); +0x0009FE copies the seven currents into
+`$E84(a5)..$E90(a5)`, one word each, in order. Every reading below is the *consuming
+instruction*, found by scanning every even offset of the 53 KB segment body for that a5
+displacement and checking the opcode word in front of it — so each row states not only
+what a record means but how many places in the whole program can see it.
 
-| # | current | max | default | Reading |
-|---:|---:|---:|---:|---|
-| 1 | 3 | 5 | 3 | Balls per game — matches the documented 3-or-5 choice |
-| 2 | 2 | 8 | 4 | Players (the series supports up to 8) |
-| 3 | 1 | 7 | 5 | Unidentified |
-| 4 | 0 | 200 | 100 | Percentage-style scalar, centred at 100 |
-| 5 | −3 | 3 | 0 | **Signed** −3…+3, centred at 0 — consistent with table slope |
-| 6 | 0 | 10 | 5 | Nudges before tilt. **Extreme Sports differs: default 10** |
-| 7 | 0 | 2 | 2 | Small cap, plausibly maximum simultaneous multiballs |
+Zero-indexed to match `$E84 + 2n`, and byte-identical across all three tables except
+record 5's default:
 
-Record 6 is the only field that varies between tables, which is itself a parity fact
-worth preserving: Extreme Sports is configured to tolerate twice as many nudges.
+| # | live word | min | max | default | Meaning | Readers |
+|---:|---|---:|---:|---:|---|---|
+| 0 | `$E84` | 3 | 5 | 3 | Balls per game | — |
+| 1 | `$E86` | 2 | 8 | 4 | **Gravity**: added to the ball's Y acceleration once per sub-step | +0x003500 (seeds a ball), +0x00B758 (the add) |
+| 2 | `$E88` | 1 | 7 | 5 | **Camera scroll divisor**: `step = (ballY - scrollY - anchor) / divisor` | +0x006D6A only |
+| 3 | `$E8A` | 0 | 200 | 100 | **Tilt sensitivity**: counts added to a warning counter that trips at 200 | +0x00BE9A only |
+| 4 | `$E8C` | −3 | +3 | 0 | **Table x-tilt**: added to the ball's X acceleration beside gravity | +0x003500 (seeds a ball), +0x00B754 (the add) |
+| 5 | `$E8E` | 0 | 10 | 5 (**Extreme Sports 10**) | A duration in whole **seconds**, consumed at +0x0049AE as `option x VBlankFrequency` frames for the ball-start countdown | +0x0049AE |
+| 6 | `$E90` | 0 | 2 | 2 | **View mode**: 0 narrow and locked, 1 wide, 2 narrow with the script allowed to widen | +0x003514, +0x005A26 |
 
-Readings for records 3, 4 and 7 are **inferences, not established facts**. The
-authoritative labels live as text inside the `table00N.mnu` menu definitions; those
-must be read before any of this is treated as settled.
+### The camera follower, record 2
+
++0x006D5A is the whole vertical camera and it is thirteen instructions. `$DA8` is the
+followed ball's row, `$DA4` the top visible playfield row, `$D9E` the anchor and `$DA0`
+the maximum scroll:
+
+```text
+006D5A  err  = $DA8 - $DA4 - $D9E
+006D6A  step = err / $E88                    ; divs.w, truncates toward zero
+006D6E  bpl -> the downward branch
+        UP:   if $DA4 <= 32: step >>= 1      ; asr.w #1, a soft landing at the top
+              $DA4 += step, floored at 0
+        DOWN: if $DA0 - $DA4 is in -49..-1: do not scroll at all
+              step >>= 1                     ; downward tracking is ALWAYS half rate
+              $DA4 += step, clamped to $DA0
+006DAC  display row = $DA4 + $D98            ; $D98/$D96 are the +-3 px nudge shake
+```
+
+There is **no dead zone and no per-tick cap**. `$D9E`/`$DA0` are set by the screen mode
+rather than by an option: narrow is `$D9E = 70, $DA0 = 370` at +0x003C10, i.e. a
+**230-row window**; wide is `$D9E = 200, $DA0 = 138` at +0x003C52, 462 rows.
+
+The follower's fixed point is `anchor + 2 x divisor x v` for a ball falling at `v` px a
+frame and `anchor - divisor x v` for one rising. **That is why the shipped default is 5**,
+and it is a derivation rather than a fit: the engine's own velocity clamp is ±4095 units
+= 16 px a frame, and `70 + 2 x 5 x 16 = 230` is *exactly* the narrow window's height, so a
+ball at the machine's top speed sits precisely on the bottom edge and never leaves it.
+Divisor 6 gives 262 and divisor 7 gives 294, both off the bottom. Upward, `70 - 5 x 14 = 0`
+and 14 px a frame is the measured full plunge, so a plunge puts the ball precisely on the
+top edge. Four separately measured numbers — the clamp, the anchor, the window height and
+the divisor — close on each other to the pixel.
+
+The followed ball is the **lowest** one: +0x00BEF0 seeds from the first ball and then keeps
+any ball with a larger Y (`cmp.w $da8(a5),d1 / bcs` at +0x00BF2C), skipping any at or below
+row 600.
+
+### The tilt rule, record 3
+
++0x00BE90 is the tail of `$BC24`, entered with no `rts` between it and the flipper
+animation loop that precedes it:
+
+```text
+00BE90  d0 = $23EF AND $23EE       ; a direction went live THIS pass
+00BE98  beq -> skip the add
+00BE9A  $23F0 += $E8A(a5)          ; warning += SENSITIVITY
+00BEA2  cmpi.w #$C8,$23F0 / bcs    ; 200
+00BEAA  st.b $23ED                 ; TILT
+00BEAE  if $23F0 != 0: subq.w #1   ; and it decays on EVERY pass, nudged or not
+```
+
+Two things decide what that means in nudges and neither is in the routine itself:
+
+- **The add is once per key PRESS.** `$23EE` has all three bits re-armed by
+  `ori.b #$7,$23ee(a5)` at +0x00BC28 on every call, and the per-direction blocks at
+  +0x00BC34/+0x00BC9C/+0x00BCDC `bset` `$23EF` and then `bclr` the matching `$23EE` bit
+  only when the bset found the bit already set. So the AND is non-zero on the pass a
+  direction first goes active and zero on every pass it is held. The key bytes `$ED2`,
+  `$EF8`, `$EF9` are never written in hunk 0 — the keyboard handler sets them on key-down
+  and clears them on key-up — so a held key counts exactly once.
+- **The decay is four a frame.** `$BC24` is called once per COLLISION PASS: +0x00A65A,
+  +0x00A6A4, +0x00A6EE, +0x00A736, and four times over in each of the two no-ball paths at
+  +0x00A750 and +0x00A770. 200 counts a second.
+
+So at the shipped sensitivity of 100 against a threshold of 200: one nudge drains to
+nothing in 25 frames (half a second); **two nudges can never tilt** (100 + (100−4) = 196 at
+the very best); **three inside half a second do**. Sensitivity 0 makes the table
+untiltable and 200 tilts on the first shove. `$23F0` is cleared at ball and game start
+(+0x0045F2, +0x004A80, +0x005052, +0x0054B6) and `$23ED`, while set, suppresses the surface
+handlers at +0x00B216 and +0x00B234, so kickers and scoring go dead.
+
+### What the previous reading was, and why it survived eleven commits
+
+The day-one decode read the record as `{u16 current, u16 max, u32 default, u16 FFFF}` and
+labelled the seven as *balls, players, three unknowns, table slope, nudges before tilt, and
+a multiball cap*. It produced the right **defaults** — because "u32 default" is
+current(=0) followed by default, so the low word of the long is the right number — which
+is precisely what made it look verified. Every check anyone ran was "do the published
+defaults come out?", and they did.
+
+The single most durable piece of it was **"nudges before tilt: 5, 5, 10 — Extreme Sports
+tolerates twice as many"**. That is record 5, and it is a duration in whole SECONDS
+(+0x0049AE multiplies it by `VBlankFrequency` and counts frames). The same three numbers,
+meaning something else entirely, attached to the one record that actually does vary between
+tables — so the reading came with its own corroborating "parity fact". It was carried as
+**[disk]** for eleven commits and quoted throughout the project, and it was wrong in every
+respect except the digits.
+
+Two lessons are worth keeping with the correction rather than in a postmortem: a decode
+that reproduces the values it was derived from has not been tested, only restated; and a
+record's *meaning* is established by the instruction that consumes the live word, never by
+the plausibility of its range. Every row of the table above now names that instruction.
+
+**The option labels do not exist as text anywhere in the shipped data.** There is no
+options screen in this release; the only menu descriptor in the program has three items
+(`Tables`, `Exit`, `Info`). Any option name in this reconstruction is the project's own
+invention. The semantics are facts; the words are not.
 
 ## The `TSL!` package container — solved
 
@@ -598,7 +697,19 @@ Recorded so nobody spends effort re-opening them:
 5. Which odd material index carries which wall behaviour (rubber / slingshot / plain
    wall / ramp edge).
 6. Whether bit 2 is the upper deck's collision plane for a ball on the second level.
-7. The multiball camera / resolution switch.
+7. ~~The multiball camera / resolution switch.~~ **CLOSED.** It is option record 6 and a
+   script opcode: +0x005A26 compares `$E90(a5)` with 2 and calls the wide-screen setup at
+   +0x003C52 if it matches. The dispatcher at +0x0058FC indexes a 4-byte table at 0x5912,
+   and the entry whose handler is 0x5A26 is number 25, length 2, no operands. See
+   `GAMEPLAY_PARITY.md`.
+8. The original's true window HEIGHT. `$DA0 = 370` over a 600 px playfield forces a
+   230-row narrow window, and the wide mode's interlaced `BPLxMOD` of `$2D0 = 2*384-48`
+   corroborates the 2x relationship, but the display-window words set alongside them at
+   +0x003BE0 (`$9CA = 48`, `$9CE = 208`) imply 160 lines and have not been reconciled.
+   This port renders 256 rows, which is 26 more than the camera law was designed around.
+9. Which of the two screen modes the game's own `F9 FOR LO-RES` / `F10 FOR HI-RES` strings
+   name. `$EEA`/`$EEB` drive the same two routines from the vertical-blank handler at
+   +0x00094A, but neither has been tied to a scancode.
 
 ## Rights boundary
 

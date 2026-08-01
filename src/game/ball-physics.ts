@@ -1315,7 +1315,10 @@ export function stepBalls(
         : resolved.rampDrive.driveAt(ball.level, q10ToPixel(ball.x), q10ToPixel(ball.y));
 
     ball.velocityX = clampVelocity(
-      ball.velocityX + (shoved ? forces.nudgeX : 0) + (drive === null ? 0 : drive.x),
+      ball.velocityX +
+        (forces.tiltX ?? 0) +
+        (shoved ? forces.nudgeX : 0) +
+        (drive === null ? 0 : drive.x),
     );
     ball.velocityY = clampVelocity(
       ball.velocityY +

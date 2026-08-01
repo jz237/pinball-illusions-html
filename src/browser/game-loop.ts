@@ -167,6 +167,7 @@ import { SLINGSHOT_KICK } from "../game/surface-physics.js";
 import type { FlipperBank } from "../game/flippers.js";
 import {
   FLIPPER_BOSS_RADIUS_PIXELS,
+  applyFlipperReactions,
   createFlipperBank,
   flipperEndpoints,
   flipperInputFrom,
@@ -205,7 +206,7 @@ import {
 import type { TableAcceleration } from "../game/table-accel.js";
 import { tableAccelerationFor } from "../game/table-accel.js";
 import type { PlungerConfig, PlungerState } from "../game/plunger.js";
-import { SIMULATION_GRAVITY } from "../game/timebase.js";
+import { SIMULATION_GRAVITY, SIMULATION_X_TILT } from "../game/timebase.js";
 import {
   INITIAL_PLUNGER,
   autoLaunchOutcome,
@@ -456,6 +457,8 @@ export interface GameOptions {
    * a full plunge stops clearing the lane.
    */
   readonly gravityY: Q10;
+  /** Option record 4, the table x-tilt. Zero on every shipped table. */
+  readonly tiltX: Q10;
   readonly serveDelayTicks: number;
   readonly firstServeDelayTicks: number;
   /** Motionless ticks before a ball is written off. See BALL_SEARCH_TICKS. */
@@ -467,6 +470,7 @@ export interface GameOptions {
 export const DEFAULT_GAME_OPTIONS: GameOptions = Object.freeze({
   ballsPerGame: DEFAULT_BALLS_PER_GAME,
   gravityY: SIMULATION_GRAVITY,
+  tiltX: SIMULATION_X_TILT,
   serveDelayTicks: SERVE_DELAY_TICKS,
   firstServeDelayTicks: FIRST_SERVE_DELAY_TICKS,
   ballSearchTicks: BALL_SEARCH_TICKS,
@@ -487,6 +491,7 @@ function resolveGameOptions(options?: Partial<GameOptions>): GameOptions {
   return {
     ballsPerGame,
     gravityY: options?.gravityY ?? DEFAULT_GAME_OPTIONS.gravityY,
+    tiltX: options?.tiltX ?? DEFAULT_GAME_OPTIONS.tiltX,
     serveDelayTicks: options?.serveDelayTicks ?? DEFAULT_GAME_OPTIONS.serveDelayTicks,
     firstServeDelayTicks: options?.firstServeDelayTicks ?? DEFAULT_GAME_OPTIONS.firstServeDelayTicks,
     ballSearchTicks: options?.ballSearchTicks ?? DEFAULT_GAME_OPTIONS.ballSearchTicks,
@@ -743,8 +748,8 @@ function cameraOptionsFor(game: Game): CameraOptions {
   const base = game.options.camera;
   return {
     forceFullTable: base.forceFullTable || game.forceFullTable,
-    deadZoneHeight: base.deadZoneHeight,
-    maxScrollStep: base.maxScrollStep,
+    scrollDivisor: base.scrollDivisor,
+    anchorRows: base.anchorRows,
   };
 }
 
@@ -902,7 +907,12 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
   game.flippers = bankTick.bank;
 
   // ---- physics -----------------------------------------------------------
-  const forces: SimulationForces = { gravityY: game.options.gravityY, nudgeX, nudgeY };
+  const forces: SimulationForces = {
+    gravityY: game.options.gravityY,
+    tiltX: game.options.tiltX,
+    nudgeX,
+    nudgeY,
+  };
   // The drive is spread in LAST so a caller cannot switch it off through
   // `options.simulation` without noticing they have done it — and it is the
   // game's own, from the registry, not something the options carry.
@@ -911,13 +921,16 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     rampDrive: game.rampDrive,
     surfaces: game.devices,
   });
-  resolveFlipperContacts(
+  const flipperContacts = resolveFlipperContacts(
     game.balls.balls,
     bankTick.sweeps,
     ballRadiusOf(game),
     null,
     restThresholdOf(game),
   );
+  // The ball takes angular momentum out of the bat — measured, see
+  // `applyFlipperReactions` — so the bank has to be told what it just paid for.
+  game.flippers = applyFlipperReactions(game.flippers, flipperContacts);
 
   // A plunge too weak to clear the arch drops back down the lane, and the lane
   // floor IS the plunger rod, so the ball ends up back on it and may be shot
