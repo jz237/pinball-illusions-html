@@ -182,6 +182,29 @@ export interface TableModesDocument {
 }
 
 /**
+ * On-disk shape of `public/generated/tables/<id>.lamps.json`: the playfield
+ * lamp overlays — position, shape and (for the masked kind) both image states
+ * of every insert lamp — plus the wiring from each mode element to the lamps
+ * its START and AWARD opcodes drive. See `table-lamps.ts` for what it means,
+ * `lamp-overlays.ts` for what draws it, and `scripts/export-table-lamps.mjs`
+ * for where it comes from.
+ */
+export interface TableLampsDocument {
+  readonly schema: "pinball-illusions/table-lamps/v1";
+  readonly tableId: TableId;
+  readonly displayName: string;
+  readonly provenance: {
+    readonly sourceClass: string;
+    readonly description: string;
+    readonly authorizationRequired: boolean;
+  };
+  readonly blink: { readonly halfPeriodFrames: number };
+  readonly lamps: readonly Readonly<Record<string, unknown>>[];
+  /** Dense, in mode element-pool order: each element's start/award lamp index. */
+  readonly elements: readonly Readonly<Record<string, unknown>>[];
+}
+
+/**
  * On-disk shape of `public/generated/tables/<id>.audio.json`: the sound-effect
  * samples and the device, bumper, slingshot and zone bindings that play them.
  * See `table-audio.ts` for what it means, `src/browser/audio.ts` for what plays

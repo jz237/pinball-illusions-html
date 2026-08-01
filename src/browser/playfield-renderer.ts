@@ -369,8 +369,11 @@ function uploadRaster(context: RasterUploadContext, raster: PixelTarget): void {
  * `putImageData`, not `drawImage` of the PNG: the pixels go up exactly as the
  * palette produced them, with no chance of a colour-managed decode changing a
  * 1995 artist's RGB values on the way past.
+ *
+ * Exported for the lamp layer, which uploads its overlay sprites through the
+ * exact same path for the exact same colour-fidelity reason.
  */
-function rasterToCanvas(raster: PixelTarget): CanvasImageSource {
+export function rasterToCanvas(raster: PixelTarget): CanvasImageSource {
   if (typeof OffscreenCanvas !== "undefined") {
     const canvas = new OffscreenCanvas(raster.width, raster.height);
     const context = canvas.getContext("2d");

@@ -195,6 +195,21 @@ export interface ModeState {
   readonly armed: Uint8Array;
   /** Per-element DONE byte, `+$02`: the shot is finished for this player. */
   readonly done: Uint8Array;
+  /**
+   * Per-element AWARD-RELIGHT latch — the original's always-on byte at +$05 of
+   * the element's +$08 lamp, kept here per ELEMENT because that is the join
+   * the renderer has (the lamp wiring in `table-lamps.ts` maps it back).
+   *
+   * MEASURED: the AWARD lamp handler ($6440-$6462) does `or.b d7,$5(lamp)` on
+   * the element's award-path lamp, which keeps that insert lit STEADY after
+   * the award — the collected mugshot ring, the earned bonus multiplier —
+   * until the force-off at $6234 puts it out; `LAMP_OFF` is the opcode that
+   * calls it. PRESENTATION ONLY: nothing in this machine reads the latch —
+   * `litElements`, the waits and the awards all key off `armed` exactly as
+   * before — so lamp state cannot feed back into the rules, let alone the
+   * physics.
+   */
+  readonly awardLit: Uint8Array;
   /** Frames left on an element's own countdown; 0 is "no timer". */
   readonly timers: Int32Array;
   /** Award effect 21's progress count, per element. */
@@ -254,6 +269,7 @@ export function createModeState(modes: TableModes): ModeState {
   return {
     armed,
     done: new Uint8Array(count),
+    awardLit: new Uint8Array(count),
     timers: new Int32Array(count),
     counts: new Int32Array(count),
     ladderCounts: new Int32Array(modes.ladders.length),
@@ -292,6 +308,11 @@ export function createModeState(modes: TableModes): ModeState {
 export function resetModesForNewBall(modes: TableModes, state: ModeState): void {
   state.armed.fill(0);
   for (const element of modes.litAtGameStart) state.armed[element] = 1;
+  // RECONSTRUCTION: the award-relight latches go out with the ball, exactly as
+  // the armed bits do — clearing either at all is this reconstruction's own
+  // divergence (see the header), and the two lamp states should not diverge
+  // from each other across a drain.
+  state.awardLit.fill(0);
   state.timers.fill(0);
   state.queue.fill(-1);
   state.queueWrite = 0;
@@ -552,6 +573,10 @@ function awardElement(
   if (state.armed[index] === 0) return;
   state.armed[index] = 0;
   state.timers[index] = 0;
+  // MEASURED: the award lamp handler or.b's the always-on byte of the
+  // element's +$08 lamp, so the awarded shot's insert stays lit steady. The
+  // latch is presentation state; see its declaration.
+  state.awardLit[index] = 1;
   // MEASURED: the relight. 0x5CA8 sets the armed bit straight back when the
   // element's flags carry a bit of $A, so a lock-lit lamp survives its own
   // award and the next capture counts too. See `FLAGS_RELIGHT`.
@@ -680,6 +705,9 @@ function step(
       if (index >= 0) {
         state.armed[index] = 0;
         state.timers[index] = 0;
+        // The force-off at $6234 takes the whole lamp out, so the award
+        // relight latch goes with it.
+        state.awardLit[index] = 0;
       }
       return next;
     }

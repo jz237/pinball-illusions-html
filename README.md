@@ -67,6 +67,29 @@ And the **missions** are decoded and shipped in
 - `scripts/export-table-modes.mjs` is the generator of record, with the same
   `<segment-dir>` and `--check` interface, and six fatal self-checks.
 
+And the **playfield lamps** are decoded and shipped in
+`public/generated/tables/*.lamps.json`:
+
+- The mission VM's lamp opcodes drive **lamp objects** in hunk 4, reached from an
+  element's `+$04` (START, lit **blinking** at the measured 8-frame half-period)
+  and `+$08` (AWARD, relit **steady**). The per-frame scan at `$64D0` walks the
+  group table the slot-0 descriptor names at `+$38` and blits each lamp's slot-6
+  shape into **bitplane 7** of the playfield. The shipped artwork stores every
+  insert **lit**: the OFF blit (minterm `$FC`) sets bit 7 and moves the insert's
+  pixels into the upper palette half, where the artist painted the dim variants.
+  So the port draws the **dim overlays of the lamps the VM is not lighting** —
+  `index | 0x80` through the artwork's own palette — over the cached raster each
+  frame. Extreme Sports adds six masked-image lamps with explicit OFF/ON sprites.
+- `scripts/export-table-lamps.mjs` is the generator of record, same
+  `<segment-dir>` and `--check` interface, with four fatal self-checks —
+  including that every one of the ~11,000 mask pixels per table sits on
+  bit-7-clear artwork, and that the element wiring agrees with the shipped
+  `*.modes.json` element by element. `src/game/lamp-overlays.ts` decides the
+  pixels (pure, node-testable); `src/browser/lamp-layer.ts` blits them; and
+  `tests/lamp-overlays.test.ts` runs the same game twice — once rendering lamps
+  every tick, once never touching them — and asserts identical state, so lamp
+  state cannot feed back into the physics.
+
 And the **sound effects** are decoded and shipped in
 `public/generated/tables/*.audio.json` plus one WAV per sample:
 
@@ -293,6 +316,11 @@ this project draws is between **functional geometry** and **creative content**:
   decoded into `public/generated/tables/*.modes.json` under the
   `disk-derived-mode-scripts` marker. Rules data: no artwork, no audio, no
   executable code, and no 68k is emulated to run it.
+- **The lamp overlays are disk-derived, and gated the same way.** Each table's
+  insert positions, mask shapes and the masked lamps' two image states are
+  decoded into `public/generated/tables/*.lamps.json` under the
+  `disk-derived-lamp-overlays` marker. Functional presentation data: no audio,
+  no executable code.
 - **THE SOUND EFFECTS ARE DISK-DERIVED. This changed, and the change matters.**
   This section used to say audio was "newly created — synthesised or
   independently recreated rather than sampled", and while the missions were being

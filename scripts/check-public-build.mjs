@@ -114,6 +114,7 @@ const DERIVED_MARKERS = [
   { class: "disk-derived-ramp-acceleration", noun: "ramp drive" },
   { class: "disk-derived-scoring-devices", noun: "device and award table" },
   { class: "disk-derived-mode-scripts", noun: "mission and mode bytecode" },
+  { class: "disk-derived-lamp-overlays", noun: "lamp overlay" },
   { class: "disk-derived-audio", noun: "sound effect" },
   { class: "disk-derived-shell-artwork", noun: "shell artwork" },
 ];

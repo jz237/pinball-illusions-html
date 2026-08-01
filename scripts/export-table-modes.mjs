@@ -133,6 +133,7 @@
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { join, resolve, dirname } from "node:path";
+import { pathToFileURL } from "node:url";
 
 const PREAMBLE = 4;
 const DEVICE_SLOTS = 160;
@@ -268,7 +269,7 @@ const PROVENANCE = {
 // The package
 // ---------------------------------------------------------------------------
 
-function loadPackage(segDir, stem) {
+export function loadPackage(segDir, stem) {
   const bodies = [];
   const relocations = new Map();
   const seg2 = join(dirname(resolve(segDir)), "seg2");
@@ -325,28 +326,28 @@ function bodyOf(pkg, hunk) {
   return body;
 }
 
-const key = (at) => `${at.hunk}:${at.offset}`;
+export const key = (at) => `${at.hunk}:${at.offset}`;
 
-function inBounds(pkg, at, span) {
+export function inBounds(pkg, at, span) {
   const body = pkg.bodies[at.hunk];
   return body !== undefined && at.offset >= 0 && at.offset + span <= body.length;
 }
 
-function readU8(pkg, at, delta = 0) {
+export function readU8(pkg, at, delta = 0) {
   return bodyOf(pkg, at.hunk).readUInt8(at.offset + delta);
 }
-function readU16(pkg, at, delta = 0) {
+export function readU16(pkg, at, delta = 0) {
   return bodyOf(pkg, at.hunk).readUInt16BE(at.offset + delta);
 }
-function readS16(pkg, at, delta = 0) {
+export function readS16(pkg, at, delta = 0) {
   return bodyOf(pkg, at.hunk).readInt16BE(at.offset + delta);
 }
-function readU32(pkg, at, delta = 0) {
+export function readU32(pkg, at, delta = 0) {
   return bodyOf(pkg, at.hunk).readUInt32BE(at.offset + delta);
 }
 
 /** Follows the relocated longword at `at + delta`, or null when it is not one. */
-function follow(pkg, at, delta = 0) {
+export function follow(pkg, at, delta = 0) {
   if (!inBounds(pkg, at, delta + 4)) return null;
   const target = pkg.relocations.get(`${at.hunk}:${at.offset + delta}`);
   if (target === undefined) return null;
@@ -594,7 +595,7 @@ function elementLooksReal(pkg, at) {
  * survives on the three tables is 94 / 109 / 77 scripts, every element of which
  * passes the packed-BCD check that `readBcd` then applies for real.
  */
-function findScripts(pkg) {
+export function findScripts(pkg) {
   const scripts = new Map();
   const admit = (at, frontier) => {
     if (at === null || scripts.has(key(at))) return;
@@ -1283,4 +1284,12 @@ function main(argv) {
   return 0;
 }
 
-process.exit(main(process.argv.slice(2)));
+// Runs only when invoked as a script. `export-table-lamps.mjs` imports the
+// decode machinery above (the package loader, the relocation follower and the
+// script/element discovery), and an import must not execute an export run.
+if (
+  process.argv[1] !== undefined &&
+  import.meta.url === pathToFileURL(resolve(process.argv[1])).href
+) {
+  process.exit(main(process.argv.slice(2)));
+}

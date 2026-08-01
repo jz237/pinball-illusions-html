@@ -49,6 +49,7 @@ import { loadTableArt, tableArtUrl } from "./game/table-art.js";
 import { loadTableAcceleration } from "./game/table-accel.js";
 import { loadTableDevices } from "./game/table-devices.js";
 import { loadTableModes } from "./game/table-modes.js";
+import { loadTableLamps } from "./game/table-lamps.js";
 import { loadTableAudio } from "./game/table-audio.js";
 import { createAudioBank, loadAudioBank, playTick, resumeAudio } from "./browser/audio.js";
 import type { AudioBank } from "./browser/audio.js";
@@ -391,11 +392,12 @@ async function boot(): Promise<void> {
     const [map, artwork] = await Promise.all([
       loadTableMap(tableId),
       loadTableArt(tableId),
-      // These three register themselves; `createGame` reads them back out of
+      // These four register themselves; `createGame` reads them back out of
       // their registries.
       loadTableAcceleration(tableId),
       loadTableDevices(tableId),
       loadTableModes(tableId),
+      loadTableLamps(tableId),
     ]);
     setPlayfieldArtwork(map, artwork);
     const game = createGame(map);

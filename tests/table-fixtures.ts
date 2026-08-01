@@ -2,10 +2,10 @@
  * Loading the shipped table documents from disk, for tests that drive the real
  * machine.
  *
- * There are FIVE documents per table and the game needs four of them. The map,
- * the ramp drive, the scoring layer and the mission layer each go through their
- * own exporter and each is gated as disk-derived; the artwork is loaded
- * separately by the renderer tests, which is why it is not here.
+ * There are SIX documents per table and the game needs five of them. The map,
+ * the ramp drive, the scoring layer, the mission layer and the lamp layer each
+ * go through their own exporter and each is gated as disk-derived; the artwork
+ * is loaded separately by the renderer tests, which is why it is not here.
  *
  * The registries are why this module exists rather than each test file reading
  * its own JSON. `createGame` obtains the drive from the registry and THROWS when
@@ -28,16 +28,19 @@ import { parseTableDevicesDocument, registerTableDevices } from "../src/game/tab
 import type { TableDevices } from "../src/game/table-devices.js";
 import { parseTableModesDocument, registerTableModes } from "../src/game/table-modes.js";
 import type { TableModes } from "../src/game/table-modes.js";
+import { parseTableLampsDocument, registerTableLamps } from "../src/game/table-lamps.js";
+import type { TableLamps } from "../src/game/table-lamps.js";
 import type {
   TableAccelDocument,
   TableDevicesDocument,
   TableId,
+  TableLampsDocument,
   TableMap,
   TableMapDocument,
   TableModesDocument,
 } from "../src/game/contracts.js";
 
-function documentUrl(tableId: TableId, kind: "map" | "accel" | "devices" | "modes"): URL {
+function documentUrl(tableId: TableId, kind: "map" | "accel" | "devices" | "modes" | "lamps"): URL {
   return new URL(`../public/generated/tables/${tableId}.${kind}.json`, import.meta.url);
 }
 
@@ -63,6 +66,12 @@ export function modesFor(tableId: TableId): TableModes {
   return parseTableModesDocument(doc);
 }
 
+/** The shipped lamp layer for one table, parsed. */
+export function lampsFor(tableId: TableId): TableLamps {
+  const doc = JSON.parse(readFileSync(documentUrl(tableId, "lamps"), "utf8")) as TableLampsDocument;
+  return parseTableLampsDocument(doc);
+}
+
 /**
  * The shipped map for one table, with its ramp drive, its scoring layer and its
  * mission layer registered as a side effect, so `createGame(mapFor(id))` always
@@ -72,6 +81,7 @@ export function mapFor(tableId: TableId): TableMap {
   accelFor(tableId);
   registerTableDevices(devicesFor(tableId));
   registerTableModes(modesFor(tableId));
+  registerTableLamps(lampsFor(tableId));
   const doc = JSON.parse(readFileSync(documentUrl(tableId, "map"), "utf8")) as TableMapDocument;
   return parseTableMapDocument(doc);
 }

@@ -194,6 +194,9 @@ import {
 } from "../game/scoring.js";
 import type { TableModes } from "../game/table-modes.js";
 import { tableModesFor } from "../game/table-modes.js";
+import type { TableLamps } from "../game/table-lamps.js";
+import { tableLampsFor } from "../game/table-lamps.js";
+import { drawLampOverlays } from "./lamp-layer.js";
 import type { ModeState, ModeTickReport } from "../game/mode-vm.js";
 import {
   EMPTY_MODE_TICK,
@@ -542,6 +545,15 @@ export interface Game {
    * `mode-vm.ts`.
    */
   readonly modes: TableModes | null;
+  /**
+   * The table's LAMP LAYER, or null.
+   *
+   * Nullable like the mission layer, and even more consequence-free: lamps are
+   * PRESENTATION ONLY. Nothing in the tick reads this field or the overlay
+   * state derived from it — a game without it plays an identical ball and
+   * merely shows the static (all-lit) artwork. See `lamp-overlays.ts`.
+   */
+  readonly lamps: TableLamps | null;
   readonly options: GameOptions;
   readonly plungerConfig: PlungerConfig;
   readonly nudgeConfig: NudgeConfig;
@@ -676,6 +688,7 @@ export function createGame(map: TableMap, options?: Partial<GameOptions>): Game 
     rampDrive: tableAccelerationFor(map.tableId),
     devices: tableDevicesFor(map.tableId),
     modes,
+    lamps: tableLampsFor(map.tableId),
     options: resolveGameOptions(options),
     plungerConfig: plungerConfigFor(map.tableId),
     nudgeConfig: nudgeConfigFor(map.tableId),
@@ -2002,6 +2015,12 @@ export function renderGame(context: CanvasRenderingContext2D, game: Game, scale:
   context.fillRect(0, 0, size.width, size.height);
 
   drawPlayfield(context, game.map, game.camera, scale);
+  // The lamps, straight over the artwork and before anything that sits above
+  // the playfield glass: the cached raster stores every insert lit, so this
+  // draws the DIM face of each lamp the mission VM is not lighting this frame.
+  if (game.lamps !== null) {
+    drawLampOverlays(context, game.map, game.camera, scale, game.lamps, game.modeState, game.tick);
+  }
   drawFlippers(context, game, scale);
   // Every ball on the table, INCLUDING the ones sitting in saucers: a locked
   // ball is still a steel ball the player can see, and drawing only the ones in
