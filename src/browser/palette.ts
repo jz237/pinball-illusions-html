@@ -87,3 +87,32 @@ export const FLIPPER_EDGE = "#f7c948";
 /** Status text, and the colour it turns when the machine has tilted. */
 export const HUD_TEXT = "#9fb4cc";
 export const HUD_ALERT = "#ff6b5a";
+
+// ---------------------------------------------------------------------------
+// The shell
+// ---------------------------------------------------------------------------
+
+/**
+ * The menu screens.
+ *
+ * Invented, and it has to be. The original's shell screens take their colours
+ * from `menudata.bin` — a sixteen-entry luminance RAMP for the tumbling-object
+ * backdrop, cross-faded through nine windows of a palette table at h4+0x480,
+ * with the text on a separate two-plane playfield above it. That backdrop is a
+ * pre-rendered animation strip of a cube, a cross and a torus, and none of it is
+ * exported, so nothing here is claiming to be the disk's colours. What it does
+ * claim is the disk's LAYOUT: every coordinate in `shell-screens.ts` is off the
+ * display lists in `main.bin` hunk 0.
+ *
+ * A cold blue ramp because that is what the measured step-0 window is — the
+ * fade's first window reads as a dark blue ramp and its last as orange — and
+ * amber for the item the cursor is on, so a selected box reads at a glance.
+ */
+export const SHELL_BACKDROP = "#0a1020";
+export const SHELL_BAND = "#111c33";
+export const SHELL_FRAME = "#4d6f9c";
+export const SHELL_TEXT = "#c8d8ec";
+export const SHELL_DIM = "#6b83a3";
+export const SHELL_HIGHLIGHT = "#f7c948";
+export const SHELL_HIGHLIGHT_FILL = "#243a5e";
+export const SHELL_PANEL = "#050a14";

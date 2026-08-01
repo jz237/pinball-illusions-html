@@ -182,11 +182,47 @@ with it, all read off the original rather than chosen:
   hand-off boxes. Both are now applied, and between them they took the ninety-game
   aggressive census from 26 written-off balls on Law 'n Justice to zero.
 
+### The shell
+
+`main.bin` is the shell, and `src/browser/shell.ts` is its two state machines:
+the menu machine at hunk-0 0x100E and the non-gameplay half of the in-game
+machine at 0x3D3E. The flow is the disk's — attract roll, main menu ("Tables"
+and "Exit", and there are only two), table select with its scrolling name list
+and its "Info" box, the info screen, the game, "REALLY QUIT TABLE?" on ESC,
+game over, the high-score check against that table's own ladder, three initials
+typed on the keyboard, and the table's own attract screen. The function keys
+pick a table and go straight into a game, skipping the menu, as they do on the
+Amiga. All three tables are reachable and all three are playable; there is no
+build-time choice of table anywhere.
+
+Every coordinate on those screens is read off the display lists in `main.bin`
+and used unchanged, in a 320 x 256 box centred in this reconstruction's
+336-wide window. The colours and the fonts are NOT the disk's: the original
+takes both from `menudata.bin`, whose two proportional bitmap fonts and three
+tumbling-object backdrop strips are not exported.
+
+**The table names ship; the marketing prose does not.** The names are exactly
+the twenty-three-byte fields in `tables.bin` — the shell patches the record's
+index into every filename and into the nonvolatile item name `Table00N`, so the
+name is how the machine refers to the table at all. The paragraph each
+`tableNNN.mnu` carries beside its artwork is the publisher's copy, and the
+credits roll in `menudata.bin` is the developers' own authored text; neither is
+reproduced. The info screen's description is written fresh, and the picture it
+shows is the table's own playfield artwork, which already ships and is already
+claimed by the build's manifest.
+
+**There is no options screen, and that is not an omission.** The `.opt` records
+are read by the engine at fixed addresses and their labels do not exist as text
+anywhere in the release.
+
 ### Not started
 
-Modes, missions and the bonus ladder; table select, options and high-score
-screens; audio; BabeWatch and Extreme Sports beyond geometry, the shared engine
-and the shipped scoring layer.
+The intro (`intro.bin` is a FreeAnim animation plus an SNT! tune, and its frame
+format is not decoded); the credits roll's own text and its tumbling-object
+backdrops; the bonus ladder; and MULTIPLE PLAYERS — the original scans F1..F8
+for one to eight and alternates them per ball, and this reconstruction is one
+player, because the simulation holds a single score, ball count and mission
+machine, and giving it eight is a change to the game rather than to the shell.
 
 See [docs/DISK_ANALYSIS.md](docs/DISK_ANALYSIS.md) and
 [docs/GAMEPLAY_PARITY.md](docs/GAMEPLAY_PARITY.md).

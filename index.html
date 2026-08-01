@@ -17,17 +17,26 @@
         number only. The backing store is resized to that magnification in
         main.ts and the element is left at its natural size, so one source pixel
         is always an exact square block of device pixels.
+
+        The same canvas carries the shell. The original's menu screens are
+        320 x 256, so they are drawn into a 320-wide box centred in this one —
+        eight pixels of surround each side, and not one of the decoded
+        coordinates moved. See src/browser/shell-screens.ts.
       -->
       <canvas id="playfield" width="336" height="256" aria-label="Pinball playfield"></canvas>
 
-      <p id="boot" class="boot">Loading Law 'n Justice…</p>
+      <p id="boot" class="boot">Loading…</p>
 
       <ul class="controls">
+        <li><kbd>Space</kbd> <span>select in the menus — and hold to wind the plunger once a ball is in the lane</span></li>
+        <li><kbd>&uarr;</kbd> <kbd>&darr;</kbd> <kbd>&larr;</kbd> <kbd>&rarr;</kbd> <span>move the menu cursor</span></li>
+        <li><kbd>F1</kbd> <kbd>F2</kbd> <kbd>F3</kbd> <span>straight to a table</span></li>
+        <li><kbd>Esc</kbd> <span>back a screen — on the playfield it asks whether to quit the table</span></li>
         <li><kbd>Z</kbd> <span>left flipper</span></li>
         <li><kbd>/</kbd> <span>right flipper</span></li>
-        <li><kbd>Space</kbd> <span>hold to wind the plunger, release to launch</span></li>
+        <li><kbd>X</kbd> <kbd>;</kbd> <span>upper flipper</span></li>
         <li><kbd>&larr;</kbd> <kbd>&rarr;</kbd> <kbd>&uarr;</kbd> <span>nudge — five and it tilts</span></li>
-        <li><kbd>Enter</kbd> <span>start a new game</span></li>
+        <li><kbd>Enter</kbd> <span>start a game on the table you are on</span></li>
         <li><kbd>P</kbd> <span>pause</span></li>
         <li><kbd>F9</kbd> <span>whole-table view</span></li>
       </ul>
