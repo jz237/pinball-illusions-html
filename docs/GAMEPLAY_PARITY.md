@@ -9,6 +9,14 @@ The target behaviour this reimplementation is measured against. Every claim is t
 Secondary sources contradict each other on several points. Where they do, the disk
 wins, and unresolved conflicts are recorded rather than papered over.
 
+> **Rules, scoring and options now have their own document: [`RULES_SPEC.md`](RULES_SPEC.md).**
+> It carries the score representation, the per-table award tables, the mode inventories
+> and the settled meaning of all seven `.opt` records, each with the byte offset that
+> proves it — plus an honest grade of what the excavation did *not* reach. This document
+> keeps the physical and behavioural target; `RULES_SPEC.md` keeps the rules. Several
+> **[open]** items below are closed there, and three claims below were **refuted** by it
+> and are corrected in place.
+
 > **Every column number in this document is 32 larger than it was.** The shipped
 > collision maps were exported a word out of phase — slot 2's payload begins at byte
 > 4, not byte 8 — so every row of the old export was framed 32 px left of where it
@@ -46,34 +54,66 @@ cannot simply be lifted from the Dreams or Fantasies reconstructions — both of
 simulate exactly one ball.
 
 - Sources disagree on the ceiling: some say up to three balls, others up to six.
-  The `.opt` record that plausibly caps simultaneous multiballs has maximum 2 with
-  default 2, which is a count of *multiball events* rather than balls. **[open]**
+  **The `.opt` record previously offered as a cap is not one** — record 7 is the view
+  mode (see Options). What the engine says instead: balls in play is a word at
+  `$DBC(a5)` derived by *counting occupied slots* in the 8-byte array at `$EE2(a5)`
+  (`main.seg00` `0x4ADC–0x4B0C`) and clamped to a maximum of **8** at `0x4B10` — never
+  read from a constant. So the engine's hard ceiling is 8; the per-mode ball count is
+  still **[open]**. **[disk]**
 - The display switches to a high-resolution full-screen mode while multiball is
-  active so every ball stays visible; toggleable by the player. **[src]**
-- Multiball is entered by locking balls, per table. **[open]**
+  active so every ball stays visible; toggleable by the player. **[src]** — the
+  mechanism is now identified as option record 7 with its two display configurations
+  (`$3C1E` wide / `$3BDC` narrow). **[disk]**
+- Multiball is entered by locking balls, per table. **CONFIRMED** — Law 'n Justice has a
+  4-step ladder (`1..4 MORE FOR M-BALL`), BabeWatch has `BALL 1..4 LOCKED` plus
+  `LOCK 1 BALL 4 M-BALL` … `LOCK 4 BALLS 4 CASINO`. See `RULES_SPEC.md` §4.3, §5.3.
+  **[disk]**
 
 Engineering consequence: the simulation must be N-ball from the start — ball list,
 ball-to-ball collision, per-ball state, drain handling while others remain live, and
 a camera policy that changes when ball count exceeds one. Retrofitting this later
 would mean rewriting the physics core.
 
-## Options
+## Options — SETTLED
 
-Seven per-table settings, defaults measured from `table00N.opt`. **[disk]**
-Labels for records 3, 4 and 7 are inferred and are **[open]** until the `.mnu` menu
-definitions are read.
+All seven records are now identified positionally, from the code that consumes each
+live word. Full derivation, with every consuming instruction, in
+[`RULES_SPEC.md` §3](RULES_SPEC.md#3-options--table00nopt-fully-settled). **[disk]**
 
-| # | Setting | Range | Default | Confidence |
-|---:|---|---|---:|---|
-| 1 | Balls per game | 3–5 | 3 | measured; matches published description |
-| 2 | Players | up to 8 | 4 | measured |
-| 3 | *unidentified* | 0–7 | 5 | **[open]** |
-| 4 | *percentage scalar* | 0–200 | 100 | **[open]** |
-| 5 | Table slope | −3…+3 | 0 | measured; signed and centred |
-| 6 | Nudges before tilt | 0–10 | 5 | measured — **Extreme Sports defaults to 10** |
-| 7 | *max multiballs* | 0–2 | 2 | **[open]** |
+**The record layout previously given here was wrong.** It is not
+`{u16 value, u16 max, u32 default, FFFF}`; it is
+`{s16 min, s16 max, u16 current (always 0 on disk), u16 default, u16 flag}`. The old
+"u32 default" was current(=0) followed by default, which is why the published defaults
+were right and the first word of every record was not.
 
-Multiplayer is sequential, not simultaneous. **[src]**
+| # | Setting | Range | Default | Live word | Was |
+|---:|---|---|---:|---|---|
+| 1 | Balls per game | 3–5 | 3 | `$E84(a5)` | confirmed |
+| 2 | **Table slope** — downhill (Y) acceleration | 2–8 | 4 | `$E86(a5)` | **was "players" — refuted** |
+| 3 | **Camera follow divisor** — `divs.w` on (ball Y − camera Y − dead zone) | 1–7 | 5 | `$E88(a5)` | **was [open] — closed** |
+| 4 | **Tilt sensitivity** — units added per nudge frame against a hard-coded threshold of 200 | 0–200 | 100 | `$E8A(a5)` | **was [open] — closed** |
+| 5 | **Lateral lean** — sideways (X) acceleration bias | −3…+3 | 0 | `$E8C(a5)` | was "table slope" — it is the other axis |
+| 6 | **Timed ball-save grace, in whole seconds** (× `GfxBase.VBlankFrequency` → a frame countdown) | 0–10 | 5 (**Extreme Sports 10**) | `$E8E(a5)` | **was "nudges before tilt" — refuted** |
+| 7 | **View / screen mode**: 0 = always narrow, 1 = always wide, 2 = narrow, script may switch to wide | 0–2 | 2 | `$E90(a5)` | **was "max multiballs" — refuted** |
+
+Consequences worth restating:
+
+- **Nudge tolerance is record 4, and it is identical on all three tables (100).** Extreme
+  Sports' "double tolerance" was record 6 — it gets **10 seconds of ball save, not 10
+  nudges**. The claim under *Extreme Sports* below is corrected accordingly.
+- **Players are not an option.** They are chosen with F1–F8 at start
+  (`PRESS ENTER OR F1-F8 TO BEGIN PLAY`); the 8-entry player array at `$DC6(a5)` is never
+  sourced from the `.opt`. Multiplayer is sequential, not simultaneous. **[src]/[disk]**
+- **Record 7 is the option behind the in-game `F9 FOR LO-RES` / `F10 FOR HI-RES` keys**,
+  and it is the multiball camera switch that this document has been calling **[src]**:
+  wide shows ~462 of the 600 playfield rows, narrow ~230, exactly 2×. Which of the two
+  the game calls "LO-RES" is still **[open]**.
+
+**There is no options screen in this release and the option labels do not exist as text
+anywhere in the shipped data** — established by exhaustive search, not merely unfound
+(`RULES_SPEC.md` §3). The only menu descriptor in the program has three items: `Tables`,
+`Exit`, `Info`. **Any option label in this reconstruction is the project's own invention
+and must be documented as such.** The semantics are facts; the words are not. **[disk]**
 
 ## Physical layout
 
@@ -319,40 +359,91 @@ Multiplayer is sequential, not simultaneous. **[src]**
 
 ## Per-table behaviour
 
-Everything below is from secondary sources and is indicative only — enough to know
-what mechanisms must exist, not enough to implement scoring. Concrete values require
-observation of the original.
+This section used to be entirely **[src]**. It is now partly measured. The mode
+inventories, the award values and the strings are in
+[`RULES_SPEC.md`](RULES_SPEC.md) §4–§6; only the parity-relevant summary is here.
+
+Shared and now settled **[disk]**: scores are 6-byte packed BCD (12 digits);
+end-of-ball bonus = `BONUS × multiplier` and **tilting forfeits it entirely**; the combo
+bonus is **1,000,000 per combo on all three tables**; the bonus multiplier ladder is
+`X2/X4/X6/X8/X10` on Law 'n Justice and BabeWatch but only `X2/X3/X4/X5` on Extreme
+Sports.
+
+**The big remaining gap, stated plainly:** 337 award records with exact values were
+recovered, but **nothing connects an award record to a trigger** — not to a material
+index, a lamp, a switch or a coordinate. The values cannot be wired in until that link
+exists. `RULES_SPEC.md` §9 recommends breakpointing the engine's three award primitives
+under emulation as the cheapest way to get it.
 
 ### Law 'n Justice
 
-- Reported as having 17 scoring missions built around police chases, jailbreaks and
-  hostage situations. **[src]**
-- Locking criminals and locking balls both feed multiball. **[src]**
-- Ramps and transport channels; upper-level ramp shots noted as difficult. **[src]**
-- A sub-game played on the score panel, aimed with the flippers. **[src]**
+- **17 scoring missions — REFUTED.** The mission dispatch is **8 entries** (data
+  `0x3112`, stride 12, op `0x0009`), all eight matched to their on-screen announce text
+  by a 7/7 byte-identical-template match plus a 1/1 reverse-pointer lookup. There is no
+  17-entry structure anywhere in any of the three table modules; Law 'n Justice's only
+  near-miss is a 16-entry mode-object array whose preceding NULL is the award array's
+  terminator. Themes: riot control, bomb defusal, hostage rescue, drug bust, prisoner
+  return, arson, hover chase, street clear-out. **[disk]**
+- Police chases, jailbreaks and hostage situations. **CONFIRMED** **[disk]**
+- Locking balls feeds multiball — 4-step ladder `1..4 MORE FOR M-BALL`. **CONFIRMED**
+  **[disk]**. Locking *criminals* also feeding it is **[open]**.
+- **A sub-game played on the score panel — REFUTED for this table.** No such strings
+  exist in Law 'n Justice. The claim is true of **BabeWatch** (the jukebox), so the
+  source appears to have attributed it to the wrong table. **[disk]**
+- Ramps and transport channels; upper-level ramp shots noted as difficult. **[src]**,
+  corroborated independently by the collision maps above.
 - No stopper post between the flippers, and side drains that are easy to hit — a
   layout characteristic, not a bug, and parity means reproducing it. **[src]**
-- Mission list, scoring, jackpot values. **[open]**
+- 123 award records recovered with exact values, including a 15M→50M ladder in 5M steps
+  and eight 100,000,000 awards. **[disk]** — but see the trigger gap above.
+- Jackpot values, mission timers, what advances each mission. **[open]**
 
 ### BabeWatch
 
-- Venues include a casino and a gym; activities include a race and a
-  chat-up sequence driven by hitting targets. **[src]**
-- Multiple independent routes to raise the bonus multiplier. **[src]**
-- Multiplier lanes sit near the top of the playfield. **[src]**
-- A music-selection feature lets the player choose the table music. **[src]**
-- Multiplier values, mode structure, scoring. **[open]**
+- **Five modes, named: GYM, SURF, BURGER, CASINO, BABE HUNT** — one contiguous block of
+  message records at data `0x40D0`, splitting 3 + 2 by font index, with BURGER and
+  CASINO the two gated behind 3 and 4 ball locks. **[disk]**
+- Casino and gym venues; a race. **CONFIRMED** — `THE CASINO IS OPEN`/`IS CLOSED`,
+  `GYM MODE ENABLED`, `RACE ENABLED` with a 5-step gear ladder `2ND`–`6TH GEAR`.
+  **[disk]**
+- A chat-up sequence driven by hitting targets — `BABE HUNT` exists as a mode with a
+  5-record award group; the target-driven mechanic is **[open]**.
+- Multiple independent routes to raise the bonus multiplier. **CONFIRMED** — the
+  `X2..X10` ladder plus an independent `MILLIONS ENABLED` / `ALL WHITE TARGETS` /
+  `ENABLED FOR 1 MILLION` route. **[disk]**
+- Multiplier lanes near the top of the playfield. **[open]** — position not established.
+- A music-selection feature. **CONFIRMED** — `PICK A SONG`, `JUKEBOX`,
+  `CHOOSE LEFT RIGHT`, `SELECT WITH RETURN`, three titles. This is also the score-panel
+  sub-game. **[disk]**
+- Ball-lock ladder award values: **5M/100k · 10M/250k · 15M/500k · 20M/1M · 25M/5M** —
+  the cleanest object in the excavation, a 1:2:3:4:5 score progression. **[disk]**
+- Mode entry conditions, timers, jackpot rules. **[open]**
 
 ### Extreme Sports
 
-- Free-fall, bungee, cliff-diving and off-piste modes. **[src]**
-- Distinctive bonus rule: the bonus counts **up** while its timer counts **down**, so
-  collecting late is worth far more. This is a real mechanical difference from the
-  other two tables and needs its own model. **[src]**
-- An "Iron Man" mode described as a four-ball multiball with combo scoring from
-  ramp shots in quick succession. **[src]**
-- Named awards reported: a Maniac Skier jackpot and a Super Iron Man jackpot. **[src]**
-- Defaults to twice the nudge tolerance of the other tables. **[disk]**
+- Free-fall, bungee, cliff-diving and off-piste modes. **CONFIRMED** — all four present
+  by name, with 15 mode objects total. **[disk]**
+- Distinctive bonus rule: the bonus counts **up** while its timer counts **down**.
+  **MECHANISM CONFIRMED** — engine `0x6334` services add-direction and subtract-direction
+  BCD ramps from one list on one tick, selected by bit 0 of object`+0x01`, so an
+  up-ramping bonus and a down-ramping timer are literally the same loop on the same
+  frame. **Which ramp object is the bonus is [open].** **[disk]**
+- An "Iron Man" mode described as a **four-ball** multiball. **NOT ESTABLISHED.** No
+  literal 4 is used as a ball count anywhere; the mode object is referenced by exactly
+  four award records, three of which look like locks, which *would* give four balls —
+  but that is an inference from record counts, not a decoded constant. The table's own
+  menu blurb says "Iron Man **Races**". **[open]**
+- Named awards: **`GET THE SUPER` / `IRON MAN JACKPOT` confirmed**; **no "Maniac Skier"
+  string exists** — the nearest are the four ski-trick names `SPLIT`, `DUFFY`, `KOSAK`,
+  `LOOP` and `GO OFF PISTE MANIA FOR` / `WHITE POWDER JACKPOT`. **[disk]**
+- Combo scoring from ramp shots in quick succession. **[open]** — the combo bonus
+  constant is known (1,000,000 each) but no combo *window* was found.
+- ~~Defaults to twice the nudge tolerance of the other tables.~~ **CORRECTED.** Its tilt
+  sensitivity is 100, identical to the others. What differs is option record 6: **10
+  seconds of ball-save grace instead of 5**. **[disk]**
+- Its bonus multiplier caps at **×5**, where the other two reach **×10**. **[disk]**
+- 98 award records recovered, the richest set of the three, including a 6-step
+  5M→50M ramp ladder and six 25,000,000/1,000,000 `EXTREMIST` awards. **[disk]**
 - Rates, ceilings, combo windows. **[open]**
 
 ## Known original defects
@@ -367,16 +458,35 @@ Both are candidates for a "faithful / fixed" toggle rather than silent correctio
 
 ## How the open items get closed
 
-In rough dependency order:
+In rough dependency order.
 
-Two of the original five are now **closed**: the `Table00N.bin` container structure
-(the `TSL!` format is solved) and the per-table collision/material map (recovered,
-decoded, shipped). What remains:
+Four of the original five are now **closed**: the `Table00N.bin` container structure
+(`TSL!` solved), the per-table collision/material map (recovered, decoded, shipped), the
+option semantics (all seven records, `RULES_SPEC.md` §3), and the multiball camera
+switch (it is option record 7).
 
-1. Read the `.mnu` menu definitions — closes the option labels.
-2. Recover the wall-behaviour constants from the slot 4 per-table code — closes which
-   odd material index is rubber, slingshot, plain wall or ramp edge.
-3. Observe the original running, for timings, scoring, mode flow and the multiball
-   camera switch.
-4. Fill this document in, replacing **[open]** with **[disk]** or an observation
+Item 1 as previously written — "read the `.mnu` menu definitions, closes the option
+labels" — is **answered NO**. All three `.mnu` files are decompressed; they hold the
+table-select artwork, the table name, a two-line blurb and `Press ESC to exit.`, and no
+option label text exists anywhere in the release. The option *semantics* were closed a
+different way, from the consuming code.
+
+What remains:
+
+1. **Link award records to triggers.** The single biggest gap: 337 award records with
+   exact values and no keys. Nothing maps an award index to a material index, a lamp or a
+   switch. Do **not** adopt the "material = index + 32" annotation that appears in one
+   prior report — it is unsupported (`RULES_SPEC.md` §7).
+2. **Recover the wall-behaviour constants** — closes which odd material index is rubber,
+   slingshot, plain wall or ramp edge. Note that the slot-4 modules turned out to contain
+   almost no code, so this is an engine question, not a per-table one.
+3. **Observe the original under emulation**, and instrument it. Breakpointing
+   `main.seg00` `0x6BCC` / `0x6BEE` / `0x6B96` and logging `a3` on every call yields
+   (award record → game event) pairs directly, which is exactly item 1. This is now the
+   recommended route for everything still open: mode timers, combo windows, hurry-up
+   rates, ball counts per mode, and whether the panel appends zeros to stored award
+   digits. **Static analysis has reached its practical limit for the rules.**
+4. **Find the loader** that writes `$2352`–`$236E` — it is not in `main.seg00` and no
+   other `main.segNN` contains code.
+5. Fill both documents in, replacing **[open]** with **[disk]** or an observation
    reference, before the corresponding rules are written.
