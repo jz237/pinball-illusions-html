@@ -131,6 +131,32 @@ export interface TableAccelDocument {
   readonly levels: readonly (readonly (readonly number[])[])[];
 }
 
+/**
+ * On-disk shape of `public/generated/tables/<id>.devices.json`: the surface-id
+ * map plus the device, bumper, slingshot and zone records the original scores
+ * with. See `table-devices.ts` for what it means and
+ * `scripts/export-table-devices.mjs` for where it comes from.
+ */
+export interface TableDevicesDocument {
+  readonly schema: "pinball-illusions/table-devices/v1";
+  readonly tableId: TableId;
+  readonly displayName: string;
+  readonly provenance: {
+    readonly sourceClass: string;
+    readonly description: string;
+    readonly authorizationRequired: boolean;
+  };
+  readonly width: number;
+  readonly height: number;
+  readonly devices: readonly Readonly<Record<string, unknown>>[];
+  readonly bumpers: readonly Readonly<Record<string, unknown>>[];
+  readonly slingshots: readonly Readonly<Record<string, unknown>>[];
+  readonly zones: readonly Readonly<Record<string, unknown>>[];
+  readonly surfaceHistogram: readonly Readonly<Record<string, number>>[];
+  /** One per playfield level; per pixel row, flat [inclusive_end_x, surface id]. */
+  readonly surfaceIds: readonly (readonly (readonly number[])[])[];
+}
+
 /** One ball in flight. Positions are Q10; velocities are signed 16-bit. */
 export interface BallState {
   readonly id: number;
