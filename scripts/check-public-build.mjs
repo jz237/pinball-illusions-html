@@ -36,6 +36,7 @@ const FORBIDDEN_TEXT = [
   { name: "preservation directory", re: /_pinball_research|PinballIllusions_Disk/ },
   { name: "AWS access key", re: /\bAKIA[0-9A-Z]{16}\b/ },
   { name: "GitHub token", re: /\bgh[pousr]_[A-Za-z0-9]{36,}\b/ },
+  { name: "fal API key", re: /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9a-f]{16,}\b/ },
   { name: "private key block", re: /-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----/ },
 ];
 
