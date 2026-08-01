@@ -37,7 +37,13 @@ import type { Control, ControlEdges, ControlSnapshot } from "../src/browser/inpu
 import { parseTableMapDocument } from "../src/game/table-map.js";
 import { TABLE_IDS } from "../src/game/contracts.js";
 import { parseTableAccelDocument, registerTableAcceleration } from "../src/game/table-accel.js";
-import type { TableAccelDocument, TableId, TableMapDocument } from "../src/game/contracts.js";
+import { parseTableDevicesDocument, registerTableDevices } from "../src/game/table-devices.js";
+import type {
+  TableAccelDocument,
+  TableDevicesDocument,
+  TableId,
+  TableMapDocument,
+} from "../src/game/contracts.js";
 
 /**
  * Ticks a census game is given. Forty thousand, thirteen minutes of play at
@@ -70,13 +76,22 @@ const TAP_TICKS = 3;
 const PULL_HARDER_TICKS = 4;
 
 /**
- * The map, with the table's ramp drive registered as a side effect. `createGame`
- * requires the drive and throws without it; see src/game/table-accel.ts.
+ * The map, with the table's ramp drive AND scoring layer registered as side
+ * effects. `createGame` requires the drive and throws without it (see
+ * src/game/table-accel.ts); the scoring layer carries the surface-id map the
+ * contact model reads its restitution and its bumper kicks out of, so a census
+ * run without it would be measuring a different machine.
  */
 function mapFor(tableId: TableId) {
   const accelUrl = new URL(`../public/generated/tables/${tableId}.accel.json`, import.meta.url);
   registerTableAcceleration(
     parseTableAccelDocument(JSON.parse(readFileSync(accelUrl, "utf8")) as TableAccelDocument),
+  );
+  const devicesUrl = new URL(`../public/generated/tables/${tableId}.devices.json`, import.meta.url);
+  registerTableDevices(
+    parseTableDevicesDocument(
+      JSON.parse(readFileSync(devicesUrl, "utf8")) as TableDevicesDocument,
+    ),
   );
   const url = new URL(`../public/generated/tables/${tableId}.map.json`, import.meta.url);
   return parseTableMapDocument(JSON.parse(readFileSync(url, "utf8")) as TableMapDocument);

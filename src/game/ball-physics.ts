@@ -119,6 +119,13 @@ import {
   ringOffsetsFor,
 } from "./collision-probe.js";
 import { SOLID_BORDER_INDEX } from "./materials.js";
+import type { SurfaceResponse } from "./surface-physics.js";
+import {
+  LEVEL_TO_LOWER_ID,
+  LEVEL_TO_UPPER_ID,
+  SURFACE_ID_NONE,
+  surfaceResponseFor,
+} from "./surface-physics.js";
 import type { TableAcceleration } from "./table-accel.js";
 import type { LevelGate, PlayfieldLevel } from "./playfield-levels.js";
 import {
@@ -370,6 +377,39 @@ export interface SimulationOptions {
    * rather than answering null. There is no path to a real game without it.
    */
   readonly rampDrive: TableAcceleration | null;
+  /**
+   * The table's SURFACE-ID MAP: one byte per pixel per level, naming what the
+   * ball is touching rather than merely whether it is solid.
+   *
+   * Null means "this map has no surface layer", which is right for every
+   * synthetic map in the test suite and for nothing else. With it, three things
+   * change and all three are the original's own behaviour:
+   *
+   *   - restitution comes from the 256-row table in `surface-physics.ts`, keyed
+   *     by the id under the contact, instead of from the pixel index;
+   *   - ids 16..21 fire a POP BUMPER and 22..31 a SLINGSHOT, adding the measured
+   *     kick to the inward normal speed before restitution, exactly where the
+   *     original adds it;
+   *   - every id the ball touched in the tick is reported in `StepResult`, which
+   *     is what the scoring layer runs on.
+   *
+   * Nullable rather than required for the same reason `rampDrive` is not: the
+   * physics tests below build maps that have no such thing, and a simulation
+   * that refused to run without one would take the whole suite with it. The game
+   * loop does register it — see `createGame`.
+   */
+  readonly surfaces: SurfaceIdMap | null;
+}
+
+/**
+ * The slice of the scoring document the physics needs: a surface id per pixel
+ * per level. `TableDevices` satisfies it structurally, so nothing here has to
+ * know what a device or an award is.
+ */
+export interface SurfaceIdMap {
+  surfaceIdAt(level: PlayfieldLevel, x: number, y: number): number;
+  /** The level a hand-off zone at this point sends the ball to, or null. */
+  levelChangeAt(level: PlayfieldLevel, x: number, y: number): PlayfieldLevel | null;
 }
 
 export const DEFAULT_SIMULATION_OPTIONS: SimulationOptions = {
@@ -380,6 +420,7 @@ export const DEFAULT_SIMULATION_OPTIONS: SimulationOptions = {
   topWallRows: null,
   ballToBall: true,
   rampDrive: null,
+  surfaces: null,
 };
 
 interface ResolvedOptions {
@@ -390,6 +431,7 @@ interface ResolvedOptions {
   readonly topWallRows: number;
   readonly ballToBall: boolean;
   readonly rampDrive: TableAcceleration | null;
+  readonly surfaces: SurfaceIdMap | null;
 }
 
 /**
@@ -420,6 +462,7 @@ function resolveOptions(map: TableMap, options?: Partial<SimulationOptions>): Re
     topWallRows,
     ballToBall: options?.ballToBall ?? DEFAULT_SIMULATION_OPTIONS.ballToBall,
     rampDrive: options?.rampDrive ?? DEFAULT_SIMULATION_OPTIONS.rampDrive,
+    surfaces: options?.surfaces ?? DEFAULT_SIMULATION_OPTIONS.surfaces,
   };
 }
 
@@ -554,6 +597,19 @@ export interface StepResult {
    * tick is one set of contacts rather than one per substep.
    */
   readonly contacts: ReadonlyMap<number, ContactResult>;
+  /**
+   * SURFACE IDS touched by each ball this tick, in first-touch order, deduped.
+   *
+   * Empty unless `options.surfaces` was supplied. This is the input the scoring
+   * layer runs on and it is deliberately the WHOLE tick's set rather than the
+   * blocker's single id: the original's device dispatch runs off the collision
+   * pass, and a ball that clips a drop target and a wall in the same tick has hit
+   * the target whichever of the two turned it around.
+   *
+   * Order is the order the ids were first seen, which is a function of the ring
+   * scan and the substep sequence and therefore reproducible.
+   */
+  readonly surfaces: ReadonlyMap<number, readonly number[]>;
 }
 
 function clampVelocity(value: number): number {
@@ -629,6 +685,7 @@ export function reflectVelocity(
   normalX: number,
   normalY: number,
   restThreshold: number,
+  surface: SurfaceResponse | null = null,
 ): void {
   const normalSpeedIn = q10Multiply(ball.velocityX, normalX) + q10Multiply(ball.velocityY, normalY);
   if (normalSpeedIn >= 0) return;
@@ -636,14 +693,42 @@ export function reflectVelocity(
   const tangentX = ball.velocityX - q10Multiply(normalSpeedIn, normalX);
   const tangentY = ball.velocityY - q10Multiply(normalSpeedIn, normalY);
 
-  const bounced = -q10Multiply(normalSpeedIn, behaviour.elasticity);
+  // ---------------------------------------------------------------------------
+  // THE SURFACE, WHEN THE MAP HAS ONE, OUTRANKS THE PIXEL INDEX
+  // ---------------------------------------------------------------------------
+  // The original does not look a coefficient up by pixel index at all — it reads
+  // the SURFACE ID under the contact and indexes a 256-row table. When the caller
+  // supplied a surface map that is what happens here too, and `behaviour`
+  // contributes only its friction, which is the one coefficient the original has
+  // no importable equivalent for. Without a surface map nothing below changes and
+  // the arithmetic is bit-identical to what it always was.
+  //
+  // The kick goes in BEFORE the restitution because that is where the original
+  // puts it — `subi.w #$157c,d0` at +0x00B588 and `subi.w #$dac,d0` at +0x00B5E0
+  // both precede the `muls.w $36(a4),d0` at +0x00B620 — so a pop bumper's 5500
+  // units are scaled by the bumper's own 0.348 restitution, not added on top of
+  // it. Each has a minimum approach speed and below it the surface is an ordinary
+  // wall: 50 units for a bumper, 100 for a slingshot.
+  const elasticity = surface === null ? behaviour.elasticity : surface.elasticity;
+  const fires =
+    surface !== null && surface.kick > 0 && -normalSpeedIn >= surface.kickThreshold;
+  const drivenIn = fires && surface !== null ? normalSpeedIn - surface.kick : normalSpeedIn;
+
+  const bounced = -q10Multiply(drivenIn, elasticity);
   // A ball creeping into the surface under gravity must settle, not chatter.
   const deflected = bounced <= restThreshold ? 0 : bounced;
-  const normalSpeedOut = deflected + behaviour.kick;
+  const normalSpeedOut = deflected + (surface === null ? behaviour.kick : 0);
 
   // The surface's reaction: the ball's approach killed, plus whatever of it is
   // handed back elastically. Never negative, so the friction budget cannot be.
-  const normalImpulse = -normalSpeedIn + deflected;
+  //
+  // Measured from the UNPOWERED reflection even when a coil fired, for the reason
+  // the header gives: a slingshot's energy must not be charged to the tangential
+  // friction budget, or the device scrubs the very shot it exists to launch. With
+  // no kick this is exactly `-normalSpeedIn + deflected` as before.
+  const passiveBounce = -q10Multiply(normalSpeedIn, elasticity);
+  const passiveDeflected = passiveBounce <= restThreshold ? 0 : passiveBounce;
+  const normalImpulse = -normalSpeedIn + passiveDeflected;
   const friction = q10Clamp(behaviour.friction, 0, Q10_ONE);
   // A loss that rounds to nothing is not a loss. `friction * normalImpulse`
   // truncates to zero once the impulse is under 1/friction — about 7 Q10 units
@@ -743,7 +828,7 @@ export function reflectVelocity(
   const budget = q10Multiply(friction, normalImpulse);
   const full = friction > 0 && normalImpulse > 0 ? Math.max(1, budget) : budget;
   const tangentSpeed = integerSqrt(tangentX * tangentX + tangentY * tangentY);
-  const resting = deflected === 0 && friction > 0 && normalImpulse > 0;
+  const resting = passiveDeflected === 0 && friction > 0 && normalImpulse > 0;
   const drop = resting
     ? Math.max(1, Math.min(budget, q10Multiply(ROLLING_SLIP_FRICTION, tangentSpeed)))
     : full;
@@ -751,11 +836,26 @@ export function reflectVelocity(
   const keep =
     tangentSpeed <= drop ? 0 : Math.trunc(((tangentSpeed - drop) * Q10_ONE) / tangentSpeed);
 
+  // A SLINGSHOT ALSO THROWS ALONG ITS FACE. The original's `add.w $6(a4),d2` at
+  // +0x00B5E4 adds +400 or -400 to the tangential speed, the sign chosen by
+  // whether the surface id is even or odd — a slingshot is two ids, one per
+  // face, and the sign is which way that face throws.
+  //
+  // The direction used is the outward normal turned a quarter turn, so it is a
+  // property of the SURFACE and not of how the ball happened to arrive; a ball
+  // that comes in dead square still gets thrown along the face, which is what a
+  // kicker arm does. Which of the two rotations the original called positive is
+  // not recoverable from the data — only that the two faces of one slingshot
+  // disagree — so the handedness is this port's and the ANTISYMMETRY is the
+  // original's. Added after the friction for the reason the header already gives
+  // for the normal kick: a coil's energy must not be charged to the tangential
+  // friction budget.
+  const tangentKick = surface === null ? 0 : surface.tangentKick;
   ball.velocityX = clampVelocity(
-    q10Multiply(tangentX, keep) + q10Multiply(normalSpeedOut, normalX),
+    q10Multiply(tangentX, keep) + q10Multiply(normalSpeedOut, normalX) - q10Multiply(tangentKick, normalY),
   );
   ball.velocityY = clampVelocity(
-    q10Multiply(tangentY, keep) + q10Multiply(normalSpeedOut, normalY),
+    q10Multiply(tangentY, keep) + q10Multiply(normalSpeedOut, normalY) + q10Multiply(tangentKick, normalX),
   );
 }
 
@@ -999,10 +1099,25 @@ interface ContactLog {
   sumY: number;
   dominant: MaterialIndex | null;
   dominantBehaviour: MaterialBehaviour | null;
+  /** Surface ids touched this tick, first-touch order, deduped. Empty with no map. */
+  readonly surfaceIds: number[];
+  readonly surfacesSeen: Set<number>;
+  /** Reads the id under a contact pixel on the level this ball is riding. */
+  readonly surfaceAt: ((x: number, y: number) => number) | null;
 }
 
-function newContactLog(): ContactLog {
-  return { points: [], seen: new Set<number>(), sumX: 0, sumY: 0, dominant: null, dominantBehaviour: null };
+function newContactLog(surfaceAt: ((x: number, y: number) => number) | null): ContactLog {
+  return {
+    points: [],
+    seen: new Set<number>(),
+    sumX: 0,
+    sumY: 0,
+    dominant: null,
+    dominantBehaviour: null,
+    surfaceIds: [],
+    surfacesSeen: new Set<number>(),
+    surfaceAt,
+  };
 }
 
 /** Injective for any pixel a probe can reach; plain `y * width + x` is not, for negative x. */
@@ -1029,7 +1144,56 @@ function logContacts(
       log.dominantBehaviour = behaviour;
       log.dominant = point.material;
     }
+
+    // Id 0 is "no surface" and is not reported: it is what the map answers for
+    // every pixel nothing was ever assigned to, and a scoring layer that saw it
+    // would be told the ball touched something on every tick of every game.
+    if (log.surfaceAt !== null) {
+      const id = log.surfaceAt(point.x, point.y);
+      if (id !== SURFACE_ID_NONE && !log.surfacesSeen.has(id)) {
+        log.surfacesSeen.add(id);
+        log.surfaceIds.push(id);
+      }
+    }
   }
+}
+
+/**
+ * The surface response the bounce is taken with, picked from the pixels the
+ * blocking probe actually touched.
+ *
+ * The original reads ONE id, at its single contact point. This port resolves a
+ * whole ring of them, so it needs a rule for which one speaks for the contact,
+ * and the rule is `moreDeflecting` restated for surfaces: a powered face
+ * outranks an unpowered one, and between two of the same sort the bouncier wins.
+ * That is the same tie-break the material path has used since the probe was
+ * written, and it errs the only safe way — a ball that grazes a bumper's rim and
+ * a wall in the same contact gets the bumper, which is what the player sees.
+ */
+function surfaceResponseOf(
+  probe: RingProbe,
+  surfaceAt: ((x: number, y: number) => number) | null,
+): SurfaceResponse | null {
+  if (surfaceAt === null) return null;
+  let best: SurfaceResponse | null = null;
+  for (const point of probe.contacts) {
+    const id = surfaceAt(point.x, point.y);
+    if (id === SURFACE_ID_NONE) continue;
+    const response = surfaceResponseFor(id);
+    if (best === null) {
+      best = response;
+      continue;
+    }
+    if (response.kick > best.kick) best = response;
+    else if (response.kick === best.kick && response.elasticity > best.elasticity) best = response;
+  }
+  return best;
+}
+
+/** What one ball's integration reported: its contacts, and the ids under them. */
+interface IntegrationResult {
+  readonly contact: ContactResult | null;
+  readonly surfaceIds: readonly number[];
 }
 
 function closeContactLog(log: ContactLog, ring: RingOffsets): ContactResult | null {
@@ -1068,6 +1232,7 @@ export function stepBalls(
   const gates = levelGatesFor(map.tableId);
 
   const contacts = new Map<number, ContactResult>();
+  const surfaces = new Map<number, readonly number[]>();
   const drained: number[] = [];
 
   for (const ball of balls.balls) {
@@ -1113,7 +1278,7 @@ export function stepBalls(
     // the tick for it to count.
     const fromX = q10ToPixel(ball.x);
     const fromY = q10ToPixel(ball.y);
-    const contact = integrateBall(
+    const integrated = integrateBall(
       ball,
       viewForLevel(views, ball.level),
       materials,
@@ -1121,10 +1286,20 @@ export function stepBalls(
       ring,
       resolved,
     );
-    if (contact !== null) {
-      contacts.set(ball.id, contact);
+    if (integrated.contact !== null) {
+      contacts.set(ball.id, integrated.contact);
     }
+    if (integrated.surfaceIds.length > 0) {
+      surfaces.set(ball.id, integrated.surfaceIds);
+    }
+    // Three level-change mechanisms, in the order the engine runs them: this
+    // project's reconstructed geometric gates, then the SURFACE IDS the
+    // collision pass dispatches at +0x00AD42, then the ZONE rectangles the ball
+    // loop walks afterwards at +0x0052E6. The two measured ones run last so they
+    // have the last word over the reconstruction.
     applyLevelGates(ball, gates, fromX, fromY);
+    applyLevelSurfaces(ball, integrated.surfaceIds);
+    applyLevelZones(ball, resolved.surfaces);
   }
 
   if (resolved.ballToBall) {
@@ -1147,7 +1322,7 @@ export function stepBalls(
     }
   }
 
-  return { drained, contacts };
+  return { drained, contacts, surfaces };
 }
 
 /**
@@ -1176,6 +1351,70 @@ function applyLevelGates(
     q10ToPixel(ball.x),
     q10ToPixel(ball.y),
   );
+}
+
+/**
+ * Moves a ball onto the other collision line because it TOUCHED a surface whose
+ * whole job is to move it, and stops it dead in the process.
+ *
+ * Surface ids 10 and 11 are two of the thirty-two entries in the engine's jump
+ * table at +0x00AE40 — 10 to +0x00B420, 11 to +0x00B408 — and both handlers do
+ * the same two things: swap the ball's plane pointers for the other level's, and
+ * ZERO the velocity. They are drawn as short solid bars, and on Law 'n Justice
+ * the clearest is a 25-pixel run of id 11 at x 23..47, y 465..467, lying flat
+ * across the foot of the left habitrail's channel. That is the habitrail
+ * DELIVERY: the ball rides the upper line down the rail, lands on the bar, stops,
+ * and is handed to the lower line in the left inlane.
+ *
+ * Without it a ball that reached the foot of that channel had nowhere to go —
+ * the upper line simply stops at y=468 — and the aggressive census wrote off
+ * fifty-seven balls at (36,456) and (37,456), which is a ball centre resting one
+ * radius above that bar. Zeroing the velocity is the handler's own behaviour and
+ * is what a drop off the end of a wireform looks like.
+ *
+ * Id 10 (to the upper level) appears on ZERO pixels of any of the six shipped
+ * surface maps, so only the downward half is ever reached; it is implemented
+ * anyway because the handler exists and because a map that used it would
+ * otherwise fail silently. Ids are visited in first-touch order and the last one
+ * wins, matching a dispatch that runs once per contact.
+ */
+function applyLevelSurfaces(ball: BallState, surfaceIds: readonly number[]): void {
+  let next: PlayfieldLevel | null = null;
+  for (const id of surfaceIds) {
+    if (id === LEVEL_TO_UPPER_ID) next = 1;
+    else if (id === LEVEL_TO_LOWER_ID) next = 0;
+  }
+  if (next === null) return;
+  ball.velocityX = 0;
+  ball.velocityY = 0;
+  ball.level = next;
+}
+
+/**
+ * Moves a ball onto the other collision line if it finished the tick inside one
+ * of the ENGINE'S OWN hand-off rectangles.
+ *
+ * This is types 2 and 3 of the zone dispatch at +0x0053A8, and it is applied
+ * after `applyLevelGates` so that where the shipped data and this project's
+ * reconstructed gates disagree, the shipped data has the last word.
+ *
+ * A rectangle rather than a row is the whole point. The gates in
+ * `playfield-levels.ts` are three or four columns wide on a single row, because
+ * that is what could be inferred from where two collision lines happen to carry
+ * identical runs; the original's hand-offs are twenty-pixel boxes. A ball that
+ * crossed Law 'n Justice's `ramp-end` gate row at x=37 when the gate is x 34..36
+ * missed it by one pixel, stayed on the habitrail, drifted down the upper line
+ * and was eventually tipped onto the lower one by the `left-apron` gate at the
+ * top of a strip that is SEALED on the lower collision line. That is one pixel
+ * of miss turning into a lost ball, and the box catches it.
+ *
+ * Idempotent: a ball already on the level the zone names is left alone, so a
+ * ball sitting in a hand-off box costs nothing per tick.
+ */
+function applyLevelZones(ball: BallState, surfaces: SurfaceIdMap | null): void {
+  if (surfaces === null) return;
+  const next = surfaces.levelChangeAt(ball.level, q10ToPixel(ball.x), q10ToPixel(ball.y));
+  if (next !== null && next !== ball.level) ball.level = next;
 }
 
 /**
@@ -1289,8 +1528,15 @@ function integrateBall(
   passable: readonly boolean[],
   ring: RingOffsets,
   options: ResolvedOptions,
-): ContactResult | null {
-  const log = newContactLog();
+): IntegrationResult {
+  // Bound to the level the ball is riding at the start of the tick, matching the
+  // per-level view it is about to be collided against. A ball changes level only
+  // after the integration, so one tick never mixes the two maps.
+  const surfaces = options.surfaces;
+  const level = ball.level;
+  const surfaceAt =
+    surfaces === null ? null : (x: number, y: number): number => surfaces.surfaceIdAt(level, x, y);
+  const log = newContactLog(surfaceAt);
   recoverPenetration(ball, map, materials, passable, ring, options, log);
 
   const startX = ball.x;
@@ -1333,6 +1579,7 @@ function integrateBall(
         stop.blocker.normalX,
         stop.blocker.normalY,
         options.restThreshold,
+        surfaceResponseOf(stop.blocker, surfaceAt),
       );
     } else if (!stop.clamped) {
       // The path ran out with nothing in the way; `remaining` is zero and the
@@ -1374,7 +1621,7 @@ function integrateBall(
     }
   }
 
-  return closeContactLog(log, ring);
+  return { contact: closeContactLog(log, ring), surfaceIds: log.surfaceIds };
 }
 
 // ---------------------------------------------------------------------------

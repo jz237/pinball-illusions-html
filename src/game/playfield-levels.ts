@@ -698,11 +698,25 @@ function crownMouthGates(): readonly LevelGate[] {
  * untouched. Measured: level-1 write-offs on Law 'n Justice go from fourteen to
  * ZERO and completions stay at 90 of 90.
  *
- * It does not reduce the TOTAL, and that is stated here rather than buried.
- * Those balls now roll on down the far-left strip and end at (8,388) instead.
- * That strip is a genuine sealed pocket on the shipped lower line and closing it
- * needs something this pass did not find; see `BALL_SEARCH_TICKS` in
- * `game-loop.ts` for what is known about it.
+ * It did not reduce the TOTAL, and that was stated here rather than buried:
+ * those balls rolled on down the far-left strip and ended at (8,388) instead.
+ *
+ * THAT HAS SINCE BEEN CLOSED, AND NOT BY A GATE. The strip is a genuine sealed
+ * pocket on the shipped lower line, so the fix was never going to be here; it was
+ * that a ball reaching `left-apron` at all was already off its route. The engine
+ * carries its own hand-offs and this file did not have them: a twenty-one pixel
+ * BOX at (25,180)-(45,200) in the zone list where `ramp-end` is three columns of
+ * one row, and a flat bar of surface id 11 at the foot of the habitrail's channel
+ * whose handler stops the ball and delivers it to the inlane. Both are wired in
+ * `ball-physics.ts` (`applyLevelZones` and `applyLevelSurfaces`) and both run
+ * AFTER the gates below, so where the shipped data and these reconstructions
+ * disagree, the shipped data wins.
+ *
+ * The gates are kept because they cover hand-offs the zone list does not name at
+ * all — every table's plunger-lane mouth is one — and because removing a measured
+ * correction to test an unrelated one is how a regression gets attributed to the
+ * wrong change. With both mechanisms in, the aggressive census writes off zero
+ * balls on all three tables.
  */
 export const LEVEL_GATES_BY_TABLE: Readonly<Record<TableId, readonly LevelGate[]>> = Object.freeze({
   "law-n-justice": Object.freeze([

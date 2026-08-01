@@ -361,10 +361,13 @@ and must be documented as such.** The semantics are facts; the words are not. **
   nothing now puts a ball there. Free
   lower-line centres there are `[20-20] [28-76]` at `y = 432` and `[30-46] [54-74]` one
   row down, so the ball is resting on top of a post with nothing beneath it. A real
-  machine's coil clears one; this reconstruction has no device layer. Budgeted rather
-  than hidden — `tests/plays.test.ts` measures the rate and holds it at 5% on every
-  table, down from 35% on Law 'n Justice. Slot 4's per-8x8 acceleration field and a
-  device layer are the documented right answers. **[open]**
+  machine's coil clears one — and the machine now does exactly that: the ball search
+  fires the measured slingshot coil at a still ball up to `BALL_SEARCH_PULSES` times
+  before it writes it off, alternating direction, which is the half of the mechanism
+  this reconstruction had always described and never built. With that, with the
+  surface-ID map driving the physics and with the engine's own level hand-offs applied,
+  the ninety-game aggressive census writes off **zero** balls on all three tables and
+  completes 90 of 90 games on each, against 9.0% / 2.0% / 1.1% before. **[closed]**
 - **All three shooter lanes are measured, and they are not identical.** Free ball
   centres are `x = 321..324` on Law 'n Justice, `321..323` on BabeWatch and `322..324` on
   Extreme Sports, with lane walls at `310..312 / 333..335`, `310..312 / 332..335` and

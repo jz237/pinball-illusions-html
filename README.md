@@ -116,19 +116,45 @@ box) and Extreme Sports' two (whose lane changes line twice). `tests/level-scan.
 re-runs the derivation on every build and asserts the shipped gates are what it
 produces, so those constants stay checkably derived rather than merely asserted.
 
-Two things there are honest about their status. The row at which the ramp puts
-the ball back on the playfield is **inferred, not read** — the ramp's outboard
-rail runs off the edge of the bitmap and the channel pinches shut below y=91, so
-the ball must leave somewhere, but nothing in the data says where. And the ball
-search — a real machine's "nothing has moved, write the ball off" timeout — is
-currently doing more work than it should, because the playfield has kicker holes
-that the undecoded device layer would empty. Both are documented at the point of
-use with the measurements that constrain them.
+One thing there is honest about its status: the row at which the ramp puts the
+ball back on the playfield is **inferred, not read** — the ramp's outboard rail
+runs off the edge of the bitmap and the channel pinches shut below y=91, so the
+ball must leave somewhere, but nothing in the data says where.
+
+The other used to be the ball search, which was doing more work than it should
+because nothing emptied the playfield's holes. That is closed, and the fix was
+not a bigger constant.
+
+### Devices and scoring
+
+The **surface-ID map** — one byte per pixel per level, naming what the ball is
+touching rather than merely whether it is solid — is decoded, shipped beside the
+collision map and the ramp drive, and wired into the physics. Three things come
+with it, all read off the original rather than chosen:
+
+- **Restitution and the kicks.** The engine indexes a 256-row table of four words
+  at `main.seg08` by surface ID; a plain wall returns 0.297 of the approach where
+  this project had been assuming 0.625, a pop bumper adds 5500 of the original's
+  velocity units before restitution and a slingshot 3500 plus ±400 along its face.
+  `src/game/surface-physics.ts` has all thirty-two numbers and says which two of
+  the four words this port can honestly adopt and why the other two are recorded
+  and not applied.
+- **The awards.** Devices, bumpers, slingshots, zone triggers and locks, each with
+  its packed-BCD first-hit score, first-hit bonus and repeat score. The score is
+  kept in packed BCD as the original keeps it, twelve digits, through the same
+  ABCD chain — the digits displayed are the digits stored. Every bonus field in
+  every record on all three tables is zero, which is a result rather than a gap:
+  the bonus ladder comes from a mission-script VM that is not decoded.
+- **The hand-offs.** Surface IDs 10 and 11 move the ball between the two collision
+  lines and stop it dead, and the zone list carries the engine's own twenty-pixel
+  hand-off boxes. Both are now applied, and between them they took the ninety-game
+  aggressive census from 26 written-off balls on Law 'n Justice to zero.
 
 ### Not started
 
-Devices, rules and scoring; table select, options and high-score screens; audio;
-BabeWatch and Extreme Sports beyond geometry and the shared engine.
+Modes, missions and the bonus ladder; table select, options and high-score
+screens; audio; BabeWatch and Extreme Sports beyond geometry, the shared engine
+and the shipped scoring layer.
 
 See [docs/DISK_ANALYSIS.md](docs/DISK_ANALYSIS.md) and
 [docs/GAMEPLAY_PARITY.md](docs/GAMEPLAY_PARITY.md).

@@ -127,6 +127,24 @@ export interface TableDevices {
   deviceFor(level: PlayfieldLevel, surfaceId: number): DeviceRecord | null;
   bumperFor(index: number): HitRecord | null;
   slingshotFor(index: number): HitRecord | null;
+  /**
+   * The level a `to-upper` or `to-lower` zone at this point hands the ball to,
+   * or null when no such zone covers it.
+   *
+   * THIS IS THE ENGINE'S OWN LEVEL-CHANGE MECHANISM and it is why the zone list
+   * had to be decoded before the ramps could be trusted. Types 2 and 3 of the
+   * five-entry dispatch table at +0x0053A8 do nothing but swap the ball's plane
+   * pointers — `$22EE/$22FE/$2302` for the lower level, `$2306/$2316/$231A` for
+   * the upper — so a hand-off is a RECTANGLE, twenty pixels on a side, and not a
+   * row of three columns that a ball can miss by one pixel.
+   *
+   * `playfield-levels.ts` reconstructs the same thing from map geometry and
+   * still runs, because it covers hand-offs the zone list does not: the plunger
+   * lane's mouth is a gate on every table and no zone names it. The two are
+   * complementary and the measured one is applied second, so where they disagree
+   * the shipped data wins.
+   */
+  levelChangeAt(level: PlayfieldLevel, x: number, y: number): PlayfieldLevel | null;
 }
 
 function describeValue(value: unknown): string {
@@ -349,6 +367,11 @@ export function parseTableDevicesDocument(doc: TableDevicesDocument): TableDevic
 
   const frozenDevices = Object.freeze(devices);
   const frozenZones = Object.freeze(zones);
+  // Pulled out once rather than filtered per lookup: this runs for every ball
+  // on every tick.
+  const levelChanges = frozenZones.filter(
+    (zone) => zone.kind === "to-upper" || zone.kind === "to-lower",
+  );
 
   return Object.freeze({
     tableId,
@@ -374,6 +397,15 @@ export function parseTableDevicesDocument(doc: TableDevicesDocument): TableDevic
     },
     slingshotFor(index: number): HitRecord | null {
       return slingshotByIndex.get(index) ?? null;
+    },
+    levelChangeAt(level: PlayfieldLevel, x: number, y: number): PlayfieldLevel | null {
+      const here = level === 1 ? 1 : 0;
+      for (const zone of levelChanges) {
+        if (zone.level !== here) continue;
+        if (x < zone.minX || x > zone.maxX || y < zone.minY || y > zone.maxY) continue;
+        return zone.kind === "to-upper" ? 1 : 0;
+      }
+      return null;
     },
   });
 }

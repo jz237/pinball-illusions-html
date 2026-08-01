@@ -130,16 +130,29 @@
  * could have closed the shallow-slope traps: the missing term was never a
  * coefficient.
  *
- * So: every `passable` flag and every `kind` below is derived from the data.
- * NOT ONE elasticity, friction or kick number in this file is measured. They
- * are engineering defaults chosen to feel like a pinball table. The
- * `confidence` field grades the KIND AND PASSABILITY assignment only, and the
- * per-entry comments say so where it matters.
+ * ---------------------------------------------------------------------------
+ * WHERE THE COEFFICIENTS DO COME FROM — AND THE ANSWER IS NO LONGER "NOWHERE"
+ * ---------------------------------------------------------------------------
+ * This block used to end "NOT ONE elasticity, friction or kick number in this
+ * file is measured", and that has been superseded. The restitution and the kicks
+ * are now read off the original's own 256-row table at main.seg08, and only the
+ * friction is still chosen. What did NOT change is the sentence above it: the
+ * numbers are not in the pixel index, and no amount of staring at slot 2 would
+ * ever have found them.
  *
- * Slingshot, bumper and rubber behaviour must be applied by the device layer
- * from coordinates in the slot-4 rules module, layered on top of this table.
- * DEVICE_PRESETS at the bottom holds those coefficients so nothing has to
- * pretend a pixel index encodes them.
+ * THE STRUCTURAL POINT, which matters more than any single number: THE ENGINE
+ * DOES NOT KEY BEHAVIOUR OFF THIS 16-ENTRY TABLE AT ALL. Slot 2 answers
+ * solid-or-not-solid, one bit per level, and nothing else; the coefficients are
+ * indexed by the SLOT-1 SURFACE ID, a separate byte-per-pixel map with 256
+ * values. So this table keeps the two things it is genuinely the authority on —
+ * `passable` and `kind`, both derived from the data — and the numbers in it are
+ * now a FALLBACK for maps that have no surface layer, kept equal to the measured
+ * plain-wall row so a synthetic map and a real one are the same machine. See
+ * `surface-physics.ts` for the table, `table-devices.ts` for the per-pixel ids
+ * and `ball-physics.ts` for the contact path that prefers them.
+ *
+ * The `confidence` field on the 16 entries below still grades the KIND AND
+ * PASSABILITY assignment, which is what those entries are for.
  */
 
 import type { Q10 } from "../core/fixed-point.js";
@@ -175,10 +188,44 @@ export const SLOT2_PLANE_BASES = [
 /** Rolling resistance of bare playfield. Small: the ball must reach the drain. */
 const ROLLING_FRICTION: Q10 = 20;
 
-/** Plain wall restitution, mid of the 0.55-0.7 band the project settled on. */
-const WALL_ELASTICITY: Q10 = 640;
 /**
- * Tangential loss on a wall graze, ~0.15.
+ * PLAIN-WALL RESTITUTION, NOW MEASURED: 304, where this file carried 640 for its
+ * whole life.
+ *
+ * The original looks restitution up by SURFACE ID, not by pixel index, in a
+ * 256-row table of four words at main.seg08 — `surface-physics.ts` has the
+ * relocation that pins the address, what the other three words are, and which
+ * of them this port can honestly adopt. The plain-wall row's restitution word is
+ * 76 out of 256, and `Q10_ONE / 256 = 4`, so the Q10 value is 304. The shipped
+ * default was 2.1 times too bouncy.
+ *
+ * This constant is the FALLBACK the contact model uses when the table being
+ * simulated has no surface map registered — every synthetic map in the test
+ * suite, and nothing else. On the three real tables the coefficient comes from
+ * `surfaceResponseFor(id)` per contact, so the two are deliberately the same
+ * number: a fallback that disagreed with the measured table would make a unit
+ * test and the game two different machines.
+ *
+ * Written as a literal rather than as `originalRestitutionToQ10(76)` because
+ * `surface-physics.ts` reaches this module through `table-accel.ts` and
+ * `plunger.ts`, and a constant initialised across an import cycle is a load-order
+ * hazard for the sake of one multiplication. `tests/surface-physics.test.ts`
+ * asserts the equality mechanically instead, so the two cannot drift.
+ */
+export const WALL_ELASTICITY: Q10 = 304;
+
+/**
+ * Tangential loss on a wall graze, ~0.15. STILL CHOSEN, and that is a measured
+ * result rather than an omission.
+ *
+ * The original's fourth per-surface word IS its tangential rule, and it is
+ * friction on the SLIP between the ball's spin and its along-surface speed — so
+ * a ball rolling without slipping loses nothing and no slope, however shallow,
+ * can hold a ball. `BallState` has no spin, and dropping the spin term turns the
+ * rule into a percentage of the whole tangential speed, which `reflectVelocity`
+ * has already measured and rejected. THERE IS NO PER-SURFACE FRICTION NUMBER IN
+ * THE ORIGINAL TO IMPORT; see `SURFACE_CONSTANT_ROWS` for all four words of all
+ * eight rows, recorded in full.
  *
  * Exported because it is not only a coefficient: under the Coulomb rule in
  * `reflectVelocity` it also fixes a STATIC FRICTION ANGLE of
@@ -332,38 +379,55 @@ const BEHAVIOURS: readonly MaterialBehaviour[] = [
 ];
 
 /**
- * Coefficients for powered and sprung devices.
+ * Coefficients for powered and sprung devices. NOW MEASURED, all three of them.
  *
- * NOT reachable from any pixel index — the map cannot express them. The device
- * layer looks up bumper and slingshot positions from the slot-4 rules module
- * and applies these at the contact point. Every number here is a chosen
- * default; none is measured. Kept in this file so there is one place to tune
- * rebound and nothing is tempted to smuggle "rubber" into the pixel table.
+ * Still not reachable from any pixel index — the map cannot express them — but
+ * they are no longer chosen either. The original selects them by SURFACE ID:
+ * `surface-physics.ts` carries the whole 256-row table from main.seg08 and the
+ * two kick sites from the collision responder, and these three entries are the
+ * rows those ids land in, restated in this file's own vocabulary so there is
+ * still exactly one place to read a rebound number off.
+ *
+ *   rubber     ids 15 and 22..63, restitution 153/256 -> 612 Q10
+ *   slingshot  ids 22..31, the SAME rubber row, plus 3500 units of normal kick
+ *              and +-400 along the surface
+ *   bumper     ids 16..21, restitution 89/256 -> 356 Q10, plus 5500 of kick
+ *
+ * Three of this project's long-standing guesses are refuted by that and it is
+ * worth naming them: rubber was 845 where nothing in the game exceeds 612;
+ * the slingshot was modelled as LESS bouncy than a wall when it is in fact the
+ * bounciest surface on the table, twice a wall; and the kicks were 420 and 560
+ * against a real 2625 and 4125 Q10 per tick. `friction` is the one field here
+ * that is still this port's own — see `WALL_FRICTION` for why there is no
+ * per-surface friction number in the original to import.
+ *
+ * The kicks are in Q10 per tick through the acceleration bridge the ramp drive
+ * is already calibrated to, and the arithmetic is in `surface-physics.ts`.
  */
 export const DEVICE_PRESETS: Readonly<Record<string, Omit<MaterialBehaviour, "index">>> = {
   rubber: {
     kind: "rubber",
     passable: false,
-    elasticity: 845,
-    friction: 205,
+    elasticity: 612,
+    friction: WALL_FRICTION,
     kick: 0,
-    confidence: "provisional",
+    confidence: "measured",
   },
   slingshot: {
     kind: "slingshot",
     passable: false,
-    elasticity: 512,
-    friction: 205,
-    kick: 420,
-    confidence: "provisional",
+    elasticity: 612,
+    friction: WALL_FRICTION,
+    kick: 2625,
+    confidence: "measured",
   },
   bumper: {
     kind: "bumper",
     passable: false,
-    elasticity: 460,
-    friction: 205,
-    kick: 560,
-    confidence: "provisional",
+    elasticity: 356,
+    friction: WALL_FRICTION,
+    kick: 4125,
+    confidence: "measured",
   },
 };
 

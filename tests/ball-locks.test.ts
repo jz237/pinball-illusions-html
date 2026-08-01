@@ -585,11 +585,32 @@ describe("the zero-deadlock guarantee, restated for locks", () => {
       startGame(game);
       const input = playingInput();
       let overflow = 0;
-      for (let tick = 0; tick < 40_000; tick += 1) {
+      // THE STIMULUS IS BOUNDED AND THE BUDGET IS A MEASUREMENT.
+      //
+      // Steering a ball into a saucer every 500 ticks is not a neutral probe: a
+      // capture the machine has to replace, and a second capture that lights
+      // multiball and tops the table back up to three, together MANUFACTURE
+      // BALLS. Run without a bound it is an infinite free-ball supply, and the
+      // only thing that ever ended the game was the ball being lost. That used
+      // to happen often enough to hide it; it does not now, because the ball is
+      // much harder to lose — the habitrail delivery (surface id 11) hands a
+      // stranded ball back to the inlane, and the measured pop-bumper kick is
+      // 5500 of the original's velocity units where this project had been
+      // guessing 560. Left unbounded, Extreme Sports plays forever: six hundred
+      // thousand ticks, three hundred million points and still on ball one, with
+      // no ball ever stuck.
+      //
+      // So the steering stops after 40,000 ticks — eighty capture opportunities,
+      // which is "over and over" by any reading — and the game is then required
+      // to finish on its own. Measured to game-over that way:
+      // Law 'n Justice 39,586, BabeWatch 41,819, Extreme Sports 47,527, all
+      // three with `ballsServed` at 3.
+      const STEER_UNTIL = 40_000;
+      for (let tick = 0; tick < 100_000; tick += 1) {
         runTicks(game, input, 1);
         // Drop a ball into a saucer whenever one is free, so the locks are
         // exercised over and over rather than once.
-        if (tick % 500 === 250) {
+        if (tick % 500 === 250 && tick < STEER_UNTIL) {
           const empty = ballLocksFor(tableId).find(
             (device) => heldBallIn(game.locks, device.id) === null,
           );

@@ -30,6 +30,7 @@ import { integerScaleFor, setPlayfieldArtwork } from "./browser/playfield-render
 import { loadTableMap } from "./game/table-map.js";
 import { loadTableArt } from "./game/table-art.js";
 import { loadTableAcceleration } from "./game/table-accel.js";
+import { loadTableDevices } from "./game/table-devices.js";
 import type { TableId } from "./game/contracts.js";
 
 const TABLE: TableId = "law-n-justice";
@@ -126,20 +127,27 @@ async function boot(): Promise<void> {
   const context = requireContext(canvas);
   const router = new InputRouter();
 
-  // Three files per table, and all three are required. The map is the collision
+  // Four files per table, and all four are required. The map is the collision
   // geometry the physics reads; the artwork is the picture the player sees; the
   // ramp drive is the per-block acceleration that carries the ball along
   // surfaces too shallow for gravity to move it against friction, without which
-  // a ball reaching an arch stops there for the rest of the game. Fetched
-  // together because none depends on the others, and all awaited before the loop
-  // starts — the renderer refuses to draw a table whose artwork is missing, and
-  // `createGame` refuses to assemble one whose drive is missing, rather than
-  // either of them inventing a substitute.
+  // a ball reaching an arch stops there for the rest of the game; and the
+  // scoring layer is the SURFACE-ID MAP plus the device, bumper, slingshot and
+  // zone records — which is not only what makes the score move, but what the
+  // contact model reads its restitution out of, what makes a pop bumper kick,
+  // and what hands a ball from a habitrail back to the playfield.
+  //
+  // Fetched together because none depends on the others, and all awaited before
+  // the loop starts — the renderer refuses to draw a table whose artwork is
+  // missing, and `createGame` refuses to assemble one whose drive is missing,
+  // rather than either of them inventing a substitute.
   const [map, artwork] = await Promise.all([
     loadTableMap(TABLE),
     loadTableArt(TABLE),
-    // Registers itself; `createGame` reads it back out of the registry.
+    // Both register themselves; `createGame` reads them back out of their
+    // registries.
     loadTableAcceleration(TABLE),
+    loadTableDevices(TABLE),
   ]);
   setPlayfieldArtwork(map, artwork);
   const game = createGame(map);

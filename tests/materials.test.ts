@@ -10,10 +10,12 @@ import {
   OPEN_INDEX,
   SLOT2_PLANE_BASES,
   SOLID_BORDER_INDEX,
+  WALL_ELASTICITY,
   isLevel0Solid,
   isLevel1Solid,
   materialTableFor,
 } from "../src/game/materials.js";
+import { surfaceResponseFor } from "../src/game/surface-physics.js";
 
 const ALL_INDICES: readonly MaterialIndex[] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 const CONFIDENCES = ["measured", "inferred", "provisional"] as const;
@@ -93,17 +95,30 @@ describe("passability and coefficients are coherent", () => {
     }
   });
 
-  it("gives every blocking material a usable but sub-unity rebound", () => {
+  it("gives every blocking material the measured plain-wall rebound, exactly", () => {
     for (const tableId of TABLE_IDS) {
       const blocking = behavioursOf(tableId).filter((b) => !b.passable);
       expect(blocking.length).toBeGreaterThan(0);
       for (const behaviour of blocking) {
-        // A plain wall sits in the 0.55-0.7 band; nothing in the pixel table
-        // may exceed a perfect bounce or it would pump energy in forever.
-        expect(behaviour.elasticity).toBeGreaterThanOrEqual(Math.round(0.5 * Q10_ONE));
-        expect(behaviour.elasticity).toBeLessThanOrEqual(Q10_ONE);
+        // This used to be a 0.5..1.0 BAND, because every number in this file was
+        // once a chosen one. It is an equality now: the pixel table cannot
+        // express a material at all — the original indexes restitution by
+        // SURFACE ID — so the only honest value for a blocking index is the
+        // measured plain wall, and a band would let an edit drift off it unseen.
+        expect(behaviour.elasticity).toBe(WALL_ELASTICITY);
+        expect(behaviour.elasticity).toBeGreaterThan(0);
+        expect(behaviour.elasticity).toBeLessThan(Q10_ONE);
       }
     }
+  });
+
+  it("keeps the wall fallback equal to the measured plain-wall row", () => {
+    // materials.ts writes 304 as a literal rather than initialising a constant
+    // across an import cycle; this is what keeps the two honest. Surface id 0 is
+    // the plain-wall row, and Q10_ONE / 256 is 4.
+    expect(WALL_ELASTICITY).toBe(surfaceResponseFor(0).elasticity);
+    expect(surfaceResponseFor(0).constants.restitution * 4).toBe(WALL_ELASTICITY);
+    expect(surfaceResponseFor(0).constants.restitution).toBe(76);
   });
 
   it("keeps every coefficient a non-negative Q10 integer", () => {
@@ -192,27 +207,46 @@ describe("bitfield semantics", () => {
 });
 
 describe("device presets", () => {
-  it("keeps rubber bouncier than a wall and gives powered devices a kick", () => {
-    const wall = materialTableFor("law-n-justice").behaviourFor(SOLID_BORDER_INDEX);
+  it("is the measured surface table restated, not a set of chosen coefficients", () => {
+    // Every one of these three used to be a guess and every one of them is now
+    // read off main.seg08. The assertions are equalities against
+    // `surface-physics.ts` rather than inequalities against a wall, because the
+    // point of the change is that these numbers came from somewhere.
     const rubber = DEVICE_PRESETS["rubber"];
     const slingshot = DEVICE_PRESETS["slingshot"];
     const bumper = DEVICE_PRESETS["bumper"];
     expect(rubber).toBeDefined();
     expect(slingshot).toBeDefined();
     expect(bumper).toBeDefined();
-    expect(rubber?.elasticity).toBeGreaterThan(wall.elasticity);
-    expect(rubber?.elasticity).toBeLessThan(Q10_ONE);
+
+    // Id 15 is the posts and rings; 22..31 are the slingshot faces and share the
+    // same row, so a slingshot IS rubber plus a coil.
+    expect(rubber?.elasticity).toBe(surfaceResponseFor(15).elasticity);
+    expect(slingshot?.elasticity).toBe(surfaceResponseFor(22).elasticity);
+    expect(rubber?.elasticity).toBe(slingshot?.elasticity);
+    // Ids 16..21 are the pop bumpers, and they are LESS bouncy than rubber.
+    expect(bumper?.elasticity).toBe(surfaceResponseFor(16).elasticity);
+    expect(bumper?.elasticity).toBeLessThan(rubber?.elasticity ?? 0);
+
+    // The refuted guess, recorded so nobody reintroduces it: rubber was 845 and
+    // nothing in the game exceeds 612, and the slingshot was modelled as LESS
+    // bouncy than a plain wall when it is in fact twice one.
+    expect(rubber?.elasticity).toBe(612);
+    expect(slingshot?.elasticity).toBeGreaterThan(WALL_ELASTICITY);
+
+    // Powered surfaces add energy; rubber only gives it back.
     expect(rubber?.kick).toBe(0);
-    // Slingshots and bumpers add energy rather than merely reflecting it.
-    expect(slingshot?.elasticity).toBeLessThan(wall.elasticity);
-    expect(bumper?.elasticity).toBeLessThan(wall.elasticity);
+    expect(slingshot?.kick).toBe(surfaceResponseFor(22).kick);
+    expect(bumper?.kick).toBe(surfaceResponseFor(16).kick);
     expect(slingshot?.kick ?? 0).toBeGreaterThan(0);
-    expect(bumper?.kick ?? 0).toBeGreaterThan(0);
+    expect(bumper?.kick ?? 0).toBeGreaterThan(slingshot?.kick ?? 0);
   });
 
-  it("marks every device preset provisional, because the map cannot encode them", () => {
+  it("marks every device preset measured, because the surface table encodes them", () => {
+    // The inverse of what this test used to say. The map cannot encode a device
+    // and never could; the SURFACE-ID table can and does.
     for (const preset of Object.values(DEVICE_PRESETS)) {
-      expect(preset.confidence).toBe("provisional");
+      expect(preset.confidence).toBe("measured");
     }
   });
 });

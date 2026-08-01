@@ -677,7 +677,12 @@ describe("launching up the real Law 'n Justice lane", () => {
   it("settles the served ball inside the lane instead of drifting out of it", () => {
     const { restY } = launchAndTrack(pullAndRelease(1), 1);
     expect(restY).toBeGreaterThan(q10ToPixel(CONFIG.serveY) - 4);
-    expect(restY).toBeLessThan(LAW_N_JUSTICE_SHOOTER_LANE.bottomY);
+    // Inclusive, because `bottomY` is documented as "the bottommost FREE CENTRE
+    // row of the unbroken channel" — a ball centre on it is in the lane, not out
+    // of it. The strict form happened to hold while the plain wall was a chosen
+    // 0.625 and the ball settled one row higher; at the measured 304 it comes to
+    // rest on the last free row itself, which is where a ball on a rod sits.
+    expect(restY).toBeLessThanOrEqual(LAW_N_JUSTICE_SHOOTER_LANE.bottomY);
   });
 
   it("sends a full plunge all the way to the top of the channel", () => {

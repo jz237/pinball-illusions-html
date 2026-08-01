@@ -12,7 +12,9 @@
 import { describe, expect, it } from "vitest";
 import {
   BALL_SEARCH_BOX_PIXELS,
+  BALL_SEARCH_PULSES,
   BALL_SEARCH_TICKS,
+  SERVE_DELAY_TICKS,
   createGame,
   debugSnapshot,
   runTicks,
@@ -326,7 +328,14 @@ describe("a whole game", () => {
       ball.level = 0;
     }
 
-    const reports = runTicks(game, idleInput(), 200);
+    // Four search windows plus a serve delay. The search fires the machine's own
+    // coils BALL_SEARCH_PULSES times before it writes a ball off — see
+    // BALL_SEARCH_PULSES in game-loop.ts — so a ball the playfield really cannot
+    // return takes (pulses + 1) windows to be given up on, not one. This spiral
+    // is walled on every side, so the pulses move it and it comes straight back,
+    // which is exactly the case the bound exists for.
+    const windows = (BALL_SEARCH_PULSES + 1) * 40;
+    const reports = runTicks(game, idleInput(), windows + SERVE_DELAY_TICKS + 120);
     expect(reports.flatMap((r) => r.drained)).toContain(ball?.id);
     expect(debugSnapshot(game).ballsServed).toBeGreaterThan(1);
   });
@@ -390,7 +399,16 @@ describe("a whole game", () => {
         return controls;
       });
 
-      const reports = runTicks(game, input, 20_000);
+      // FIFTY THOUSAND TICKS, and the number is a measurement rather than a
+      // round one. A scripted game got shorter when a ball could be lost and
+      // longer when it could not, and the ball is a great deal harder to lose
+      // than it was: the habitrail delivery (surface id 11) hands a ball back to
+      // the inlane instead of stranding it, and the measured pop-bumper kick
+      // keeps it alive far longer than the guessed one did. Traced to game-over,
+      // these three seeds now finish at ticks 23,929 / 6,844 / 10,939, and the
+      // slowest scripted game anywhere in this file at 35,627, against a budget
+      // that used to be 20,000.
+      const reports = runTicks(game, input, 50_000);
       const state = debugSnapshot(game);
       expect(
         state.phase,
@@ -1042,7 +1060,11 @@ describe("all three tables", () => {
           return controls;
         });
 
-        runTicks(game, input, 20_000);
+        // Fifty thousand; see the seeded version of this test above for why the
+        // budget moved. Measured to game-over on each of the six combinations:
+        // 23,929 and 35,627 on Law 'n Justice, 5,553 and 4,951 on BabeWatch,
+        // 8,264 and 10,973 on Extreme Sports.
+        runTicks(game, input, 50_000);
         const state = debugSnapshot(game);
         expect(
           state.phase,

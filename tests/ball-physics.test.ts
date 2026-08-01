@@ -965,8 +965,14 @@ describe("substep independence", () => {
     const ball = only(set);
     stepBalls(set, FLOOR_MAP, MATERIALS, WEIGHTLESS);
     expect(ball.velocityY).toBeLessThan(0);
-    // 84.96% of the incoming speed, whatever the tick was cut into.
-    expect(ball.velocityY).toBe(-5119);
+    // Exactly the wall's restitution applied to the incoming speed, whatever the
+    // tick was cut into. Derived from the coefficient as well as pinned to a
+    // literal: this file is about the substep count not changing the answer, and
+    // the answer moved from -5119 to -2432 when the plain wall stopped being a
+    // chosen 0.625 and became the measured 304/1024. See materials.ts.
+    const elasticity = MATERIALS.behaviourFor(WALL).elasticity;
+    expect(ball.velocityY).toBe(-Math.round((8191 * elasticity) / 1024));
+    expect(ball.velocityY).toBe(-2432);
   });
 
   it("keeps the approach the ball made before the bounce instead of discarding it", () => {

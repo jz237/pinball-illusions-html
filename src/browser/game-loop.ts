@@ -51,13 +51,21 @@
  * THE BALL SEARCH
  * ---------------------------------------------------------------------------
  * `runBallSearch` writes off balls that have stayed inside a box of one ball
- * radius for `ballSearchTicks`. It is a real mechanism — every machine has one —
- * but it is also load-bearing here in a way it should not stay: most of the
- * device layer does not exist yet, so nothing empties the playfield's kicker
- * holes, and a ball that finds one would otherwise end the game silently. It is
- * deliberately position-based rather than velocity-based; see `ballsLeftTheBox`
- * for the two bugs that taught the current shape. It watches only balls IN PLAY:
- * a ball in a lock is motionless on purpose and for as long as the rules like.
+ * radius for `ballSearchTicks` — but only after firing the machine's own coils
+ * at them `BALL_SEARCH_PULSES` times, which is what a real search does and what
+ * this one only ever described. It is deliberately position-based rather than
+ * velocity-based; see `ballsLeftTheBox` for the two bugs that taught the current
+ * shape. It watches only balls IN PLAY: a ball in a lock is motionless on
+ * purpose and for as long as the rules like.
+ *
+ * IT IS NO LONGER LOAD-BEARING, and that is a measured claim. It used to be
+ * carrying the absence of the device layer: nothing emptied the playfield's
+ * holes, and Law 'n Justice lost 9.0% of its balls to it. With the surface-id
+ * map wired into the physics — the habitrail deliveries, the engine's own
+ * hand-off boxes, the pop bumpers — and with the coil pulse implemented, the
+ * ninety-game aggressive census writes off ZERO balls on all three tables and
+ * completes 90 of 90 games on each. The search is now what it is supposed to
+ * be: a backstop nothing normally reaches.
  *
  * ---------------------------------------------------------------------------
  * BALL LOCKS, AND THE TWO SERVE QUEUES THAT ARE REALLY ONE
@@ -136,6 +144,7 @@ import {
   DEFAULT_SIMULATION_OPTIONS,
   activeBalls,
   ballById,
+  ballIsInPlay,
   createBallSet,
   freeBallCount,
   freeBalls,
@@ -145,6 +154,7 @@ import {
 import type { LockBank } from "../game/ball-locks.js";
 import {
   LOCKS_TO_LIGHT_MULTIBALL,
+  MAX_SIMULTANEOUS_BALLS,
   MULTIBALL_BALL_COUNT,
   ballsToTopUp,
   captureBalls,
@@ -153,6 +163,7 @@ import {
   releaseHeldBalls,
 } from "../game/ball-locks.js";
 import { BALL_RADIUS_PIXELS, DEFAULT_PROBE_RADIUS } from "../game/collision-probe.js";
+import { SLINGSHOT_KICK } from "../game/surface-physics.js";
 import type { FlipperBank } from "../game/flippers.js";
 import {
   FLIPPER_BOSS_RADIUS_PIXELS,
@@ -163,6 +174,20 @@ import {
   tickFlipperBank,
 } from "../game/flippers.js";
 import { materialTableFor } from "../game/materials.js";
+import type { TableDevices } from "../game/table-devices.js";
+import { tableDevicesFor } from "../game/table-devices.js";
+import type { Award, ScoringState } from "../game/scoring.js";
+import {
+  applyAward,
+  createScoringState,
+  formatBcdField,
+  readBcdField,
+  resetScoringForNewBall,
+  scoreLock,
+  scoreSurfaces,
+  scoreZones,
+  tickScoring,
+} from "../game/scoring.js";
 import type { TableAcceleration } from "../game/table-accel.js";
 import { tableAccelerationFor } from "../game/table-accel.js";
 import type { PlungerConfig, PlungerState } from "../game/plunger.js";
@@ -229,50 +254,35 @@ export const FIRST_SERVE_DELAY_TICKS = 25;
  * what stops the game hanging.
  *
  * ---------------------------------------------------------------------------
- * THE ONE SITE THAT IS STILL LOAD-BEARING, MEASURED AND WRITTEN DOWN
+ * THE SITE THAT USED TO BE LOAD-BEARING, AND WHAT ACTUALLY CLOSED IT
  * ---------------------------------------------------------------------------
  * Law 'n Justice, (8,388) and its neighbours (8,389), (9,387), (7,389),
- * (19,378). Every remaining write-off on that table is in one place and it is
- * not a friction problem, an acceleration problem or a level problem. It was
- * measured rather than guessed and the answer is a negative, so here is the
- * negative:
+ * (19,378). Every remaining write-off on that table used to be in that one
+ * place, and this comment used to carry a long negative result about it: the
+ * ball rests on the left shoulder of the wire-support post at (12,400) jammed
+ * against the table's left edge, the far-left strip above it is a SEALED POCKET
+ * on the lower collision line, the upper line's habitrail runs through the same
+ * strip on different columns, and the original's acceleration map is (0,0)
+ * everywhere in it. All of that was correct and none of it was the answer.
  *
- *   - WHAT THE BALL IS RESTING ON. The 9x9 wire-support post at (12,400), on
- *     its left shoulder, jammed against the table's left edge. The probe reads
- *     ZERO contacts at (8,388) itself and the ring's straight-down sample at
- *     (8,397) is solid, so the contact normal is exactly vertical, the
- *     tangential velocity is exactly zero, and the ball is at rest for a
- *     completely correct reason. Traced tick by tick it arrives with
- *     v = (-1850, 934), rattles between the post and the edge for ninety ticks
- *     and settles at v = (0,0).
- *   - WHY IT CANNOT ROLL OFF. The gap between the post's left edge (x=8) and the
- *     playfield's left edge (x=0) is 8 px and the ball is 16. The gap between
- *     that post and the next one at (22,391) is 4.5 px. There is no way past on
- *     either side.
- *   - WHY THE PLACE IS A TRAP AND NOT A DIP. The far-left strip it sits at the
- *     bottom of runs from y=150 to y=388 between the table's left edge and the
- *     left spiral's outer wall, and it is a SEALED POCKET on the lower line: its
- *     free ball-centre runs go [8-19] at y=150, [8-13] at 300, [8-32] at 345,
- *     [8-10] at 387, [8-8] at 388 and NOTHING at 389, and its only opening is
- *     the top-left bowl above it. Below the posts the lower line reopens at
- *     y=397, but not connected to it.
- *   - WHY THE OTHER LINE DOES NOT HELP. The upper line carries the left
- *     habitrail through the same strip, but on its own columns: [12-13] from
- *     y=264 to 377, then [16-17] at 388 while the lower line has [8-8]. There is
- *     no row where the two lines agree across the columns a ball rolling down
- *     the strip actually occupies, so the `left-apron` / `crown-mouth` hand-off
- *     pattern has nothing to attach to. A gate at the columns the ball uses
- *     would drop it inside the habitrail's rail.
- *   - AND IT IS NOT MISSING DRIVE. The original's own acceleration map carries
- *     (0,0) in every block of the strip and of the left ramp above it, on BOTH
- *     levels. It has no zone there because it never has a ball there.
+ * THE BALL WAS NEVER SUPPOSED TO BE IN THE STRIP. It arrived there because this
+ * project's reconstructed `left-apron` gate tipped it off the LEFT HABITRAIL,
+ * which it was riding on the upper line, onto a lower line that has no way out.
+ * It was riding the habitrail because it had missed the reconstructed `ramp-end`
+ * gate — three columns wide, x 34..36 — by one pixel at x=37. The engine's own
+ * hand-off is not three columns; it is a twenty-one pixel BOX at (25,180)-(45,200)
+ * in the zone list, and it does not miss. See `applyLevelZones` in
+ * ball-physics.ts, and `applyLevelSurfaces` beside it for the other half: the
+ * flat bar of surface id 11 across the foot of the habitrail's channel at
+ * x 23..47, y 465..467, whose handler stops the ball and hands it to the lower
+ * line in the left inlane.
  *
- * So the ball search is doing the only thing available, and this comment is here
- * so the next person does not spend the afternoon re-deriving it. What would
- * close it is a device — a kicker, or whatever the original puts at the foot of
- * that strip — and no such device appears in any table module decoded so far.
+ * With both wired, the aggressive census on Law 'n Justice goes from 26 write-offs
+ * in 290 ball ends to ZERO in 349, with completions unchanged at 90 of 90. The
+ * strip is still a sealed pocket and the post is still a trap; nothing rolls
+ * into them any more.
  *
- * (Every column named in this file is 32 larger than it was recorded as. The
+ * (Every column named above is 32 larger than it was first recorded as. The
  * measurements were taken against maps exported a word out of phase, so each
  * site was written down 32 px left of the geometry it names; the maps have since
  * been re-exported and these are the same sites on the corrected frame. The rows
@@ -319,6 +329,55 @@ export const BALL_SEARCH_TICKS = 500;
  * all.
  */
 export const BALL_SEARCH_BOX_PIXELS = BALL_RADIUS_PIXELS;
+
+/**
+ * COIL PULSES the machine fires before it gives up on a ball: one.
+ *
+ * `BALL_SEARCH_TICKS` above has always described the real mechanism in full —
+ * "when no switch has closed for long enough the machine pulses its coils, and
+ * if that does not shift anything it writes the ball off" — and only ever
+ * implemented the second half. This is the first half, and it is here because
+ * the write-off was starting to be asked to do a job it cannot do.
+ *
+ * What it is for, precisely: a ball that comes to rest on the APEX of something
+ * round. Extreme Sports' top lanes are rings nine pixels across on the upper
+ * collision line, and a ball whose tangential speed has been taken to exactly
+ * zero one radius above the middle of one is in a perfect unstable equilibrium —
+ * the contact normal is exactly vertical, gravity has no component along the
+ * surface, and nothing in an integer contact model will ever tip it off. The
+ * playfield has several such apexes and the player cannot help with any of them
+ * on the upper level: `nudgeReachesLevel(1)` is false, measured, because a shove
+ * on the cabinet does not reach into a habitrail. THE COILS DO — they are bolted
+ * to the playfield.
+ *
+ * THREE, and the count is measured. A real search pulses its coils several times
+ * before giving up, and here it has to: with a single pulse an Extreme Sports
+ * ball rolled off the apex of one top-lane ring and came to rest on the apex of
+ * the NEXT one, nine pixels along, which is why the aggressive census still
+ * reported one level-1 write-off at (210,62) after having reported one at
+ * (241,62). Successive pulses alternate direction so the second is never a
+ * repeat of the first. At three, every table's census is clean.
+ *
+ * Bounded so it cannot become the very defect the search exists to prevent. The
+ * budget is per SERVE, not per stillness: a pulse spends it, and once it is
+ * spent the next expiry writes the ball off whatever happened in between. The
+ * worst case is therefore three extra `ballSearchTicks` windows per ball and the
+ * termination guarantee is untouched — which matters, because the search was
+ * defeatable once already, by a player nudging every 700 ticks.
+ */
+export const BALL_SEARCH_PULSES = 3;
+
+/**
+ * The pulse, in Q10 per tick: the measured SLINGSHOT coil, 3500 of the
+ * original's velocity units through the acceleration bridge.
+ *
+ * Not a chosen number, and not the player's nudge either. A ball search fires
+ * the machine's own coils, and this reconstruction now knows exactly how hard
+ * one of those hits — see `surface-physics.ts`, +0x00B5E0. Using the slingshot
+ * rather than the pop bumper because the bumper is the harder of the two and
+ * this is meant to dislodge a ball, not launch it across the table.
+ */
+export const BALL_SEARCH_PULSE: Q10 = SLINGSHOT_KICK;
 
 /**
  * Ticks a ball the MACHINE served sits in the lane before the auto-launcher
@@ -400,6 +459,18 @@ export interface Game {
    * for why a game without it is a different machine.
    */
   readonly rampDrive: TableAcceleration;
+  /**
+   * The table's SCORING LAYER, or null.
+   *
+   * Nullable where the ramp drive is not, and the asymmetry is the one
+   * `table-devices.ts` argues for: a missing drive changes the PHYSICS and every
+   * shallow ramp becomes a trap, so it throws; a missing scoring layer leaves
+   * the ball rolling exactly the same path and only the score reads zero. It is
+   * also the SURFACE-ID MAP, which is handed to `stepBalls` so the contact model
+   * can take its restitution from the id under the contact and so a bumper can
+   * be a bumper.
+   */
+  readonly devices: TableDevices | null;
   readonly options: GameOptions;
   readonly plungerConfig: PlungerConfig;
   readonly nudgeConfig: NudgeConfig;
@@ -427,11 +498,15 @@ export interface Game {
   autoLaunchCountdown: number;
   /** Locks captured so far this ball, for the presentation. */
   ballsLocked: number;
+  /** Packed-BCD score and bonus, plus the three award debounces. */
+  scoring: ScoringState;
   /** The ball sitting on the plunger rod, or null once it has been launched. */
   laneBallId: number | null;
   serveCountdown: number;
   /** Consecutive ticks with every live ball inside its box and none on the rod. */
   stillTicks: number;
+  /** Coil pulses left before the ball search writes the ball off. Per serve. */
+  searchPulses: number;
   /** Where each live ball was when that run of ticks began. See `runBallSearch`. */
   stillAnchors: readonly BallAnchor[];
   plunger: PlungerState;
@@ -455,6 +530,8 @@ export interface GameTickReport {
   readonly locked: readonly number[];
   /** True on the tick a multiball was lit and the saucers gave their balls back. */
   readonly multiballStarted: boolean;
+  /** Everything that scored this tick, in the order it scored. */
+  readonly awards: readonly Award[];
   readonly justTilted: boolean;
   readonly gameOver: boolean;
 }
@@ -481,6 +558,7 @@ export function createGame(map: TableMap, options?: Partial<GameOptions>): Game 
     map,
     materials: materialTableFor(map.tableId),
     rampDrive: tableAccelerationFor(map.tableId),
+    devices: tableDevicesFor(map.tableId),
     options: resolveGameOptions(options),
     plungerConfig: plungerConfigFor(map.tableId),
     nudgeConfig: nudgeConfigFor(map.tableId),
@@ -493,9 +571,11 @@ export function createGame(map: TableMap, options?: Partial<GameOptions>): Game 
     multiball: false,
     autoLaunchCountdown: 0,
     ballsLocked: 0,
+    scoring: createScoringState(),
     laneBallId: null,
     serveCountdown: 0,
     stillTicks: 0,
+    searchPulses: BALL_SEARCH_PULSES,
     stillAnchors: [],
     plunger: INITIAL_PLUNGER,
     tilt: INITIAL_TILT,
@@ -525,9 +605,14 @@ export function startGame(game: Game): void {
   game.multiball = false;
   game.autoLaunchCountdown = 0;
   game.ballsLocked = 0;
+  // A fresh board rather than a cleared one: the flag bytes that decide whether
+  // an award is a first hit or a repeat are per GAME, and a new game must not
+  // inherit the last one's.
+  game.scoring = createScoringState();
   game.laneBallId = null;
   game.serveCountdown = game.options.firstServeDelayTicks;
   game.stillTicks = 0;
+  game.searchPulses = BALL_SEARCH_PULSES;
   game.stillAnchors = [];
   game.plunger = resetPlunger();
   game.tilt = resetTiltForNewBall();
@@ -606,6 +691,7 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     drained: [],
     locked: [],
     multiballStarted: false,
+    awards: [],
     justTilted: false,
     gameOver: false,
   };
@@ -642,6 +728,10 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
           game.ballsServed += 1;
           game.tilt = resetTiltForNewBall();
           game.ballsLocked = 0;
+          game.searchPulses = BALL_SEARCH_PULSES;
+          // The hit timers and zone occupancies, and only those: the flag bytes
+          // that decide first-hit versus repeat are per game, not per ball.
+          resetScoringForNewBall(game.scoring);
         }
         served = true;
       }
@@ -716,6 +806,7 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
   const step = stepBalls(game.balls, game.map, game.materials, forces, {
     ...game.options.simulation,
     rampDrive: game.rampDrive,
+    surfaces: game.devices,
   });
   resolveFlipperContacts(
     game.balls.balls,
@@ -756,8 +847,18 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     }
   }
 
+  // ---- scoring -----------------------------------------------------------
+  //
+  // After the physics and after the rod is pinned, so the ids scored are the
+  // ones the ball really touched this tick and the ball parked on the plunger
+  // cannot score the lane it is sitting in. Before the locks, because a lock
+  // captures a ball that has already been scored for whatever it rolled over on
+  // the way in.
+  const awards = runScoring(game, step.surfaces);
+
   // ---- ball locks and multiball ------------------------------------------
   const lockTick = runLocks(game);
+  awards.push(...lockTick.awards);
 
   // ---- ball search -------------------------------------------------------
   const lost = runBallSearch(game);
@@ -808,9 +909,61 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     drained,
     locked: lockTick.locked,
     multiballStarted: lockTick.multiballStarted,
+    awards,
     justTilted,
     gameOver,
   };
+}
+
+/**
+ * Runs one tick of the scoring layer: the hit timers down one frame, then the
+ * surfaces each ball touched, then the zones each ball is inside.
+ *
+ * Surfaces before zones because that is the order the original's ball loop does
+ * it in — the collision pass at +0x00AD42 dispatches the device chain, and the
+ * zone walk at +0x0052E6 runs after it — and because it is the order a player
+ * would describe: the ball hit the target, then it rolled into the lane.
+ *
+ * A held ball is skipped entirely. It is out of the simulation (see
+ * `ballIsInPlay`), so it has no contacts to score, and leaving it in the zone
+ * pass would make a saucer re-award its own rectangle every tick it held a ball.
+ */
+function runScoring(game: Game, surfaces: ReadonlyMap<number, readonly number[]>): Award[] {
+  const devices = game.devices;
+  if (devices === null) return [];
+  tickScoring(game.scoring);
+
+  const awards: Award[] = [];
+  for (const ball of game.balls.balls) {
+    if (!ballIsInPlay(ball)) continue;
+    if (ball.id === game.laneBallId) continue;
+    const touched = surfaces.get(ball.id);
+    if (touched === undefined || touched.length === 0) continue;
+    awards.push(...scoreSurfaces(game.scoring, devices, ball.level, touched));
+  }
+
+  const centres = freeBalls(game.balls)
+    .filter((ball) => ball.id !== game.laneBallId)
+    .map((ball) => ({
+      id: ball.id,
+      level: ball.level,
+      x: q10ToPixel(ball.x),
+      y: q10ToPixel(ball.y),
+    }));
+  awards.push(...scoreZones(game.scoring, devices, centres));
+
+  for (const award of awards) applyAward(game.scoring, award);
+  return awards;
+}
+
+/** The player's score, as a decimal number read out of the BCD field. */
+export function currentScore(game: Game): number {
+  return readBcdField(game.scoring.score);
+}
+
+/** The player's bonus, as a decimal number read out of the BCD field. */
+export function currentBonus(game: Game): number {
+  return readBcdField(game.scoring.bonus);
 }
 
 /**
@@ -821,8 +974,28 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
  * blocks the queue until the player shoots it, which is the original's rule
  * (`$D88/$D89(a5)`, set by the server at data 0x65EE and cleared only by the
  * shooter-lane zone at data 0x54C2).
+ *
+ * ---------------------------------------------------------------------------
+ * THE MACHINE HAS THREE BALLS AND CANNOT OWE A FOURTH
+ * ---------------------------------------------------------------------------
+ * `MAX_SIMULTANEOUS_BALLS` is not a policy, it is the size of the original's
+ * ball array: three objects of 110 bytes at data 0x3536, with the next live
+ * global immediately after the third. A ball that does not exist cannot be
+ * served, so the debt is capped by what the trough actually has left —
+ * everything not already rolling, held in a saucer or already queued.
+ *
+ * Without the cap the debt could exceed the trough by a route that needs
+ * multiball to reach: `startMultiball` queues one serve per saucer it empties
+ * and only THEN tops up, so emptying two saucers while two balls are still
+ * rolling queued two serves on top of two live balls and the table briefly
+ * carried four. The top-up cannot correct it, because a top-up only ever adds.
+ * Capping the debt at its source fixes every caller at once and leaves the
+ * top-up doing exactly what opcode `$6C` does.
  */
 function oweServes(game: Game, count: number): void {
+  const inHand = freeBallCount(game.balls) + heldBallCount(game.locks) + game.pendingServes;
+  const room = MAX_SIMULTANEOUS_BALLS - inHand;
+  count = Math.min(count, room);
   if (count <= 0) return;
   game.pendingServes += count;
   if (game.laneBallId === null && game.serveCountdown === 0) {
@@ -850,19 +1023,44 @@ function oweServes(game: Game, count: number): void {
 function runLocks(game: Game): {
   readonly locked: readonly number[];
   readonly multiballStarted: boolean;
+  readonly awards: readonly Award[];
 } {
   const captured = captureBalls(game.locks, game.balls.balls);
-  if (captured.length === 0) return { locked: [], multiballStarted: false };
+  if (captured.length === 0) return { locked: [], multiballStarted: false, awards: [] };
 
   game.ballsLocked += captured.length;
   const locked = captured.map((capture) => capture.ballId);
 
+  // The lock's own award, taken on the tick the saucer swallows the ball —
+  // `jsr $6b96` at +0x005568, immediately after the ball is flagged held. A
+  // lock that was already occupied never gets here, which is why this is scored
+  // from the capture rather than from the zone pass.
+  const awards: Award[] = [];
+  const devices = game.devices;
+  if (devices !== null) {
+    for (const capture of captured) {
+      const ball = ballById(game.balls, capture.ballId);
+      if (ball === undefined) continue;
+      const award = scoreLock(
+        game.scoring,
+        devices,
+        ball.level,
+        q10ToPixel(ball.x),
+        q10ToPixel(ball.y),
+      );
+      if (award !== null) {
+        applyAward(game.scoring, award);
+        awards.push(award);
+      }
+    }
+  }
+
   if (heldBallCount(game.locks) >= LOCKS_TO_LIGHT_MULTIBALL) {
     startMultiball(game);
-    return { locked, multiballStarted: true };
+    return { locked, multiballStarted: true, awards };
   }
   if (freeBallCount(game.balls) === 0) oweServes(game, 1);
-  return { locked, multiballStarted: false };
+  return { locked, multiballStarted: false, awards };
 }
 
 /**
@@ -1024,12 +1222,51 @@ function runBallSearch(game: Game): number[] {
 
   game.stillTicks = 0;
   game.stillAnchors = [];
+
+  // The coils first. See BALL_SEARCH_PULSES for why this is bounded per serve
+  // rather than per stillness: a pulse that could be earned again by moving
+  // would let a ball be shoved back and forth forever, which is exactly how the
+  // search was defeated once before.
+  if (game.searchPulses > 0) {
+    const spent = BALL_SEARCH_PULSES - game.searchPulses;
+    game.searchPulses -= 1;
+    for (const ball of live) pulseBall(game, ball, spent);
+    game.stillAnchors = anchorsFor(live);
+    return [];
+  }
+
   const lost: number[] = [];
   for (const ball of live) {
     ball.active = false;
     lost.push(ball.id);
   }
   return lost;
+}
+
+/**
+ * Fires the coils at one ball the search has run out of patience with.
+ *
+ * THE FIRST PULSE IS TOWARDS THE MIDDLE OF THE TABLE, because that is the one
+ * direction that is a property of the machine rather than of the ball: it gets a
+ * ball off an outer rail and back into play, and it never drives a ball at the
+ * edge further into a corner it is already stuck in. SUCCESSIVE PULSES
+ * ALTERNATE, because a ball that rolled off one apex and settled on the next one
+ * along needs to be sent back the way it came, and because a search that keeps
+ * repeating one shove is not a search.
+ *
+ * `spent` counts the pulses already used this serve, so the direction is a pure
+ * function of the game state and two identical runs pulse identically.
+ *
+ * Velocity is SET rather than added, like the kicker device's `movem.w` at
+ * +0x0056B0: whatever the ball had, it had been sitting still with it for the
+ * whole search window and it is not worth preserving.
+ */
+function pulseBall(game: Game, ball: BallState, spent: number): void {
+  const centre = game.map.width / 2;
+  const inward = q10ToPixel(ball.x) < centre ? 1 : -1;
+  const sign = spent % 2 === 0 ? inward : -inward;
+  ball.velocityX = sign * BALL_SEARCH_PULSE;
+  ball.velocityY = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1189,11 +1426,17 @@ export interface GameDebugState {
   readonly pendingServes: number;
   readonly multiball: boolean;
   readonly ballsLocked: number;
+  /** Player score, read back out of the packed-BCD field. */
+  readonly score: number;
+  /** Player bonus. Zero throughout the shipped data; see `scoring.ts`. */
+  readonly bonus: number;
   /** Device id to ball id for every occupied saucer, in table order. */
   readonly locks: readonly { readonly deviceId: string; readonly ballId: number }[];
   readonly plungerCharge: number;
   /** Consecutive motionless ticks counted toward the ball search. */
   readonly stillTicks: number;
+  /** Coil pulses the ball search has left before it writes the ball off. */
+  readonly searchPulses: number;
   readonly tilt: TiltState;
   readonly flippersLive: boolean;
   readonly camera: CameraState;
@@ -1227,6 +1470,8 @@ export function debugSnapshot(game: Game): GameDebugState {
     pendingServes: game.pendingServes,
     multiball: game.multiball,
     ballsLocked: game.ballsLocked,
+    score: readBcdField(game.scoring.score),
+    bonus: readBcdField(game.scoring.bonus),
     // Built from the bank's declared device order, never from the map's
     // iteration order, so this stays a determinism digest.
     locks: game.locks.locks.flatMap((device) => {
@@ -1235,6 +1480,7 @@ export function debugSnapshot(game: Game): GameDebugState {
     }),
     plungerCharge: chargeLevel(game.plunger),
     stillTicks: game.stillTicks,
+    searchPulses: game.searchPulses,
     tilt: { ...game.tilt },
     flippersLive: flippersLive(game.tilt),
     camera: { ...game.camera },
@@ -1338,13 +1584,20 @@ function drawFlippers(context: CanvasRenderingContext2D, game: Game, scale: numb
 
 function statusLine(game: Game): string {
   if (game.phase === "attract") return "PRESS ENTER TO START";
-  if (game.phase === "game-over") return "GAME OVER  -  ENTER FOR A NEW GAME";
+  // The score outlives the ball, so it is on the game-over line too — that is
+  // the one moment a player actually wants to read it.
+  if (game.phase === "game-over") {
+    return `GAME OVER  ${formatBcdField(game.scoring.score)}  -  ENTER FOR A NEW GAME`;
+  }
   if (game.paused) return "PAUSED";
   if (game.tilt.tilted) return "TILT";
   const ball = Math.max(1, ballNumber(game));
   const charge = Math.round(chargeLevel(game.plunger) * 100);
   const plunger = game.laneBallId === null ? "" : `  PLUNGER ${charge}%`;
-  return `BALL ${ball} OF ${game.options.ballsPerGame}${plunger}`;
+  // Digits straight out of the BCD field: what is displayed is what is stored.
+  const bonus = readBcdField(game.scoring.bonus);
+  const bonusText = bonus === 0 ? "" : `  BONUS ${formatBcdField(game.scoring.bonus)}`;
+  return `BALL ${ball} OF ${game.options.ballsPerGame}  ${formatBcdField(game.scoring.score)}${bonusText}${plunger}`;
 }
 
 /**
