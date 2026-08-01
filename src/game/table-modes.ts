@@ -58,10 +58,11 @@ export const TABLE_MODES_BASE_PATH = "generated/tables/";
  *   e  element index, -1 when the operand was NULL
  *   s  script index                    m  message index
  *   o  a record this decode has not identified; always -1 here
+ *   l  a count-ladder index (SET_COUNT), -1 when the record hosts no ladder
  *   w  a signed word                   c  a branch target, -1 when it dangles
  *   i  a 32-bit immediate
  */
-export type ModeOperandKind = "e" | "s" | "m" | "o" | "w" | "c" | "i";
+export type ModeOperandKind = "e" | "s" | "m" | "o" | "l" | "w" | "c" | "i";
 
 export interface ModeOpcodeInfo {
   readonly index: number;
@@ -110,6 +111,46 @@ export interface ModeElement {
   /** Award effect 21's ladder step: the script queued when the count is reached. */
   readonly counterScript: number;
   readonly counterTarget: number;
+  /**
+   * Award effect 6's count ladder: index into `TableModes.ladders`, or -1.
+   *
+   * Elements sharing one counter record share one ladder — BabeWatch's three
+   * lock-lit lamps all drive the same per-game lock counter.
+   */
+  readonly ladder: number;
+}
+
+/**
+ * One entry of an effect-6 launcher table: when the ladder's counter reaches
+ * `id`, `script` is queued. The 12-byte records inline at counter+$50.
+ */
+export interface ModeLadderEntry {
+  readonly id: number;
+  readonly script: number;
+}
+
+/**
+ * One decoded count ladder — THE MULTIBALL LOCK DISPATCH, and a generic
+ * count-to-launcher primitive the tables also use for smaller features.
+ *
+ * Award effect 6 (handler main.seg00 0x5E5A) increments the per-player counter
+ * in the element's counter record and walks this table (0x5EAA) comparing the
+ * count against each ascending `id`; on equality the entry's launcher script is
+ * queued. Walking past the 0xFFFE terminator subtracts `wrap` from the counter
+ * and re-walks (0x5F26), so a finished ladder starts over. `wrap` of 0 means
+ * the table ended on 0xFFFF and never wraps.
+ *
+ * BabeWatch's lock ladder is the decoded shape of its multiball rule: ids 1..10
+ * in capture tiers of 1/2/3/4, the tier-completing ids launching the four
+ * multiball modes and the intermediate ids the "n MORE TO START MODE"
+ * alternates — selection is purely positional, one linear per-game counter.
+ * Law 'n Justice's is ids 1..14 in tiers of 2/3/4/5 jail locks with multiball
+ * at ids 2/5/9/14 and wrap 5.
+ */
+export interface ModeLadder {
+  readonly index: number;
+  readonly wrap: number;
+  readonly entries: readonly ModeLadderEntry[];
 }
 
 export interface ModeMessage {
@@ -134,6 +175,13 @@ export interface ModeTrigger {
   /** Surface id for a device binding, zone list index for a zone or lock. */
   readonly id: number;
   readonly script: number;
+}
+
+/** A lock device, named by the zone that feeds it. */
+export interface LockDevice {
+  readonly level: PlayfieldLevel;
+  /** The lock's index in its level's zone list. */
+  readonly index: number;
 }
 
 export interface TableModes {
@@ -162,12 +210,49 @@ export interface TableModes {
    * `mode-vm.ts`.
    */
   readonly armElements: readonly number[];
+  /** The decoded effect-6 count ladders. See `ModeLadder`. */
+  readonly ladders: readonly ModeLadder[];
+  /**
+   * RECONSTRUCTION: the lock-ladder lamps lit at game start.
+   *
+   * The MECHANISM is decoded — a lock only advances the multiball ladder while
+   * its lock-lit lamp element is armed (the capture script's `AWARD` refuses an
+   * unlit element), and the lamp relights itself after every award (`flags &
+   * $A` at 0x5CA8) until a `LAMP_OFF` puts it out. What is NOT located is the
+   * site that lights those lamps for the first time in a fresh game: no
+   * game-init script does it, so it is presumably the per-table native init in
+   * slot 6, which is not decoded.
+   *
+   * The rule used instead, computed from the shipped scripts: a MULTIBALL
+   * ladder's feeder that a LOCK capture script awards, and that no script
+   * directly bound to a physical trigger ever STARTs, is lit at game start. On
+   * the shipped tables that lights BabeWatch's three lock lamps (29/30/31 —
+   * only the selectable jackpot missions relight them, which matches the
+   * operator's finding that the first lock of a game already starts the 2-ball
+   * multiball) plus the two of its five mission-ladder lamps its lock scripts
+   * award (23/25); it leaves Law 'n Justice's jail lamp (26) OUT, because its
+   * lighting is fully decoded — device surface ids 128/129 fire the script
+   * that STARTs it — and lights nothing on Extreme Sports, whose lock-fed
+   * multiball goes through award effect 17, which is not decoded.
+   */
+  readonly litAtGameStart: readonly number[];
   /** The script a device surface id fires on one level, or -1. */
   scriptForDevice(level: PlayfieldLevel, surfaceId: number): number;
   /** The script a trigger zone fires, or -1. */
   scriptForZone(level: PlayfieldLevel, index: number): number;
   /** The script a ball lock fires when it swallows a ball, or -1. */
   scriptForLock(level: PlayfieldLevel, index: number): number;
+  /**
+   * The lock device behind an element index, or null.
+   *
+   * The exporter's element pool files the lock DEVICE records as elements — a
+   * misclassification the scripts force on it, because `PUSH`, `PUSH_LINKED`
+   * and `BALL_REMOVE` name the device record where the other element opcodes
+   * name real elements. This is the join back: an element index that is really
+   * a lock device answers which lock, so the runtime can eject or remove the
+   * ball that device is holding.
+   */
+  lockDeviceForElement(element: number): LockDevice | null;
   opcodeName(op: number): string;
 }
 
@@ -194,11 +279,16 @@ function requireArray(value: unknown, label: string): readonly unknown[] {
   return value;
 }
 
-const OPERAND_KINDS: readonly string[] = ["e", "s", "m", "o", "w", "c", "i"];
+const OPERAND_KINDS: readonly string[] = ["e", "s", "m", "o", "l", "w", "c", "i"];
 
 /** The two opcodes that bracket a mission's use of an arm element. */
 const OPCODE_COMPLETE = 3;
 const OPCODE_CLEAR_DONE = 12;
+/** The opcodes the game-start lamp derivation reads. See `litAtGameStart`. */
+const OPCODE_START = 1;
+const OPCODE_START_TIMED = 2;
+const OPCODE_AWARD = 5;
+const OPCODE_MODE_START = 9;
 
 /** Expands one document into a `TableModes`, checking every cross-reference. */
 export function parseTableModesDocument(doc: TableModesDocument): TableModes {
@@ -258,6 +348,38 @@ export function parseTableModesDocument(doc: TableModesDocument): TableModes {
     messages.push(Object.freeze({ index: at, lines: Object.freeze(lines as string[]) }));
   }
 
+  // The script pool's size is needed before the scripts themselves are walked:
+  // ladder entries and element counter-continuations both name scripts.
+  const rawScripts = requireArray(raw["scripts"], `${label} scripts`);
+  const scriptCount = rawScripts.length;
+
+  // --- ladders -------------------------------------------------------------
+  const ladders: ModeLadder[] = [];
+  for (const [at, entry] of requireArray(raw["ladders"] ?? [], `${label} ladders`).entries()) {
+    const item = entry as Record<string, unknown>;
+    const where = `${label} ladder ${at}`;
+    const index = requireWholeNumber(item["index"], `${where} index`, at, at);
+    const wrap = requireWholeNumber(item["wrap"], `${where} wrap`, 0, 0xffff);
+    const entries: ModeLadderEntry[] = [];
+    let previousId = 0;
+    for (const [entryAt, rawEntry] of requireArray(item["entries"], `${where} entries`).entries()) {
+      const record = rawEntry as Record<string, unknown>;
+      const id = requireWholeNumber(record["id"], `${where} entry ${entryAt} id`, 1, 0xfffd);
+      if (id <= previousId) {
+        throw new Error(`${where} entry ${entryAt} has id ${id} after ${previousId}; ids must ascend`);
+      }
+      previousId = id;
+      entries.push(
+        Object.freeze({
+          id,
+          script: requireWholeNumber(record["script"], `${where} entry ${entryAt} script`, 0, scriptCount - 1),
+        }),
+      );
+    }
+    if (entries.length === 0) throw new Error(`${where} has no entries`);
+    ladders.push(Object.freeze({ index, wrap, entries: Object.freeze(entries) }));
+  }
+
   // --- elements ------------------------------------------------------------
   const rawElements = requireArray(raw["elements"], `${label} elements`);
   const elements: ModeElement[] = [];
@@ -282,14 +404,12 @@ export function parseTableModesDocument(doc: TableModesDocument): TableModes {
         displayAward,
         counterScript: requireWholeNumber(item["counterScript"], `${where} counterScript`, -1, 0xffff),
         counterTarget: requireWholeNumber(item["counterTarget"], `${where} counterTarget`, 0, 0xffff),
+        ladder: requireWholeNumber(item["ladder"] ?? -1, `${where} ladder`, -1, ladders.length - 1),
       }),
     );
   }
 
   // --- scripts -------------------------------------------------------------
-  const rawScripts = requireArray(raw["scripts"], `${label} scripts`);
-  const scriptCount = rawScripts.length;
-
   // Two passes: the shapes first, so a MODE_START can be checked against the
   // real script count rather than against however many happen to be parsed yet.
   const parsed = rawScripts.map((entry, at) => {
@@ -331,6 +451,9 @@ export function parseTableModesDocument(doc: TableModesDocument): TableModes {
         }
         if (kind === "m" && (value < -1 || value >= messages.length)) {
           throw new Error(`${where} names message ${value}, and there are ${messages.length}`);
+        }
+        if (kind === "l" && (value < -1 || value >= ladders.length)) {
+          throw new Error(`${where} names ladder ${value}, and there are ${ladders.length}`);
         }
         // -1 is a branch the record does not contain: several missions share one
         // timeout label that lives outside their own code. The runtime ends the
@@ -386,6 +509,9 @@ export function parseTableModesDocument(doc: TableModesDocument): TableModes {
     throw new Error(`${label} has no triggers block`);
   }
   const triggers = rawTriggers as Record<string, unknown>;
+  // Lock triggers also carry the DEVICE record's slot in the element pool; see
+  // `lockDeviceForElement`. -1 when the exporter could not match the record.
+  const lockDeviceByElement = new Map<number, LockDevice>();
   const readTriggers = (kind: "devices" | "zones" | "locks", idKey: string): Map<string, number> => {
     const out = new Map<string, number>();
     for (const [at, entry] of requireArray(triggers[kind], `${label} ${kind} triggers`).entries()) {
@@ -397,6 +523,15 @@ export function parseTableModesDocument(doc: TableModesDocument): TableModes {
       const bindKey = `${level}:${id}`;
       if (out.has(bindKey)) throw new Error(`${where} binds ${bindKey} twice`);
       out.set(bindKey, script);
+      if (kind === "locks") {
+        const element = requireWholeNumber(item["element"] ?? -1, `${where} element`, -1, elements.length - 1);
+        if (element >= 0) {
+          if (lockDeviceByElement.has(element)) {
+            throw new Error(`${where} files element ${element} as a second lock device`);
+          }
+          lockDeviceByElement.set(element, Object.freeze({ level: (level === 1 ? 1 : 0) as PlayfieldLevel, index: id }));
+        }
+      }
     }
     return out;
   };
@@ -408,8 +543,40 @@ export function parseTableModesDocument(doc: TableModesDocument): TableModes {
 
   const selectable = missions.flatMap((mission, at) => (mission.selected ? [at] : []));
 
+  // The MULTIBALL ladders: an effect-6 ladder one of whose launcher scripts
+  // asks for balls, directly or through the mode it MODE_STARTs. Their feeder
+  // elements are the lock-lit lamps of the decoded multiball rule, and two
+  // derivations below treat them specially.
+  const OPCODE_BALLS_UP_TO = 27;
+  const asksForBalls = (index: number): boolean =>
+    (scripts[index]?.ops ?? []).some((op) => op.op === OPCODE_BALLS_UP_TO);
+  const launchesMultiball = (index: number): boolean =>
+    (scripts[index]?.ops ?? []).some(
+      (op) =>
+        (op.op === OPCODE_BALLS_UP_TO) ||
+        (op.op === OPCODE_MODE_START && (op.args[0] ?? -1) >= 0 && asksForBalls(op.args[0] ?? -1)),
+    );
+  const multiballLadders = new Set<number>();
+  for (const ladder of ladders) {
+    if (ladder.entries.some((entry) => launchesMultiball(entry.script))) {
+      multiballLadders.add(ladder.index);
+    }
+  }
+
   // An arm element is one some mission both COMPLETEs and CLEAR_DONEs. Derived
   // here, once, so the runtime never walks the scripts looking for it.
+  //
+  // MULTIBALL-LADDER FEEDERS ARE EXCLUDED, and the exclusion is a decode
+  // catching up with a reconstruction: the selector reconstruction in
+  // mode-vm.ts treats "an arm element was STARTed" as "a mission may begin",
+  // which was written before award effect 6 was decoded. Law 'n Justice's
+  // jail lamp (element 26) is bracketed by its SHOOT JAIL wizard mode exactly
+  // like an arm shot, but its role is now DECODED — it is the multiball lock
+  // ladder's gate, lit by the SHOOT JAIL targets — and letting the invented
+  // selector hijack its lighting put a mission prologue's COMPLETE on the very
+  // lamp the jail capture was about to award, so the decoded ladder could
+  // never count. An element whose ladder starts a multiball is the multiball
+  // rule's, not the selector's.
   const armElements: number[] = [];
   const completed = new Set<number>();
   const restored = new Set<number>();
@@ -422,9 +589,48 @@ export function parseTableModesDocument(doc: TableModesDocument): TableModes {
     }
   }
   for (const element of completed) {
-    if (restored.has(element)) armElements.push(element);
+    if (!restored.has(element)) continue;
+    if (multiballLadders.has(elements[element]?.ladder ?? -1)) continue;
+    armElements.push(element);
   }
   armElements.sort((a, b) => a - b);
+
+  // --- the game-start lamps, derived ---------------------------------------
+  //
+  // RECONSTRUCTION, and the derivation is the label: see `litAtGameStart` on
+  // the interface. Three conditions, all computed from the shipped data:
+  //
+  //   1. the element feeds a MULTIBALL ladder (above);
+  //   2. a LOCK capture script AWARDs it, so it is a lock-lit lamp;
+  //   3. no script directly bound to a physical trigger STARTs it — where one
+  //      does, the lighting is decoded and the shot is the rule (Law 'n
+  //      Justice's jail lamp 26, lit by device surface ids 128/129).
+  const triggerScripts = new Set<number>([
+    ...deviceTriggers.values(),
+    ...zoneTriggers.values(),
+    ...lockTriggers.values(),
+  ]);
+  const triggerStarted = new Set<number>();
+  for (const at of triggerScripts) {
+    for (const op of scripts[at]?.ops ?? []) {
+      const operand = op.args[0] ?? -1;
+      if ((op.op === OPCODE_START || op.op === OPCODE_START_TIMED) && operand >= 0) {
+        triggerStarted.add(operand);
+      }
+    }
+  }
+  const litAtGameStart: number[] = [];
+  for (const script of lockTriggers.values()) {
+    for (const op of scripts[script]?.ops ?? []) {
+      const operand = op.args[0] ?? -1;
+      if (op.op !== OPCODE_AWARD || operand < 0) continue;
+      const element = elements[operand];
+      if (element === undefined || !multiballLadders.has(element.ladder)) continue;
+      if (triggerStarted.has(operand) || litAtGameStart.includes(operand)) continue;
+      litAtGameStart.push(operand);
+    }
+  }
+  litAtGameStart.sort((a, b) => a - b);
 
   return Object.freeze({
     tableId,
@@ -436,6 +642,8 @@ export function parseTableModesDocument(doc: TableModesDocument): TableModes {
     missions: Object.freeze(missions),
     selectable: Object.freeze(selectable),
     armElements: Object.freeze(armElements),
+    ladders: Object.freeze(ladders),
+    litAtGameStart: Object.freeze(litAtGameStart),
     scriptForDevice(level: PlayfieldLevel, surfaceId: number): number {
       return deviceTriggers.get(`${level === 1 ? 1 : 0}:${surfaceId}`) ?? -1;
     },
@@ -444,6 +652,9 @@ export function parseTableModesDocument(doc: TableModesDocument): TableModes {
     },
     scriptForLock(level: PlayfieldLevel, index: number): number {
       return lockTriggers.get(`${level === 1 ? 1 : 0}:${index}`) ?? -1;
+    },
+    lockDeviceForElement(element: number): LockDevice | null {
+      return lockDeviceByElement.get(element) ?? null;
     },
     opcodeName(op: number): string {
       return opcodeNames[op] ?? `op${op}`;

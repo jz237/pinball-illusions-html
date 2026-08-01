@@ -328,7 +328,7 @@ describe("a mission", () => {
     expect(missionRunning(state)).toBe(true);
     state.done[0] = 1;
 
-    resetModesForNewBall(state);
+    resetModesForNewBall(modes, state);
     expect(missionRunning(state)).toBe(false);
     expect(litElements(state)).toEqual([]);
     expect(state.queueRead).toBe(0);
@@ -534,7 +534,7 @@ describe("the missions, wired into a real game", () => {
     startSelectedMission(modesFor("law-n-justice"), state);
     runTicks(game, { sample: () => IDLE_SNAPSHOT }, 5);
     // Force the end of the ball the way a drain does.
-    resetModesForNewBall(state);
+    resetModesForNewBall(modesFor("law-n-justice"), state);
     expect(runningMission(game)).toBeNull();
 
     state.done[0] = 1;

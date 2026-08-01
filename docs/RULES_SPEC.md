@@ -40,8 +40,11 @@ searching for an award table found nothing. And there are two independent
 geometry-to-award keys: the per-pixel surface-id map in slot 1, whose ids ≥ 32 index a
 per-level array of device records; and the 14-byte zone rectangles in each table
 module, whose type-1 and type-4 records carry the award inline. Both are decoded below.
-The remaining gap is the per-table SCRIPT — which mode a device starts, and how many
-locks light multiball — and that has not been located.
+The remaining gap was the per-table SCRIPT — which mode a device starts, and how many
+locks light multiball. It has since been located and decoded: the mode bytecode
+export (`scripts/export-table-modes.mjs`) carries the scripts, and the lock-multiball
+dispatch is award effect 6's per-game counter walking the launcher table inline at
+its counter record's +$50. See `GAMEPLAY_PARITY.md`, "Defining feature: multiball".
 
 Four independent investigators produced the underlying work. **Two of them contradicted
 each other on the most load-bearing number in the document** (award magnitudes, by a

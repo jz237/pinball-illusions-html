@@ -46,9 +46,17 @@
  *   - the wait: timeout first, then the armed bit, then fall through
  *   - `AWARD`'s refusals (done bit set, or armed bit already clear) and its
  *     packed-BCD payment through $6B96
- *   - `BALLS_UP_TO`'s ceiling of three, and `BALL_REMOVE` taking a ball off the
- *     table into the trough
- *   - award effects 21 (advance the ladder) and 23 (add time to the mode timer)
+ *   - `BALLS_UP_TO`'s ceiling of three, and `BALL_REMOVE` taking a lock
+ *     device's held ball off the table into the trough
+ *   - award effects 6 (the COUNT DISPATCH — the multiball lock ladder, see
+ *     `applyAwardEffect`), 21 (advance the ladder) and 23 (add time)
+ *   - the AWARD relight for elements whose flags carry a bit of $A, which is
+ *     what keeps a lock-lit lamp lit across its own award (0x5CA8)
+ *   - `SET_COUNT` writing a counter record's per-player counts (0x5C64), which
+ *     is how BabeWatch's jackpot missions arm the multiball tiers
+ *   - `PUSH`/`PUSH_LINKED` on a lock DEVICE record ejecting the held ball
+ *     (0x5BFC/0x5C14 push it at `$23DC`, the popper 0x7078 ejects), and the
+ *     exporter's "element" reading of those operands being a misclassification
  *
  * RECONSTRUCTED, and labelled `RECONSTRUCTION` at each site:
  *   - `TICKS_PER_SECOND`. The engine multiplies a wait's operand by `$50(a5)`,
@@ -68,18 +76,21 @@
  * search cannot help because there is no ball to search for.
  *
  * ---------------------------------------------------------------------------
- * NINE OPCODES DO NOTHING, ON PURPOSE
+ * EIGHT OPCODES DO NOTHING, ON PURPOSE
  * ---------------------------------------------------------------------------
  * `KICK_IF`, `LINK_RESTORE`, `SET_VALUE`, `RESET_GROUP`, `RESTORE_POS`,
- * `CLEAR_BYTE`, `SET_MAX`, `SET_COUNT` and `SET_COUNT_SELF` take a pointer to a
- * record type nobody has identified — their operands fail the packed-BCD test
- * that every real element passes, which is how they were caught. Guessing at
- * them would put invented behaviour into the middle of a decoded mission. They
- * are counted in `ModeTickReport.unimplemented` so the cost of not knowing is
- * visible rather than silent.
+ * `CLEAR_BYTE`, `SET_MAX` and `SET_COUNT_SELF` take a pointer to a record type
+ * nobody has identified — their operands fail the packed-BCD test that every
+ * real element passes, which is how they were caught. Guessing at them would
+ * put invented behaviour into the middle of a decoded mission. They are counted
+ * in `ModeTickReport.unimplemented` so the cost of not knowing is visible
+ * rather than silent. `SET_COUNT` used to be on this list; its record is now
+ * identified (the effect-6/effect-21 counter record) and its handler decoded,
+ * so it runs — except where its record hosts no decoded ladder, which is still
+ * counted.
  */
 
-import type { ModeElement, ModeScript, TableModes } from "./table-modes.js";
+import type { LockDevice, ModeElement, ModeScript, TableModes } from "./table-modes.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -119,6 +130,7 @@ const OP_LAMP_OFF = 14;
 const OP_MESSAGE = 17;
 const OP_ANIMATE = 19;
 const OP_NATIVE = 20;
+const OP_SET_COUNT = 21;
 const OP_JMP_IF_UNLIT = 23;
 const OP_PUSH_LINKED = 24;
 /**
@@ -148,8 +160,22 @@ const OP_SET_RESUME = 30;
 const OP_SET_LOOP = 31;
 
 /** Award effects with decoded handlers. Everything else is left alone. */
+const EFFECT_COUNT_DISPATCH = 6;
 const EFFECT_ADVANCE_LADDER = 21;
 const EFFECT_ADD_TIME = 23;
+
+/**
+ * MEASURED: the element flag bits that relight a lamp the moment it is awarded.
+ *
+ * The AWARD handler at 0x5CA8 clears the armed bit (`bclr.b d6,$1(a2)`), pays,
+ * and then — when the element's flags word has a bit of $A set — sets the bit
+ * straight back, so the lamp stays lit until a `LAMP_OFF` puts it out. This is
+ * what lets one saucer advance the multiball lock ladder capture after capture:
+ * BabeWatch's lock lamps carry flags $09 and Law 'n Justice's jail lamp $28,
+ * both with a relight bit. No element any mission WAITs on carries one, checked
+ * across all three tables, so the relight cannot stall a mission's wait.
+ */
+const FLAGS_RELIGHT = 0x0a;
 
 // ---------------------------------------------------------------------------
 // State
@@ -173,6 +199,18 @@ export interface ModeState {
   readonly timers: Int32Array;
   /** Award effect 21's progress count, per element. */
   readonly counts: Int32Array;
+  /**
+   * Award effect 6's per-ladder counters — the original's per-player words at
+   * counter-record +$16, the live multiball-lock count. Per GAME, never reset
+   * by a new ball: nothing in the engine resets these per ball (checked — the
+   * only writers are the effect-6 increment, the 0xFFFE wrap subtract and
+   * SET_COUNT). Whether a fresh GAME starts from zero is an unresolved residue
+   * — no code clearing the arrays was found, so either the table module is
+   * reloaded per game or the count persists across games in a session; this
+   * reconstruction takes the reload reading and starts each game at zero,
+   * which the disk image's zeroed fields support.
+   */
+  readonly ladderCounts: Int32Array;
 
   /** The background ring at `$2396(a5)`; -1 is an empty slot. */
   readonly queue: Int32Array;
@@ -209,11 +247,16 @@ export interface ModeState {
 
 export function createModeState(modes: TableModes): ModeState {
   const count = modes.elements.length;
+  const armed = new Uint8Array(count);
+  // The game-start lamps. RECONSTRUCTION — the derivation, and why it is one,
+  // is at `TableModes.litAtGameStart`.
+  for (const element of modes.litAtGameStart) armed[element] = 1;
   return {
-    armed: new Uint8Array(count),
+    armed,
     done: new Uint8Array(count),
     timers: new Int32Array(count),
     counts: new Int32Array(count),
+    ladderCounts: new Int32Array(modes.ladders.length),
     queue: new Int32Array(MODE_QUEUE_SLOTS).fill(-1),
     queueWrite: 0,
     queueRead: 0,
@@ -241,9 +284,14 @@ export function createModeState(modes: TableModes): ModeState {
  * reconstruction (see the divergence note in the header). The DONE bits are per
  * player and per game and are NOT cleared, exactly as the scoring layer's flag
  * bytes are not: a shot a player has finished stays finished across a ball.
+ * The effect-6 ladder counters are per game too — nothing in the engine resets
+ * them per ball — and the game-start lamps come back on, because clearing the
+ * armed bits at all is this reconstruction's own divergence and a ball that
+ * started with its lock lamps dark could never advance the multiball ladder.
  */
-export function resetModesForNewBall(state: ModeState): void {
+export function resetModesForNewBall(modes: TableModes, state: ModeState): void {
   state.armed.fill(0);
+  for (const element of modes.litAtGameStart) state.armed[element] = 1;
   state.timers.fill(0);
   state.queue.fill(-1);
   state.queueWrite = 0;
@@ -402,6 +450,20 @@ export interface ModeTickReport {
   readonly ballsUpTo: number;
   /** How many balls `BALL_REMOVE` asked the machine to take off the table. */
   readonly ballsRemoved: number;
+  /**
+   * Lock devices whose held ball a `PUSH`/`PUSH_LINKED` ejected this tick.
+   *
+   * MEASURED mechanism: PUSH's handler 0x5BFC stacks the lock DEVICE record at
+   * `$23DC(a5)` and the per-frame popper 0x7078 runs a $4C-frame timer, then
+   * physically ejects the held ball using the device's own position and
+   * impulse words (+$06..+$0D) — which is how every non-final lock of a
+   * multiball ladder gives the ball back. The caller decides what "eject"
+   * means in this port; see `runModes` in game-loop.ts for the labelled
+   * divergence (trough and serve queue, not an in-place kick).
+   */
+  readonly lockEjects: readonly LockDevice[];
+  /** Lock devices whose held ball `BALL_REMOVE` took off the table. */
+  readonly lockRemoves: readonly LockDevice[];
   /** Opcodes executed whose behaviour is not decoded. See the header. */
   readonly unimplemented: number;
 }
@@ -414,6 +476,8 @@ export const EMPTY_MODE_TICK: ModeTickReport = Object.freeze({
   missionEnded: false,
   ballsUpTo: 0,
   ballsRemoved: 0,
+  lockEjects: Object.freeze([]),
+  lockRemoves: Object.freeze([]),
   unimplemented: 0,
 });
 
@@ -424,6 +488,8 @@ interface Accumulator {
   missionEnded: boolean;
   ballsUpTo: number;
   ballsRemoved: number;
+  lockEjects: LockDevice[];
+  lockRemoves: LockDevice[];
   unimplemented: number;
 }
 
@@ -486,6 +552,10 @@ function awardElement(
   if (state.armed[index] === 0) return;
   state.armed[index] = 0;
   state.timers[index] = 0;
+  // MEASURED: the relight. 0x5CA8 sets the armed bit straight back when the
+  // element's flags carry a bit of $A, so a lock-lit lamp survives its own
+  // award and the next capture counts too. See `FLAGS_RELIGHT`.
+  if ((element.flags & FLAGS_RELIGHT) !== 0) state.armed[index] = 1;
 
   out.awards.push({
     element: index,
@@ -498,9 +568,19 @@ function awardElement(
 }
 
 /**
- * The award-effect table at 0x5D0E. Two of its entries are decoded well enough
- * to run and both matter for progression; the rest are left alone.
+ * The award-effect table at 0x5D0E. Three of its entries are decoded well
+ * enough to run and all three matter for progression; the rest are left alone.
  *
+ *    6, handler 0x5E5A — the COUNT DISPATCH, and the decoded multiball lock
+ *       rule. Increments the per-game counter shared by every element pointing
+ *       at the same record, then walks the launcher table inline at the
+ *       record's +$50 (0x5EAA): the entry whose ascending id equals the count
+ *       has its script queued through $6C10, and walking past the 0xFFFE
+ *       terminator subtracts the wrap word from the count and re-walks
+ *       (0x5F26). The Nth qualifying lock therefore runs the Nth launcher —
+ *       "BALL 1 LOCKED" through the multiball MODE_STARTs and the "n MORE TO
+ *       START MODE" alternates are all just positions on one linear per-game
+ *       counter. See `ModeLadder` in table-modes.ts for the decoded tables.
  *   21, handler 0x5FA8 — the LADDER. Increments the element's progress count and,
  *       when the target in the counter record is reached, queues the next step.
  *       This is how a mission's later shots get armed at all.
@@ -513,6 +593,20 @@ function applyAwardEffect(
   index: number,
   element: ModeElement,
 ): void {
+  if (element.effect === EFFECT_COUNT_DISPATCH) {
+    const ladder = element.ladder < 0 ? undefined : modes.ladders[element.ladder];
+    if (ladder === undefined || ladder.entries.length === 0) return;
+    let count = (state.ladderCounts[element.ladder] ?? 0) + 1;
+    // The wrap, exactly as 0x5F26 does it: run off the end, subtract, re-walk.
+    // Bounded so a wrap word that cannot catch the count (or a wrap of zero,
+    // the 0xFFFF-terminated tables) ends the walk instead of spinning.
+    const lastId = ladder.entries[ladder.entries.length - 1]?.id ?? 0;
+    while (ladder.wrap > 0 && count > lastId) count -= ladder.wrap;
+    state.ladderCounts[element.ladder] = count;
+    const entry = ladder.entries.find((one) => one.id === count);
+    if (entry !== undefined) queueScript(state, entry.script);
+    return;
+  }
   if (element.effect === EFFECT_ADVANCE_LADDER) {
     state.counts[index] = (state.counts[index] ?? 0) + 1;
     if (element.counterScript >= 0 && (state.counts[index] ?? 0) >= Math.max(1, element.counterTarget)) {
@@ -581,17 +675,45 @@ function step(
       return next;
     }
 
-    case OP_LAMP_OFF:
-    case OP_PUSH: {
-      // LAMP_OFF puts a lit shot out. PUSH also clears the element's flag bit
-      // and pushes it on the `$23DC` stack, and nothing that POPS that stack has
-      // been decoded — so the stack half is not reproduced, and this is the half
-      // that is. See the dynamic-link note in the exporter.
+    case OP_LAMP_OFF: {
       const index = args[0] ?? -1;
       if (index >= 0) {
         state.armed[index] = 0;
         state.timers[index] = 0;
       }
+      return next;
+    }
+
+    case OP_PUSH:
+    case OP_PUSH_LINKED: {
+      // DECODED, and it closed the last open question about locks: the operand
+      // is not an element at all but a lock DEVICE record. The handlers 0x5BFC
+      // and 0x5C14 push it onto the stack at `$23DC(a5)`, and the per-frame
+      // popper at 0x7078 pops one, runs a $4C-frame timer and physically
+      // ejects the ball that device is holding — the intermediate steps of a
+      // multiball lock ladder spit the ball back out, and only the
+      // tier-completing step (which never pushes) leaves it held for
+      // `BALL_REMOVE`. The eject itself is reported to the caller; where the
+      // ball reappears in this port is game-loop.ts's labelled call.
+      const device = modes.lockDeviceForElement(args[0] ?? -1);
+      if (device !== null) {
+        out.lockEjects.push(device);
+        return next;
+      }
+      // A push of anything that is not a lock device is the dynamic-link use,
+      // whose consumer is still undecoded. The old reading — treat the operand
+      // as an element and put its lamp out — is kept for PUSH, since that is
+      // what the exporter's element pool made of the operand and nothing that
+      // has been traced contradicts it for the non-lock records.
+      if (instruction.op === OP_PUSH) {
+        const index = args[0] ?? -1;
+        if (index >= 0) {
+          state.armed[index] = 0;
+          state.timers[index] = 0;
+        }
+        return next;
+      }
+      out.unimplemented += 1;
       return next;
     }
 
@@ -630,12 +752,29 @@ function step(
     }
 
     case OP_BALL_REMOVE: {
-      const index = args[0] ?? -1;
-      if (index >= 0) {
-        state.armed[index] = 0;
-        state.timers[index] = 0;
-      }
+      // The operand names the lock DEVICE whose held ball leaves the table for
+      // the trough — Law 'n Justice's multiball modes do `BALL_REMOVE <jail>`
+      // and then `BALLS_UP_TO`, so the removed ball comes back as part of the
+      // top-up rather than as its own serve.
+      const device = modes.lockDeviceForElement(args[0] ?? -1);
+      if (device !== null) out.lockRemoves.push(device);
       out.ballsRemoved += 1;
+      return next;
+    }
+
+    case OP_SET_COUNT: {
+      // DECODED: 0x5C64 writes the operand word into both per-player counts of
+      // the named counter record. Where the record hosts a launcher table the
+      // export names the ladder, and this is how BabeWatch's jackpot missions
+      // arm the multiball tiers — SET_COUNT 0/1/3/6 puts the lock counter at
+      // the base of tiers 1..4. A SET_COUNT whose record is not a decoded
+      // ladder still has nowhere to go and stays counted as unimplemented.
+      const ladder = args[0] ?? -1;
+      if (ladder >= 0 && ladder < state.ladderCounts.length) {
+        state.ladderCounts[ladder] = args[1] ?? 0;
+        return next;
+      }
+      out.unimplemented += 1;
       return next;
     }
 
@@ -675,13 +814,11 @@ function step(
       state.resumePc = args[0] ?? -1;
       return next;
 
-    case OP_PUSH_LINKED:
     case OP_VIEW_WIDE:
     case OP_ANIMATE:
     case OP_NATIVE:
-      // PUSH_LINKED needs the undecoded stack; VIEW_WIDE asks for a screen mode
-      // this port does not have; ANIMATE and NATIVE reach graphics and per-table
-      // 68k code that is not being emulated.
+      // VIEW_WIDE asks for a screen mode this port does not have; ANIMATE and
+      // NATIVE reach graphics and per-table 68k code that is not being emulated.
       out.unimplemented += 1;
       return next;
 
@@ -792,6 +929,8 @@ export function tickModes(modes: TableModes, state: ModeState): ModeTickReport {
     missionEnded: false,
     ballsUpTo: 0,
     ballsRemoved: 0,
+    lockEjects: [],
+    lockRemoves: [],
     unimplemented: 0,
   };
 
@@ -812,6 +951,8 @@ export function tickModes(modes: TableModes, state: ModeState): ModeTickReport {
     !out.missionEnded &&
     out.ballsUpTo === 0 &&
     out.ballsRemoved === 0 &&
+    out.lockEjects.length === 0 &&
+    out.lockRemoves.length === 0 &&
     out.unimplemented === 0
   ) {
     return EMPTY_MODE_TICK;
@@ -823,6 +964,8 @@ export function tickModes(modes: TableModes, state: ModeState): ModeTickReport {
     missionEnded: out.missionEnded,
     ballsUpTo: out.ballsUpTo,
     ballsRemoved: out.ballsRemoved,
+    lockEjects: out.lockEjects,
+    lockRemoves: out.lockRemoves,
     unimplemented: out.unimplemented,
   };
 }

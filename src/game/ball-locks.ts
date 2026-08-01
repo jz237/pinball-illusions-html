@@ -24,11 +24,39 @@
  *       it out of the saucer
  *     - that the multiball opcode is a TOP-UP to a requested ball count, and
  *       that it refuses any count above THREE
+ *     - HOW LOCKS START MULTIBALL — decoded end to end, and it is script data
+ *       driven by one shared-engine primitive, not an engine rule. The capture
+ *       handler runs the lock's own script (device+$14, `jsr $6c10` at 0x557A);
+ *       on the tables with a lock multiball that script AWARDs a lock-lit lamp
+ *       element whose award effect 6 (handler 0x5E5A) bumps a per-game counter
+ *       and runs the launcher whose ascending id in the table inline at the
+ *       counter record's +$50 equals the count (0x5EAA; 0xFFFE wraps, 0x5F26).
+ *       The Nth qualifying capture of a game therefore runs the Nth launcher:
+ *       BabeWatch's ladder is tiers of 1/2/3/4 locks whose tier-completing
+ *       ids MODE_START the four multiball modes (BALLS_UP_TO 2/3/2/3 — the
+ *       FIRST lock of a fresh game starts a two-ball multiball) and whose
+ *       intermediate ids print "n MORE TO START MODE"; Law 'n Justice's is
+ *       tiers of 2/3/4/5 jail locks with multiball at ids 2/5/9/14 and every
+ *       later multiball costing 5 locks. Only the scripted saucers feed it —
+ *       BabeWatch's three level-0 grid saucers and Law 'n Justice's jail; the
+ *       other rectangles award and eject without counting. The whole mechanism
+ *       lives in `mode-vm.ts` (effect 6, SET_COUNT, the AWARD relight) on the
+ *       tables exported by `scripts/export-table-modes.mjs`; this module keeps
+ *       the devices. The engine's own lock counters at device+$03 and
+ *       `$23E4(a5)` are ornaments — written, never read — exactly as the
+ *       earlier decode concluded; the live counter is in the table package.
  *
  *   RECONSTRUCTED, and labelled as such wherever it appears
- *     - HOW MANY LOCKS LIGHT MULTIBALL. See `LOCKS_TO_LIGHT_MULTIBALL`.
  *     - that capturing the last ball in play serves a replacement.
  *       See `BALL_LOCK_RULES_NOTE`.
+ *     - WHERE AN EJECTED BALL REAPPEARS. The decoded eject (PUSH's popper,
+ *       0x7078) kicks the ball out of the saucer in place, using authored
+ *       position and impulse words at device+$06..$0D that are not yet
+ *       exported; this port returns it through the trough and the serve queue
+ *       instead, like every other release. See `runModes` in game-loop.ts.
+ *     - WHICH LOCK LAMPS ARE LIT AT GAME START. The gate is measured (AWARD
+ *       refuses an unlit lamp), the initial lighting site is not located; see
+ *       `litAtGameStart` in table-modes.ts for the derived stand-in.
  *
  * ---------------------------------------------------------------------------
  * THE ENGINE'S CAPTURE PATH, WHICH THIS IMPLEMENTS
@@ -54,8 +82,8 @@
  * either. And release, opcode $68 at data 0x5B4E, does not kick it out of the
  * saucer — it clears the flag, decrements the live count, re-initialises the
  * ball object and increments the serve queue at `$D86(a5)`. Locked balls come
- * back out of the PLUNGER LANE, one at a time, which is why `startMultiball`
- * below queues serves instead of teleporting anything.
+ * back out of the PLUNGER LANE, one at a time, which is why every release in
+ * this module queues serves instead of teleporting anything.
  *
  * ---------------------------------------------------------------------------
  * THE AWARDS ARE DECODED BUT NOT WIRED, ON PURPOSE
@@ -119,68 +147,34 @@ import { q10ToPixel } from "../core/fixed-point.js";
 export const MAX_SIMULTANEOUS_BALLS = 3;
 
 /**
- * How many balls a multiball puts into play: the ceiling.
+ * THE TWO-SAUCERS RULE IS GONE, AND THIS COMMENT IS ITS HEADSTONE.
  *
- * Opcode `$6C` takes the target as a word parameter and merely refuses anything
- * over three, so two-ball and three-ball multiballs are both expressible and the
- * choice is per-table script data this project does not have. Three is used
- * because every published description of all three tables' multiball describes
- * more than two balls, and because it is what "lock two, the third starts it"
- * gives — see `LOCKS_TO_LIGHT_MULTIBALL`.
+ * This file used to export `LOCKS_TO_LIGHT_MULTIBALL = 2` ("two saucers held
+ * lights a three-ball multiball") and `MULTIBALL_BALL_COUNT = 3`, both
+ * labelled reconstructions, because the shared engine keeps two lock counters
+ * and reads neither and the per-table script streams had not been located. The
+ * dispatch is now DECODED — award effect 6's per-game counter walking the
+ * launcher table at counter+$50, see the header — and it replaces both
+ * constants outright: how many locks, which locks, how many balls, and what
+ * the display says at every step are all shipped script data run by
+ * `mode-vm.ts`. The old rule was TIGHTER than BabeWatch's real one (whose
+ * first lock already starts a two-ball multiball) and LOOSER than Law 'n
+ * Justice's (which needs two counted JAIL locks, with the jail lamp lit by the
+ * SHOOT JAIL targets first, and never counts the other two saucers at all).
+ *
+ * A game built without a mission layer — every synthetic-map physics test —
+ * therefore has NO multiball at all now, which is honest: the engine alone
+ * never had one.
  */
-export const MULTIBALL_BALL_COUNT = 3;
-
-/**
- * RECONSTRUCTION. Balls that must be locked before multiball starts: two.
- *
- * This is the one rule in the file that is not decoded, and the reason is a
- * result rather than a gap. The shared engine holds every primitive — capture at
- * data 0x552A, release at data 0x5B4E, top-up at data 0x5BCC, end-detection at
- * data 0x5794 — and it maintains TWO lock counters, one per device at `+$03` and
- * a global at `$23E4(a5)`. It reads NEITHER. `$23E4` is written at exactly one
- * site, data 0x5554, and read at zero sites across main.seg00 and main.seg01.
- * Worse, `+$02` of the device record, the byte that gates those increments, is
- * ZERO on every type-4 device on all three tables as shipped, so the counting
- * path is dead at load time. The rule therefore lives in per-table script data,
- * and the script streams have not been located in the table modules.
- *
- * Two is chosen, not guessed at random:
- *
- *   - BabeWatch says so itself. Its module carries the strings "LOCK 1 BALL 4
- *     M-BALL" and "LOCK 2 BALLS 4 M-BALL" at data 18570..18838, beside "BALL 1
- *     LOCKED".."BALL 4 LOCKED". Two balls locked plus the one in play is three,
- *     which is the engine's ceiling exactly.
- *   - It is the only value that reaches the ceiling without exceeding it. One
- *     lock gives a two-ball multiball and wastes the third; three locks is
- *     impossible, because the third ball would have to be locked while no ball
- *     was in play.
- *
- * For Law 'n Justice and Extreme Sports there is no such string — Extreme Sports
- * has no lock or multiball string at all — so two is a reconstruction on those
- * tables and is labelled one.
- *
- * THE SCRIPTS ARE NOW LOCATED, AND THEY SAY THE REAL RULE IS LOOSER — this
- * paragraph is the trail for whoever wires it. The mode-VM export reads every
- * lock device's own capture script (device+$14, `jsr $6c10` at 0x557A): they
- * award and light lamps and never start a multiball themselves. The multiball
- * scripts are separate, and on BabeWatch they form a per-game LADDER: launcher
- * scripts 110/114/117/119 print "BALL 1..4 LOCKED" and MODE_START the modes at
- * scripts 179 (BALLS_UP_TO 2), 182 (3), 188 (2), 192 (3) — the FIRST lock of a
- * game already starts a two-ball multiball. LnJ's scripts 93/94 do BALL_REMOVE
- * then BALLS_UP_TO 2/3. What is still missing is the dispatch that runs the Nth
- * launcher on the Nth capture (nothing in the export references scripts
- * 110..119; their mission records carry selector -1), so this constant stays
- * the shipped reconstruction — now known to be TIGHTER than the original's
- * BabeWatch rule, which matters at the measured flipper energies because the
- * upper saucers are rarely reachable there. See docs/GAMEPLAY_PARITY.md.
- */
-export const LOCKS_TO_LIGHT_MULTIBALL = 2;
 
 /** Says out loud which parts of the lock behaviour are invented. For the UI and for tests. */
 export const BALL_LOCK_RULES_NOTE =
-  "Lock rectangles, capture, freeze, release-to-serve-queue and the three-ball " +
-  "ceiling are decoded from the original. How many locks light multiball " +
-  "(two) and that capturing the last ball in play serves a replacement are " +
+  "Lock rectangles, capture, freeze, release-to-serve-queue, the three-ball " +
+  "ceiling and the multiball lock ladder (award effect 6: the Nth counted " +
+  "lock runs the Nth launcher script) are decoded from the original. That " +
+  "capturing the last ball in play serves a replacement, that an ejected " +
+  "lock ball returns through the trough rather than being kicked from the " +
+  "saucer, and which lock lamps are lit at game start are " +
   "reconstruction, not decoded fact.";
 
 // ---------------------------------------------------------------------------
@@ -198,6 +192,13 @@ export interface BallLock {
   /** Stable name, so a failing test says which saucer broke. */
   readonly id: string;
   readonly level: PlayfieldLevel;
+  /**
+   * The lock's index in its level's shipped zone list — the same index the
+   * devices export files it under and the mission layer binds its capture
+   * script to (`triggers.locks` in the modes document), and the name a
+   * `PUSH`/`BALL_REMOVE` eject comes back under. Decoded, not assigned.
+   */
+  readonly zoneIndex: number;
   readonly minX: number;
   readonly minY: number;
   readonly maxX: number;
@@ -207,12 +208,13 @@ export interface BallLock {
 function lock(
   id: string,
   level: PlayfieldLevel,
+  zoneIndex: number,
   minX: number,
   minY: number,
   maxX: number,
   maxY: number,
 ): BallLock {
-  return Object.freeze({ id, level, minX, minY, maxX, maxY });
+  return Object.freeze({ id, level, zoneIndex, minX, minY, maxX, maxY });
 }
 
 /**
@@ -243,20 +245,20 @@ export const BALL_LOCKS_BY_TABLE: Readonly<Record<TableId, readonly BallLock[]>>
   // the left green crater under the CITY JAIL sign — an independent corroboration
   // from the surface map that something catches a ball there.
   "law-n-justice": Object.freeze([
-    lock("jail-top", 0, 85, 60, 145, 100),
-    lock("right-crater", 0, 235, 165, 260, 190),
-    lock("jail-throat", 0, 55, 170, 85, 200),
+    lock("jail-top", 0, 5, 85, 60, 145, 100),
+    lock("right-crater", 0, 6, 235, 165, 260, 190),
+    lock("jail-throat", 0, 7, 55, 170, 85, 200),
   ]),
   babewatch: Object.freeze([
-    lock("grid-top", 0, 66, 48, 86, 68),
-    lock("grid-mid", 0, 152, 110, 172, 130),
-    lock("top-lane", 0, 145, 14, 165, 34),
-    lock("lower-bowl", 0, 200, 250, 230, 295),
-    lock("upper-deck", 1, 70, 40, 110, 80),
+    lock("grid-top", 0, 15, 66, 48, 86, 68),
+    lock("grid-mid", 0, 16, 152, 110, 172, 130),
+    lock("top-lane", 0, 17, 145, 14, 165, 34),
+    lock("lower-bowl", 0, 18, 200, 250, 230, 295),
+    lock("upper-deck", 1, 8, 70, 40, 110, 80),
   ]),
   "extreme-sports": Object.freeze([
-    lock("bowl", 0, 249, 159, 269, 179),
-    lock("upper-orbit", 1, 65, 10, 105, 50),
+    lock("bowl", 0, 12, 249, 159, 269, 179),
+    lock("upper-orbit", 1, 10, 65, 10, 105, 50),
   ]),
 });
 
@@ -308,6 +310,41 @@ export function heldBallCount(bank: LockBank): number {
 /** The ball a given saucer is holding, or null. */
 export function heldBallIn(bank: LockBank, deviceId: string): number | null {
   return bank.held.get(deviceId) ?? null;
+}
+
+/** The lock filed under a zone-list index on one level, or null. */
+export function lockForZone(
+  bank: LockBank,
+  level: PlayfieldLevel,
+  zoneIndex: number,
+): BallLock | null {
+  return bank.locks.find((one) => one.level === level && one.zoneIndex === zoneIndex) ?? null;
+}
+
+/**
+ * Empties ONE saucer, sending its ball to the trough, and returns the ball id.
+ *
+ * The single-device counterpart of `releaseHeldBalls`, for the decoded script
+ * opcodes that name a specific lock: `PUSH`'s eject and `BALL_REMOVE`. Same
+ * semantics — the ball is deactivated, not dropped onto the playfield — and the
+ * caller decides whether the trough owes a serve for it.
+ */
+export function releaseLock(
+  bank: LockBank,
+  deviceId: string,
+  balls: readonly BallState[],
+): number | null {
+  const ballId = bank.held.get(deviceId);
+  if (ballId === undefined) return null;
+  bank.held.delete(deviceId);
+  const ball = balls.find((one) => one.id === ballId);
+  if (ball !== undefined) {
+    ball.heldBy = null;
+    ball.active = false;
+    ball.velocityX = 0;
+    ball.velocityY = 0;
+  }
+  return ballId;
 }
 
 /** One capture, for the tick report. */

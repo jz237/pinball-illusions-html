@@ -10,8 +10,10 @@
  *      rather than to the playfield. These are decoded from the original and the
  *      assertions are literal.
  *   2. THE MACHINE, against the assembled game on real geometry: a captured ball
- *      stops moving and stops draining, the player gets a replacement, two locks
- *      light multiball, three balls come out of the lane one after another, the
+ *      stops moving and stops draining, the player gets a replacement, the
+ *      DECODED lock ladder starts each table's own multiball — BabeWatch's
+ *      first counted lock, Law 'n Justice's second lit jail lock, Extreme
+ *      Sports none at all — balls come out of the lane one after another, the
  *      camera reframes to the whole table and back, and the game still ends.
  *   3. THAT IT CANNOT HANG. The zero-deadlock guarantee, restated for every path
  *      a lock adds: locking the last ball, locking during a multiball, and
@@ -43,9 +45,7 @@ import { materialTableFor } from "../src/game/materials.js";
 import {
   BALL_LOCKS_BY_TABLE,
   BALL_LOCK_RULES_NOTE,
-  LOCKS_TO_LIGHT_MULTIBALL,
   MAX_SIMULTANEOUS_BALLS,
-  MULTIBALL_BALL_COUNT,
   ballLocksFor,
   ballsToTopUp,
   captureBalls,
@@ -53,8 +53,12 @@ import {
   heldBallCount,
   heldBallIn,
   lockCovers,
+  lockForZone,
   releaseHeldBalls,
+  releaseLock,
 } from "../src/game/ball-locks.js";
+import { queueScript } from "../src/game/mode-vm.js";
+import { modesFor } from "./table-fixtures.js";
 import type { BallLock } from "../src/game/ball-locks.js";
 import { createBallSet, freeBallCount, spawnBall, stepBalls } from "../src/game/ball-physics.js";
 import { SIMULATION_GRAVITY } from "../src/game/timebase.js";
@@ -173,13 +177,21 @@ function dropInto(game: Game, device: BallLock): BallState {
 // ---------------------------------------------------------------------------
 
 describe("the decoded lock rectangles", () => {
-  it("gives every table at least one lock, and none more than the ball ceiling can use", () => {
+  it("gives every table at least one lock, each bound to a capture script", () => {
     for (const tableId of TABLE_IDS) {
       const locks = ballLocksFor(tableId);
       expect(locks.length, `${tableId} locks`).toBeGreaterThan(0);
-      // Two is enough to light multiball, so a table with two devices can reach
-      // it without any device having to hold two balls at once.
-      expect(locks.length, `${tableId} locks`).toBeGreaterThanOrEqual(LOCKS_TO_LIGHT_MULTIBALL);
+      // Every rectangle carries the zone index its capture script is bound
+      // under in the mission layer, and the binding must exist: the decoded
+      // multiball rule is script data, so a saucer without its script is a
+      // saucer disconnected from the rules.
+      const modes = modesFor(tableId);
+      for (const device of locks) {
+        expect(
+          modes.scriptForLock(device.level, device.zoneIndex),
+          `${tableId} ${device.id} has no capture script bound at zone ${device.zoneIndex}`,
+        ).toBeGreaterThanOrEqual(0);
+      }
     }
   });
 
@@ -346,7 +358,6 @@ describe("the top-up, which is what the multiball opcode really is", () => {
     expect(MAX_SIMULTANEOUS_BALLS).toBe(3);
     expect(ballsToTopUp(4, 0, 0)).toBe(0);
     expect(ballsToTopUp(6, 0, 0)).toBe(0);
-    expect(MULTIBALL_BALL_COUNT).toBeLessThanOrEqual(MAX_SIMULTANEOUS_BALLS);
   });
 });
 
@@ -396,57 +407,188 @@ describe("a lock in a running game", () => {
     expect(held.active).toBe(true);
   });
 
-  for (const tableId of TABLE_IDS) {
-    it(`${tableId} swallows a ball, replaces it, and lights multiball on the second lock`, () => {
-      const game = started(tableId);
-      const locks = ballLocksFor(tableId);
-      runTicks(game, idleInput(), 60);
+  // -------------------------------------------------------------------------
+  // THE DECODED LADDER, per table. These used to assert the port's "two
+  // saucers held lights a three-ball multiball" reconstruction; the dispatch
+  // is now decoded (award effect 6 — see ball-locks.ts and mode-vm.ts) and the
+  // expectations below are the decoded rules, table by table. The correction
+  // is deliberate and is exactly the "never weaken a test" case working as
+  // intended: the old expectations encoded a reconstruction, not a measurement.
+  // -------------------------------------------------------------------------
 
-      // First lock. Drop a ball into the saucer and step once.
-      const first = dropInto(game, locks[0]!);
-      const firstReport = runTicks(game, idleInput(), 1)[0];
-      expect(firstReport?.locked, `${tableId} first capture`).toContain(first.id);
-      expect(firstReport?.multiballStarted).toBe(false);
-
-      let state = debugSnapshot(game);
-      expect(state.locks.map((one) => one.deviceId)).toEqual([locks[0]!.id]);
-      expect(state.multiball).toBe(false);
-      expect(state.balls.find((one) => one.id === first.id)?.heldBy).toBe(locks[0]!.id);
-      // The player's ball count is untouched: a lock is not a drain.
-      const servedBefore = state.ballsServed;
-
-      // Second lock lights it. Everything held comes back, and the machine tops
-      // the table up to three.
-      const second = dropInto(game, locks[1]!);
-      const secondReport = runTicks(game, idleInput(), 1)[0];
-      expect(secondReport?.locked, `${tableId} second capture`).toContain(second.id);
-      expect(secondReport?.multiballStarted, `${tableId} multiball`).toBe(true);
-
-      state = debugSnapshot(game);
-      expect(state.multiball).toBe(true);
-      expect(state.locks, `${tableId} saucers after release`).toEqual([]);
-      expect(
-        freeBallCount(game.balls) + state.pendingServes,
-        `${tableId} balls promised`,
-      ).toBe(MULTIBALL_BALL_COUNT);
-      expect(state.ballsServed, `${tableId} player charged for a lock`).toBe(servedBefore);
-    });
+  /** Runs until a tick reports the multiball starting, or -1. */
+  function runToMultiball(game: Game, input: InputSource, budget: number): number {
+    for (let tick = 0; tick < budget; tick += 1) {
+      if (runTicks(game, input, 1)[0]?.multiballStarted === true) return tick;
+    }
+    return -1;
   }
 
-  it("feeds the multiball balls out of the lane one at a time and gets three rolling", () => {
+  /** Every display line shown over a stretch of ticks. */
+  function collectMessages(game: Game, input: InputSource, ticks: number): Set<string> {
+    const seen = new Set<string>();
+    for (let tick = 0; tick < ticks; tick += 1) {
+      runTicks(game, input, 1);
+      for (const line of debugSnapshot(game).modeMessages) seen.add(line);
+    }
+    return seen;
+  }
+
+  it("babewatch starts a TWO-ball multiball on the FIRST counted lock", () => {
+    // The decoded ladder h4+0x49F8: id 1 -> launcher script 110, "BALL 1
+    // LOCKED", MODE_START 179 ("SHOW YOUR MUSCLES", BALLS_UP_TO 2). The lock
+    // lamp is lit at game start (the labelled reconstruction in
+    // table-modes.ts), so the very first grid saucer capture counts.
+    const game = started("babewatch");
+    runTicks(game, idleInput(), 60);
+    const grid = ballLocksFor("babewatch").find((one) => one.id === "grid-top");
+    expect(grid).toBeDefined();
+    if (grid === undefined) return;
+
+    const ball = dropInto(game, grid);
+    const report = runTicks(game, idleInput(), 1)[0];
+    expect(report?.locked, "capture").toContain(ball.id);
+    // Not instantly: the capture script, the launcher and the mode's intro all
+    // run through the queue at one opcode a frame first.
+    expect(report?.multiballStarted).toBe(false);
+    const servedBefore = debugSnapshot(game).ballsServed;
+
+    expect(runToMultiball(game, idleInput(), 600), "multiball never started").toBeGreaterThanOrEqual(0);
+    const state = debugSnapshot(game);
+    expect(state.multiball).toBe(true);
+    // TWO balls, because script 179 says BALLS_UP_TO 2 — not the old three.
+    expect(freeBallCount(game.balls) + state.pendingServes, "balls promised").toBe(2);
+    // The capture script's PUSH ejected the held ball back through the trough.
+    expect(state.locks, "saucer emptied by the scripted eject").toEqual([]);
+    // The player is never charged for any of it.
+    expect(state.ballsServed).toBe(servedBefore);
+  });
+
+  it("babewatch's second counted lock is the positional alternate: 1 MORE TO START MODE", () => {
+    // Ladder id 2 -> launcher 111, which prints and starts nothing. The
+    // alternates are not a fallback for a busy mode — they are ordinary ladder
+    // positions, settled by the decoded table.
+    const game = started("babewatch");
+    runTicks(game, idleInput(), 60);
+    const grid = ballLocksFor("babewatch").find((one) => one.id === "grid-top");
+    if (grid === undefined) return;
+
+    dropInto(game, grid);
+    expect(runToMultiball(game, idleInput(), 600)).toBeGreaterThanOrEqual(0);
+
+    dropInto(game, grid);
+    const seen = collectMessages(game, idleInput(), 300);
+    expect([...seen].some((line) => line.includes("1 MORE TO START MODE")), [...seen].join(" | ")).toBe(true);
+  });
+
+  it("law-n-justice's jail counts nothing while its lamp is unlit: the capture just ejects", () => {
+    // Script 63's JMP_IF_UNLIT(26) — the jail lamp is lit by the SHOOT JAIL
+    // targets (device surface ids 128/129), decoded, so a fresh game's first
+    // jail capture is spat back out uncounted.
     const game = started("law-n-justice");
-    const locks = ballLocksFor("law-n-justice");
+    const modes = modesFor("law-n-justice");
+    runTicks(game, idleInput(), 60);
+    const jail = ballLocksFor("law-n-justice").find((one) => one.id === "right-crater");
+    expect(jail).toBeDefined();
+    if (jail === undefined) return;
+    const ladder = modes.elements[26]?.ladder ?? -1;
+    expect(ladder, "element 26 must carry the multiball ladder").toBeGreaterThanOrEqual(0);
+
+    dropInto(game, jail);
+    runTicks(game, idleInput(), 200);
+    expect(game.modeState?.ladderCounts[ladder]).toBe(0);
+    const state = debugSnapshot(game);
+    expect(state.multiball).toBe(false);
+    expect(state.locks, "ejected, not held").toEqual([]);
+  });
+
+  it("law-n-justice starts a TWO-ball multiball on the second LIT jail lock", () => {
+    // The decoded ladder h4+0x40F4: tiers of 2/3/4/5 jail locks, multiball at
+    // ids 2/5/9/14. Id 1 -> launcher 80 ("1 MORE FOR M-BALL", ejects the
+    // jail); id 2 -> launcher 88 -> MODE_START 93 (BALL_REMOVE jail,
+    // BALLS_UP_TO 2).
+    const game = started("law-n-justice");
+    const modes = modesFor("law-n-justice");
+    runTicks(game, idleInput(), 60);
+    const jail = ballLocksFor("law-n-justice").find((one) => one.id === "right-crater");
+    if (jail === undefined) return;
+    const ladder = modes.elements[26]?.ladder ?? -1;
+
+    // Light the jail lamp the decoded way: the script the SHOOT JAIL targets
+    // fire, which STARTs element 26.
+    const shootJail = modes.scriptForDevice(0, 128);
+    expect(shootJail).toBeGreaterThanOrEqual(0);
+    expect(game.modeState).not.toBeNull();
+    if (game.modeState === null) return;
+    queueScript(game.modeState, shootJail);
+    runTicks(game, idleInput(), 10);
+
+    // First counted lock: the alternate. Ball ejected, no multiball.
+    dropInto(game, jail);
+    const seen = collectMessages(game, idleInput(), 200);
+    expect(game.modeState.ladderCounts[ladder]).toBe(1);
+    expect([...seen].some((line) => line.includes("MORE FOR M-BALL")), [...seen].join(" | ")).toBe(true);
+    expect(debugSnapshot(game).multiball).toBe(false);
+    expect(debugSnapshot(game).locks, "intermediate locks eject").toEqual([]);
+
+    // Second counted lock completes the tier: the ball stays held for the
+    // mode's BALL_REMOVE, and the mode tops the table up to two.
+    dropInto(game, jail);
+    expect(runToMultiball(game, idleInput(), 600), "multiball never started").toBeGreaterThanOrEqual(0);
+    expect(game.modeState.ladderCounts[ladder]).toBe(2);
+    const state = debugSnapshot(game);
+    expect(state.multiball).toBe(true);
+    expect(state.locks, "BALL_REMOVE emptied the jail").toEqual([]);
+    expect(freeBallCount(game.balls) + state.pendingServes, "balls promised").toBe(2);
+    // Script 93 puts the jail lamp out again: the next multiball needs the
+    // SHOOT JAIL targets first.
+    expect(game.modeState.armed[26]).toBe(0);
+  });
+
+  it("extreme-sports locks eject the ball and start no multiball", () => {
+    // Decoded as far as it goes: ES's lock capture scripts (36/37) award
+    // effect-17 elements — a direct event dispatch whose handler is NOT
+    // decoded — and always PUSH the ball back out. Until effect 17 is traced,
+    // an ES lock is a scoring eject, and this asserts exactly that rather than
+    // inventing a rule. See docs/GAMEPLAY_PARITY.md.
+    const game = started("extreme-sports");
+    runTicks(game, idleInput(), 60);
+    const bowl = ballLocksFor("extreme-sports").find((one) => one.id === "bowl");
+    expect(bowl).toBeDefined();
+    if (bowl === undefined) return;
+
+    const ball = dropInto(game, bowl);
+    const report = runTicks(game, idleInput(), 1)[0];
+    expect(report?.locked).toContain(ball.id);
+    runTicks(game, idleInput(), 200);
+    const state = debugSnapshot(game);
+    expect(state.locks, "ejected by the capture script's PUSH").toEqual([]);
+    expect(state.multiball).toBe(false);
+  });
+
+  it("feeds a three-ball multiball out of the lane one at a time and gets three rolling", () => {
+    // BabeWatch tier 2: two locks counted, the third completes the tier and
+    // MODE_STARTs script 182 ("SURF THEM WAVES", BALLS_UP_TO 3). The counter
+    // is preset to 2 exactly as the decoded SET_COUNT opcode does it, so one
+    // capture completes the tier without three minutes of steering.
+    const game = started("babewatch");
+    const modes = modesFor("babewatch");
     const input = playingInput();
     clearTheLane(game, input);
+    const ladder = modes.elements[29]?.ladder ?? -1;
+    expect(ladder).toBeGreaterThanOrEqual(0);
+    expect(game.modeState).not.toBeNull();
+    if (game.modeState === null) return;
+    game.modeState.ladderCounts[ladder] = 2;
 
-    dropInto(game, locks[0]!);
-    runTicks(game, input, 1);
-    dropInto(game, locks[1]!);
-    runTicks(game, input, 1);
+    const grid = ballLocksFor("babewatch").find((one) => one.id === "grid-top");
+    if (grid === undefined) return;
+    dropInto(game, grid);
+    expect(runToMultiball(game, input, 900), "multiball never started").toBeGreaterThanOrEqual(0);
     expect(debugSnapshot(game).multiball).toBe(true);
 
     let peak = 0;
-    for (let tick = 0; tick < 900; tick += 1) {
+    for (let tick = 0; tick < 1500; tick += 1) {
       runTicks(game, input, 1);
       const state = debugSnapshot(game);
       // Never two balls on the rod at once, whatever else happens: one lane, one
@@ -456,9 +598,9 @@ describe("a lock in a running game", () => {
       ).length;
       expect(onRod).toBeLessThanOrEqual(1);
       peak = Math.max(peak, freeBallCount(game.balls));
-      if (peak >= MULTIBALL_BALL_COUNT) break;
+      if (peak >= 3) break;
     }
-    expect(peak, "balls simultaneously in play").toBe(MULTIBALL_BALL_COUNT);
+    expect(peak, "balls simultaneously in play").toBe(3);
     expect(peak).toBeLessThanOrEqual(MAX_SIMULTANEOUS_BALLS);
   });
 
@@ -473,14 +615,18 @@ describe("a lock in a running game", () => {
     ).not.toBeNull();
 
     // The machine's own do go, and nothing on the input has to ask for it: the
-    // count below is taken while the player holds no control at all.
-    const game = started("law-n-justice");
-    const locks = ballLocksFor("law-n-justice");
+    // count below is taken while the player holds no control at all. The
+    // three-ball tier is used so the machine owes at least two serves — the
+    // scripted eject of the captured ball plus the top-up.
+    const game = started("babewatch");
+    const modes = modesFor("babewatch");
     clearTheLane(game, playingInput());
-    dropInto(game, locks[0]!);
-    runTicks(game, idleInput(), 1);
-    dropInto(game, locks[1]!);
-    runTicks(game, idleInput(), 1);
+    const ladder = modes.elements[29]?.ladder ?? -1;
+    if (game.modeState === null) return;
+    game.modeState.ladderCounts[ladder] = 2;
+    const grid = ballLocksFor("babewatch").find((one) => one.id === "grid-top");
+    if (grid === undefined) return;
+    dropInto(game, grid);
 
     let launches = 0;
     for (let tick = 0; tick < 900; tick += 1) {
@@ -705,29 +851,52 @@ describe("what is decoded and what is not", () => {
     // A reader has to be able to find out which half of this is measured without
     // reading the disassembly, so the note is part of the module's interface.
     expect(BALL_LOCK_RULES_NOTE).toMatch(/reconstruction, not decoded fact/);
-    expect(LOCKS_TO_LIGHT_MULTIBALL).toBe(2);
+    // And the decoded half now includes the multiball rule itself.
+    expect(BALL_LOCK_RULES_NOTE).toMatch(/multiball lock ladder/);
+  });
+
+  it("releases exactly the saucer a scripted eject names", () => {
+    const bank = createLockBank("law-n-justice");
+    const set = createBallSet();
+    const jail = lockForZone(bank, 0, 6);
+    expect(jail?.id).toBe("right-crater");
+    if (jail === null || jail === undefined) return;
+    const at = centreOf(jail);
+    const ball = spawnBall(set, pixelsToQ10(at.x), pixelsToQ10(at.y), 0, 0, jail.level);
+    captureBalls(bank, set.balls);
+    expect(heldBallIn(bank, jail.id)).toBe(ball.id);
+
+    // A miss releases nothing.
+    expect(releaseLock(bank, "grid-top", set.balls)).toBe(null);
+    expect(heldBallCount(bank)).toBe(1);
+    // The named device gives its ball to the trough.
+    expect(releaseLock(bank, jail.id, set.balls)).toBe(ball.id);
+    expect(ball.active).toBe(false);
+    expect(ball.heldBy).toBe(null);
+    expect(heldBallCount(bank)).toBe(0);
   });
 
   it("keeps the rectangles exactly as they were read off the table modules", () => {
     // A change-detector on purpose, and the only one in this file: these numbers
     // came out of `Table00N.seg04`'s zone lists and nothing in this repository
     // may quietly adjust them to make a ball behave. Re-decode the module if they
-    // need to move.
-    expect(BALL_LOCKS_BY_TABLE["law-n-justice"].map((one) => [one.id, one.level, one.minX, one.minY, one.maxX, one.maxY])).toEqual([
-      ["jail-top", 0, 85, 60, 145, 100],
-      ["right-crater", 0, 235, 165, 260, 190],
-      ["jail-throat", 0, 55, 170, 85, 200],
+    // need to move. The zone index is part of the decode: it is the slot the
+    // mission layer's `triggers.locks` binds the capture script under.
+    expect(BALL_LOCKS_BY_TABLE["law-n-justice"].map((one) => [one.id, one.level, one.zoneIndex, one.minX, one.minY, one.maxX, one.maxY])).toEqual([
+      ["jail-top", 0, 5, 85, 60, 145, 100],
+      ["right-crater", 0, 6, 235, 165, 260, 190],
+      ["jail-throat", 0, 7, 55, 170, 85, 200],
     ]);
-    expect(BALL_LOCKS_BY_TABLE["babewatch"].map((one) => [one.id, one.level, one.minX, one.minY, one.maxX, one.maxY])).toEqual([
-      ["grid-top", 0, 66, 48, 86, 68],
-      ["grid-mid", 0, 152, 110, 172, 130],
-      ["top-lane", 0, 145, 14, 165, 34],
-      ["lower-bowl", 0, 200, 250, 230, 295],
-      ["upper-deck", 1, 70, 40, 110, 80],
+    expect(BALL_LOCKS_BY_TABLE["babewatch"].map((one) => [one.id, one.level, one.zoneIndex, one.minX, one.minY, one.maxX, one.maxY])).toEqual([
+      ["grid-top", 0, 15, 66, 48, 86, 68],
+      ["grid-mid", 0, 16, 152, 110, 172, 130],
+      ["top-lane", 0, 17, 145, 14, 165, 34],
+      ["lower-bowl", 0, 18, 200, 250, 230, 295],
+      ["upper-deck", 1, 8, 70, 40, 110, 80],
     ]);
-    expect(BALL_LOCKS_BY_TABLE["extreme-sports"].map((one) => [one.id, one.level, one.minX, one.minY, one.maxX, one.maxY])).toEqual([
-      ["bowl", 0, 249, 159, 269, 179],
-      ["upper-orbit", 1, 65, 10, 105, 50],
+    expect(BALL_LOCKS_BY_TABLE["extreme-sports"].map((one) => [one.id, one.level, one.zoneIndex, one.minX, one.minY, one.maxX, one.maxY])).toEqual([
+      ["bowl", 0, 12, 249, 159, 269, 179],
+      ["upper-orbit", 1, 10, 65, 10, 105, 50],
     ]);
   });
 });

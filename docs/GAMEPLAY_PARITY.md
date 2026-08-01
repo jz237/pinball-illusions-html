@@ -93,28 +93,62 @@ simulate exactly one ball.
   zero sites across `main.seg00` and `main.seg01`. Worse, `device+$02`, the byte that
   gates those increments, is **zero on every type-4 device on all three tables as
   shipped**, so the counting path is dead at load time. The rule lives in per-table
-  script data, **and the scripts are now located and readable** (the mode-VM export):
+  script data, **and it is now DECODED end to end**:
   - Every lock device carries its own capture script via `device+$14`
     (`move.l $14(a1),d0 / jsr $6c10` at `0x557A`), and those scripts are exported —
     BabeWatch's five locks fire scripts 52/53/54/55/57, LnJ's three fire 62/63/64,
-    ES's two fire 36/37. They award and light lamps; **none releases a ball or starts
-    a multiball directly**. **[disk]**
-  - The multiball scripts themselves are decoded. **BabeWatch is a per-game lock
-    LADDER, not "hold two saucers":** launcher scripts 110/114/117/119 print
-    `BALL 1..4 LOCKED` and `MODE_START` the four multiball modes 179 ("SHOW YOUR
-    MUSCLES", `BALLS_UP_TO 2`), 182 ("SURF THEM WAVES", `BALLS_UP_TO 3`),
-    188 ("HAVE A BURGER DUDE", `BALLS_UP_TO 2`), 192 ("MONEY HUNT",
-    `BALLS_UP_TO 3`) — so the FIRST lock of the game already starts a two-ball
-    multiball. LnJ's multiball scripts 93/94 do `BALL_REMOVE 24` (release the jail's
-    held balls to the serve queue) then `BALLS_UP_TO 2`/`3`. **[disk]**
-  - What is still **[open]** is the dispatch that runs the Nth launcher on the Nth
-    capture: nothing in the export references scripts 110–119 (their mission records
-    have `selector -1`), so the counter that picks `BALL 1 LOCKED` versus
-    `BALL 2 LOCKED` — and the alternates `n MORE TO START MODE` used while a
-    lock-gated mode is lit — lives in a structure not yet exported. Until it is
-    traced, the port's "two saucers held lights a three-ball multiball" stays a
-    labelled reconstruction (`ball-locks.ts`), now known to be tighter than the
-    original's BabeWatch rule.
+    ES's two fire 36/37. **[disk]**
+  - **The dispatch that runs the Nth launcher on the Nth capture is award
+    effect 6, and it is one linear per-game counter.** The capture script `AWARD`s a
+    lock-lit lamp element whose award-effect index is 6; the handler (`0x5E5A`)
+    increments the per-player counts in the element's counter record (`+$34`, the
+    same record family effect 21 uses) and walks the 12-byte launcher table inline
+    at the record's `+$50` (`0x5EAA`) — the mission selector's own
+    `{u16 id, u16 mask, u32 launcher, u32 lamp}` format, which is why no relocation
+    points at it and the earlier export missed it. The entry whose ascending id
+    equals the count has its launcher queued through `$6C10`; walking past the
+    `0xFFFE` terminator subtracts the word after it from the count and re-walks
+    (`0x5F26`), so the ladder wraps. **BabeWatch's table (h4+0x49F8, ids 1..10,
+    wrap 10)** is capture tiers of 1/2/3/4: the tier-completing ids launch scripts
+    110/114/117/119 (`BALL 1..4 LOCKED` + `MODE_START` of the four multiball modes
+    179 `BALLS_UP_TO 2`, 182 `3`, 188 `2`, 192 `3` — the FIRST lock of a fresh game
+    starts a two-ball multiball) and the intermediate ids the `n MORE TO START
+    MODE` alternates. **The alternates are purely positional** — the
+    "chosen while a mode is already running" hypothesis is REFUTED; no reader of
+    the running-mode flag `$d9b` exists anywhere on the dispatch path. (A launcher
+    that fires while another mode runs still loses its `MODE_START` to the
+    one-mode-at-a-time gate at `0x5D80` even though the ladder consumed the count —
+    a consequence the port models.) **Law 'n Justice is the same mechanism**
+    (table h4+0x40F4, ids 1..14, wrap 5): tiers of 2/3/4/5 JAIL locks, multiball at
+    ids 2/5/9/14 (scripts 93/94: `BALL_REMOVE` jail then `BALLS_UP_TO 2`/`3`), every
+    later multiball costing 5 locks. Only the scripted saucers count — BW's three
+    level-0 grid saucers (lamps 29/30/31) and LnJ's jail (lamp 26, **lit by the
+    SHOOT JAIL targets**, device surface ids 128/129, script 78) — the other
+    rectangles award and eject without counting. `SET_COUNT` (handler `0x5C64`)
+    writes the counter directly, which is how BW's four selectable jackpot missions
+    arm tiers 1..4 with values 0/1/3/6; the `AWARD` relight (`flags & $A` at
+    `0x5CA8`) keeps a lock lamp lit across its own award. **[disk]**
+  - **`PUSH`/`PUSH_LINKED` on a lock is the physical eject.** The operand is the
+    lock DEVICE record (the exporter's element pool misclassifies it); handlers
+    `0x5BFC`/`0x5C14` push it onto the stack at `$23DC(a5)` and the per-frame popper
+    `0x7078` runs a `$4C`-frame timer, then ejects the held ball using the device's
+    own position and impulse words (`+$06..$0D`) — so a non-final lock spits the
+    ball back out, and the final lock's entry (no push) leaves it held for
+    `BALL_REMOVE`. **[disk]** The eject VECTORS are not yet exported; the port
+    returns an ejected ball through the trough and serve queue instead, a labelled
+    reconstruction (`runModes` in game-loop.ts).
+  - **Extreme Sports has no lock ladder.** Its lock capture scripts award
+    effect-**17** elements (a direct event-record dispatch at element `+$34`) whose
+    handler is **not decoded**; its `BALLS_UP_TO 3` modes are mission-launched. An
+    ES lock is a scoring eject until effect 17 is traced. **[open]**
+  - Two residues, stated plainly: the site that lights the lock lamps **for the
+    first time in a fresh game** was not located (no game-init script does it;
+    presumably the per-table native init in slot 6), and nothing was found that
+    resets the per-game counters at game start (either the table module is reloaded
+    per game or ladder state persists across games in one session). The port lights
+    the underivable lamps at game start and zeroes the counters per game, both
+    labelled (`litAtGameStart` in table-modes.ts, `ladderCounts` in mode-vm.ts).
+    **[open]**
 - The display switches to a high-resolution full-screen mode while multiball is
   active so every ball stays visible; toggleable by the player. **[src]** — the
   mechanism is now identified as option record 7 with its two display configurations
@@ -129,21 +163,32 @@ ball-to-ball collision, per-ball state, drain handling while others remain live,
 a camera policy that changes when ball count exceeds one. Retrofitting this later
 would mean rewriting the physics core.
 
-**Implemented**, in `src/game/ball-locks.ts` and the lock section of
-`src/browser/game-loop.ts`. The ten decoded capture rectangles, capture, freeze,
-release-to-serve-queue, the three-ball ceiling and the top-up are all as above. Two
-things are **reconstruction and are labelled as such in the code**: that two balls
-locked lights multiball (BabeWatch's own string `LOCK 2 BALLS 4 M-BALL`, and the only
-value that fills the three-ball ceiling without exceeding it), and that a capture
-which leaves nothing rolling buys the player a replacement ball. Balls the machine
-owes itself are auto-launched after half a second, because a player already flipping
-two balls cannot also be winding a spring; a ball the *player* was given is never
-auto-launched. A third labelled behaviour joined them with the measured flipper: a
-ball that settles inside an **occupied** saucer — which capture must refuse, per the
-engine — is swallowed back to the trough as an owed serve by the ball search rather
-than written off, which is the decoded `$68` release semantics applied to the one
-place the playfield genuinely cannot return a ball from (see the census baseline
-below, and `runBallSearch` in `game-loop.ts`).
+**Implemented**, in `src/game/ball-locks.ts`, `src/game/mode-vm.ts` (award effect 6,
+`SET_COUNT`, the `AWARD` relight, the `PUSH`/`BALL_REMOVE` lock releases) and the
+lock sections of `src/browser/game-loop.ts`; the decoded ladders themselves ship in
+the mode export (`ladders` in `*.modes.json`, `scripts/export-table-modes.mjs`). The
+ten decoded capture rectangles, capture, freeze, release-to-serve-queue, the
+three-ball ceiling, the top-up **and the multiball lock ladder** are all as above —
+**the port's old "two saucers held lights a three-ball multiball" reconstruction is
+deleted**, and both tables with a lock multiball now run the one decoded code path
+(BabeWatch: first counted lock starts the 2-ball SHOW YOUR MUSCLES; Law 'n Justice:
+second lit jail lock starts the 2-ball mode, with the jail lamp lit by the SHOOT
+JAIL targets). Extreme Sports' locks eject and start nothing, which is as far as its
+decode goes (effect 17, **[open]**). Labelled **reconstructions** that remain: a
+capture which leaves nothing rolling buys the player a replacement ball (and the
+saucer is remembered so a later scripted eject of the same ball does not owe a
+second serve); an ejected ball returns through the trough and serve queue rather
+than being kicked from the saucer in place (the decoded eject vectors at
+device+$06..$0D are not yet exported); the lock lamps no physical trigger can light
+are lit at game start; and the per-game ladder counters start at zero each game.
+Balls the machine owes itself are auto-launched after half a second, because a
+player already flipping two balls cannot also be winding a spring; a ball the
+*player* was given is never auto-launched. And as before: a ball that settles inside
+an **occupied** saucer — which capture must refuse, per the engine — is swallowed
+back to the trough as an owed serve by the ball search rather than written off,
+which is the decoded `$68` release semantics applied to the one place the playfield
+genuinely cannot return a ball from (see the census baseline below, and
+`runBallSearch` in `game-loop.ts`).
 
 ## Options — SETTLED
 
@@ -627,8 +672,11 @@ under emulation as the cheapest way to get it.
   terminator. Themes: riot control, bomb defusal, hostage rescue, drug bust, prisoner
   return, arson, hover chase, street clear-out. **[disk]**
 - Police chases, jailbreaks and hostage situations. **CONFIRMED** **[disk]**
-- Locking balls feeds multiball — 4-step ladder `1..4 MORE FOR M-BALL`. **CONFIRMED**
-  **[disk]**. Locking *criminals* also feeding it is **[open]**.
+- Locking balls feeds multiball — 4-step ladder `1..4 MORE FOR M-BALL`. **CONFIRMED,
+  DECODED AND IMPLEMENTED** — tiers of 2/3/4/5 jail locks, multiball at ladder ids
+  2/5/9/14 (2-ball twice, then 3-ball), wrap 5, gated on the jail lamp the SHOOT
+  JAIL targets light; see "Defining feature: multiball". **[disk]**. Locking
+  *criminals* also feeding it is **[open]**.
 - **A sub-game played on the score panel — REFUTED for this table.** No such strings
   exist in Law 'n Justice. The claim is true of **BabeWatch** (the jukebox), so the
   source appears to have attributed it to the wrong table. **[disk]**
@@ -659,7 +707,12 @@ under emulation as the cheapest way to get it.
   sub-game. **[disk]**
 - Ball-lock ladder award values: **5M/100k · 10M/250k · 15M/500k · 20M/1M · 25M/5M** —
   the cleanest object in the excavation, a 1:2:3:4:5 score progression. **[disk]**
-- Mode entry conditions, timers, jackpot rules. **[open]**
+- Mode entry conditions for the four lock multiballs are **DECODED AND
+  IMPLEMENTED**: the per-game lock ladder (tiers of 1/2/3/4 counted locks →
+  SHOW YOUR MUSCLES 2-ball / SURF THEM WAVES 3-ball / HAVE A BURGER DUDE 2-ball
+  / MONEY HUNT 3-ball, wrap 10), with the selectable jackpot missions arming
+  each tier via `SET_COUNT` 0/1/3/6 and relighting the lock lamps. **[disk]**
+  Other mode timers and jackpot rules stay **[open]**.
 
 ### Extreme Sports
 
@@ -684,7 +737,12 @@ under emulation as the cheapest way to get it.
   60 printable strings, none matching lock/multi/ball N/kick/saucer/hole — yet its zone
   list has **two type-4 capture devices**, one per level, at (249,159)-(269,179) on
   level 0 and (65,10)-(105,50) on level 1, both awarding 250,000. So the devices are
-  there and the wording is not. **[disk]**
+  there and the wording is not. **[disk]** Its lock capture scripts (36/37) are now
+  read: they `AWARD` a batch of gated elements — including effect-**17** records
+  whose `+$34` points straight at an event record (the shape that would
+  `MODE_START` Iron Man and EXTREMIST) — and always `PUSH` the ball back out. The
+  effect-17 handler is **not decoded**, so in this port an ES lock is a scoring
+  eject and no lock multiball is reconstructed in its place. **[open]**
 - Named awards: **`GET THE SUPER` / `IRON MAN JACKPOT` confirmed**; **no "Maniac Skier"
   string exists** — the nearest are the four ski-trick names `SPLIT`, `DUFFY`, `KOSAK`,
   `LOOP` and `GO OFF PISTE MANIA FOR` / `WHITE POWDER JACKPOT`. **[disk]**
@@ -726,6 +784,9 @@ same budget.
 
 - **Completions: 90/90 on all three tables, zero stalls.** A separate whole-game
   probe at the same budget with a nudge every 400 ticks completed 270/270.
+  **Re-measured after the decoded lock ladder landed: still 90/90 on all three,
+  write-offs still 0.0% / 0.0% / 0.0%** (LnJ 270 ends, BW 277, ES 270 — all real
+  drains, same 40,000-tick budget). **[measured]**
 - **Write-offs: 0.0% / 0.0% / 0.0%** (Law 'n Justice 288 ends, BabeWatch 270,
   Extreme Sports 279 — all real drains). The census as first run read BW at 0.4%:
   one deterministic strand at `(220,289)` level 0, hold 25 / cadence 20 — a
@@ -739,26 +800,30 @@ same budget.
   written off. After the fix the same census slice reads 0.0% with LnJ/ES
   figures unchanged to the ball. **[measured]**
 - **Determinism holds:** hold-40 games run twice per table give byte-identical
-  tick-state hash chains and scores (LnJ `84bc21a6` / 1,185,000; BW `3a0540a8` /
-  265,000; ES `8be26f7e` / 50,000).
-- **Missions and multiball run at the measured energies.** Aggressive play:
-  missions started LnJ 87, ES 29, BW 5; locks LnJ 128, BW 11, ES 57; multiball
-  starts LnJ 19 (in 12/90 games), ES 1, BW 0; max simultaneous balls 3 on every
-  table. Every mission started in play ended with its ball (lifetimes 111–1641
-  ticks); a VM-only run of the shipped scripts with no shots confirms the WAIT
-  clocks time out to END (LnJ 7, BW 3, ES 10 reach END; the rest park on untimed
-  shot-waits that end at drain, by design).
-- **BabeWatch plays much tighter at the measured flipper, and that is the
-  machine, not a defect.** Its aggressive-play ball ends dropped 311 → 270
-  (exactly zero extra balls: no multiball started in 90 games, 11 lock captures,
-  never two in one game, missions in only 3/90), and its mean score (331k) is
-  now the lowest of the three. The multiball machinery itself is intact — forced
-  lock-release tests get three balls rolling on every table — the measured
-  flipper simply no longer reaches the upper saucers often enough to satisfy the
-  port's two-saucer reconstruction. The decoded BabeWatch rule is looser (first
-  lock starts a 2-ball multiball — see "Defining feature: multiball"), so wiring
-  the decoded ladder is the correct future fix, as its own change with its own
-  census. **[measured]**
+  tick-state digest chains and scores (measured again after the decoded lock
+  ladder landed: LnJ `4267ffb2` / 1,265,000; BW `7f805169` / 265,000; ES
+  `72d524d7` / 205,000 — digests from the ladder-census harness, not comparable
+  to the pre-ladder hash values; the identity of the two runs is the claim).
+- **Missions and multiball at the measured energies, WITH THE DECODED LADDER
+  (re-measured 2026-08 at the same 40,000-tick budget, 90 games/table, holds
+  8..97).** Missions started LnJ 50, ES 37, BW 7; locks LnJ 126, BW 10, ES 36;
+  multiball starts **BW 6 (in 6/90 games), LnJ 0, ES 0**; max simultaneous
+  balls BW 2 (its first-tier multiball IS two-ball), LnJ/ES 1. Three shifts
+  against the pre-ladder baseline, each with its reason: **BabeWatch went 0 → 6
+  multiballs**, because the decoded rule is its first counted lock — the
+  headline defect of the previous census is closed by the decode, not by
+  tuning. **Law 'n Justice went 19 → 0**, and that is measured-beats-
+  reconstructed working as intended: the old 19 were counterfeit ("any two
+  saucers held"), while the decoded rule needs the SHOOT JAIL targets to light
+  the jail lamp and then two captures of the jail saucer — the one lock
+  rectangle the census player has never reached at the measured flipper
+  energies (0 entries in the 30-game reachability census). A player who can
+  shoot the jail gets the decoded 2-ball mode; the census player cannot, and
+  parity means keeping the rule, not the count. **LnJ missions went 87 → 50**
+  because lighting the jail lamp no longer hijacks the invented mission
+  selector (element 26 is now the decoded multiball lamp, not a mode-arm shot —
+  see `armElements` in table-modes.ts); ES missions went 29 → 37 as its
+  effect-6 count ladders now queue their launcher scripts. **[measured]**
 - **Scores (mean / median / max):** LnJ 1,673,000 / 860,000 / 15,545,000;
   BW 330,722 / 265,000 / 2,690,000; ES 609,167 / 380,000 / 9,810,000. The
   previously quoted 20.9M/11.4M/11.3M came from an unrecorded harness and is
@@ -797,6 +862,15 @@ What remains:
 2. **Recover the wall-behaviour constants** — closes which odd material index is rubber,
    slingshot, plain wall or ramp edge. Note that the slot-4 modules turned out to contain
    almost no code, so this is an engine question, not a per-table one.
+2a. **The lock-ladder residues** (the dispatch itself is closed — award effect 6):
+   trace award effect **17** (Extreme Sports' lock-fed multiball goes through it —
+   its handler is entry 17 of the dispatch table at `0x5D0E`); locate the site that
+   lights the lock lamps at game start and whatever resets the per-game ladder
+   counters (both are candidates for the per-table NATIVE init through opcode 20's
+   handler `0x5E00`, which jumps into slot-6 code that has not been disassembled);
+   and export the per-device eject vectors at device `+$06..$0D` so a `PUSH` eject
+   can kick the ball out of the saucer in place instead of routing it through the
+   trough.
 3. **Observe the original under emulation**, and instrument it. Breakpointing
    `main.seg00` `0x6BCC` / `0x6BEE` / `0x6B96` and logging `a3` on every call yields
    (award record → game event) pairs directly, which is exactly item 1. This is now the

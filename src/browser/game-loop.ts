@@ -153,15 +153,15 @@ import {
 } from "../game/ball-physics.js";
 import type { LockBank } from "../game/ball-locks.js";
 import {
-  LOCKS_TO_LIGHT_MULTIBALL,
   MAX_SIMULTANEOUS_BALLS,
-  MULTIBALL_BALL_COUNT,
   ballsToTopUp,
   captureBalls,
   createLockBank,
   heldBallCount,
   lockCovers,
+  lockForZone,
   releaseHeldBalls,
+  releaseLock,
 } from "../game/ball-locks.js";
 import { BALL_RADIUS_PIXELS, DEFAULT_PROBE_RADIUS } from "../game/collision-probe.js";
 import { SLINGSHOT_KICK } from "../game/surface-physics.js";
@@ -563,6 +563,15 @@ export interface Game {
   /** True from the moment a multiball starts until it is back down to one ball. */
   multiball: boolean;
   /**
+   * Saucers whose held ball the machine has ALREADY replaced: the device ids
+   * marked when a capture left nothing rolling and a replacement serve was
+   * owed. When the lock's script later ejects that ball, the eject does not
+   * owe a second serve — the replacement already stands in for it — which is
+   * what keeps the decoded eject path and the reconstruction's replacement
+   * rule from together minting a ball the player never had.
+   */
+  lockDebts: Set<string>;
+  /**
    * Ticks until the auto-launcher fires the ball in the lane, or 0 when it is
    * not armed. Armed only for balls the machine owes itself.
    */
@@ -677,6 +686,7 @@ export function createGame(map: TableMap, options?: Partial<GameOptions>): Game 
     locks: createLockBank(map.tableId),
     pendingServes: 0,
     multiball: false,
+    lockDebts: new Set<string>(),
     autoLaunchCountdown: 0,
     ballsLocked: 0,
     scoring: createScoringState(),
@@ -713,6 +723,7 @@ export function startGame(game: Game): void {
   game.locks = createLockBank(game.map.tableId);
   game.pendingServes = 0;
   game.multiball = false;
+  game.lockDebts = new Set<string>();
   game.autoLaunchCountdown = 0;
   game.ballsLocked = 0;
   // A fresh board rather than a cleared one: the flag bytes that decide whether
@@ -984,6 +995,7 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
   const awards = runScoring(game, step.surfaces);
 
   // ---- ball locks and multiball ------------------------------------------
+  const wasMultiball = game.multiball;
   const lockTick = runLocks(game);
   awards.push(...lockTick.awards);
 
@@ -1021,13 +1033,16 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
       // ball across the end of a ball would leave the machine one short on the
       // next one, and this reconstruction has no rule saying which tables do that.
       releaseHeldBalls(game.locks, game.balls.balls);
+      game.lockDebts.clear();
       pruneInactiveBalls(game.balls);
       // The mission goes with the ball. The original refuses to END THE BALL
       // while a mission is running instead (0x4F12-0x4F28 will not advance the
       // game state while `$daa(a5)` is set), which is not reproducible here: the
       // ball is already gone, so nothing could ever advance the script and the
       // machine would hang. See the divergence note in `mode-vm.ts`.
-      if (game.modeState !== null) resetModesForNewBall(game.modeState);
+      if (game.modes !== null && game.modeState !== null) {
+        resetModesForNewBall(game.modes, game.modeState);
+      }
       game.modeMessages = [];
       game.multiball = false;
       game.plunger = resetPlunger();
@@ -1059,7 +1074,7 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     writtenOff: lost,
     swallowed: search.swallowed,
     locked: lockTick.locked,
-    multiballStarted: lockTick.multiballStarted,
+    multiballStarted: game.multiball && !wasMultiball,
     missionStarted: modeTick.missionStarted,
     missionEnded: modeTick.missionEnded,
     awards,
@@ -1166,12 +1181,41 @@ function runModes(game: Game, awards: readonly Award[]): ModeTickReport {
   // ended is worse than showing nothing.
   if (report.messages.length > 0) game.modeMessages = report.messages;
   if (report.missionEnded) game.modeMessages = [];
+
+  // THE DECODED LOCK RELEASES. `BALL_REMOVE` takes the named lock's held ball
+  // off the table into the trough with nothing owed for it — the `BALLS_UP_TO`
+  // that follows it in every script that uses it counts live and queued balls,
+  // so the removed ball comes back as part of the top-up. A `PUSH` eject gives
+  // the ball back on its own: the machine owes a serve for it, unless the
+  // capture already bought a replacement (see `Game.lockDebts`).
+  //
+  // WHERE the ejected ball reappears is this port's one divergence from the
+  // decoded mechanism, and it is labelled: the popper at 0x7078 kicks the ball
+  // out of the saucer in place with authored per-device impulse words that are
+  // not yet exported, and this reconstruction returns it through the trough
+  // and the plunger lane like every other release instead. Same ball count,
+  // different door.
+  let released = false;
+  for (const eject of report.lockEjects) {
+    const device = lockForZone(game.locks, eject.level, eject.index);
+    if (device === null) continue;
+    const ballId = releaseLock(game.locks, device.id, game.balls.balls);
+    if (ballId === null) continue;
+    released = true;
+    if (game.lockDebts.delete(device.id)) continue;
+    oweServes(game, 1);
+  }
+  for (const remove of report.lockRemoves) {
+    const device = lockForZone(game.locks, remove.level, remove.index);
+    if (device === null) continue;
+    if (releaseLock(game.locks, device.id, game.balls.balls) !== null) released = true;
+    game.lockDebts.delete(device.id);
+  }
+  if (released) pruneInactiveBalls(game.balls);
+
   // `BALLS_UP_TO` is the multiball opcode and it is a TOP-UP with a ceiling of
-  // three, which is what `oweServes` already implements. `BALL_REMOVE` is not
-  // honoured: it takes the ball off the table so that the top-up that follows it
-  // can put several back, and since the top-up counts live balls the end state
-  // is the same three balls either way. It is reported so the omission is
-  // visible rather than assumed harmless.
+  // three, which is what `oweServes` already implements. Which count each
+  // multiball asks for is the script's own word — 2 or 3, per table, decoded.
   if (report.ballsUpTo > 0) {
     oweServes(game, ballsToTopUp(report.ballsUpTo, freeBallCount(game.balls), game.pendingServes));
     if (report.ballsUpTo > 1) game.multiball = true;
@@ -1215,12 +1259,11 @@ function modeAwardsAsAwards(report: ModeTickReport): Award[] {
  * everything not already rolling, held in a saucer or already queued.
  *
  * Without the cap the debt could exceed the trough by a route that needs
- * multiball to reach: `startMultiball` queues one serve per saucer it empties
- * and only THEN tops up, so emptying two saucers while two balls are still
- * rolling queued two serves on top of two live balls and the table briefly
- * carried four. The top-up cannot correct it, because a top-up only ever adds.
- * Capping the debt at its source fixes every caller at once and leaves the
- * top-up doing exactly what opcode `$6C` does.
+ * multiball to reach: a scripted eject queues a serve for the ball it frees and
+ * the top-up that follows only ever adds, so a burst of ejects while balls are
+ * still rolling could briefly promise a fourth. Capping the debt at its source
+ * fixes every caller at once and leaves the top-up doing exactly what opcode
+ * `$6C` does.
  */
 function oweServes(game: Game, count: number): void {
   const inHand = freeBallCount(game.balls) + heldBallCount(game.locks) + game.pendingServes;
@@ -1234,29 +1277,31 @@ function oweServes(game: Game, count: number): void {
 }
 
 /**
- * Captures balls into saucers, and lights multiball when enough are locked.
- *
- * Two decisions live here and only one of them is decoded.
+ * Captures balls into saucers. What a capture LEADS TO is no longer decided
+ * here: the saucer's own script does that, through the mission machine.
  *
  * DECODED: capture freezes the ball where it is and takes it out of the
- * simulation; release does not kick it out of the saucer but puts it back in the
- * serve queue; multiball is a top-up to a requested count with a hard ceiling of
- * three. See `ball-locks.ts` for the instructions.
+ * simulation; the capture's award queues the lock's script (`jsr $6c10` at
+ * +0x005582, routed through `runModes`); that script advances the multiball
+ * lock ladder (award effect 6), ejects the ball back (`PUSH`) or leaves it
+ * held for its multiball's `BALL_REMOVE` and `BALLS_UP_TO`. The two-saucers
+ * rule that used to live here is replaced by that mechanism — see the
+ * headstone comment in `ball-locks.ts`.
  *
- * RECONSTRUCTION: `LOCKS_TO_LIGHT_MULTIBALL` balls held lights it, and a capture
- * that leaves nothing rolling buys the player a replacement ball. The engine has
- * no rule for either — it keeps two lock counters and reads neither — so both are
- * this reconstruction's, and the replacement is the one that keeps the promise
- * that a game always ends: without it, locking the last ball in play would leave
- * the table empty with a non-zero active count and no way forward.
+ * RECONSTRUCTION: a capture that leaves nothing rolling buys the player a
+ * replacement ball, which keeps the promise that a game always ends — a
+ * swallowed launcher (`MODE_START` while another mode runs eats the start but
+ * the ladder still counts, a measured consequence) or a modeless table would
+ * otherwise leave the table empty with no way forward. The saucer is marked in
+ * `lockDebts` so a later scripted eject of the same ball does not owe a second
+ * serve on top of the replacement.
  */
 function runLocks(game: Game): {
   readonly locked: readonly number[];
-  readonly multiballStarted: boolean;
   readonly awards: readonly Award[];
 } {
   const captured = captureBalls(game.locks, game.balls.balls);
-  if (captured.length === 0) return { locked: [], multiballStarted: false, awards: [] };
+  if (captured.length === 0) return { locked: [], awards: [] };
 
   game.ballsLocked += captured.length;
   const locked = captured.map((capture) => capture.ballId);
@@ -1285,33 +1330,14 @@ function runLocks(game: Game): {
     }
   }
 
-  if (heldBallCount(game.locks) >= LOCKS_TO_LIGHT_MULTIBALL) {
-    startMultiball(game);
-    return { locked, multiballStarted: true, awards };
+  if (freeBallCount(game.balls) === 0) {
+    oweServes(game, 1);
+    // The replacement stands in for the FIRST held ball of this tick's
+    // captures: when its saucer's script ejects it later, no second serve.
+    const deviceId = captured[0]?.deviceId;
+    if (deviceId !== undefined) game.lockDebts.add(deviceId);
   }
-  if (freeBallCount(game.balls) === 0) oweServes(game, 1);
-  return { locked, multiballStarted: false, awards };
-}
-
-/**
- * Gives every saucer's ball back and fills the table to `MULTIBALL_BALL_COUNT`.
- *
- * This is opcode `$68` (release, data 0x5B4E) run over the whole bank followed by
- * opcode `$6C` (top-up, data 0x5BCC). The released balls go into the queue rather
- * than back onto the playfield, so the balls come out of the plunger lane one
- * after another exactly as they do in the original; `ballsToTopUp` then adds
- * however many more the target needs, and refuses to exceed the engine's ceiling
- * of three.
- */
-function startMultiball(game: Game): void {
-  const freed = releaseHeldBalls(game.locks, game.balls.balls);
-  pruneInactiveBalls(game.balls);
-  oweServes(game, freed.length);
-  oweServes(
-    game,
-    ballsToTopUp(MULTIBALL_BALL_COUNT, freeBallCount(game.balls), game.pendingServes),
-  );
-  game.multiball = true;
+  return { locked, awards };
 }
 
 /**

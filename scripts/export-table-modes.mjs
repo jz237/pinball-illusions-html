@@ -164,6 +164,23 @@ const ELEMENT_COUNTDOWN = 0x2e;
 const ELEMENT_COUNTER = 0x34;
 const COUNTER_TARGET = 0x04;
 const COUNTER_CONTINUATION = 0x48;
+/**
+ * Award effect 6's LAUNCHER TABLE, inline at counter record +$50: the decoded
+ * multiball-lock dispatch. Handler 0x5E5A takes `a0 = element+$34` (the same
+ * counter record family effect 21 uses), increments the per-player counts at
+ * +$06 and +$16, and 0x5EAA walks the 12-byte records at +$50 — the mission
+ * selector's own `{u16 id, u16 mask, u32 launcher, u32 lamp}` format — comparing
+ * the count against each ascending id (`move.w (a1),d1 / cmp.w d1,d0`); on
+ * equality the entry's launcher is queued through $6C10. Walking past the 0xFFFE
+ * terminator subtracts the word stored after it from the count and re-walks
+ * (`move.w $2(a1),d2 / sub.w d2,$16(a0,d6.w)` at 0x5F26), so the table wraps.
+ * This is the structure the earlier export could not find: no relocation points
+ * at the table base, because it is only ever reached as counter+$50.
+ */
+const LADDER_TABLE = 0x50;
+const LADDER_ENTRY_BYTES = 12;
+/** Longest ladder accepted by the scan; the longest shipped is 14 entries. */
+const LADDER_MAX_ENTRIES = 64;
 
 /** Where a script hangs off each kind of physical record. */
 const AWARD_EVENT = 0x1a;
@@ -208,7 +225,11 @@ const OPCODES = [
   { index: 18, name: "SET_MAX", length: 14, args: "oii" },
   { index: 19, name: "ANIMATE", length: 6, args: "o" },
   { index: 20, name: "NATIVE", length: 6, args: "o" },
-  { index: 21, name: "SET_COUNT", length: 8, args: "ow" },
+  // SET_COUNT's pointer is a progress-counter record. Where that record hosts a
+  // decoded effect-6 launcher table the operand is exported as the LADDER index
+  // (kind "l"); handler 0x5C64 writes the word to both per-player counts:
+  // `move.w $6(a1),$6(a2,d6.w) / move.w $6(a1),$16(a2,d6.w)`.
+  { index: 21, name: "SET_COUNT", length: 8, args: "lw" },
   { index: 22, name: "SET_COUNT_SELF", length: 6, args: "o" },
   { index: 23, name: "JMP_IF_UNLIT", length: 8, args: "ec" },
   { index: 24, name: "PUSH_LINKED", length: 10, args: "ee" },
@@ -475,6 +496,51 @@ function decodeScript(pkg, at) {
   };
 }
 
+/**
+ * Decodes the effect-6 launcher table inline at a counter record's +$50, or
+ * answers null.
+ *
+ * This is the MULTIBALL LOCK DISPATCH — the structure that runs the Nth
+ * launcher on the Nth lock — and the parse is strict the way `decodeScript` is:
+ * ids must ascend from at least 1, every launcher longword must be a genuine
+ * relocation entry resolving to a script that survived the prune, and the run
+ * must end on 0xFFFE (whose following word is the WRAP subtracted from the
+ * count when the walk runs off the end — decoded at 0x5F26, not inferred) or on
+ * 0xFFFF (no wrap: the handler's `bmi` ends the walk and only 0xFFFE re-enters
+ * it). A record that fails any of that yields nothing rather than a partial
+ * table.
+ *
+ * On the shipped tables this recovers BabeWatch's h4+0x49F8 (ids 1..10, wrap
+ * 10: lock tiers of 1/2/3/4 captures launching scripts 110/114/117/119, the
+ * four multiball modes, with the "n MORE TO START MODE" alternates at the
+ * intermediate ids) and Law 'n Justice's h4+0x40F4 (ids 1..14, wrap 5: tiers of
+ * 2/3/4/5 jail locks, multiball at ids 2/5/9/14), plus the smaller count-driven
+ * ladders each table uses for its own features.
+ */
+function ladderOf(pkg, record, scriptIndex) {
+  const entries = [];
+  let delta = LADDER_TABLE;
+  let previousId = 0;
+  for (;;) {
+    if (!inBounds(pkg, record, delta + 4)) return null;
+    const id = readU16(pkg, record, delta);
+    if (id === 0xfffe || id === 0xffff) {
+      if (entries.length === 0) return null;
+      return {
+        wrap: id === 0xfffe ? readU16(pkg, record, delta + 2) : 0,
+        entries,
+      };
+    }
+    if (id <= previousId || entries.length >= LADDER_MAX_ENTRIES) return null;
+    previousId = id;
+    const launcher = follow(pkg, record, delta + 4);
+    const script = launcher === null ? undefined : scriptIndex.get(key(launcher));
+    if (script === undefined) return null;
+    entries.push({ id, script });
+    delta += LADDER_ENTRY_BYTES;
+  }
+}
+
 /** The progress-counter continuation an element's award effect 21 queues. */
 function counterScriptOf(pkg, element) {
   const record = follow(pkg, element, ELEMENT_COUNTER);
@@ -702,7 +768,13 @@ function zoneBindings(pkg) {
         if (event !== null) triggers.push({ level, index, event });
       } else if (type === 4) {
         const event = follow(pkg, object, ZONE_LOCK_EVENT);
-        if (event !== null) locks.push({ level, index, event });
+        // The OBJECT is kept alongside the event: it is the lock DEVICE record,
+        // and the scripts hand that same record to PUSH / PUSH_LINKED /
+        // BALL_REMOVE (the element pool files it as an "element", a
+        // misclassification the runtime needs to see through — PUSH's handler
+        // 0x5BFC pushes the device onto the popper stack at $23DC(a5) and the
+        // popper 0x7078 physically ejects the ball the device is holding).
+        if (event !== null) locks.push({ level, index, event, object });
       }
     }
   }
@@ -849,6 +921,32 @@ function decode(pkg, table) {
   const messageIndex = new Map(messageList.map((at, i) => [key(at), i]));
   const scriptIndex = new Map(scriptList.map((script, i) => [key(script.at), i]));
 
+  // The LOCK LADDERS: award effect 6 (handler 0x5E5A). Every element whose
+  // award effect is 6 carries a counter record at +$34, and the launcher table
+  // inline at that record's +$50 is the decoded count dispatch — see
+  // `ladderOf`. Elements sharing one record share one ladder (BabeWatch's three
+  // lock-lit lamps 29/30/31 all point at h4+0x49A8), so the ladders are pooled
+  // by record and each element carries an index into the pool.
+  const EFFECT_COUNT_DISPATCH = 6;
+  const ladders = [];
+  const ladderIndexByKey = new Map();
+  const ladderIndexOf = (record) => {
+    if (record === null) return -1;
+    const k = key(record);
+    const cached = ladderIndexByKey.get(k);
+    if (cached !== undefined) return cached;
+    const ladder = ladderOf(pkg, record, scriptIndex);
+    const index = ladder === null ? -1 : ladders.length;
+    ladderIndexByKey.set(k, index);
+    if (ladder !== null) ladders.push({ index, wrap: ladder.wrap, entries: ladder.entries });
+    return index;
+  };
+  const elementLadder = elementList.map((at) =>
+    readU16(pkg, at, ELEMENT_EFFECT) === EFFECT_COUNT_DISPATCH
+      ? ladderIndexOf(follow(pkg, at, ELEMENT_COUNTER))
+      : -1,
+  );
+
   // The progress counter. AWARD effect 21 (handler 0x5FA8) takes `a0 = P+$34`,
   // increments the per-player counters there and, when the target at `a0+$04` is
   // reached, queues the script at `a0+$48` through $6C10. That is how a mission
@@ -878,6 +976,7 @@ function decode(pkg, table) {
     displayAward: messageIndex.get(keyOrNull(follow(pkg, at, ELEMENT_DISPLAY_AWARD))) ?? -1,
     counterScript: counters[index].script,
     counterTarget: counters[index].target,
+    ladder: elementLadder[index],
   }));
 
   const messages = messageList.map((at, index) => ({ index, lines: messageText(pkg, at) }));
@@ -907,6 +1006,10 @@ function decode(pkg, table) {
           return arg.value;
         }
         if (arg.target === null) return -1;
+        // A SET_COUNT whose record hosts a decoded ladder names the ladder;
+        // one whose record does not is exported unresolved, exactly as the
+        // other opaque pointers are.
+        if (arg.kind === "l") return ladderIndexOf(arg.target);
         // CHECK 4 — the operand must be in the pool its opcode requires.
         const pool =
           arg.kind === "e" ? elementIndex : arg.kind === "m" ? messageIndex : arg.kind === "s" ? scriptIndex : null;
@@ -938,7 +1041,17 @@ function decode(pkg, table) {
     .map((entry) => ({ level: entry.level, index: entry.index, script: bindScript(entry.event) }))
     .filter((entry) => entry.script >= 0);
   const locks = zoneBind.locks
-    .map((entry) => ({ level: entry.level, index: entry.index, script: bindScript(entry.event) }))
+    .map((entry) => ({
+      level: entry.level,
+      index: entry.index,
+      script: bindScript(entry.event),
+      // The lock DEVICE record's slot in the element pool, or -1. This is the
+      // join the runtime needs to honour PUSH / PUSH_LINKED / BALL_REMOVE on a
+      // lock: those opcodes name the device record, the pool filed it as an
+      // element, and matching the addresses here is what turns "push element
+      // 24" back into "eject the ball the jail is holding".
+      element: elementIndex.get(key(entry.object)) ?? -1,
+    }))
     .filter((entry) => entry.script >= 0);
 
   // Missions. The selector tables first, then every other MODE_START target, so
@@ -1007,6 +1120,7 @@ function decode(pkg, table) {
     messages,
     scripts: scriptDocs,
     missions,
+    ladders,
     triggers: { devices, zones, locks },
     selectors: selectors.map((entry, index) => ({
       index,
@@ -1069,6 +1183,7 @@ function buildDocument(table, decoded) {
     messages: decoded.messages,
     scripts: decoded.scripts,
     missions: decoded.missions,
+    ladders: decoded.ladders,
     triggers: decoded.triggers,
   };
 }
@@ -1140,7 +1255,7 @@ function main(argv) {
     }
     console.log(
       `  ${pad}  ${decoded.scripts.length} scripts, ${decoded.elements.length} elements, ` +
-        `${decoded.messages.length} display records`,
+        `${decoded.messages.length} display records, ${decoded.ladders.length} count ladders`,
     );
     console.log(
       `  ${pad}  ${decoded.missions.length} modes (${selected} on ${decoded.selectors.length} ` +
