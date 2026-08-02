@@ -13,8 +13,10 @@
  * The drawing language is the original's too. `main.bin` interprets a
  * big-endian opcode stream: 0x0001 LINE(x1,y1,x2,y2), 0x0002 TEXT(x, y, asciiz)
  * and 0x0003 end of page, with an alignment word choosing left, right or centred
- * on x. `line`, `box` and `text` below are those three primitives; everything
- * else in the file is a page written in them.
+ * on x. `fill`, `box` and `glyphs` below are those primitives — the lines are
+ * only ever axis-aligned, so they are filled spans rather than stroked paths,
+ * which is what keeps a 1-px rule exactly one pixel rather than two half-lit
+ * ones. Everything else in the file is a page written in them.
  *
  * WHAT IS THE DISK'S AND WHAT IS NOT
  * ---------------------------------------------------------------------------
@@ -23,23 +25,30 @@
  *
  *   - both proportional FONTS — the 19-px two-plane menu font and the small
  *     single-plane font — drawn glyph by glyph on the disk's own advance,
- *     height and y-offset metrics, outline pass under fill pass exactly as the
- *     blitter ORs them;
- *   - the three BACKDROP strips: eight 32-row bands, each showing a 320-px
- *     window into the 1472 x 32 strip of that screen's tumbling object
- *     (rings for attract, cubes for the menu, crosses for table select),
- *     wobbled by the disk's own ±64 sine table on the copper's indexing —
- *     10 per band, 1 per tick;
- *   - the shared 16-colour palette, whose colour 0 is the 0x36A blue;
+ *     height and y-offset metrics. The two planes are an anti-alias ramp, not
+ *     fill and outline: there is no black outline and no knockout anywhere in
+ *     the original's text, the backdrop shows right up against the glyph edge;
+ *   - the BACKDROP strips: eight 32-row bands, each showing a 288-px window
+ *     into a 1472 x 32 strip of a tumbling object, wobbled by the disk's own
+ *     ±64 sine table on the copper's indexing — 10 per band, 1 per tick — over
+ *     a base scroll quantised to whole 32-px objects;
+ *   - the SIXTEEN PAGE PALETTES, cycled by the disk's own free-running
+ *     backdrop service (see `shell-skin.ts`). Colour 0 is black in every live
+ *     one, so the objects always tumble on a black field;
  *   - the original's own 16 x 16 dissolve order for the info screen's picture.
  *
- * Not the disk's, even skinned: the text COLOUR registers (menudata carries
- * only the backdrop palette; white fill over black outline follows the glyph
- * plane semantics and the fade table's white text entries, amber accents are
- * this reconstruction's), the attract PAGE TEXT (the original's nineteen pages
+ * MEASURED OFF THE FILM rather than decoded, because they live in `main.bin`'s
+ * copper list and not in `menudata.bin` (see `palette.ts`): the $003 navy
+ * surround ring, the 1-px white frame rectangle, and the $fff / $aaa / $777
+ * text ramp. Every coordinate below that carries a "measured" note was read off
+ * the filmed original at native resolution.
+ *
+ * NOT THE DISK'S AT ALL: the attract PAGE TEXT (the original's nineteen pages
  * are the developers' own credit and greeting prose, which does not ship; the
  * pages here are written fresh and set in the decoded font at the decoded
- * pitch), and the hint lines naming keys, which the original never needed.
+ * pitch), the hint lines naming keys, and every screen the film never caught —
+ * table select, the info screen, the ladder and the cards over the playfield.
+ * Those are marked screen by screen below.
  *
  * Without the skin — assets still fetching, or fetch failed — every screen
  * falls back to the browser-font placeholder rendering, so the shell is never
@@ -50,12 +59,13 @@ import {
   SHELL_BACKDROP,
   SHELL_BAND,
   SHELL_DIM,
+  SHELL_FIELD,
   SHELL_FRAME,
   SHELL_HIGHLIGHT,
   SHELL_HIGHLIGHT_FILL,
   SHELL_PANEL,
+  SHELL_SURROUND,
   SHELL_TEXT,
-  SURROUND,
 } from "./palette.js";
 import {
   ATTRACT_PAGES,
@@ -65,8 +75,9 @@ import {
   shellTableFor,
 } from "./shell.js";
 import type { ShellState } from "./shell.js";
+import { shellBackdropFrame } from "./shell-skin.js";
 import type { ShellSkin, SkinFontKey } from "./shell-skin.js";
-import { FONT_ATLAS_WIDTH, alignShellText } from "../game/shell-art.js";
+import { FONT_ATLAS_WIDTH, STRIP_PITCH, STRIP_WIDTH, alignShellText } from "../game/shell-art.js";
 import type { ShellFont } from "../game/shell-art.js";
 import type { HighScoreEntry } from "../game/high-scores.js";
 import type { TableId } from "../game/contracts.js";
@@ -80,6 +91,23 @@ export const SHELL_HEIGHT = 256;
 /** The reconstruction's window is 336 wide; the shell is centred in it. */
 export const SHELL_ORIGIN_X = 8;
 
+/**
+ * The frame rectangle and the field inside it — measured off the filmed screen.
+ *
+ * The 1-px white rectangle runs (15,15) to (304,240) INCLUSIVE; the navy ring
+ * is everything outside it; the objects are clipped to the 288 x 224 interior.
+ * Those coordinates were already in this file's `frame()` before the film was
+ * measured, and the film agreed with them to the pixel.
+ */
+export const FRAME_LEFT = 15;
+export const FRAME_TOP = 15;
+export const FRAME_RIGHT = 304;
+export const FRAME_BOTTOM = 240;
+export const FIELD_X = FRAME_LEFT + 1;
+export const FIELD_Y = FRAME_TOP + 1;
+export const FIELD_WIDTH = FRAME_RIGHT - FRAME_LEFT - 1;
+export const FIELD_HEIGHT = FRAME_BOTTOM - FRAME_TOP - 1;
+
 /** The three fallback fonts, as logical pixel heights on the original's pitches. */
 const FONT_BIG = 14;
 const FONT_SMALL = 9;
@@ -88,29 +116,71 @@ const FONT_TINY = 7;
 const FONT_STACK = "ui-monospace, 'DejaVu Sans Mono', 'Courier New', monospace";
 
 /**
- * Skin text colours. White is the measured choice — the fade table's text
- * entries are all 0xFFF — and the outline is always black. Amber is kept for
- * the one job the placeholder already used it for: marking the freshly-earned
- * ladder row. The register values the original loads for its text planes are
- * the decode's one open question, so these are stated as choices, not facts.
+ * Skin text colours.
+ *
+ * White is measured, not chosen: plane value 1 is $fff on every filmed page,
+ * and `shell-skin.ts` derives the ramp's other two steps from it. Amber is kept
+ * for the one job the placeholder already used it for — marking the freshly-
+ * earned ladder row — and is stated as a choice: nothing on the film is amber.
+ *
+ * `SKIN_DIM` is the ramp's darkest step. It is for ink that sits on a BLACK
+ * card, never on the object field: measured against the field it scores 1.02:1
+ * on the orange page and 1.05:1 on green, i.e. invisible wherever it crosses an
+ * object. `SKIN_HINT` is therefore white, and it is what the hint rows use —
+ * those rows are the reconstruction's own (the original names its keys in a
+ * manual, not on screen), so nothing about them is a fidelity claim and there is
+ * no reason to print them in the one tone that cannot be read. White's worst
+ * case over any live palette is 3.57:1, on gold.
  */
-const SKIN_WHITE = "#ffffff";
-const SKIN_DIM = "#9ab6d4";
-const SKIN_AMBER = "#f7c948";
+const SKIN_WHITE = SHELL_TEXT;
+const SKIN_DIM = SHELL_DIM;
+const SKIN_HINT = SHELL_TEXT;
+const SKIN_AMBER = SHELL_HIGHLIGHT;
 
 /** Eight 32-row bands: the original's own division of the 256-row screen. */
 const BAND_HEIGHT = 32;
 const BAND_COUNT = SHELL_HEIGHT / BAND_HEIGHT;
 
 /**
- * Where the 320-px window sits in the 1472-px strip before the sine wobble.
- * Centred: (1472 - 320) / 2. The wobble is ±64, so the window stays inside the
- * strip and never needs to wrap.
+ * The base scroll under the sine wobble.
+ *
+ * Measured: every band offset read off the seven filmed pages fits
+ * `C + sine[(p + 10*band) & 255]` with C a MULTIPLE OF 32 — the base scroll is
+ * quantised to whole objects and the sine supplies the sub-object wobble. The
+ * code walks a counter 0..62 once per frame and takes `(counter >> 1) * 32`, so
+ * the base steps one whole object every two frames and cycles 0..992.
+ *
+ * `STRIP_MARGIN` is the constant the base sits on. The film pins C to multiples
+ * of 32 in the range 256..992 but not the constant itself; 64 is the smallest
+ * multiple of 32 that keeps the whole travel — base 0..992, wobble ±64, window
+ * 288 wide — inside the 1472-px strip at both ends (leftmost 1, rightmost 1408),
+ * so the strip never has to wrap. That choice is this file's, the shape is the
+ * film's.
  */
-const STRIP_BASE_X = 576;
+const STRIP_BASE_STEP = STRIP_PITCH;
+const STRIP_BASE_COUNTER = 63;
+const STRIP_MARGIN = 64;
 
 /** The copper's sine indexing: 10 per band, 1 per tick. */
 const SINE_STEP_PER_BAND = 10;
+
+/**
+ * The page-reveal wipe.
+ *
+ * Two filmed stills caught an attract page mid-transition and both obey exactly
+ *
+ *     row y is visible  iff  y >= front - 7 * (y mod 8)
+ *
+ * with `front` a multiple of 8 — eight interleaved fronts, one per (y mod 8)
+ * phase, staggered 7 rows apart. Measured front = 160 on one still and 128 on
+ * the other. What the film does NOT say is the direction (revealing upward or
+ * erasing downward) or the rate, because a single frame cannot show either, so
+ * the rate below is this file's: the front drops 8 rows a tick, which walks a
+ * three-line credits block on in about a third of a second.
+ */
+const WIPE_PHASE_STAGGER = 7;
+const WIPE_PHASES = 8;
+const WIPE_ROWS_PER_TICK = 8;
 
 type Align = "left" | "center" | "right";
 
@@ -123,20 +193,14 @@ type Align = "left" | "center" | "right";
  */
 export interface ShellContext {
   fillStyle: string | CanvasGradient | CanvasPattern;
-  strokeStyle: string | CanvasGradient | CanvasPattern;
-  lineWidth: number;
   font: string;
   textAlign: CanvasTextAlign;
   textBaseline: CanvasTextBaseline;
   imageSmoothingEnabled: boolean;
   globalAlpha: number;
   fillRect(x: number, y: number, w: number, h: number): void;
-  strokeRect(x: number, y: number, w: number, h: number): void;
   fillText(text: string, x: number, y: number): void;
   beginPath(): void;
-  moveTo(x: number, y: number): void;
-  lineTo(x: number, y: number): void;
-  stroke(): void;
   save(): void;
   restore(): void;
   rect(x: number, y: number, w: number, h: number): void;
@@ -168,30 +232,40 @@ function py(value: number, scale: number): number {
   return value * scale;
 }
 
-function line(
+/**
+ * A block of shell pixels, filled exactly.
+ *
+ * Every rule and rectangle on these screens is one game pixel thick and axis
+ * aligned, which a stroked path cannot draw: `strokeRect` centres the stroke on
+ * the path and turns a 1-px rule into two half-lit rows. Filling spans instead
+ * puts each shell pixel on an exact `scale` x `scale` block of device pixels,
+ * which is the whole point of drawing a 1995 screen at an integer magnification.
+ */
+function fill(
   ctx: ShellContext,
   scale: number,
-  x1: number,
-  y1: number,
-  x2: number,
-  y2: number,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
   colour: string,
 ): void {
-  ctx.strokeStyle = colour;
-  ctx.lineWidth = Math.max(1, Math.round(scale));
-  ctx.beginPath();
-  ctx.moveTo(px(x1, scale), py(y1, scale));
-  ctx.lineTo(px(x2, scale), py(y2, scale));
-  ctx.stroke();
+  if (width <= 0 || height <= 0) return;
+  ctx.fillStyle = colour;
+  ctx.fillRect(px(x, scale), py(y, scale), width * scale, height * scale);
 }
 
 /**
- * One of the shell's boxes.
+ * One of the shell's boxes. `x2`/`y2` are INCLUSIVE, as the display list's
+ * vector coordinates are: (120,83)-(200,115) is the 81 x 33 menu highlight the
+ * film measures.
  *
- * The original emits every box twice with a different separator word between
- * the two polylines — a bevel pass — which is why a menu button has an edge
- * rather than a hairline. Here the second pass is a fill, which is what carries
- * the highlight.
+ * The raster detail is the original's own, measured on the filmed menu page: the
+ * top edge and the left edge run their full length, the bottom and the right
+ * stop one pixel short, and the BOTTOM-RIGHT CORNER IS NOT DRAWN AT ALL. That is
+ * what a four-segment polyline whose last segment ends where the first began
+ * leaves behind, and reproducing it is what takes the menu page to a zero
+ * mismatch against the film.
  */
 function box(
   ctx: ShellContext,
@@ -201,19 +275,15 @@ function box(
   x2: number,
   y2: number,
   colour: string,
-  fill: string | null,
+  background: string | null,
 ): void {
-  const left = px(x1, scale);
-  const top = py(y1, scale);
-  const width = (x2 - x1) * scale;
-  const height = (y2 - y1) * scale;
-  if (fill !== null) {
-    ctx.fillStyle = fill;
-    ctx.fillRect(left, top, width, height);
-  }
-  ctx.strokeStyle = colour;
-  ctx.lineWidth = Math.max(1, Math.round(scale));
-  ctx.strokeRect(left, top, width, height);
+  const width = x2 - x1 + 1;
+  const height = y2 - y1 + 1;
+  if (background !== null) fill(ctx, scale, x1, y1, width, height, background);
+  fill(ctx, scale, x1, y1, width, 1, colour);
+  fill(ctx, scale, x1, y2, width - 1, 1, colour);
+  fill(ctx, scale, x1, y1, 1, height, colour);
+  fill(ctx, scale, x2, y1, 1, height - 1, colour);
 }
 
 /** The browser-font fallback TEXT primitive. Skinned screens use `glyphs`. */
@@ -247,9 +317,14 @@ function skinFontData(skin: ShellSkin, font: SkinFontKey): ShellFont {
  *
  * `y` is the glyph-box top, which is the coordinate the original's TEXT opcode
  * carries; each glyph adds its own signed y-offset (that is how a comma sits
- * low). Centring and right-alignment are the original's integer arithmetic in
- * `alignShellText`. Two passes — outlines, then fills — reproduce the
- * blitter's OR compositing; see `SkinFontLayer` in shell-skin.ts.
+ * low). Centring is the original's own arithmetic: `alignShellText` computes
+ * `x - floor(width/2)`, which on x = 160 is identically the
+ * `(320 - width + 1) >> 1` the filmed strings measure to, including the two
+ * whose odd advance sums round the other way under a plain `>> 1`.
+ *
+ * One pass, because the glyph planes are an anti-alias ramp rather than a fill
+ * over an outline: every non-zero plane value is ink of some brightness and
+ * value 0 leaves the backdrop showing, which is what the film has.
  */
 function glyphs(
   ctx: ShellContext,
@@ -263,118 +338,168 @@ function glyphs(
   align: Align = "left",
 ): void {
   const data = skinFontData(skin, font);
-  const startPen = alignShellText(data, value, x, align);
+  const atlas = skin.fontAtlas(font, colour);
+  let pen = alignShellText(data, value, x, align);
   ctx.imageSmoothingEnabled = false;
-  for (const layer of ["outline", "fill"] as const) {
-    const atlas = skin.fontAtlas(font, layer, colour);
-    let pen = startPen;
-    for (let i = 0; i < value.length; i += 1) {
-      const glyph = data.glyphs[value.charCodeAt(i)];
-      if (glyph === undefined) continue;
-      if (glyph.height > 0) {
-        ctx.drawImage(
-          atlas,
-          0,
-          glyph.top,
-          FONT_ATLAS_WIDTH,
-          glyph.height,
-          px(pen, scale),
-          py(y + glyph.yOffset, scale),
-          FONT_ATLAS_WIDTH * scale,
-          glyph.height * scale,
-        );
-      }
-      pen += glyph.advance;
+  for (let i = 0; i < value.length; i += 1) {
+    const glyph = data.glyphs[value.charCodeAt(i)];
+    if (glyph === undefined) continue;
+    if (glyph.height > 0) {
+      ctx.drawImage(
+        atlas,
+        0,
+        glyph.top,
+        FONT_ATLAS_WIDTH,
+        glyph.height,
+        px(pen, scale),
+        py(y + glyph.yOffset, scale),
+        FONT_ATLAS_WIDTH * scale,
+        glyph.height * scale,
+      );
     }
+    pen += glyph.advance;
   }
 }
 
 /**
- * The decoded backdrop: eight 32-row bands, each a 320-px window into that
- * screen's 1472 x 32 tumbling-object strip, offset by the disk's own sine
- * table with the copper's indexing — the band number times 10, plus the tick.
- * A pure function of the tick, so two runs at the same tick draw the same
+ * Where band `band` reads the strip at `tick`.
+ *
+ * `base + sine[(tick + 10*band) & 255]`, exactly the shape every filmed page
+ * fits, with the base stepping one whole 32-px object every two frames.
+ */
+export function shellBandOffset(sine: readonly number[], tick: number, band: number): number {
+  const counter = ((tick % STRIP_BASE_COUNTER) + STRIP_BASE_COUNTER) % STRIP_BASE_COUNTER;
+  const base = STRIP_MARGIN + (counter >> 1) * STRIP_BASE_STEP;
+  return base + (sine[(tick + band * SINE_STEP_PER_BAND) & 0xff] ?? 0);
+}
+
+/**
+ * The decoded backdrop: eight 32-row bands over the whole 256-row screen, each
+ * a 288-px window into the current strip at that band's own offset, clipped to
+ * the frame's interior so bands 0 and 7 show only their inner 16 rows — which is
+ * how the original's field meets its border.
+ *
+ * Pure in the tick and the palette, so two runs at the same tick draw the same
  * frame.
  */
 function skinBands(
   ctx: ShellContext,
   skin: ShellSkin,
   role: "attract" | "menu" | "select",
+  palette: Uint8Array,
   scale: number,
   tick: number,
 ): void {
-  const strip = skin.backdrop(role);
-  const sine = skin.art.sine;
+  const strip = skin.backdrop(role, palette);
   ctx.imageSmoothingEnabled = false;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(px(FIELD_X, scale), py(FIELD_Y, scale), FIELD_WIDTH * scale, FIELD_HEIGHT * scale);
+  ctx.clip();
   for (let band = 0; band < BAND_COUNT; band += 1) {
-    const wobble = sine[(tick + band * SINE_STEP_PER_BAND) & 0xff] ?? 0;
+    const left = shellBandOffset(skin.art.sine, tick, band);
     ctx.drawImage(
       strip,
-      STRIP_BASE_X + wobble,
+      Math.max(0, Math.min(STRIP_WIDTH - FIELD_WIDTH, left)),
       0,
-      SHELL_WIDTH,
+      FIELD_WIDTH,
       BAND_HEIGHT,
-      px(0, scale),
+      px(FIELD_X, scale),
       py(band * BAND_HEIGHT, scale),
-      SHELL_WIDTH * scale,
+      FIELD_WIDTH * scale,
       BAND_HEIGHT * scale,
     );
   }
-}
-
-/** The screen frame: four lines, (15,15)-(304,240) — table select's border. */
-function frame(ctx: ShellContext, scale: number, colour: string = SHELL_FRAME): void {
-  line(ctx, scale, 15, 15, 304, 15, colour);
-  line(ctx, scale, 15, 240, 304, 240, colour);
-  line(ctx, scale, 15, 15, 15, 240, colour);
-  line(ctx, scale, 304, 15, 304, 240, colour);
-}
-
-/** Clears the whole canvas, including the eight pixels either side of the box. */
-function clear(ctx: ShellContext, scale: number, skin: ShellSkin | null): void {
-  ctx.imageSmoothingEnabled = false;
-  ctx.globalAlpha = 1;
-  ctx.fillStyle = SURROUND;
-  ctx.fillRect(0, 0, (SHELL_WIDTH + 2 * SHELL_ORIGIN_X) * scale, SHELL_HEIGHT * scale);
-  ctx.fillStyle = skin === null ? SHELL_BACKDROP : skin.background;
-  ctx.fillRect(px(0, scale), py(0, scale), SHELL_WIDTH * scale, SHELL_HEIGHT * scale);
+  ctx.restore();
 }
 
 /**
- * The fallback bands: eight scrolling stripes standing in for the strips when
- * the artwork has not arrived. Deterministic in the tick, like the real thing.
+ * The screen frame: the 1-px rectangle (15,15)-(304,240), measured white.
+ *
+ * Its own polyline runs the other way round from a menu box's, so the corner it
+ * leaves out is the BOTTOM-LEFT one — (15,240) is navy on every filmed page, and
+ * that single pixel is the whole difference between this and `box`. Measured on
+ * the film run by run: top x 15..304, right y 15..240, bottom x 16..304, left
+ * y 15..239.
+ */
+function frame(ctx: ShellContext, scale: number, colour: string = SHELL_FRAME): void {
+  const width = FRAME_RIGHT - FRAME_LEFT + 1;
+  const height = FRAME_BOTTOM - FRAME_TOP + 1;
+  fill(ctx, scale, FRAME_LEFT, FRAME_TOP, width, 1, colour);
+  fill(ctx, scale, FRAME_RIGHT, FRAME_TOP, 1, height, colour);
+  fill(ctx, scale, FRAME_LEFT + 1, FRAME_BOTTOM, width - 1, 1, colour);
+  fill(ctx, scale, FRAME_LEFT, FRAME_TOP, 1, height - 1, colour);
+}
+
+/**
+ * The empty screen: navy everywhere, black inside the frame.
+ *
+ * Both colours are measured. The navy ring is 15 px of $003 on all four sides
+ * of the 320 x 256 screen; this reconstruction's window is 336 wide, so the
+ * eight extra pixels each side take the same navy and the ring simply reads as
+ * 23 px rather than 15. The field is $000, which is also colour 0 of every live
+ * page palette — the strip's own background index — so the two cannot drift.
+ */
+function clear(ctx: ShellContext, scale: number, skin: ShellSkin | null): void {
+  ctx.imageSmoothingEnabled = false;
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = SHELL_SURROUND;
+  ctx.fillRect(0, 0, (SHELL_WIDTH + 2 * SHELL_ORIGIN_X) * scale, SHELL_HEIGHT * scale);
+  fill(
+    ctx,
+    scale,
+    FIELD_X,
+    FIELD_Y,
+    FIELD_WIDTH,
+    FIELD_HEIGHT,
+    skin === null ? SHELL_BACKDROP : SHELL_FIELD,
+  );
+}
+
+/**
+ * The fallback bands: eight rows of blocks standing in for the strips when the
+ * artwork has not arrived, on the same eight-band grid, wobbled by the same
+ * cosine so the stand-in moves the way the real field does. Deterministic in the
+ * tick, like the real thing.
  */
 function bands(ctx: ShellContext, scale: number, tick: number): void {
-  const cell = 16;
+  const cell = STRIP_PITCH;
   ctx.save();
   ctx.beginPath();
-  ctx.rect(px(0, scale), py(0, scale), SHELL_WIDTH * scale, SHELL_HEIGHT * scale);
+  ctx.rect(px(FIELD_X, scale), py(FIELD_Y, scale), FIELD_WIDTH * scale, FIELD_HEIGHT * scale);
   ctx.clip();
-  ctx.fillStyle = SHELL_BAND;
   for (let band = 0; band < BAND_COUNT; band += 1) {
-    const speed = band % 2 === 0 ? 1 : -1;
-    const drift = (tick * (band + 2) * speed) / 8;
-    const phase = ((drift % (cell * 2)) + cell * 2) % (cell * 2);
+    const phase =
+      (((64 * Math.cos((2 * Math.PI * (tick + band * SINE_STEP_PER_BAND)) / 256)) % cell) + cell) %
+      cell;
     const top = band * BAND_HEIGHT;
-    for (let x = -cell * 2; x < SHELL_WIDTH + cell * 2; x += cell * 2) {
-      const left = x + phase;
-      ctx.fillRect(px(left, scale), py(top + 8, scale), cell * scale, (BAND_HEIGHT - 16) * scale);
+    for (let x = FIELD_X - cell; x < FIELD_X + FIELD_WIDTH + cell; x += cell) {
+      fill(ctx, scale, Math.round(x + phase) + 6, top + 8, cell - 12, BAND_HEIGHT - 16, SHELL_BAND);
     }
   }
   ctx.restore();
 }
 
-/** Backdrop for one of the three menu screens: the real strip, or the stand-in. */
-function backdrop(
-  ctx: ShellContext,
-  scale: number,
-  skin: ShellSkin | null,
-  role: "attract" | "menu" | "select",
-  tick: number,
-): void {
+/**
+ * Backdrop for a menu screen: the real strip, or the stand-in.
+ *
+ * WHICH strip and WHICH palette is not the screen's to choose, and that is why
+ * this takes no role. The original runs ONE free-running backdrop service under
+ * every shell state, cycling the eight page tints and swapping the strip at the
+ * black one — which is why the film caught the same credits page on the cube
+ * strip once and on the torus twice, across three cold boots, and caught the
+ * main menu on the cube. The clock is the shell's own free-running tick, so the
+ * field goes on turning across every screen change exactly as it does on the
+ * disk.
+ */
+function backdrop(ctx: ShellContext, scale: number, skin: ShellSkin | null, tick: number): void {
   clear(ctx, scale, skin);
-  if (skin === null) bands(ctx, scale, tick);
-  else skinBands(ctx, skin, role, scale, tick);
+  if (skin === null) {
+    bands(ctx, scale, tick);
+    return;
+  }
+  const service = shellBackdropFrame(skin.art, tick);
+  skinBands(ctx, skin, service.role, service.palette, scale, tick);
 }
 
 // ---------------------------------------------------------------------------
@@ -483,7 +608,16 @@ function thumbnail(
   height: number,
   dissolveFrames: number | null,
 ): void {
-  box(ctx, scale, x, y, x + width, y + height, skin === null ? SHELL_FRAME : SKIN_WHITE, SHELL_PANEL);
+  box(
+    ctx,
+    scale,
+    x,
+    y,
+    x + width - 1,
+    y + height - 1,
+    skin === null ? SHELL_FRAME : SKIN_WHITE,
+    SHELL_PANEL,
+  );
   const image = artwork.imageFor(tableId);
   if (image === null) {
     if (skin === null) {
@@ -567,66 +701,121 @@ function imageSize(image: CanvasImageSource): { width: number; height: number } 
 /**
  * The credits roll.
  *
- * Skinned: the page's lines in the big font, centred on x = 160 on the
- * original's own y ladder — 30-pixel pitch centred between 104 and 134, which
- * is where its six-line pages put y = 44..194 and its two-line pages 104/134 —
- * over the tumbling-rings strip. No border: the original's attract pages have
- * none. The text itself is written fresh (see the header); the hint lines at
- * the bottom are the reconstruction's, in the small font.
+ * MEASURED off the film: the frame and its navy surround; the field of tumbling
+ * objects behind the text; the line tops, which are y = 104, 134 and 164 on a
+ * 30-px pitch and are TOP-ANCHORED — a two-line page uses 104 and 134 and does
+ * not centre itself between them; the centring arithmetic; the white ink.
+ *
+ * NOT the film's: the words. The original's nineteen pages are the developers'
+ * own credit and greeting prose and do not ship (see the header), so these
+ * pages are written fresh and set in the decoded font on the decoded ladder.
+ * Nor is the hint line at the bottom, which names keys the original's manual
+ * named instead; it is in the small font, in the ramp's darkest step, clear of
+ * the text block and well inside the frame.
  */
+const ATTRACT_LINE_TOP = 104;
+const ATTRACT_LINE_PITCH = 30;
+/** The reconstruction's own hint row, below every page's last line. */
+const HINT_Y = 224;
+const HINT_ATTRACT = "PRESS SPACE - F1-F3 GO STRAIGHT TO A TABLE";
+
+/** Rows a wipe front has reached. See `WIPE_PHASE_STAGGER`. */
+export function shellWipeShowsRow(front: number, y: number): boolean {
+  return y >= front - WIPE_PHASE_STAGGER * (((y % WIPE_PHASES) + WIPE_PHASES) % WIPE_PHASES);
+}
+
+/**
+ * The wipe front `ticks` into a page, or null once the page is fully on.
+ *
+ * Starts far enough below the block that every row is hidden and drops
+ * `WIPE_ROWS_PER_TICK` a tick until every row is shown. Both ends are computed
+ * from the block itself rather than fixed, so a taller page takes longer.
+ */
+function attractWipeFront(ticks: number, top: number, bottom: number): number | null {
+  const start = bottom + WIPE_PHASE_STAGGER * (WIPE_PHASES - 1) + WIPE_ROWS_PER_TICK;
+  const front = start - Math.max(0, ticks) * WIPE_ROWS_PER_TICK;
+  return front <= top ? null : front;
+}
+
 function drawAttract(ctx: ShellContext, scale: number, state: ShellState, skin: ShellSkin | null): void {
-  const tick = state.attractTicks + state.attractPage * 64;
-  backdrop(ctx, scale, skin, "attract", tick);
+  backdrop(ctx, scale, skin, state.ticks);
 
   const page = ATTRACT_PAGES[state.attractPage] ?? [];
   const lines = page.length;
   if (skin === null) {
     frame(ctx, scale);
-    const middle = 119;
-    const top = middle - ((lines - 1) * 30) / 2 - 15;
     for (let i = 0; i < lines; i += 1) {
       const value = page[i];
       if (value === undefined) continue;
-      text(ctx, scale, 160, top + i * 30, value, i === 0 ? SHELL_HIGHLIGHT : SHELL_TEXT, FONT_BIG, "center");
+      const y = ATTRACT_LINE_TOP + i * ATTRACT_LINE_PITCH;
+      text(ctx, scale, 160, y, value, i === 0 ? SHELL_HIGHLIGHT : SHELL_TEXT, FONT_BIG, "center");
     }
-    text(ctx, scale, 160, 214, "PRESS SPACE", SHELL_HIGHLIGHT, FONT_SMALL, "center");
-    text(ctx, scale, 160, 226, "F1-F3 GOES STRAIGHT TO A TABLE", SHELL_DIM, FONT_TINY, "center");
+    text(ctx, scale, 160, HINT_Y, HINT_ATTRACT, SHELL_DIM, FONT_TINY, "center");
     return;
   }
 
-  // The decoded ladder: 44, 74, 104, ... — i.e. 119 - 15*(lines-1) at pitch 30.
-  const top = 119 - 15 * (lines - 1);
+  frame(ctx, scale, SKIN_WHITE);
+
+  const bottom = ATTRACT_LINE_TOP + (lines - 1) * ATTRACT_LINE_PITCH + 24;
+  const front = attractWipeFront(state.attractTicks, ATTRACT_LINE_TOP, bottom);
+  ctx.save();
+  ctx.beginPath();
+  if (front === null) {
+    // The page text is the only writing on these screens whose length is not
+    // fixed, so it is the only one that could ever reach the frame. Clipped to
+    // the field so it cannot: a line too wide to fit is cut off inside the
+    // border rather than printed over it.
+    ctx.rect(px(FIELD_X, scale), py(FIELD_Y, scale), FIELD_WIDTH * scale, FIELD_HEIGHT * scale);
+  } else {
+    // Strictly per-scanline and all-or-nothing across the width, which is what
+    // the two mid-transition stills show. One clip path of 1-px rows does it.
+    for (let y = ATTRACT_LINE_TOP; y <= bottom; y += 1) {
+      if (shellWipeShowsRow(front, y)) {
+        ctx.rect(px(FIELD_X, scale), py(y, scale), FIELD_WIDTH * scale, scale);
+      }
+    }
+  }
+  ctx.clip();
   for (let i = 0; i < lines; i += 1) {
     const value = page[i];
     if (value === undefined) continue;
-    glyphs(ctx, skin, "font1", scale, 160, top + i * 30, value, SKIN_WHITE, "center");
+    const y = ATTRACT_LINE_TOP + i * ATTRACT_LINE_PITCH;
+    glyphs(ctx, skin, "font1", scale, 160, y, value, SKIN_WHITE, "center");
   }
-  glyphs(ctx, skin, "font2", scale, 160, 226, "PRESS SPACE", SKIN_WHITE, "center");
-  glyphs(ctx, skin, "font2", scale, 160, 240, "F1-F3 GOES STRAIGHT TO A TABLE", SKIN_DIM, "center");
+  ctx.restore();
+
+  glyphs(ctx, skin, "font2", scale, 160, HINT_Y, HINT_ATTRACT, SKIN_HINT, "center");
 }
 
 /**
  * The main menu. Two items and only two: display list 0xCF3C — centred
- * "Tables" at (160,90) and centred "Exit" at (160,133), with the highlight
- * rectangles at 0xCF58 — (120,83)-(200,115) and (120,126)-(200,158) — around
- * whichever the cursor is on. Skinned it is exactly that over the cubes strip;
- * the fallback adds a title and boxes both items because a placeholder needs
- * more signposting than the real artwork does.
+ * "Tables" at (160,90) and centred "Exit" at (160,133), with the rectangles at
+ * 0xCF58, (120,83)-(200,115) and (120,126)-(200,158).
+ *
+ * MEASURED off the film, which caught this page whole: both rectangles are
+ * drawn every frame and both are 81 x 33; the one the cursor is on is WHITE and
+ * the other is BLACK. A black rectangle over a black field is invisible except
+ * where it crosses a lit object, which is why the unselected item looks chopped
+ * up on the original rather than boxed. The film's cursor was on "Exit".
+ *
+ * The hint line is the reconstruction's. The fallback additionally titles the
+ * page, because a placeholder needs more signposting than the real artwork does.
  */
-function drawMenu(ctx: ShellContext, scale: number, state: ShellState, skin: ShellSkin | null): void {
-  backdrop(ctx, scale, skin, "menu", state.frameTicks);
+const MENU_RECTS = Object.freeze([
+  Object.freeze({ x1: 120, y1: 83, x2: 200, y2: 115, textY: 90 }),
+  Object.freeze({ x1: 120, y1: 126, x2: 200, y2: 158, textY: 133 }),
+]);
 
-  // Highlight rectangles from 0xCF58, text at the display list's own y.
-  const rects = [
-    { x1: 120, y1: 83, x2: 200, y2: 115, textY: 90 },
-    { x1: 120, y1: 126, x2: 200, y2: 158, textY: 133 },
-  ];
+const HINT_MENU = "UP/DOWN CHOOSE   SPACE SELECTS   ESC BACK";
+
+function drawMenu(ctx: ShellContext, scale: number, state: ShellState, skin: ShellSkin | null): void {
+  backdrop(ctx, scale, skin, state.ticks);
 
   if (skin === null) {
     frame(ctx, scale);
     text(ctx, scale, 160, 40, "PINBALL ILLUSIONS", SHELL_HIGHLIGHT, FONT_BIG, "center");
-    for (let i = 0; i < rects.length; i += 1) {
-      const rect = rects[i];
+    for (let i = 0; i < MENU_RECTS.length; i += 1) {
+      const rect = MENU_RECTS[i];
       const label = MENU_ITEMS[i];
       if (rect === undefined || label === undefined) continue;
       const chosen = state.menuCursor === i;
@@ -642,20 +831,20 @@ function drawMenu(ctx: ShellContext, scale: number, state: ShellState, skin: She
       );
       text(ctx, scale, 160, rect.textY, label, chosen ? SHELL_HIGHLIGHT : SHELL_TEXT, FONT_BIG, "center");
     }
-    text(ctx, scale, 160, 200, "UP/DOWN CHOOSE   SPACE SELECTS   ESC BACK", SHELL_DIM, FONT_TINY, "center");
+    text(ctx, scale, 160, HINT_Y, HINT_MENU, SHELL_DIM, FONT_TINY, "center");
     return;
   }
 
-  for (let i = 0; i < rects.length; i += 1) {
-    const rect = rects[i];
+  frame(ctx, scale, SKIN_WHITE);
+  for (let i = 0; i < MENU_RECTS.length; i += 1) {
+    const rect = MENU_RECTS[i];
     const label = MENU_ITEMS[i];
     if (rect === undefined || label === undefined) continue;
-    if (state.menuCursor === i) {
-      box(ctx, scale, rect.x1, rect.y1, rect.x2, rect.y2, SKIN_WHITE, null);
-    }
+    const chosen = state.menuCursor === i;
+    box(ctx, scale, rect.x1, rect.y1, rect.x2, rect.y2, chosen ? SKIN_WHITE : SHELL_FIELD, null);
     glyphs(ctx, skin, "font1", scale, 160, rect.textY, label, SKIN_WHITE, "center");
   }
-  glyphs(ctx, skin, "font2", scale, 160, 226, "UP/DOWN CHOOSE   SPACE SELECTS   ESC BACK", SKIN_DIM, "center");
+  glyphs(ctx, skin, "font2", scale, 160, HINT_Y, HINT_MENU, SKIN_HINT, "center");
 }
 
 /**
@@ -674,6 +863,13 @@ function drawMenu(ctx: ShellContext, scale: number, state: ShellState, skin: She
  * The preview panel above the Info box is a reconstruction: the original's table
  * select has no artwork on it at all, the picture lives one screen further in on
  * Info. Choosing between three tables is easier when you can see them.
+ *
+ * THE FILM NEVER CAUGHT THIS SCREEN — not one frame of the whole census — so
+ * nothing below is measured except the border, the surround and the ink, which
+ * are shared with the pages that were caught. The box coordinates are the
+ * display list's; the rest is stated as this reconstruction's arrangement. The
+ * unselected box follows the menu's measured rule and is drawn in the field's
+ * own black rather than a dimmed white.
  */
 function drawSelect(
   ctx: ShellContext,
@@ -682,11 +878,11 @@ function drawSelect(
   artwork: ShellArtworkSource,
   skin: ShellSkin | null,
 ): void {
-  backdrop(ctx, scale, skin, "select", state.frameTicks);
+  backdrop(ctx, scale, skin, state.ticks);
 
   const skinned = skin !== null;
   const focusColour = skinned ? SKIN_WHITE : SHELL_HIGHLIGHT;
-  const idleColour = skinned ? SKIN_DIM : SHELL_FRAME;
+  const idleColour = skinned ? SHELL_FIELD : SHELL_FRAME;
 
   frame(ctx, scale, skinned ? SKIN_WHITE : SHELL_FRAME);
   if (skin === null) {
@@ -744,11 +940,11 @@ function drawSelect(
   // higher than this would be printed over it.
   const action = state.column === 0 ? "SPACE PLAYS THIS TABLE" : "SPACE SHOWS THE INFO SCREEN";
   if (skin === null) {
-    text(ctx, scale, 160, 216, action, SHELL_TEXT, FONT_SMALL, "center");
-    text(ctx, scale, 160, 229, "UP/DOWN   LEFT/RIGHT   SPACE   ESC", SHELL_DIM, FONT_TINY, "center");
+    text(ctx, scale, 160, 210, action, SHELL_TEXT, FONT_SMALL, "center");
+    text(ctx, scale, 160, HINT_Y, "UP/DOWN   LEFT/RIGHT   SPACE   ESC", SHELL_DIM, FONT_TINY, "center");
   } else {
-    glyphs(ctx, skin, "font2", scale, 160, 218, action, SKIN_WHITE, "center");
-    glyphs(ctx, skin, "font2", scale, 160, 229, "UP/DOWN   LEFT/RIGHT   SPACE   ESC", SKIN_DIM, "center");
+    glyphs(ctx, skin, "font2", scale, 160, 210, action, SKIN_WHITE, "center");
+    glyphs(ctx, skin, "font2", scale, 160, HINT_Y, "UP/DOWN   LEFT/RIGHT   SPACE   ESC", SKIN_HINT, "center");
   }
 }
 
@@ -767,6 +963,12 @@ function drawSelect(
  * `tables.bin` and the two lines under it are written fresh. "Press ESC to exit"
  * is the disk's own last line and is functional — it tells you the only key that
  * leaves — so it stays.
+ *
+ * THE FILM NEVER CAUGHT THIS SCREEN either. Its own coordinates put the artwork
+ * panel at x 176..303 and the typing at x = 16, both flush with the interior the
+ * frame encloses, so the frame and the navy surround are drawn here as on every
+ * other page; there are no objects behind it, which the layout leaves no room
+ * for anyway.
  */
 function drawInfo(
   ctx: ShellContext,
@@ -776,6 +978,7 @@ function drawInfo(
   skin: ShellSkin | null,
 ): void {
   clear(ctx, scale, skin);
+  frame(ctx, scale, skin === null ? SHELL_FRAME : SKIN_WHITE);
 
   const table = highlightedTable(state);
   thumbnail(ctx, scale, skin, artwork, table.id, 176, 16, 128, 128, state.frameTicks);
@@ -807,28 +1010,55 @@ function drawInfo(
     ladderBlock(ctx, scale, skin, state.ladder, 180, 300, 160, 16, FONT_SMALL, -1);
     if (skin === null) {
       text(ctx, scale, 16, 160, "HIGH SCORES", SHELL_HIGHLIGHT, FONT_SMALL);
-      text(ctx, scale, 16, 232, "Press ESC to exit.", SHELL_DIM, FONT_SMALL);
+      text(ctx, scale, 16, 228, "Press ESC to exit.", SHELL_DIM, FONT_SMALL);
     } else {
       glyphs(ctx, skin, "font2", scale, 16, 160, "HIGH SCORES", SKIN_WHITE);
-      glyphs(ctx, skin, "font2", scale, 16, 232, "Press ESC to exit.", SKIN_DIM);
+      glyphs(ctx, skin, "font2", scale, 16, 228, "Press ESC to exit.", SKIN_DIM);
     }
   }
 }
 
+/**
+ * Loading.
+ *
+ * MEASURED, and it is the one shell page that is nothing like the others: the
+ * whole 320 x 256 is pure black, with NO navy surround, NO frame and no objects.
+ * All the original puts on it is a 147 x 16 painted logo whose ink sits at
+ * x 90..236, y 120..135 — a separate image belonging to the loader, not shell
+ * art out of `menudata.bin`, and one this project has not decoded and does not
+ * ship. So the word is set in the decoded font instead, on the logo's own rows,
+ * and the table's name goes under it: the film's geometry, without inventing the
+ * film's picture.
+ */
+const LOADING_INK_TOP = 120;
+
 function drawLoading(ctx: ShellContext, scale: number, state: ShellState, skin: ShellSkin | null): void {
-  clear(ctx, scale, skin);
+  // Black to all four edges — no ring and no frame, unlike every other page.
+  ctx.imageSmoothingEnabled = false;
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = SHELL_FIELD;
+  ctx.fillRect(0, 0, (SHELL_WIDTH + 2 * SHELL_ORIGIN_X) * scale, SHELL_HEIGHT * scale);
+
   const name = state.tableId === null ? "" : shellTableFor(state.tableId).name;
   if (skin === null) {
-    frame(ctx, scale);
-    text(ctx, scale, 160, 110, "LOADING", SHELL_DIM, FONT_SMALL, "center");
-    text(ctx, scale, 160, 128, name, SHELL_HIGHLIGHT, FONT_BIG, "center");
+    text(ctx, scale, 160, LOADING_INK_TOP, "LOADING", SHELL_TEXT, FONT_BIG, "center");
+    text(ctx, scale, 160, 150, name, SHELL_DIM, FONT_SMALL, "center");
     return;
   }
-  frame(ctx, scale, SKIN_WHITE);
-  glyphs(ctx, skin, "font2", scale, 160, 104, "LOADING", SKIN_DIM, "center");
-  glyphs(ctx, skin, "font1", scale, 160, 118, name, SKIN_WHITE, "center");
+  // Cap height 19 against the logo's 16 rows of ink: one row up puts the block
+  // on the same centre line as the original's.
+  glyphs(ctx, skin, "font1", scale, 160, LOADING_INK_TOP - 2, "Loading", SKIN_WHITE, "center");
+  glyphs(ctx, skin, "font2", scale, 160, 150, name, SKIN_DIM, "center");
 }
 
+/**
+ * The table would not load.
+ *
+ * A screen the original has no equivalent of — an Amiga that could not read a
+ * floppy said so through the OS, and a browser that cannot fetch an asset has to
+ * say so itself. Chrome only: the frame, the ring and the ink are the measured
+ * ones so it belongs to the same shell; everything it says is this file's.
+ */
 function drawFailed(ctx: ShellContext, scale: number, state: ShellState, skin: ShellSkin | null): void {
   clear(ctx, scale, skin);
   if (skin === null) {
@@ -839,10 +1069,10 @@ function drawFailed(ctx: ShellContext, scale: number, state: ShellState, skin: S
     return;
   }
   frame(ctx, scale, SKIN_WHITE);
-  glyphs(ctx, skin, "font1", scale, 160, 90, "THE TABLE", SKIN_WHITE, "center");
-  glyphs(ctx, skin, "font1", scale, 160, 114, "WOULD NOT LOAD", SKIN_WHITE, "center");
-  glyphs(ctx, skin, "font2", scale, 160, 144, state.error ?? "", SKIN_DIM, "center");
-  glyphs(ctx, skin, "font2", scale, 160, 170, "PRESS ESC", SKIN_WHITE, "center");
+  glyphs(ctx, skin, "font1", scale, 160, 104, "The table", SKIN_WHITE, "center");
+  glyphs(ctx, skin, "font1", scale, 160, 134, "would not load", SKIN_WHITE, "center");
+  glyphs(ctx, skin, "font2", scale, 160, 176, state.error ?? "", SKIN_DIM, "center");
+  glyphs(ctx, skin, "font2", scale, 160, HINT_Y, "PRESS ESC", SKIN_DIM, "center");
 }
 
 // ---------------------------------------------------------------------------
@@ -866,6 +1096,16 @@ interface CardLine {
  * The in-game screens are not full-screen takeovers in the original either — the
  * playfield is still there underneath, which is what makes "REALLY QUIT TABLE?"
  * read as a question about the table you are looking at.
+ *
+ * WHAT THE FILM SAYS, AND WHAT IT DOES NOT. The census caught "GAME OVER", the
+ * high-score roll, the copyright text and "REALLY QUIT TABLE?" — all four of
+ * them as DMD messages on the 320 x 16 score panel over a live playfield, and
+ * NONE of them as a shell page. So the structure below is right and the card is
+ * not: a five-row ladder does not fit in sixteen rows of dot matrix, and this
+ * reconstruction's panel does not carry a message queue deep enough to roll one
+ * a line at a time. The card is therefore this file's own answer, drawn in the
+ * shell's measured white on a dark panel so it reads over any of the three
+ * playfields. Its coordinates are not the original's and are not claimed to be.
  */
 function card(
   ctx: ShellContext,
@@ -879,11 +1119,14 @@ function card(
   ctx.fillStyle = SHELL_PANEL;
   ctx.fillRect(px(20, scale), py(top, scale), 280 * scale, height * scale);
   ctx.globalAlpha = 1;
-  box(ctx, scale, 20, top, 300, top + height, skin === null ? SHELL_FRAME : SKIN_WHITE, null);
+  box(ctx, scale, 20, top, 299, top + height - 1, skin === null ? SHELL_FRAME : SKIN_WHITE, null);
 
-  const pitch = 20;
+  // 26, not the 20 this used to be: the big font is 19 rows tall and a 20-row
+  // pitch left the line under it touching the descenders.
+  const pitch = 26;
   const block = (lines.length - 1) * pitch;
-  let y = top + (height - block) / 2 - 7;
+  // Floored: a glyph blitted to a half pixel is a blurred glyph.
+  let y = Math.floor(top + (height - block) / 2) - 7;
   for (const item of lines) {
     if (skin === null) {
       text(ctx, scale, 160, y, item.value, item.colour, item.size, "center");
@@ -950,13 +1193,17 @@ function drawInitials(ctx: ShellContext, scale: number, state: ShellState, skin:
  * are set in the big font, which is the font the original's own cycle shows
  * them in; the ladder is the small font's, whose advances are the template's
  * own column arithmetic.
+ *
+ * Like the other cards, the original puts every line of this on the DMD panel
+ * rather than on a page — see `card` — so the panel is this file's, in the
+ * shell's measured white, and its coordinates are not claimed as the disk's.
  */
 function drawLadder(ctx: ShellContext, scale: number, state: ShellState, skin: ShellSkin | null): void {
   ctx.globalAlpha = 0.86;
   ctx.fillStyle = SHELL_PANEL;
   ctx.fillRect(px(16, scale), py(24, scale), 288 * scale, 208 * scale);
   ctx.globalAlpha = 1;
-  box(ctx, scale, 16, 24, 304, 232, skin === null ? SHELL_FRAME : SKIN_WHITE, null);
+  box(ctx, scale, 16, 24, 303, 231, skin === null ? SHELL_FRAME : SKIN_WHITE, null);
 
   const name = state.tableId === null ? "" : shellTableFor(state.tableId).name;
   if (skin === null) {

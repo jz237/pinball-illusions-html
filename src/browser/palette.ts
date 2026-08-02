@@ -115,24 +115,48 @@ export const PANEL_WHITE: Rgb = [255, 241, 214];
 // ---------------------------------------------------------------------------
 
 /**
- * The menu screens' FALLBACK palette.
+ * The shell's CHROME, measured off the filmed original.
  *
- * The disk's own shell presentation — the two fonts, the three tumbling-object
- * backdrop strips and their sixteen-colour palette out of `menudata.bin` — now
- * ships (`scripts/export-shell-art.mjs` -> `public/generated/shell/`) and is
- * what the player normally sees; `shell-screens.ts` takes those colours from
- * the skin, not from here. These constants remain for the placeholder path
- * that draws while the artwork is still fetching, or if the fetch fails.
+ * The tumbling-object strips and the sixteen page palettes they are drawn
+ * through come off the disk (`scripts/export-shell-art.mjs` ->
+ * `public/generated/shell/`) and `shell-screens.ts` takes those from the skin,
+ * not from here. What is here is the part of the picture that is NOT in
+ * `menudata.bin`: the original keeps its border, surround and text colours in a
+ * fixed copper list in `main.bin` hunk 3, a different file, and pulling sixteen
+ * words out of it would widen the `disk-derived-shell-artwork` gate class to a
+ * second source. So they are stated here instead, as what they are —
+ * measurements off the filmed screen, at native resolution, exact to the AGA
+ * nibble:
  *
- * A cold blue ramp because that is what the real palette is — colour 0 is the
- * 0x36A blue — and amber for the item the cursor is on, so a selected box
- * reads at a glance even in the placeholder.
+ *   surround ring   $003  #000033   x < 15, x > 304, y < 15, y > 240
+ *   frame rect      $fff  #ffffff   1 px, (15,15)-(304,240)
+ *   object field    $000  #000000   x 16..303, y 16..239 — and it is also
+ *                                   colour 0 of every live page palette, so the
+ *                                   two can only ever agree
+ *   text            $fff / $aaa / $777, the two glyph planes' anti-alias ramp;
+ *                   the skin derives the lower two from the ink colour.
+ *
+ * `SHELL_HIGHLIGHT` and `SHELL_HIGHLIGHT_FILL` are NOT measured — nothing on
+ * the film is amber. They mark the freshly-earned ladder row and the fallback's
+ * selected item, both of which are this reconstruction's own signposting.
  */
-export const SHELL_BACKDROP = "#0a1020";
-export const SHELL_BAND = "#111c33";
-export const SHELL_FRAME = "#4d6f9c";
-export const SHELL_TEXT = "#c8d8ec";
-export const SHELL_DIM = "#6b83a3";
+export const SHELL_SURROUND = "#000033";
+export const SHELL_FIELD = "#000000";
+export const SHELL_FRAME = "#ffffff";
+export const SHELL_TEXT = "#ffffff";
+/** The ramp's darkest step, used whole for lines the original never printed. */
+export const SHELL_DIM = "#777777";
 export const SHELL_HIGHLIGHT = "#f7c948";
 export const SHELL_HIGHLIGHT_FILL = "#243a5e";
 export const SHELL_PANEL = "#050a14";
+
+/**
+ * The placeholder backdrop, drawn only while the artwork is still fetching.
+ *
+ * A dark teal band on the black field: the same shape as the real thing —
+ * eight 32-row bands of objects on black — in the tint the filmed menu page
+ * happens to wear, so the swap to the real strip is a change of detail rather
+ * than a change of scene.
+ */
+export const SHELL_BACKDROP = SHELL_FIELD;
+export const SHELL_BAND = "#225555";

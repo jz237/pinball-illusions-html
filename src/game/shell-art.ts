@@ -8,16 +8,23 @@
  * one loads the SHELL's presentation, decoded from `menudata.bin` by
  * `scripts/export-shell-art.mjs`:
  *
- *   - FONT1, the large 19-px menu font: a 16-px-wide two-plane glyph atlas
- *     (plane 0 fill, plane 1 outline) plus 128 metric entries of
- *     (advance, height, signed y-offset);
+ *   - FONT1, the large 19-px menu font: a 16-px-wide two-plane glyph atlas plus
+ *     128 metric entries of (advance, height, signed y-offset). The two planes
+ *     are an ANTI-ALIAS RAMP, not fill + outline — the hardware ORs them and the
+ *     values 1, 2, 3 light three different colour registers;
  *   - FONT2, the small ~8-px font: single-plane, 256 entries, ASCII plus a
  *     Latin-1 accent set;
- *   - three 1472 x 32 backdrop strips — the tumbling rings (attract), cubes
- *     (main menu) and crosses (table select) — 32 pre-rendered rotation frames
- *     46 px apart, indexed into the shared 16-colour palette;
- *   - that palette, the copper's ±64 sine table, and the four 16 x 16 dissolve
- *     orders the original reveals pictures with.
+ *   - three 1472 x 32 backdrop strips — tumbling rings, cubes and crosses — of
+ *     46 objects at a 32-px pitch, carrying one 4-bit PALETTE INDEX per pixel;
+ *   - the SIXTEEN PAGE PALETTES those indices are read through, the copper's
+ *     ±64 sine table, and the four 16 x 16 dissolve orders the original reveals
+ *     pictures with.
+ *
+ * There is no single shell palette. `menudata` h4+0x480 is sixteen 16-colour
+ * palettes stored row-major, nine of which the shell's own cycler fades between
+ * while it runs; the same cube strip is teal on one page and gold on the next.
+ * A v1 manifest read that block transposed and shipped one wrong palette, which
+ * is why the schema string moved to v2 rather than being widened in place.
  *
  * Glyph atlas row layout is the disk's own: a character's rows sit at the
  * cumulative height of every character before it, exactly as `main.bin` walks
@@ -37,16 +44,23 @@ import type { IndexedImage, TableArtFetch, TableArtResponse } from "./table-art.
 export const SHELL_ART_BASE_PATH = "generated/shell/";
 
 /** The manifest schema written by `scripts/export-shell-art.mjs`. */
-export const SHELL_ART_SCHEMA = "pinball-illusions/shell-art/v1";
+export const SHELL_ART_SCHEMA = "pinball-illusions/shell-art/v2";
 
 export const SHELL_ART_MANIFEST = "shell.art.json";
 
 /** Both fonts' glyphs are stored 16 px wide, one word per plane. */
 export const FONT_ATLAS_WIDTH = 16;
 
-/** The three strips are 1472 x 32: 32 frames of 46 px. */
+/** The three strips are 1472 x 32: 46 objects at a 32-px pitch. */
 export const STRIP_WIDTH = 1472;
 export const STRIP_HEIGHT = 32;
+export const STRIP_PITCH = 32;
+export const STRIP_OBJECTS = STRIP_WIDTH / STRIP_PITCH;
+
+/** Palettes on the disk, and how many of them the shell's cycler reaches. */
+export const SHELL_PALETTE_COUNT = 16;
+export const SHELL_PALETTE_LIVE = 9;
+export const SHELL_PALETTE_COLOURS = 16;
 
 /** One glyph, resolved out of the metrics table. */
 export interface ShellGlyph {
@@ -61,11 +75,28 @@ export interface ShellGlyph {
 }
 
 export interface ShellFont {
-  /** One entry per character code the metrics table covers. */
+  /**
+   * One entry per character code the metrics table covers.
+   */
   readonly glyphs: readonly ShellGlyph[];
-  /** One byte per pixel, `FONT_ATLAS_WIDTH` wide: 0 empty, bit0 fill, bit1 outline. */
+  /**
+   * One byte per pixel, `FONT_ATLAS_WIDTH` wide.
+   *
+   * 0 is bare backdrop — there is no knockout, the picture behind the text shows
+   * right up against the glyph edge. 1, 2 and 3 are the anti-alias ramp, from
+   * the full ink colour down to its darkest step; font2 is single-plane and only
+   * ever reaches 1.
+   */
   readonly pixels: Uint8Array;
   readonly rows: number;
+}
+
+/** One of the sixteen page palettes. */
+export interface ShellPalette {
+  /** 16 AGA 12-bit `$0RGB` words, index 0 first. Index 0 is the black field. */
+  readonly aga: readonly number[];
+  /** The same 16 colours as 48 bytes, r,g,b per entry — what a canvas wants. */
+  readonly rgb: Uint8Array;
 }
 
 export type ShellBackdropRole = "attract" | "menu" | "select";
@@ -80,8 +111,15 @@ export interface ShellArt {
   readonly font1: ShellFont;
   readonly font2: ShellFont;
   readonly backdrops: Readonly<Record<ShellBackdropRole, ShellBackdrop>>;
-  /** 16 RGB triples, the fade table's final column. */
-  readonly palette: Uint8Array;
+  /**
+   * The sixteen page palettes in disk order.
+   *
+   * `palettes[0..7]` are the eight page tints the shell fades through — blue,
+   * teal, green, gold, orange, red, crimson, purple — `palettes[8]` is the black
+   * one it crossfades through when it swaps the strip, and 9..15 are on the disk
+   * but unreachable (`SHELL_PALETTE_LIVE` is where the live block ends).
+   */
+  readonly palettes: readonly ShellPalette[];
   /** 256 signed entries, ±64: the copper's per-band scroll wobble. */
   readonly sine: readonly number[];
   /**
@@ -139,7 +177,10 @@ interface ShellArtManifest {
   }[];
   readonly font1: { readonly rows: number; readonly metrics: readonly (readonly number[])[] };
   readonly font2: { readonly rows: number; readonly metrics: readonly (readonly number[])[] };
-  readonly palette: { readonly rgb: readonly number[] };
+  readonly palettes: {
+    readonly live: number;
+    readonly rows: readonly { readonly aga: readonly number[]; readonly rgb: readonly number[] }[];
+  };
   readonly sine: readonly number[];
   readonly dissolve: readonly (readonly number[])[];
 }
@@ -162,8 +203,27 @@ export function shellArtManifestFrom(parsed: unknown): ShellArtManifest {
   }
   if (doc.font1?.metrics.length !== 128) fail("font1 must carry 128 metric entries");
   if (doc.font2?.metrics.length !== 256) fail("font2 must carry 256 metric entries");
-  if (!Array.isArray(doc.palette?.rgb) || doc.palette.rgb.length !== 48) {
-    fail("palette must carry 16 RGB triples");
+  // The palette block is where the v1 manifest was wrong, so it is checked
+  // hardest: sixteen rows, sixteen colours each, and every live row a ramp that
+  // starts at black. A manifest whose page palettes do not start black would put
+  // a coloured field back under the text.
+  const palettes = doc.palettes;
+  if (palettes === undefined || !Array.isArray(palettes.rows)) fail("palettes missing");
+  if (palettes.rows.length !== SHELL_PALETTE_COUNT) {
+    fail(`expected ${SHELL_PALETTE_COUNT} palettes, got ${palettes.rows.length}`);
+  }
+  if (palettes.live !== SHELL_PALETTE_LIVE) fail(`palettes.live is ${String(palettes.live)}`);
+  for (let p = 0; p < palettes.rows.length; p += 1) {
+    const row = palettes.rows[p];
+    if (row === undefined || !Array.isArray(row.aga) || !Array.isArray(row.rgb)) {
+      fail(`palette ${p} is not {aga, rgb}`);
+    }
+    if (row.aga.length !== SHELL_PALETTE_COLOURS || row.rgb.length !== SHELL_PALETTE_COLOURS * 3) {
+      fail(`palette ${p} is ${row.aga.length} colours / ${row.rgb.length} bytes`);
+    }
+    if (p < SHELL_PALETTE_LIVE && row.aga[0] !== 0) {
+      fail(`live palette ${p} does not start at black`);
+    }
   }
   if (!Array.isArray(doc.sine) || doc.sine.length !== 256) fail("sine table must have 256 entries");
   if (!Array.isArray(doc.dissolve) || doc.dissolve.length !== 4) fail("expected 4 dissolve tables");
@@ -235,7 +295,10 @@ export function shellArtFrom(
       menu: shellBackdropFrom("menu", image("backdrop-menu")),
       select: shellBackdropFrom("select", image("backdrop-select")),
     },
-    palette: Uint8Array.from(manifest.palette.rgb),
+    palettes: manifest.palettes.rows.map((row) => ({
+      aga: row.aga,
+      rgb: Uint8Array.from(row.rgb),
+    })),
     sine: manifest.sine,
     dissolve: manifest.dissolve,
   };

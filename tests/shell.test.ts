@@ -442,10 +442,13 @@ describe("the attract roll", () => {
     expect(state.attractPage).toBe(0);
   });
 
-  it("fits the original's six-line page layout", () => {
+  it("fits the original's three-line page ladder", () => {
+    // The film pins the credits block to y = 104, 134, 164, top-anchored — three
+    // slots and no more. (This used to allow six, from a reading of the display
+    // list before the pages themselves had been seen.)
     for (const page of ATTRACT_PAGES) {
       expect(page.length).toBeGreaterThan(0);
-      expect(page.length).toBeLessThanOrEqual(6);
+      expect(page.length).toBeLessThanOrEqual(3);
     }
   });
 

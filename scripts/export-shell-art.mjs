@@ -12,7 +12,7 @@
 //   hunk 3 (148,788 B)                          hunk 4 (4,376 B)
 //   0x00000..0x01697  font1 bitmap              0x000  font1 metrics, 128 x 3 B
 //   0x01698..0x01D1F  font2 bitmap              0x180  font2 metrics, 256 x 3 B
-//   0x01D20..0x0D527  MENU backdrop             0x480  palette fade table 16x16
+//   0x01D20..0x0D527  MENU backdrop             0x480  16 PALETTES x 16 colours
 //   0x0D528..0x18D2F  TABLE-SELECT backdrop     0x680  sine table, 256 B signed
 //   0x18D30..end      ATTRACT backdrop          0x780  4 dissolve tables, 256 B
 //                                               0xB80+ attract page scripts
@@ -28,8 +28,9 @@
 // on 0x1698 and the font2 sum on 0x686 of its 0x688-byte region.
 //
 // THE BACKDROPS. Not 320x256 screens: each block is a 1472x32 animation strip
-// in 4 interleaved bitplanes (plane stride 184 B, row stride 736 B), 32 frames
-// of a tumbling object at 46 px per frame, stored TWICE as two 0x5C04 chunks
+// in 4 interleaved bitplanes (plane stride 184 B, row stride 736 B), 46 objects
+// at a 32-px pitch (1472 = 46 x 32; the object silhouette repeats every 32
+// objects, so the strip is one full tumble and a bit), stored TWICE as two 0x5C04 chunks
 // (4-byte zero header + payload); the second copy is the first shifted 16 px —
 // the pre-shifted copy for the Amiga's 32-px hardware-scroll range, which a
 // canvas does not need, so only the first copy ships. `assertPreShift` proves
@@ -38,16 +39,47 @@
 // in export-table-art.mjs). The attract block's file body ends 4 bytes short of
 // its second copy's final row; the first copy is complete, so nothing is lost.
 //
-// THE SHARED PALETTE. One 16-colour palette for all three strips, embedded as
-// the fade table at h4+0x480 — 16 colours x 16 fade steps, one AGA 12-bit
-// $xRGB word each, colour-major; the final column is the settled palette
-// (colour 0 = the 0x36A blue, 1-7 a warm object ramp, 8-9 black, 10-15 white).
+// THE PAGE PALETTES. h4+0x480 is SIXTEEN PALETTES OF SIXTEEN COLOURS, stored
+// ROW-MAJOR: palette p at +0x480 + p*32, colour i at + i*2, one AGA 12-bit
+// $0RGB word each. Not a fade table, and not one shared palette — the strips
+// are drawn in a different palette on every page of the shell's cycle, which is
+// why the same cube geometry is teal on the menu and gold on a credits page.
+//
+//   row 0 $36a blue    row 1 $377 TEAL    row 2 $582 green   row 3 $980 GOLD
+//   row 4 $a60 orange  row 5 $b20 red     row 6 $a27 crimson row 7 $809 purple
+//   row 8 $000 black (the crossfade-out)  row 9 black, rows 10-15 all $fff
+//
+// Every live row is a single-hue ramp from $000 at index 0 to the tint at index
+// 15. INDEX 0 IS BLACK IN EVERY LIVE ROW and is 35-48% of each strip: it IS the
+// black field the objects tumble on. Rows 9-15 are unreachable — the shell's
+// cycler at main.bin h0+0x10AA only ever indexes 0..8 — and ship only so the
+// block is on disk exactly as the disk stores it.
+//
+// This decode replaced an earlier misreading, and the misreading is worth
+// recording because it shipped: read COLUMN-major the same bytes look like
+// "16 colours x 16 fade steps", and the final column — an accidental diagonal
+// taking one entry from each of eight different palettes — became a single
+// shipped palette whose colour 0 was $36a blue and whose indices 10-15 were
+// white. That drew white objects on a blue field with the white text lost in
+// them, which is on no page of the original.
+//
+// The shell's cycler (main.bin h0+0x10AA, once per PAL field) fades colours
+// 1..15 one nibble step per frame toward row `index`, holds 250 frames, and
+// steps index 0,1,...,7,8; at row 8 — black — it swaps the strip and restarts
+// at row 0. Those constants are main.bin's, not menudata's, so they live in
+// src/browser/shell-skin.ts with their addresses rather than in this manifest.
 //
 // WHAT IS DELIBERATELY NOT EXPORTED: the attract PAGE SCRIPTS at h4+0xB84 —
 // they are the developers' own credit and greeting prose, and this project
 // ships the disk's functional graphics, not its authored text. The fonts, the
-// strips, the palette, the sine table and the dissolve orders are all
+// strips, the palettes, the sine table and the dissolve orders are all
 // functional presentation data and all ship.
+//
+// Nothing here is read out of main.bin. The shell's INK and BORDER colours
+// ($fff/$aaa/$777 text, the $003 navy surround) live in main.bin's copper list,
+// not in menudata; adding them would widen the disk-derived-shell-artwork
+// source class to a second file, so they stay out of the shipped manifest and
+// are stated in src/browser/palette.ts as measurements off the filmed original.
 //
 // Usage:
 //   node scripts/export-shell-art.mjs <segment-dir> [out-dir] [--check]
@@ -82,9 +114,12 @@ const FONT1_CHARS = 128;
 const FONT2_METRICS = 0x180;
 const FONT2_CHARS = 256;
 
-const FADE_TABLE = 0x480;
-const FADE_COLOURS = 16;
-const FADE_STEPS = 16;
+/** 16 palettes of 16 AGA words, row-major: palette p at +0x480 + p*32. */
+const PALETTE_TABLE = 0x480;
+const PALETTE_COUNT = 16;
+const PALETTE_COLOURS = 16;
+/** Rows 0..8 are the ones the shell's cycler indexes; 9..15 are unreachable. */
+const PALETTE_LIVE = 9;
 
 const SINE_TABLE = 0x680;
 const SINE_LENGTH = 256;
@@ -108,9 +143,22 @@ const STRIP_HEIGHT = 32;
 const STRIP_PLANES = 4;
 const STRIP_PLANE_BYTES = STRIP_WIDTH / 8; // 184
 const STRIP_ROW_BYTES = STRIP_PLANES * STRIP_PLANE_BYTES; // 736
-/** 32 pre-rendered rotation frames, 46 px apart. */
-const STRIP_FRAMES = 32;
-const STRIP_FRAME_WIDTH = 46;
+/**
+ * 46 objects at a 32-px pitch, and the silhouette repeats every 32 objects.
+ *
+ * Measured off the shipped strips by diffing whole 32x32 cells, not ink area:
+ * object 0 against object 32 differs in 0 of 1024 pixels on all three strips,
+ * while object 0 against object 16 differs in 462 (torus), 336 (cube) and 450
+ * (cross). An earlier reading called the period 16 on the strength of the
+ * per-object ink AREA alone, which is a near-match at the half-turn (374 vs 371
+ * on the torus) because a solid of revolution presents the same silhouette size
+ * when it is rotated 180 degrees — but not the same silhouette. The manifest
+ * used to say "32 frames of 46 px", which is the same 1472 divided the other way
+ * round and matches nothing in the code or on the film.
+ */
+const STRIP_OBJECTS = 46;
+const STRIP_PITCH = 32;
+const STRIP_TUMBLE_OBJECTS = 32;
 
 /**
  * The attract block's second (pre-shifted) copy is 4 bytes short in the file:
@@ -122,7 +170,11 @@ const ATTRACT_TRUNCATED_BYTES = 4;
 
 const FONT_WIDTH = 16;
 
-const MANIFEST_SCHEMA = "pinball-illusions/shell-art/v1";
+// v2: `palette` (one wrong shared palette) and `fade` (the same block under the
+// wrong name) are replaced by `palettes`, the 16 page palettes read row-major.
+// The schema string is checked by src/game/shell-art.ts, so a stale v1 manifest
+// left in public/ fails loudly instead of drawing the old blue.
+const MANIFEST_SCHEMA = "pinball-illusions/shell-art/v2";
 const MANIFEST_FILE = "shell.art.json";
 
 // Same shape as the PROVENANCE block in export-table-art.mjs.
@@ -131,9 +183,10 @@ const MANIFEST_FILE = "shell.art.json";
 const PROVENANCE = {
   sourceClass: "disk-derived-shell-artwork",
   description:
-    "Menu fonts, backdrop animation strips, palette, sine and dissolve tables decoded from " +
-    "menudata.bin on the operator's own AGA floppy set. Functional presentation data only: " +
-    "no audio, no executable code, and none of the disk's authored credit or greeting text.",
+    "Menu fonts, backdrop animation strips, the 16 page palettes, sine and dissolve tables " +
+    "decoded from menudata.bin on the operator's own AGA floppy set. Functional presentation " +
+    "data only: no audio, no executable code, and none of the disk's authored credit or " +
+    "greeting text.",
   authorizationRequired: true,
 };
 
@@ -277,17 +330,65 @@ function agaRgb(word) {
   return [((word >> 8) & 0xf) * 17, ((word >> 4) & 0xf) * 17, (word & 0xf) * 17];
 }
 
-/** The 16x16 fade table, colour-major, one AGA word per step. */
-function readFadeTable(h4) {
-  const fade = [];
-  for (let colour = 0; colour < FADE_COLOURS; colour += 1) {
-    const steps = [];
-    for (let step = 0; step < FADE_STEPS; step += 1) {
-      steps.push(h4.readUInt16BE(FADE_TABLE + colour * FADE_STEPS * 2 + step * 2));
+/** PLTE for an index carrier: entry i is the grey i*17, so i is readable back. */
+function greyRamp() {
+  return Array.from({ length: 16 }, (_, i) => [i * 17, i * 17, i * 17]).flat();
+}
+
+/**
+ * The 16 page palettes, ROW-MAJOR: `palettes[p][i]` is colour `i` of palette
+ * `p`, one AGA word each. The stride is 32 bytes, which is what the shell's
+ * installer computes at main.bin h0+0x10C4 (`lea $2(a1,d0.w*2),a1` after
+ * `lsl.w #4,d0` — the index scale is x2, so 16 x 2 x 2 = 32) before handing
+ * 15 colours to the fader.
+ *
+ * The checks below are the framing proof, the analogue of the font metrics
+ * cross-check: at the right offset colour 0 of every palette is $000, the eight
+ * live tints are the eight distinct hues the film shows, and no word can carry
+ * a high nibble (AGA 12-bit colour is $0RGB). Read at the wrong offset — or
+ * transposed, which is the mistake this replaced — those all break.
+ */
+function readPalettes(h4) {
+  const palettes = [];
+  for (let p = 0; p < PALETTE_COUNT; p += 1) {
+    const colours = [];
+    for (let i = 0; i < PALETTE_COLOURS; i += 1) {
+      const word = h4.readUInt16BE(PALETTE_TABLE + p * PALETTE_COLOURS * 2 + i * 2);
+      if (word > 0x0fff) {
+        throw new Error(
+          `palette ${p} colour ${i} is $${word.toString(16)}, not a 12-bit AGA $0RGB word — ` +
+            `the block is framed at the wrong offset`,
+        );
+      }
+      colours.push(word);
     }
-    fade.push(steps);
+    palettes.push(colours);
   }
-  return fade;
+  // Every LIVE palette starts at black and is a monotone single-hue ramp: each
+  // channel rises (never falls) from $000 at index 0 to the tint at index 15.
+  // That is what makes the objects read as shaded solids on a black field, and
+  // it is the property the transposed reading destroyed. (Rows 9..15 are the
+  // unreachable ones — one more black row and six all-$fff rows — and are
+  // excluded, which is also what pins where the live block ends.)
+  for (let p = 0; p < PALETTE_LIVE; p += 1) {
+    const row = palettes[p];
+    if (row[0] !== 0) {
+      throw new Error(`live palette ${p} starts at $${row[0].toString(16)}, not $000`);
+    }
+    for (let i = 1; i < PALETTE_COLOURS; i += 1) {
+      for (let shift = 0; shift <= 8; shift += 4) {
+        const before = (row[i - 1] >> shift) & 0xf;
+        const after = (row[i] >> shift) & 0xf;
+        if (after < before) {
+          throw new Error(
+            `palette ${p} is not a monotone ramp: colour ${i} ($${row[i].toString(16)}) ` +
+              `falls below colour ${i - 1} ($${row[i - 1].toString(16)})`,
+          );
+        }
+      }
+    }
+  }
+  return palettes;
 }
 
 function readSine(h4) {
@@ -409,10 +510,8 @@ function main(argv) {
   const font1Pixels = decodeFontBitmap(h3, FONT1_BITMAP, font1.rows, 2);
   const font2Pixels = decodeFontBitmap(h3, FONT2_BITMAP, font2.rows, 1);
 
-  // The shared 16-colour palette: the fade table's final column.
-  const fade = readFadeTable(h4);
-  const paletteWords = fade.map((steps) => steps[FADE_STEPS - 1]);
-  const paletteRgb = paletteWords.flatMap(agaRgb);
+  // The 16 page palettes, read row-major and proven by the ramp check.
+  const palettes = readPalettes(h4);
   const sine = readSine(h4);
   const dissolve = readDissolve(h4);
 
@@ -425,8 +524,12 @@ function main(argv) {
   }
 
   // Font atlases carry a viewing palette only — the loader reads indices, not
-  // colours: 0 empty, 1 fill, 2 outline, 3 both planes (fill wins).
-  const fontPalette = [0, 0, 0, 255, 255, 255, 0, 0, 0, 255, 255, 255];
+  // colours. Font1's two planes are an ANTI-ALIAS RAMP, not fill + outline:
+  // the hardware ORs them and the three values light COLOR01/02/03, measured off
+  // the filmed screen as $fff, $aaa and $777. There is no black outline and no
+  // knockout anywhere in the original's text. The viewing palette below is that
+  // ramp, so opening the atlas in an image viewer shows what the glyph is.
+  const fontPalette = [0, 0, 0, 255, 255, 255, 170, 170, 170, 119, 119, 119];
   const images = [
     {
       file: "shell-font1.png",
@@ -447,7 +550,12 @@ function main(argv) {
       role: `backdrop-${strip.role}`,
       width: STRIP_WIDTH,
       height: STRIP_HEIGHT,
-      png: encodeIndexedPng(strip.pixels, STRIP_WIDTH, STRIP_HEIGHT, paletteRgb),
+      // The strips carry INDICES: which of the sixteen page palettes is in force
+      // changes eight times a minute, so no single PLTE can be the right one and
+      // baking one in would be the old bug in a new place. The identity grey
+      // ramp is lossless through the loader (which reads indices) and shows a
+      // human the object's shading rather than a lie about its colour.
+      png: encodeIndexedPng(strip.pixels, STRIP_WIDTH, STRIP_HEIGHT, greyRamp()),
     })),
   ];
 
@@ -463,11 +571,20 @@ function main(argv) {
     })),
     font1: { chars: FONT1_CHARS, rows: font1.rows, metrics: font1.metrics },
     font2: { chars: FONT2_CHARS, rows: font2.rows, metrics: font2.metrics },
-    palette: { aga: paletteWords, rgb: paletteRgb },
-    fade: fade,
+    // All sixteen rows, in disk order. `live: 9` records that the shell's cycler
+    // only ever indexes 0..8 — rows 9..15 (black, then six all-white rows) ship
+    // because they are on the disk, not because anything draws them.
+    palettes: {
+      live: PALETTE_LIVE,
+      rows: palettes.map((row) => ({ aga: row, rgb: row.flatMap(agaRgb) })),
+    },
     sine,
     dissolve,
-    strip: { frames: STRIP_FRAMES, frameWidth: STRIP_FRAME_WIDTH },
+    strip: {
+      objects: STRIP_OBJECTS,
+      pitch: STRIP_PITCH,
+      tumbleObjects: STRIP_TUMBLE_OBJECTS,
+    },
     provenance: PROVENANCE,
   };
   const json = JSON.stringify(manifest);
@@ -503,8 +620,10 @@ function main(argv) {
 
   console.log(
     `  ${" ".repeat(26)}  font1 ${font1.rows} rows, font2 ${font2.rows} rows, ` +
-      `3 strips ${STRIP_WIDTH}x${STRIP_HEIGHT}, palette [${paletteWords
-        .map((w) => w.toString(16).padStart(3, "0"))
+      `3 strips ${STRIP_WIDTH}x${STRIP_HEIGHT} (${STRIP_OBJECTS} objects at ${STRIP_PITCH} px), ` +
+      `${PALETTE_LIVE} live palettes, tints [${palettes
+        .slice(0, PALETTE_LIVE)
+        .map((row) => row[PALETTE_COLOURS - 1].toString(16).padStart(3, "0"))
         .join(" ")}]`,
   );
 

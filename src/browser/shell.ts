@@ -244,6 +244,16 @@ export interface ShellState {
    */
   frameTicks: number;
   phaseMark: ShellPhase;
+  /**
+   * Ticks since the shell was created, reset by nothing.
+   *
+   * The original's backdrop service — the eight-tint palette cycle and the strip
+   * swap at h0+0x10AA, and the band scroll under it — is a background job called
+   * once per field in EVERY menu state, and moving between screens does not
+   * restart it. It therefore needs a clock that outlives `frameTicks`, which
+   * belongs to the current screen.
+   */
+  ticks: number;
   /** The table the host has loaded or is loading, or null. `$138(a5)`. */
   tableId: TableId | null;
   /** The ladder of whichever table the current screen is about. */
@@ -309,6 +319,7 @@ export function createShell(store: ScoreStore): ShellState {
     holdTicks: 0,
     frameTicks: 0,
     phaseMark: "attract",
+    ticks: 0,
     tableId: null,
     ladder: store.load(first.id),
     finalScore: 0,
@@ -339,17 +350,27 @@ export function highlightedTable(state: ShellState): ShellTable {
  * FACT of the credits does: the game is Digital Illusions', published by 21st
  * Century Entertainment, and saying so is attribution rather than reproduction.
  *
- * Layout follows the original's: every line centred on x = 160, on the 30-pixel
- * pitch it uses (y = 44, 74, 104, 134, 164, 194), which is why the pages below
- * are at most six lines.
+ * LAYOUT AND STYLE follow the film, which caught seven of the original's own
+ * pages. Every line is centred on x = 160 and the block is TOP-ANCHORED on the
+ * 30-pixel ladder y = 104, 134, 164 — a two-line page uses 104 and 134 and does
+ * not float itself between them — so a page is at most THREE lines. And the
+ * original sets them in sentence case, not capitals: the filmed pages read
+ * "Graphics by / Markus Nyström" and "21st Century Entertainment". Capitals in
+ * this proportional font are also half again as wide, which is how the earlier
+ * all-caps wording came to overrun the 288-pixel field; every line below is
+ * measured to fit it, and `shell-render.test.ts` keeps it that way.
  */
 export const ATTRACT_PAGES: readonly (readonly string[])[] = Object.freeze([
-  Object.freeze(["PINBALL", "ILLUSIONS"]),
-  Object.freeze(["ORIGINAL GAME BY", "DIGITAL ILLUSIONS"]),
-  Object.freeze(["PUBLISHED BY", "21ST CENTURY ENTERTAINMENT"]),
-  Object.freeze(["AMIGA AGA", "1995"]),
-  Object.freeze(["A BROWSER RECONSTRUCTION", "FROM THE ORIGINAL DISKS"]),
-  Object.freeze(["THREE TABLES", ...SHELL_TABLES.map((table) => table.name.toUpperCase())]),
+  Object.freeze(["Pinball", "Illusions"]),
+  Object.freeze(["Original game by", "Digital Illusions"]),
+  Object.freeze(["Published by", "21st Century Entertainment"]),
+  Object.freeze(["Amiga AGA, 1995"]),
+  Object.freeze(["A browser reconstruction", "from the original disks"]),
+  Object.freeze([
+    "Three tables",
+    `${SHELL_TABLES[0]?.name ?? ""}, ${SHELL_TABLES[1]?.name ?? ""}`,
+    `and ${SHELL_TABLES[2]?.name ?? ""}`,
+  ]),
 ]);
 
 // ---------------------------------------------------------------------------
@@ -645,6 +666,9 @@ export function shellTick(state: ShellState, store: ScoreStore, ticks = 1): Shel
   }
   const effects: ShellEffect[] = [];
   for (let i = 0; i < ticks; i += 1) {
+    // The backdrop service's clock: free-running, ahead of everything else,
+    // because it belongs to no screen.
+    state.ticks += 1;
     // The presentation clock first, so a screen entered by a keystroke starts
     // its animation on the very next tick rather than one frame late.
     if (state.phaseMark !== state.phase) {
