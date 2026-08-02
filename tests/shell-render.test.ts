@@ -50,14 +50,16 @@ import {
   renderShell,
   shellBandOffset,
   shellWipeShowsRow,
+  STRIP_BASE_FRAMES_PER_OBJECT,
 } from "../src/browser/shell-screens.js";
 import type { ShellArtworkSource } from "../src/browser/shell-screens.js";
-import { ATTRACT_PAGES, MENU_ITEMS, createShell } from "../src/browser/shell.js";
+import { ATTRACT_LAP_TICKS, ATTRACT_PAGES, MENU_ITEMS, createShell } from "../src/browser/shell.js";
 import type { ScoreStore, ShellState } from "../src/browser/shell.js";
 import {
   SHELL_PALETTE_LIVE,
   STRIP_WIDTH,
   loadShellArt,
+  alignShellText,
   measureShellText,
 } from "../src/game/shell-art.js";
 import type { ShellArt } from "../src/game/shell-art.js";
@@ -257,22 +259,49 @@ describe.skipIf(!exported)("the shell as it is drawn", () => {
     }
   });
 
-  it("sets the credits block top-anchored at 104, 134, 164", async () => {
-    const canvas = await draw((state) => {
-      // Past the wipe, so the whole block is on.
-      state.attractPage = 5;
-      state.attractTicks = 200;
-      state.ticks = 300;
-    });
-    const page = ATTRACT_PAGES[5] ?? [];
-    expect(page).toHaveLength(3);
-    for (let line = 0; line < page.length; line += 1) {
-      const top = 104 + line * 30;
-      let ink = 0;
-      for (let x = FIELD_X; x < FIELD_X + FIELD_WIDTH; x += 1) {
-        if (INK_TONES.includes(canvas.hex(sx(x), top))) ink += 1;
+  it("sets every line of every page on the row the display list names", async () => {
+    // This used to assert a 104/134/164 ladder, which was inferred from four
+    // filmed pages before the display list itself had been read. The list gives
+    // each line its own y word and the roll uses seven distinct ones; the tall
+    // pages start at 74 and 44. So the assertion is now made against the record
+    // rather than against a formula, on all twelve pages.
+    for (const [index, page] of ATTRACT_PAGES.entries()) {
+      const canvas = await draw((state) => {
+        // Inside the hold, before the erase front leaves zero on frame 101.
+        state.attractPage = index;
+        state.attractTicks = 60;
+        state.ticks = 300;
+      });
+      const inkOn = (y: number): number => {
+        let ink = 0;
+        for (let x = FIELD_X; x < FIELD_X + FIELD_WIDTH; x += 1) {
+          if (INK_TONES.includes(canvas.hex(sx(x), y))) ink += 1;
+        }
+        return ink;
+      };
+      for (const line of page) {
+        // The line is drawn AT its named row: ink somewhere in the 24-row band
+        // the font's tallest glyph occupies. `&` is the one glyph in the roll
+        // whose own top sits below the pen row, which is why this is a band
+        // rather than the single row this test used to read.
+        let ink = 0;
+        for (let y = line.y; y < line.y + 24; y += 1) ink += inkOn(y);
+        expect(ink, `page ${index} "${line.text}" at y=${line.y}`).toBeGreaterThan(3);
       }
-      expect(ink, `line ${line} at y=${top}`).toBeGreaterThan(3);
+      // And nothing at all above the page's first line, which is what fixes the
+      // block's anchor: a ladder-drawn page would put page 11's first line on
+      // 104 instead of the 44 the display list names.
+      // And nothing more than one glyph-height above the page's first line,
+      // which is what fixes the block's anchor: a ladder-drawn page would put
+      // page 11's first line on 104 instead of the 44 the list names. The 20-row
+      // allowance is the font's own negative y offsets — the film measures the
+      // two-line pages' text starting on row 87 for a pen row of 104.
+      const first = page[0];
+      if (first !== undefined) {
+        for (let y = FIELD_Y; y < first.y - 20; y += 1) {
+          expect(inkOn(y), `page ${index} ink above the first line at y=${y}`).toBe(0);
+        }
+      }
     }
   });
 
@@ -378,31 +407,99 @@ describe.skipIf(!exported)("the shell as it is drawn", () => {
     }
   });
 
-  it("fits every shipped attract line inside the 288-px field", async () => {
+  /**
+   * WHAT THIS USED TO ASSERT, AND WHY TWO OF ITS THREE CLAIMS ARE GONE.
+   *
+   * It required "at most three lines" and, elsewhere, "every line centred on
+   * 160 on a 30-px ladder from 104". Both were properties of the
+   * reconstruction's own invented pages and the disk refutes them: `Thanx to
+   * (in no order)` is SIX lines and the decoded roll runs y from 44 to 194.
+   * The third claim — every line fits the 288-px field — is the one that was
+   * ever about the original, and it is kept and tightened.
+   */
+  it("fits every decoded attract line inside the 288-px field", async () => {
     const art = await shippedArt();
+    let worst = FIELD_WIDTH;
     for (const page of ATTRACT_PAGES) {
-      expect(page.length).toBeLessThanOrEqual(3);
       for (const line of page) {
-        expect(measureShellText(art.font1, line), line).toBeLessThanOrEqual(FIELD_WIDTH);
+        const width = measureShellText(art.font1, line.text);
+        expect(width, line.text).toBeLessThanOrEqual(FIELD_WIDTH);
+        worst = Math.min(worst, FIELD_WIDTH - width);
       }
     }
+    // Not one of them is near the edge; the tightest is the widest line in the
+    // roll, `21st Century Entertainment`.
+    expect(worst).toBeGreaterThanOrEqual(12);
+  });
+
+  /**
+   * PEN X TO THE PIXEL, against the film.
+   *
+   * The leftmost lit column of seven lines was measured across four captures
+   * and every one agreed with the disk's own advance table to 0.0 px. Two are
+   * pinned here because they are the two that break first if the Swedish
+   * substitution or the centring truncation is wrong: `Markus Nyström` carries
+   * an ö, and `21st Century Entertainment` is the widest line in the roll.
+   */
+  it("puts the two film-checked lines on the pen columns the film measured", async () => {
+    const art = await shippedArt();
+    expect(alignShellText(art.font1, "Markus Nyström", 160, "center")).toBe(81);
+    expect(alignShellText(art.font1, "21st Century Entertainment", 160, "center")).toBe(29);
+    // The ö really is being found: without the substitution it would advance 0.
+    expect(measureShellText(art.font1, "Markus Nyström")).toBeGreaterThan(
+      measureShellText(art.font1, "Markus Nystrm"),
+    );
   });
 });
 
+/**
+ * One palette cycle: eight holds of `SHELL_TINT_HOLD_FRAMES` plus this
+ * reconstruction's own 49 frames of fade. The film measured 2058; see the
+ * residual note on `SHELL_TINT_HOLD_FRAMES`.
+ */
+const CYCLE_FRAMES = 8 * SHELL_TINT_HOLD_FRAMES + 49;
+
 describe.skipIf(!exported)("the backdrop service", () => {
-  it("fades to a page palette, holds 250 frames, and steps through all eight", async () => {
+  it("free-runs against the page cycle rather than with it", () => {
+    // The whole point of the service: the film measured the palette cycle at
+    // 2058 frames and the page lap at 2112, so the same credits page comes back
+    // under a different tint and a different object every lap — filmed directly
+    // ("Produced by / Barry Simpson" over red cubes, over a cross/cylinder/cube
+    // morph and over magenta cubes on three laps of one recording). What must
+    // not happen is the two clocks becoming commensurate.
+    expect(CYCLE_FRAMES).not.toBe(ATTRACT_LAP_TICKS);
+    expect(ATTRACT_LAP_TICKS % CYCLE_FRAMES).not.toBe(0);
+    expect(CYCLE_FRAMES % ATTRACT_LAP_TICKS).not.toBe(0);
+    // And within 1 frame of the filmed 2058.
+    expect(Math.abs(CYCLE_FRAMES - 2058)).toBeLessThanOrEqual(1);
+  });
+
+  it("fades to a page palette, holds the measured 252, and steps through all eight", async () => {
     const art = await shippedArt();
     const seen: number[] = [];
     let held = 0;
-    for (let tick = 0; tick < 2049; tick += 1) {
+    for (let tick = 0; tick < CYCLE_FRAMES; tick += 1) {
       const frame = shellBackdropFrame(art, tick);
       if (seen[seen.length - 1] !== frame.tint) seen.push(frame.tint);
       if (frame.settled && frame.tint === 3) held += 1;
     }
+    // EIGHT hold palettes and the black one they cross through — nine entries,
+    // eight of which are held. The film's own ramp-top order is aa6600 ->
+    // bb2200 -> aa2277 -> 880099 -> BLACK -> 3366aa -> 337777 -> 558822 ->
+    // 998800, which is this sequence read from index 4; it is the same cycle
+    // caught at a different phase.
     expect(seen).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8]);
-    // Palette 3 is the gold page. `moveq #$FA,dn` — 250 frames of hold, and one
-    // more frame in the segment is the one that notices the fade has finished.
+    expect(
+      [4, 5, 6, 7, 8, 0, 1, 2, 3].map((i) => (art.palettes[i]?.aga[15] ?? 0).toString(16)),
+    ).toEqual(["a60", "b20", "a27", "809", "0", "36a", "377", "582", "980"]);
+    // Palette 3 is the gold page. It is settled for 251 frames against the
+    // film's 252 on 48 of its 77 holds and 253 on the other 29 — inside the
+    // film's own one-frame spread, and chosen because it is what puts the whole
+    // cycle on the filmed 2058. The decoded counter is `moveq #$FA` = 250; see
+    // the residual note on SHELL_TINT_HOLD_FRAMES for why the two disagree and
+    // what would close it.
     expect(held).toBe(SHELL_TINT_HOLD_FRAMES);
+    expect(Math.abs(held - 252)).toBeLessThanOrEqual(1);
     // The fade lengths are the widest nibble gap each step has to cross.
     expect(shellFadeLength(art.palettes[8]!, art.palettes[0]!)).toBe(10);
     expect(shellFadeLength(art.palettes[7]!, art.palettes[8]!)).toBe(9);
@@ -412,7 +509,7 @@ describe.skipIf(!exported)("the backdrop service", () => {
     const art = await shippedArt();
     let swaps = 0;
     let previous = shellBackdropFrame(art, 0);
-    for (let tick = 1; tick <= 6147 * 2; tick += 1) {
+    for (let tick = 1; tick <= CYCLE_FRAMES * 3 * 2; tick += 1) {
       const frame = shellBackdropFrame(art, tick);
       if (frame.role !== previous.role) {
         swaps += 1;
@@ -421,15 +518,17 @@ describe.skipIf(!exported)("the backdrop service", () => {
       }
       previous = frame;
     }
-    // 2049 frames a backdrop, three backdrops, twice round.
+    // One backdrop a palette cycle, three backdrops, twice round. The film
+    // watched nine consecutive segments go MIX -> TORUS -> CUBE with no
+    // deviation, so the strip cycle is three palette cycles long.
     expect(swaps).toBe(6);
     expect(shellBackdropFrame(art, 0).role).toBe(SHELL_BACKDROP_PAGES[0]);
-    expect(shellBackdropFrame(art, 6147).role).toBe(SHELL_BACKDROP_PAGES[0]);
+    expect(shellBackdropFrame(art, CYCLE_FRAMES * 3).role).toBe(SHELL_BACKDROP_PAGES[0]);
   });
 
   it("never writes colour 0: the field stays black right through a fade", async () => {
     const art = await shippedArt();
-    for (let tick = 0; tick < 2049; tick += 1) {
+    for (let tick = 0; tick < CYCLE_FRAMES; tick += 1) {
       const frame = shellBackdropFrame(art, tick);
       expect([frame.palette[0], frame.palette[1], frame.palette[2]], `tick ${tick}`).toEqual([
         0, 0, 0,
@@ -459,6 +558,29 @@ describe.skipIf(!exported)("the backdrop service", () => {
     // multiple of 32 plus a sine entry — which is what every filmed page fits.
     const base = shellBandOffset([0], 0, 0);
     expect(base % 32).toBe(0);
+  });
+
+  it("walks C one 32-px object every 128 frames, leftward", async () => {
+    // MEASURED on a 399 s continuous capture: over 256 frames — one whole sine
+    // period, so the wobble contributes identically at both ends — the object
+    // pattern is displaced exactly 64 px = 2 objects, in 212 of 225 usable
+    // windows; over 512 frames, exactly 128 px. The window into the strip moves
+    // RIGHT as the picture moves LEFT.
+    //
+    // It is invisible to a still because the step is exactly the object pitch,
+    // which is why this file used to step it 64 times too fast (one object
+    // every two frames) and no filmed page could tell.
+    const art = await shippedArt();
+    expect(STRIP_BASE_FRAMES_PER_OBJECT).toBe(128);
+    const at = (tick: number): number => shellBandOffset(art.sine, tick, 3);
+    for (const base of [0, 256, 1024, 2560]) {
+      expect(at(base + 256) - at(base), `+256 at ${base}`).toBe(64);
+      expect(at(base + 512) - at(base), `+512 at ${base}`).toBe(128);
+      // And nothing but the sine moves inside one 128-frame window.
+      expect(at(base + 127) - at(base), `inside the window at ${base}`).toBe(
+        (art.sine[(base + 127 + 30) & 0xff] ?? 0) - (art.sine[(base + 30) & 0xff] ?? 0),
+      );
+    }
   });
 
   it("reproduces the band offsets measured off all seven filmed pages", async () => {
@@ -499,32 +621,63 @@ describe("the page-reveal wipe", () => {
     for (let y = 104; y <= 190; y += 1) expect(shellWipeShowsRow(0, y)).toBe(true);
   });
 
-  it("hides the text on the tick a page turns and shows it all soon after", async () => {
+  /**
+   * THE PAGE ARRIVES WHOLE AND LEAVES IN PIECES — the other way round from what
+   * this test used to assert.
+   *
+   * It required the text to be ABSENT on the tick a page turns and to build up
+   * over the next 60 frames, which is the reveal model. The continuous capture
+   * refutes it directly: the text pixel count goes 0 -> full between two
+   * consecutive frames on all 113 filmed page instances, the mask is then
+   * bit-identical for the whole hold, and only the disappearance is animated.
+   */
+  it("draws the page complete on its first tick and erases it from the top down", async () => {
     if (!exported) return;
-    const early = await draw((state) => {
-      state.attractPage = 1;
-      state.attractTicks = 0;
-      state.ticks = 300;
-    });
-    const late = await draw((state) => {
-      state.attractPage = 1;
-      state.attractTicks = 60;
-      state.ticks = 300;
-    });
-    const inkRows = (canvas: ReturnType<typeof createRasterCanvas>): number => {
-      let rows = 0;
-      for (let y = 104; y <= 160; y += 1) {
+    const inkRows = (canvas: ReturnType<typeof createRasterCanvas>): number[] => {
+      const rows: number[] = [];
+      for (let y = 88; y <= 160; y += 1) {
         for (let x = FIELD_X; x < FIELD_X + FIELD_WIDTH; x += 1) {
           if (canvas.hex(sx(x), y) === WHITE) {
-            rows += 1;
+            rows.push(y);
             break;
           }
         }
       }
       return rows;
     };
-    expect(inkRows(early)).toBe(0);
-    expect(inkRows(late)).toBeGreaterThan(20);
+    const at = async (ticks: number): Promise<number[]> =>
+      inkRows(
+        await draw((state) => {
+          state.attractPage = 1;
+          state.attractTicks = ticks;
+          state.ticks = 300;
+        }),
+      );
+
+    const first = await at(0);
+    expect(first.length, "the whole page is up on its very first tick").toBeGreaterThan(20);
+    // Held bit-identical right up to the last frame before the erase starts.
+    expect(await at(100)).toEqual(first);
+
+    // F(125) = 96 in PICTURE rows; `y` here is a SCREEN row, so the front the
+    // renderer applies is 96 + FIELD_Y. This used to compare against the bare 96
+    // and passed, because the renderer was making the same mistake — it dropped
+    // the same conversion, which put the erase four frames late against the film.
+    // Both are fixed; the expectation is now in one space throughout.
+    //
+    // 8*key is exactly y + 7*(y mod 8), the left side of the wipe rule, so this
+    // is the rule stated independently of the implementation rather than a copy
+    // of it.
+    const screenFront = 96 + FIELD_Y;
+    const atErase = await at(125);
+    for (const y of first) {
+      const key = Math.floor(y / 8) + (y % 8);
+      expect(atErase.includes(y), `row ${y}, key ${key}, at front=${screenFront}`).toBe(
+        8 * key >= screenFront,
+      );
+    }
+    // And by F = 272 nothing is left.
+    expect(await at(169)).toEqual([]);
   });
 });
 

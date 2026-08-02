@@ -82,8 +82,30 @@ export const SHELL_BACKDROP_PAGES: readonly ShellBackdropRole[] = Object.freeze(
   "select",
 ]);
 
-/** Frames a settled page palette is held: `moveq #$FA,dn` at h0+0x10AA. */
-export const SHELL_TINT_HOLD_FRAMES = 250;
+/**
+ * Frames a settled page palette is held.
+ *
+ * DECODED: `moveq #$FA,dn` at h0+0x10AA loads 250 into the hold counter.
+ * MEASURED: a 399 s continuous capture read the settled palette off the screen
+ * for 252 frames on 48 of its 77 holds and 253 on the other 29 — never 250.
+ * The two frames the decode does not count are the fade's own landing frame
+ * (the last step writes the target palette and is already the settled colour)
+ * and the frame the counter reloads on, so this constant is the FILMED
+ * on-screen duration minus the landing frame the segment already carries.
+ *
+ * RESIDUAL, STATED: the film's whole palette cycle is 2058 frames — eight holds
+ * plus 39 frames of fade, one of the eight transitions going down to black,
+ * sitting there two frames and coming back up. This reconstruction's own fade
+ * lengths total 49 rather than 39, because `shellFadeLength` counts STEPS and
+ * the film counted the intermediate colours it could see; five of the eight
+ * transitions agree exactly and three differ by one. With 251 the cycle here is
+ * 2057 frames against the filmed 2058. What would close it is the fader itself
+ * at `main.seg00 +0x0A44`, which has not been disassembled — the brief lists it
+ * as an open residue. It does not affect anything the page cycle does: the two
+ * clocks provably never read each other, and 2057 and 2058 are both
+ * incommensurate with the 2112-frame page lap.
+ */
+export const SHELL_TINT_HOLD_FRAMES = 251;
 
 /** The all-black palette the service crossfades through to swap the strip. */
 const SHELL_BLACK_PALETTE = SHELL_PALETTE_LIVE - 1;

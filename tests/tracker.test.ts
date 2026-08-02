@@ -152,11 +152,27 @@ describe("basic sequencing", () => {
 
     const ticks = run(player, 7);
     expect(ticks[0]).toEqual([
-      { channel: 0, action: "trigger", instrument: 1, frequencyHz: periodToHz(428), volume: 64 },
+      {
+        channel: 0,
+        action: "trigger",
+        instrument: 1,
+        frequencyHz: periodToHz(428),
+        volume: 64,
+        // Effect 9's start point rides out on every trigger; 0 is "from the
+        // beginning", which is what a note with no 9xx means.
+        sampleOffsetBytes: 0,
+      },
     ]);
     for (let at = 1; at < 6; at += 1) expect(ticks[at], `tick ${at}`).toEqual([]);
     expect(ticks[6]).toEqual([
-      { channel: 2, action: "trigger", instrument: 1, frequencyHz: periodToHz(214), volume: 64 },
+      {
+        channel: 2,
+        action: "trigger",
+        instrument: 1,
+        frequencyHz: periodToHz(214),
+        volume: 64,
+        sampleOffsetBytes: 0,
+      },
     ]);
   });
 
@@ -213,7 +229,14 @@ describe("silent channels", () => {
     const ticks = run(player, 13);
     expect(ticks[6]).toEqual([{ channel: 0, action: "volume", volume: 0x20 }]);
     expect(ticks[12]).toEqual([
-      { channel: 0, action: "trigger", instrument: 1, frequencyHz: periodToHz(428), volume: 0x20 },
+      {
+        channel: 0,
+        action: "trigger",
+        instrument: 1,
+        frequencyHz: periodToHz(428),
+        volume: 0x20,
+        sampleOffsetBytes: 0,
+      },
     ]);
   });
 
@@ -326,15 +349,71 @@ describe("effect arithmetic", () => {
   });
 
   it("ignored effects change nothing but still let the note trigger", () => {
+    // 4 and 9 used to be on this list and are now implemented — they are two of
+    // the five the front-end module actually uses. What is left ignored is 7
+    // (tremolo) and 8 (unused in ProTracker), neither of which appears in any
+    // shipped song.
     const quiet = blankPattern();
     const noisy = blankPattern();
     put(quiet, 0, 0, cell(13, 1, 0, 0));
-    put(noisy, 0, 0, cell(13, 1, 0x4, 0x33)); // vibrato, ignored
+    put(noisy, 0, 0, cell(13, 1, 0x7, 0x33)); // tremolo, ignored
     put(quiet, 1, 1, cell(25, 2, 0, 0));
-    put(noisy, 1, 1, cell(25, 2, 0x9, 0x10)); // sample offset, ignored
+    put(noisy, 1, 1, cell(25, 2, 0x8, 0x10)); // unused in PT, ignored
     const a = createTrackerPlayer(songOf([quiet]));
     const b = createTrackerPlayer(songOf([noisy]));
     expect(run(b, 18)).toEqual(run(a, 18));
+  });
+
+  it("4: vibrato bends the output period and leaves state.period alone", () => {
+    // The five effects added for the front-end module: 4 and 6 vibrato, 9
+    // sample offset, EA/EB fine volume slides, E6 pattern loop. This one is the
+    // one with per-tick arithmetic.
+    const pattern = blankPattern();
+    put(pattern, 0, 0, cell(13, 1, 0x4, 0x84)); // speed 8, depth 4
+    const player = createTrackerPlayer(songOf([pattern], { initialSpeed: 8 }));
+    const ticks = run(player, 8);
+    // Tick 0 triggers at the unbent period; the following ticks retune.
+    const pitches = ticks
+      .flat()
+      .filter((command) => command.action === "pitch")
+      .map((command) => (command.action === "pitch" ? command.frequencyHz : 0));
+    expect(pitches.length).toBeGreaterThan(0);
+    // The channel's own period is untouched: the bend is on the output only.
+    const state = player.channels[0];
+    expect(state?.period).toBe(PERIOD_TABLE[0]?.[12]);
+  });
+
+  it("9: a sample offset rides out on the trigger, in bytes", () => {
+    const pattern = blankPattern();
+    put(pattern, 0, 0, cell(13, 1, 0x9, 0x10));
+    const player = createTrackerPlayer(songOf([pattern]));
+    const first = (run(player, 1)[0] as TrackerCommand[])[0] as TrackerCommand;
+    expect(first.action === "trigger" && first.sampleOffsetBytes).toBe(0x10 * 256);
+  });
+
+  it("EA/EB: fine volume slides move once, on tick 0", () => {
+    const pattern = blankPattern();
+    put(pattern, 0, 0, cell(13, 1, 0xc, 0x20)); // volume 32
+    put(pattern, 1, 0, cell(0, 0, 0xe, 0xa5)); // fine up 5
+    put(pattern, 2, 0, cell(0, 0, 0xe, 0xb9)); // fine down 9
+    const player = createTrackerPlayer(songOf([pattern], { initialSpeed: 3 }));
+    const volumes = run(player, 9)
+      .flat()
+      .filter((command) => command.action === "volume")
+      .map((command) => (command.action === "volume" ? command.volume : -1));
+    expect(volumes).toEqual([37, 28]);
+  });
+
+  it("E6: the pattern loop replays the marked span", () => {
+    // main.seg00's own module does exactly this once: `E60` on row 48 of
+    // pattern 0 and `E62` on row 63, which plays rows 48..63 three times.
+    const pattern = blankPattern();
+    put(pattern, 60, 0, cell(0, 0, 0xe, 0x60));
+    put(pattern, 63, 0, cell(0, 0, 0xe, 0x62));
+    const player = createTrackerPlayer(songOf([pattern, blankPattern()], { initialSpeed: 1 }));
+    // 64 rows, then rows 60..63 twice more = 72 rows before the pattern ends.
+    run(player, 72);
+    expect([player.order, player.row]).toEqual([1, 0]);
   });
 });
 
@@ -492,8 +571,8 @@ describe("determinism", () => {
     put(first, 3, 0, cell(0, 0, 0x3, 0)); // porta memory
     put(first, 3, 3, cell(36, 1, 0x1, 60)); // porta up into the clamp
     put(first, 4, 0, cell(0, 0, 0xf, 0x03)); // speed 3
-    put(first, 5, 1, cell(0, 0, 0x4, 0x33)); // ignored vibrato
-    put(first, 5, 2, cell(20, 0, 0x9, 0x10)); // ignored sample offset
+    put(first, 5, 1, cell(0, 0, 0x4, 0x33)); // vibrato, now implemented
+    put(first, 5, 2, cell(20, 0, 0x9, 0x10)); // sample offset, now implemented
     put(first, 6, 0, cell(0, 0, 0xd, 0x08)); // break to row 8
 
     const second = blankPattern();
@@ -518,6 +597,6 @@ describe("determinism", () => {
     // Pure arithmetic on plain data: this hash must never drift between runs,
     // machines, or refactors that claim to preserve behaviour.
     const digest = createHash("sha256").update(streamOf(2000).join("\n")).digest("hex");
-    expect(digest).toBe("d4ae56e8ee234be9dba1c25be77d3b05ff5d1644149fed97b00d6b916a7117a5");
+    expect(digest).toBe("41d3314d0b698bb5a44a25e8b6589ba470059262ee92ab66786afa170a9c7e66");
   });
 });

@@ -174,10 +174,49 @@ for (let i = 0; i < TABLE_IDS.length; i += 1) {
 // ---------------------------------------------------------------------------
 
 /**
- * Ticks one attract page is held: the original's "one page every 2 seconds"
- * (0x1162, `$50(a5)` frames per second), at this reconstruction's 50 Hz tick.
+ * THE PAGE CYCLE, measured frame by frame off a continuous capture.
+ *
+ * `research\view\reference\session3` filmed the credits for 399.58 s without
+ * touching the machine and measured every one of the 112 start-to-start
+ * intervals in the main take and all 55 in an independent cold boot: EVERY ONE
+ * IS 176 FRAMES. It does not vary with how much text the page carries.
+ *
+ * Inside those 176 frames the text appears COMPLETE IN ONE FRAME — the text
+ * pixel count goes 0 -> full between two consecutive frames on all 113 filmed
+ * instances, with no exception — is held bit-identical, and is then ERASED
+ * downward. So the animation belongs to the page going away, not to the page
+ * arriving, which is the opposite of what this shell used to do.
+ *
+ * The erase front starts on frame 101 of the page and advances 8 rows every
+ * two frames:
+ *
+ *     F(t) = 8 * floor((t - 101) / 2)      t = frames since the page appeared
+ *     row y is still visible  iff  y + 7*(y mod 8) >= F
+ *
+ * The visibility rule is `shellWipeShowsRow` in `shell-screens.ts`, unchanged
+ * and now row-exact against the film. Because a row's erase key is
+ * K(y) = (y div 8) + (y mod 8), a page is fully up for 101 + 2*(K_min + 1)
+ * frames, where K_min is the smallest key over its text rows: 125 for the nine
+ * two-line pages (K_min 11), 129 for "Pinball Illusions" (13), 119 for "Game
+ * Testing" (8) and 111 for "Thanx to" (4). Verified on all 113 instances.
  */
-export const ATTRACT_PAGE_TICKS = 100;
+export const ATTRACT_PAGE_TICKS = 176;
+
+/** The frame of the page cycle on which the erase front leaves zero: F(101) = 0. */
+export const ATTRACT_ERASE_START_TICK = 101;
+
+/** Rows the erase front advances per frame — 8 every two frames. */
+export const ATTRACT_ERASE_ROWS_PER_TICK = 4;
+
+/**
+ * Pages in the default roll: indices 0..11, wrapping at the NULL in slot 12.
+ * The array on disk is longer; the rest of it is the HELP branch and does not
+ * ship. See `ATTRACT_PAGES`.
+ */
+export const ATTRACT_ROLL_PAGES = 12;
+
+/** Frames in one full lap of the roll: 12 * 176. Filmed at 42.24 s. */
+export const ATTRACT_LAP_TICKS = ATTRACT_PAGE_TICKS * ATTRACT_ROLL_PAGES;
 
 /** Ticks the GAME OVER card is held before the high-score check. 100 frames. */
 export const GAME_OVER_TICKS = 100;
@@ -340,36 +379,99 @@ export function highlightedTable(state: ShellState): ShellTable {
 // Attract pages
 // ---------------------------------------------------------------------------
 
+/** A centred line at x = 160, which is opcode 0x0002 and every line in the roll. */
+function c(text: string, y: number): AttractLine {
+  return Object.freeze({ text, x: 160, y, align: "center" as const });
+}
+
+/** One line of an attract page: the display list's own record, verbatim. */
+export interface AttractLine {
+  readonly text: string;
+  readonly x: number;
+  readonly y: number;
+  readonly align: "left" | "center" | "right";
+}
+
 /**
- * The attract roll.
+ * THE CREDIT ROLL — the original's own twelve pages, decoded from the disk.
  *
- * The original walks a nineteen-slot array of display-list pages at
- * menudata h4+0xB84 — a title page and then one page per credit, plus two
- * easter-egg branches. Those pages are the developers' own credit and greeting
- * text; they are authored prose, not functional data, and they do not ship. The
- * FACT of the credits does: the game is Digital Illusions', published by 21st
- * Century Entertainment, and saying so is attribution rather than reproduction.
+ * ---------------------------------------------------------------------------
+ * WHERE THEY COME FROM
+ * ---------------------------------------------------------------------------
+ * `menudata.bin` hunk 4 holds an array of page pointers at h4+0x0B84 and the
+ * page display lists after it. The interpreter is `main.seg00 +0x1CB8`: it
+ * reads a big-endian word, `cmpi.w #3` ends the page, and anything else indexes
+ * the jump table at `+0x1CB2`, word-aligning `a0` after each record
+ * (`+0x1CCA..+0x1CD4`). FOUR OPCODES, and none of them is a line or a rule:
  *
- * LAYOUT AND STYLE follow the film, which caught seven of the original's own
- * pages. Every line is centred on x = 160 and the block is TOP-ANCHORED on the
- * 30-pixel ladder y = 104, 134, 164 — a two-line page uses 104 and 134 and does
- * not float itself between them — so a page is at most THREE lines. And the
- * original sets them in sentence case, not capitals: the filmed pages read
- * "Graphics by / Markus Nyström" and "21st Century Entertainment". Capitals in
- * this proportional font are also half again as wide, which is how the earlier
- * all-caps wording came to overrun the 288-pixel field; every line below is
- * measured to fit it, and `shell-render.test.ts` keeps it that way.
+ *     0x0000  `+0x1CDA`  TEXT left-aligned    u16 x, u16 y, asciiz
+ *     0x0001  `+0x1CEA`  TEXT right-aligned   (`+0x1CF8 sub.w d4,d0`)
+ *     0x0002  `+0x1D04`  TEXT centred         (`+0x1D12 lsr.w #1,d4`, sub)
+ *     0x0003  `+0x1CD8`  end of page
+ *
+ * The array has nineteen slots plus a NULL terminator, two of the slots are
+ * embedded NULLs, and an eighteenth page sits at h4+0x0B80 reached as index -1
+ * (the read at `+0x1174` is `movea.l ([$dc,a5],d0.w*4),a0` with d0.w SIGN
+ * EXTENDED). THE DEFAULT ROLL IS INDICES 0..11, wrapping at the NULL in slot
+ * 12 — not the array length. Both the disassembly and a continuous capture say
+ * twelve: `research\view\reference\session3` filmed 221 page instances over
+ * four cold boots and hashed exactly twelve distinct text bitmaps, in this
+ * order, with no exception, starting on "Pinball Illusions" from a cold boot.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT DELIBERATELY DOES NOT SHIP
+ * ---------------------------------------------------------------------------
+ * The disk also carries pages reachable only by holding HELP and typing a code
+ * word: two personal greeting sets, a piracy scold, and a page of partisan
+ * political jokes. THE OPERATOR HAS DECIDED NONE OF THEM SHIP. There is no HELP
+ * code path in this shell, on purpose — the omission is a decision, not an
+ * oversight, and this comment is where it is recorded so nobody "restores" it
+ * later as a missing feature. The index -1 version page (`Pinball_Illusions
+ * 1.6 / (24.1.95)`) is part of the same HELP branch and is out with the rest.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY THE COORDINATES ARE LITERALS AND NOT A LADDER
+ * ---------------------------------------------------------------------------
+ * Every y below is the word in the page record. The set is exactly
+ * {44, 74, 104, 134, 164, 194} for the roll — a 30-px pitch, but ANCHORED
+ * DIFFERENTLY PER PAGE: a two-line page is 104/134, "Pinball Illusions" alone
+ * is 120, "Game Testing" runs 74/104/134/164 and "Thanx to" 44/74/104/134/164/
+ * 194. No formula reproduces that, and the previous model — at most three
+ * lines, all centred on 160, top-anchored at 104 on a 30-px pitch — could not
+ * represent it at all.
+ *
+ * `Fredrik Liliegren` is the disk's spelling (`4c 69 6c 69 65 67 72 65 6e`).
+ * The person is Fredrik Liljegren; the page is attribution and the disk is the
+ * source, so it is reproduced as the machine prints it.
+ *
+ * The Swedish letters are written here in readable Unicode and translated to
+ * the font's own slots by `shellCharCode` in `shell-art.ts` — see the table
+ * there. A literal 'ö' would measure 0 and draw nothing.
  */
-export const ATTRACT_PAGES: readonly (readonly string[])[] = Object.freeze([
-  Object.freeze(["Pinball", "Illusions"]),
-  Object.freeze(["Original game by", "Digital Illusions"]),
-  Object.freeze(["Published by", "21st Century Entertainment"]),
-  Object.freeze(["Amiga AGA, 1995"]),
-  Object.freeze(["A browser reconstruction", "from the original disks"]),
+export const ATTRACT_PAGES: readonly (readonly AttractLine[])[] = Object.freeze([
+  Object.freeze([c("Pinball Illusions", 120)]),
+  Object.freeze([c("Concept and Design by", 104), c("Digital Illusions", 134)]),
+  Object.freeze([c("Programming by", 104), c("Andreas Axelsson", 134)]),
+  Object.freeze([c("Graphics by", 104), c("Markus Nyström", 134)]),
+  Object.freeze([c("Music & Soundeffects by", 104), c("Olof Gustafsson", 134)]),
+  Object.freeze([c("Managing by", 104), c("Fredrik Liliegren", 134)]),
+  Object.freeze([c("Produced by", 104), c("Barry Simpson", 134)]),
+  Object.freeze([c("Additional Graphics by", 104), c("Patrik Bergdahl", 134)]),
+  Object.freeze([c("Intro Coding by", 104), c("Thomas Andersson", 134)]),
+  Object.freeze([c("Packing Algorithms by", 104), c("Stefan Boberg", 134)]),
   Object.freeze([
-    "Three tables",
-    `${SHELL_TABLES[0]?.name ?? ""}, ${SHELL_TABLES[1]?.name ?? ""}`,
-    `and ${SHELL_TABLES[2]?.name ?? ""}`,
+    c("Game Testing by", 74),
+    c("Digital Illusions", 104),
+    c("&", 134),
+    c("21st Century Entertainment", 164),
+  ]),
+  Object.freeze([
+    c("Thanx to (in no order)", 44),
+    c("Lisa", 74),
+    c("Nicho", 104),
+    c("Skåning", 134),
+    c("Tvilling", 164),
+    c("Inga & Bosse", 194),
   ]),
 ]);
 
@@ -681,9 +783,11 @@ export function shellTick(state: ShellState, store: ScoreStore, ticks = 1): Shel
       state.attractTicks += 1;
       if (state.attractTicks >= ATTRACT_PAGE_TICKS) {
         state.attractTicks = 0;
-        // A NULL entry wraps the original's page array back to page 0; the end
-        // of this list does the same job.
-        state.attractPage = (state.attractPage + 1) % ATTRACT_PAGES.length;
+        // The NULL in slot 12 of the original's array wraps the roll back to
+        // page 0. Twelve, not `ATTRACT_PAGES.length` by accident: the array on
+        // disk is longer and the rest of it is the HELP branch, which does not
+        // ship (see ATTRACT_PAGES).
+        state.attractPage = (state.attractPage + 1) % ATTRACT_ROLL_PAGES;
       }
       continue;
     }

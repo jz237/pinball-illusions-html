@@ -446,10 +446,16 @@ describe("initial state", () => {
     ).toBe(0);
     const second = trace();
     expect(second).toEqual(first);
-    // And it really is the filmed run, from both games: the same non-zero steps
-    // this file's other case pins from `updateCamera` directly.
+    // And it really is the filmed run, from both games: the same geometric
+    // approach this file's other case pins from `updateCamera` directly, one
+    // row wider at each early step because the ball it is chasing now rests
+    // EIGHT PIXELS LOWER. The serve row used to be `bottomY - 8`, an invented
+    // inset; the film puts the resting silver on `bottomY` itself (see
+    // SERVE_INSET_PIXELS in plunger.ts) and the whole chase moves with it. The
+    // law is untouched — every step is still 0.85..0.96 of the one before, and
+    // it still ends on SERVE_FRAMING_SCROLL, asserted above.
     const nonZeroSteps = (rows: readonly number[]): number[] =>
       rows.map((row, i) => row - (i === 0 ? 0 : (rows[i - 1] ?? 0))).filter((step) => step !== 0);
-    expect(nonZeroSteps(second)).toEqual([47, 42, 38, 34, 31, 28, 25, 22, 20, 18, 16, 15, 8]);
+    expect(nonZeroSteps(second)).toEqual([48, 43, 39, 35, 31, 28, 25, 23, 21, 18, 17, 15, 1]);
   });
 });

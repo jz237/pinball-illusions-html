@@ -205,6 +205,85 @@ describe("the shipped mission layer", () => {
   });
 });
 
+/**
+ * THE THREE RESET BITS, pinned as literals off the disassembly.
+ *
+ * These are the sets the per-game reset at `main.seg00 +0x004052` and the
+ * per-ball reset at `+0x003F80` walk out of the descriptor's element table at
+ * descriptor +$3C. They are pinned as literals rather than recomputed, because
+ * recomputing them from the same `flags` byte the source reads would test
+ * nothing: an exporter that shipped the wrong byte would agree with itself.
+ */
+describe("the game-start and per-ball reset sets", () => {
+  const LIT_AT_GAME_START: Readonly<Record<string, readonly number[]>> = {
+    "law-n-justice": [
+      0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 18, 19, 20, 27, 39, 43, 53, 54, 55, 56, 57, 60,
+      61, 62, 63, 64, 66, 67, 68, 69, 70, 71, 72, 73, 74, 82, 92, 93, 100, 109,
+    ],
+    babewatch: [
+      0, 1, 2, 3, 4, 5, 6, 14, 15, 16, 17, 18, 19, 20, 28, 35, 36, 37, 56, 66, 68, 69, 70, 71,
+      72, 74, 86, 87, 106, 108, 116, 123,
+    ],
+    "extreme-sports": [
+      13, 21, 29, 30, 45, 46, 48, 49, 50, 73, 74, 75, 82, 85, 86, 87, 88, 89, 90, 91, 92, 93,
+      94, 95, 97,
+    ],
+  };
+  const KEEP_ARMED: Readonly<Record<string, readonly number[]>> = {
+    "law-n-justice": [10, 11, 14, 21, 47, 65],
+    babewatch: [
+      7, 13, 21, 22, 23, 24, 25, 29, 30, 31, 59, 65, 67, 116, 117, 118, 119, 120, 121, 122, 124,
+    ],
+    "extreme-sports": [14, 58, 84, 96],
+  };
+  const KEEP_DONE: Readonly<Record<string, readonly number[]>> = {
+    "law-n-justice": [9, 10, 13, 26],
+    babewatch: [15, 56, 59, 65, 123],
+    "extreme-sports": [12, 13, 82, 83],
+  };
+
+  for (const tableId of TABLE_IDS) {
+    it(`${tableId}: flags bit 1 gives the elements armed at game start`, () => {
+      expect(modesFor(tableId).litAtGameStart).toEqual(LIT_AT_GAME_START[tableId]);
+    });
+
+    it(`${tableId}: flags bits 0 and 5 give what survives a ball`, () => {
+      expect(modesFor(tableId).keepArmedAcrossBall).toEqual(KEEP_ARMED[tableId]);
+      expect(modesFor(tableId).keepDoneAcrossBall).toEqual(KEEP_DONE[tableId]);
+    });
+  }
+
+  it("counts 43 / 32 / 25, which is what the reset walk arms", () => {
+    expect(modesFor("law-n-justice").litAtGameStart.length).toBe(43);
+    expect(modesFor("babewatch").litAtGameStart.length).toBe(32);
+    expect(modesFor("extreme-sports").litAtGameStart.length).toBe(25);
+  });
+
+  it("lights exactly two inserts, both on BabeWatch: elements 15 and 56", () => {
+    // Only an element that owns a START lamp at +$04 puts a light on the glass.
+    // The film agrees: every insert is dark at the serve on Law 'n Justice and
+    // Extreme Sports, and BabeWatch shows exactly two blinking.
+    for (const tableId of TABLE_IDS) {
+      const modes = modesFor(tableId);
+      const withLamps = modes.litAtGameStart.filter(
+        (index) => modes.elements[index]?.lampStart === true,
+      );
+      expect(withLamps, tableId).toEqual(tableId === "babewatch" ? [15, 56] : []);
+    }
+  });
+
+  it("no longer arms BabeWatch's lock ladder, which was the census outlier", () => {
+    // 21..25 and 29..31 have flags $01 and $09 — bit 1 clear in all of them.
+    // The retired reconstruction armed 23, 25, 29, 30 and 31 at game start and
+    // the first capture paid their own scores: 25,000,000 + 5,000,000 is the
+    // whole of the 30,850,000 and 42,245,000 games the census kept finding.
+    const lit = new Set(modesFor("babewatch").litAtGameStart);
+    for (const element of [21, 22, 23, 24, 25, 29, 30, 31]) {
+      expect(lit.has(element), `BabeWatch element ${element}`).toBe(false);
+    }
+  });
+});
+
 describe("the mission-layer parser refuses", () => {
   it("a document it does not know the schema of", () => {
     expect(() => parseTableModesDocument(mutated((doc) => { doc["schema"] = "nope"; }))).toThrow(

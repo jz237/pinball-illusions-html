@@ -84,11 +84,14 @@ const OPCODES = Array.from({ length: 32 }, (_, index) => {
   const named: Readonly<Record<number, readonly [string, number, string]>> = {
     0: ["END", 2, ""],
     1: ["START", 6, "e"],
+    2: ["START_TIMED", 8, "ew"],
     3: ["COMPLETE", 6, "e"],
     5: ["AWARD", 6, "e"],
     9: ["MODE_START", 6, "s"],
     10: ["JMP", 4, "c"],
     12: ["CLEAR_DONE", 6, "e"],
+    14: ["LAMP_OFF", 6, "e"],
+    23: ["JMP_IF_UNLIT", 8, "ec"],
     27: ["BALLS_UP_TO", 4, "w"],
     28: ["WAIT", 10, "ewc"],
   };
@@ -96,10 +99,10 @@ const OPCODES = Array.from({ length: 32 }, (_, index) => {
   return { index, name: entry[0], length: entry[1], args: entry[2] };
 });
 
-function element(index: number, score: number, bonus = 0) {
+function element(index: number, score: number, bonus = 0, flags = 0) {
   return {
     index,
-    flags: 0,
+    flags,
     score,
     bonus,
     effect: 0,
@@ -159,6 +162,24 @@ function fixtureDocument(): TableModesDocument {
 
 function fixture(): TableModes {
   return parseTableModesDocument(fixtureDocument());
+}
+
+/**
+ * The same table with three flagged elements bolted on, for the resets.
+ *
+ *   3  flags $02 — lit at game start (per-game +0x004052, per-ball +0x003FB0)
+ *   4  flags $01 — ARMED survives a ball (+0x003FA4)
+ *   5  flags $20 — DONE survives a ball (+0x003F9A)
+ */
+function resetFixture(): TableModes {
+  const doc = fixtureDocument() as unknown as Record<string, unknown>;
+  doc["elements"] = [
+    ...(doc["elements"] as unknown[]),
+    element(3, 100, 0, 0x02),
+    element(4, 100, 0, 0x01),
+    element(5, 100, 0, 0x20),
+  ];
+  return parseTableModesDocument(doc as unknown as TableModesDocument);
 }
 
 /** Runs `ticks` frames and returns everything that happened, flattened. */
@@ -361,8 +382,130 @@ describe("a mission", () => {
     expect(litElements(state)).toEqual([]);
     expect(state.queueRead).toBe(0);
     expect(state.queueWrite).toBe(0);
-    // The DONE bits are per player and per GAME and must survive the ball.
-    expect(state.done[0]).toBe(1);
+    // DECODED, +0x003F9A: the DONE bit is CLEARED by the per-ball reset unless
+    // the element's flags carry bit 5. Element 0's flags are 0, so it clears.
+    // The old assertion here — "DONE bits are per player and per GAME and must
+    // survive the ball" — was a reconstruction and the disassembly overturns it.
+    expect(state.done[0]).toBe(0);
+  });
+});
+
+describe("the per-ball reset, decoded from +0x003F80", () => {
+  it("clears DONE by default and keeps it for a flags bit-5 element", () => {
+    const modes = resetFixture();
+    const state = createModeState(modes);
+    state.done[0] = 1;
+    state.done[5] = 1;
+
+    resetModesForNewBall(modes, state);
+
+    expect(modes.keepDoneAcrossBall).toEqual([5]);
+    expect(state.done[0]).toBe(0);
+    expect(state.done[5]).toBe(1);
+  });
+
+  it("clears ARMED by default and keeps it for a flags bit-0 element", () => {
+    const modes = resetFixture();
+    const state = createModeState(modes);
+    state.armed[0] = 1;
+    state.armed[4] = 1;
+
+    resetModesForNewBall(modes, state);
+
+    expect(modes.keepArmedAcrossBall).toEqual([4]);
+    expect(state.armed[0]).toBe(0);
+    expect(state.armed[4]).toBe(1);
+  });
+
+  it("re-arms every flags bit-1 element, on a new game and on a new ball", () => {
+    const modes = resetFixture();
+    expect(modes.litAtGameStart).toEqual([3]);
+
+    const state = createModeState(modes);
+    expect(state.armed[3]).toBe(1);
+
+    state.armed[3] = 0;
+    resetModesForNewBall(modes, state);
+    expect(state.armed[3]).toBe(1);
+  });
+});
+
+describe("the opcode corrections that a permanently lit shot forces", () => {
+  /** Runs one script from the reset fixture and returns the state it left. */
+  function runScript(ops: readonly { pc: number; op: number; args: number[] }[]) {
+    const doc = fixtureDocument() as unknown as Record<string, unknown>;
+    doc["elements"] = [
+      ...(doc["elements"] as unknown[]),
+      element(3, 100, 0, 0x02),
+      element(4, 100, 0, 0x01),
+      element(5, 100, 0, 0x20),
+    ];
+    (doc["scripts"] as unknown[]).push({ index: 6, ops });
+    const modes = parseTableModesDocument(doc as unknown as TableModesDocument);
+    const state = createModeState(modes);
+    queueScript(state, 6);
+    run(modes, state, ops.length + 2);
+    return state;
+  }
+
+  it("LAMP_OFF refuses a bit-1 element and disarms an ordinary one", () => {
+    // main.seg00 +0x005A10. Without this, one LAMP_OFF anywhere in a script
+    // would put an always-lit shot out for the rest of the game.
+    const state = runScript([
+      { pc: 0, op: 1, args: [0] },
+      { pc: 6, op: 14, args: [0] },
+      { pc: 12, op: 14, args: [3] },
+      { pc: 18, op: 0, args: [] },
+    ]);
+    expect(state.armed[0]).toBe(0);
+    expect(state.armed[3]).toBe(1);
+  });
+
+  it("START on an already-armed or DONE element is a complete no-op", () => {
+    // main.seg00 +0x005A36 is `bset.b d6,$1(a2) / bne`, so the handler leaves on
+    // the OLD bit: no timer rewrite, no re-blink.
+    const state = runScript([
+      { pc: 0, op: 2, args: [0, 5] },
+      { pc: 8, op: 2, args: [0, 9] },
+      { pc: 16, op: 0, args: [] },
+    ]);
+    expect(state.armed[0]).toBe(1);
+    // Still the FIRST start's five seconds, four ticks down — not the nine the
+    // second START asked for. A handler that rewrote the timer would read 450.
+    expect(state.timers[0]).toBe(5 * TICKS_PER_SECOND - 4);
+  });
+
+  it("JMP_IF_UNLIT jumps on DONE, not only on unarmed", () => {
+    // main.seg00 +0x005C90: the branch is `done OR not armed`. Element 0 is
+    // armed AND done here, which the old `armed === 0 && done === 0` reading
+    // fell straight through.
+    const doc = fixtureDocument() as unknown as Record<string, unknown>;
+    (doc["scripts"] as unknown[]).push({
+      index: 6,
+      ops: [
+        { pc: 0, op: 23, args: [0, 14] },
+        { pc: 8, op: 5, args: [1] },
+        { pc: 14, op: 0, args: [] },
+      ],
+    });
+    const modes = parseTableModesDocument(doc as unknown as TableModesDocument);
+    const state = createModeState(modes);
+    state.armed[0] = 1;
+    state.done[0] = 1;
+    queueScript(state, 6);
+    const { awards } = run(modes, state, 6);
+    expect(awards, "the branch was taken, so element 1 was never awarded").toEqual([]);
+  });
+
+  it("COMPLETE leaves a bit-1 element armed", () => {
+    // main.seg00 +0x005B88: DONE is set, but the `bclr` at +0x005B9C is skipped
+    // for a bit-1 element.
+    const state = runScript([
+      { pc: 0, op: 3, args: [3] },
+      { pc: 6, op: 0, args: [] },
+    ]);
+    expect(state.done[3]).toBe(1);
+    expect(state.armed[3]).toBe(1);
   });
 });
 

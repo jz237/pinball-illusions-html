@@ -127,6 +127,10 @@ const DERIVED_MARKERS = [
   { class: "disk-derived-panel-animations", noun: "score panel animation" },
   { class: "disk-derived-audio", noun: "sound effect" },
   { class: "disk-derived-shell-artwork", noun: "shell artwork" },
+  // The front-end module. It ships as a decoded document plus one WAV per live
+  // instrument, each digest-claimed through the samples[] branch below — never
+  // as a `.mod`, which FORBIDDEN_EXT still refuses and should go on refusing.
+  { class: "disk-derived-shell-music", noun: "front-end music" },
 ];
 
 /** Manifest classes that must account for the binary files they ship beside. */
@@ -134,6 +138,7 @@ const MEDIA_MARKERS = new Map([
   ["disk-derived-playfield-artwork", { noun: "playfield artwork", extensions: IMAGE_EXT }],
   ["disk-derived-audio", { noun: "sound effect", extensions: AUDIO_EXT }],
   ["disk-derived-shell-artwork", { noun: "shell artwork", extensions: IMAGE_EXT }],
+  ["disk-derived-shell-music", { noun: "front-end music", extensions: AUDIO_EXT }],
 ]);
 
 /** Tolerates both `"sourceClass":"x"` and the spaced form a formatter might emit. */
@@ -201,6 +206,9 @@ for await (const file of walk(root)) {
     }
     continue;
   }
+  // The fall-through: both audio classes — the tables' sound effects and the
+  // shell's module instruments — ship a `samples: [{file, sha256}]` array, so
+  // one branch claims both. A new audio class only has to use that shape.
   const samples = Array.isArray(doc?.samples) ? doc.samples : null;
   if (samples === null) {
     violations.push(`${rel}: audio manifest carries no samples array`);

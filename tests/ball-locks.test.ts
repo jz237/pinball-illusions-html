@@ -145,6 +145,24 @@ function started(tableId: TableId): Game {
   return game;
 }
 
+/**
+ * Lights BabeWatch's three lock-lit lamps, which a fresh game does NOT light.
+ *
+ * Their flags are $09 — bit 1 CLEAR — so the per-game reset at
+ * `main.seg00 +0x004052` leaves elements 29, 30 and 31 dark; what arms them in
+ * play is scripts 120 / 125 / 128 / 134. That is a change from the labelled
+ * reconstruction these tests were written against, which lit them at game start
+ * and made the first grid capture count. The lamps are lit here directly so the
+ * assertions below stay about the LADDER — the counted lock, the ladder's own
+ * BALLS_UP_TO, the scripted eject — rather than about how the lamp got lit,
+ * which is a different mechanism with its own coverage.
+ */
+function lightLockLamps(game: Game): void {
+  const state = game.modeState;
+  if (state === null) return;
+  for (const element of [29, 30, 31]) state.armed[element] = 1;
+}
+
 /** Centre of a lock's rectangle, in whole pixels. */
 function centreOf(device: BallLock): { readonly x: number; readonly y: number } {
   return {
@@ -437,10 +455,11 @@ describe("a lock in a running game", () => {
   it("babewatch starts a TWO-ball multiball on the FIRST counted lock", () => {
     // The decoded ladder h4+0x49F8: id 1 -> launcher script 110, "BALL 1
     // LOCKED", MODE_START 179 ("SHOW YOUR MUSCLES", BALLS_UP_TO 2). The lock
-    // lamp is lit at game start (the labelled reconstruction in
-    // table-modes.ts), so the very first grid saucer capture counts.
+    // lamp is NOT lit at game start — see `lightLockLamps` — so the harness
+    // lights it and the first COUNTED capture is the one under test.
     const game = started("babewatch");
     runTicks(game, idleInput(), 60);
+    lightLockLamps(game);
     const grid = ballLocksFor("babewatch").find((one) => one.id === "grid-top");
     expect(grid).toBeDefined();
     if (grid === undefined) return;
@@ -470,11 +489,13 @@ describe("a lock in a running game", () => {
     // positions, settled by the decoded table.
     const game = started("babewatch");
     runTicks(game, idleInput(), 60);
+    lightLockLamps(game);
     const grid = ballLocksFor("babewatch").find((one) => one.id === "grid-top");
     if (grid === undefined) return;
 
     dropInto(game, grid);
     expect(runToMultiball(game, idleInput(), 600)).toBeGreaterThanOrEqual(0);
+    lightLockLamps(game);
 
     dropInto(game, grid);
     const seen = collectMessages(game, idleInput(), 300);
@@ -580,6 +601,7 @@ describe("a lock in a running game", () => {
     expect(game.modeState).not.toBeNull();
     if (game.modeState === null) return;
     game.modeState.ladderCounts[ladder] = 2;
+    lightLockLamps(game);
 
     const grid = ballLocksFor("babewatch").find((one) => one.id === "grid-top");
     if (grid === undefined) return;
@@ -624,6 +646,7 @@ describe("a lock in a running game", () => {
     const ladder = modes.elements[29]?.ladder ?? -1;
     if (game.modeState === null) return;
     game.modeState.ladderCounts[ladder] = 2;
+    lightLockLamps(game);
     const grid = ballLocksFor("babewatch").find((one) => one.id === "grid-top");
     if (grid === undefined) return;
     dropInto(game, grid);

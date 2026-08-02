@@ -141,14 +141,16 @@ simulate exactly one ball.
     effect-**17** elements (a direct event-record dispatch at element `+$34`) whose
     handler is **not decoded**; its `BALLS_UP_TO 3` modes are mission-launched. An
     ES lock is a scoring eject until effect 17 is traced. **[open]**
-  - Two residues, stated plainly: the site that lights the lock lamps **for the
-    first time in a fresh game** was not located (no game-init script does it;
-    presumably the per-table native init in slot 6), and nothing was found that
-    resets the per-game counters at game start (either the table module is reloaded
-    per game or ladder state persists across games in one session). The port lights
-    the underivable lamps at game start and zeroes the counters per game, both
-    labelled (`litAtGameStart` in table-modes.ts, `ladderCounts` in mode-vm.ts).
-    **[open]**
+  - One residue left, and one closed in round 7. CLOSED: the site that lights
+    lamps for the first time in a fresh game is the per-GAME reset at
+    `main.seg00 +0x004052`, which arms every element whose flags bit 1 ($02) is
+    set and lights its START lamp; the per-BALL reset at `+0x003F80` repeats it
+    and additionally keeps ARMED for flags bit 0 and DONE for flags bit 5. The
+    lock lamps are not in that set on any table, so the first capture of a game
+    counts nothing. **[disk]** STILL OPEN: nothing was found that resets the
+    per-game ladder counters at game start (either the table module is reloaded
+    per game or ladder state persists across games in one session); the port
+    zeroes them per game, labelled (`ladderCounts` in mode-vm.ts). **[open]**
 - The display switches to a high-resolution full-screen mode while multiball is
   active so every ball stays visible; toggleable by the player. **[src]** — the
   mechanism is now identified as option record 7 with its two display configurations

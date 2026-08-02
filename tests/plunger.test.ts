@@ -54,12 +54,17 @@ describe("the shooter lane", () => {
     expect(x).toBeGreaterThanOrEqual(lane.minCentreX);
     expect(x).toBeLessThanOrEqual(lane.maxCentreX);
     expect(y).toBeGreaterThan(lane.topY);
-    expect(y).toBeLessThan(lane.bottomY);
+    expect(y).toBe(lane.bottomY);
   });
 
-  it("serves near the bottom of the lane, not the middle of it", () => {
+  it("rests the served ball on the floor row the film rests it on", () => {
     const lane = LAW_N_JUSTICE_SHOOTER_LANE;
-    expect(q10ToPixel(CONFIG.serveY)).toBe(lane.bottomY - SERVE_INSET_PIXELS);
+    // No inset. session2 babewatch-take1 f331: the silver's bbox is y
+    // 546.0..557.5, centroid 551.3, and the f332 frame-difference centre is
+    // 550.8 — the measured rest row is bottomY (552), not 544.
+    expect(SERVE_INSET_PIXELS).toBe(0);
+    expect(q10ToPixel(CONFIG.serveY)).toBe(lane.bottomY);
+    expect(q10ToPixel(CONFIG.serveY)).toBe(552);
     // Well below the halfway point: a ball served mid-lane would have half the
     // runway and the launch shot would not reach the top.
     expect(q10ToPixel(CONFIG.serveY)).toBeGreaterThan((lane.topY + lane.bottomY) / 2);
@@ -182,8 +187,12 @@ describe("the shooter lane", () => {
     expect(() =>
       plungerConfigForLane({ ...LAW_N_JUSTICE_SHOOTER_LANE, topY: 600, bottomY: 4 }),
     ).toThrow(/inverted/);
+    // "Too short" now means "no runway at all". With the inset removed the
+    // serve row is `bottomY`, so a 550..552 lane really is servable — the ball
+    // rests on 552 with two rows above it — and the degenerate case that is
+    // still refused is the lane whose floor and ceiling are the same row.
     expect(() =>
-      plungerConfigForLane({ ...LAW_N_JUSTICE_SHOOTER_LANE, topY: 550, bottomY: 552 }),
+      plungerConfigForLane({ ...LAW_N_JUSTICE_SHOOTER_LANE, topY: 552, bottomY: 552 }),
     ).toThrow(/too short/);
   });
 

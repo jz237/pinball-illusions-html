@@ -76,6 +76,7 @@ import type { ShellArtworkSource } from "./browser/shell-screens.js";
 import { createShellSkin } from "./browser/shell-skin.js";
 import type { ShellSkin } from "./browser/shell-skin.js";
 import { loadShellArt } from "./game/shell-art.js";
+import { loadShellMusic } from "./audio/shell-music.js";
 import type { ShellFont } from "./game/shell-art.js";
 import {
   MUSIC_TOGGLE_CODE,
@@ -364,6 +365,23 @@ async function boot(): Promise<void> {
     })
     .catch((error: unknown) => {
       console.warn("pinball-illusions: shell artwork unavailable, using placeholder", error);
+    });
+
+  /**
+   * The front-end module, decoded from the disks and shipped behind the
+   * authorization gate. The controller plays nothing until this lands, and
+   * nothing at all if it never does — a build without the authorized assets is
+   * a silent shell, not a broken one.
+   */
+  void loadShellMusic((url) => fetch(url))
+    .then((asset) => {
+      music.useAsset(asset);
+      if (asset === null) {
+        console.warn("pinball-illusions: front-end music unavailable, shell will be silent");
+      }
+    })
+    .catch((error: unknown) => {
+      console.warn("pinball-illusions: front-end music unavailable, shell will be silent", error);
     });
 
   thumbnails.warm();

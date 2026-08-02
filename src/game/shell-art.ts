@@ -134,6 +134,37 @@ export interface ShellArt {
 // ---------------------------------------------------------------------------
 
 /**
+ * THE SIX SWEDISH LETTERS, and where the shell font really keeps them.
+ *
+ * font1 has 128 metric entries and no room for Latin-1, so the original stores
+ * Å Ä Ö å ä ö in the ASCII bracket/brace slots — confirmed glyph by glyph
+ * against `public/generated/shell/shell-font1.png`:
+ *
+ *     [ 0x5B = Å    \ 0x5C = Ä    ] 0x5D = Ö
+ *     { 0x7B = å    | 0x7C = ä    } 0x7D = ö
+ *
+ * Source strings in this repo are written in readable Unicode ("Markus
+ * Nyström") and translated here, so nothing in the codebase has to be read
+ * through a substitution table. A literal U+00F6 would index past font1's 128
+ * entries, advance 0 and draw nothing — which is exactly how a mis-set page
+ * would silently lose a letter and shift the whole centred line.
+ */
+const SHELL_CHAR_SUBSTITUTIONS: ReadonlyMap<number, number> = new Map([
+  [0x00c5, 0x5b],
+  [0x00c4, 0x5c],
+  [0x00d6, 0x5d],
+  [0x00e5, 0x7b],
+  [0x00e4, 0x7c],
+  [0x00f6, 0x7d],
+]);
+
+/** The font code point for the character at `at`, after the substitutions. */
+export function shellCharCode(text: string, at: number): number {
+  const code = text.charCodeAt(at);
+  return SHELL_CHAR_SUBSTITUTIONS.get(code) ?? code;
+}
+
+/**
  * Pixel width of a string: the sum of the advances, which is exactly what the
  * width tables `main.bin` builds at +0x1E16/+0x1E96 sum to. Characters the
  * font has no entry for advance 0 and draw nothing, matching a blitter fed a
@@ -142,7 +173,7 @@ export interface ShellArt {
 export function measureShellText(font: ShellFont, text: string): number {
   let width = 0;
   for (let i = 0; i < text.length; i += 1) {
-    width += font.glyphs[text.charCodeAt(i)]?.advance ?? 0;
+    width += font.glyphs[shellCharCode(text, i)]?.advance ?? 0;
   }
   return width;
 }

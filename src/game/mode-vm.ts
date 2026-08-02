@@ -90,6 +90,7 @@
  * counted.
  */
 
+import { ELEMENT_FLAG_LIT_AT_GAME_START } from "./table-modes.js";
 import type { LockDevice, ModeElement, ModeScript, TableModes } from "./table-modes.js";
 
 // ---------------------------------------------------------------------------
@@ -124,7 +125,7 @@ const OP_AWARD = 5;
 const OP_PUSH = 8;
 const OP_MODE_START = 9;
 const OP_JMP = 10;
-const OP_SET_INTRO = 11;
+const OP_SET_BALL_SAVE = 11;
 const OP_CLEAR_DONE = 12;
 const OP_LAMP_OFF = 14;
 const OP_MESSAGE = 17;
@@ -251,8 +252,18 @@ export interface ModeState {
   /** `$dba`: the DBNZ loop counter. `$db8`: the alternate resume PC. */
   loop: number;
   resumePc: number;
-  /** `$d8a`: the intro delay SET_INTRO writes. Carried, not yet spent. */
-  introTicks: number;
+  /**
+   * `$d8a(a5)`: the BALL-SAVE countdown, in ticks.
+   *
+   * DECODED, and it is not an "intro delay": opcode 11 (`main.seg00
+   * +0x005992`) writes the ball-save seconds, the same word SERVE arms at
+   * `+0x0049AE` from `$e8e(a5)` (`.opt` record 5, default 5 / 5 / 10 s). The
+   * renderer at `+0x004DEC..+0x004E20` blinks the descriptor's engine[1] lamp
+   * from it — > 100 frames 4-on/4-off, 51..100 1-on/1-off, <= 50 off — and
+   * `+0x0052CE` gives the ball back on a drain while it is non-zero.
+   * Carried here, not yet spent: nothing reads it until the ball saver lands.
+   */
+  ballSaveTicks: number;
 
   /** RECONSTRUCTION. Which selector entry the next arm shot will start. */
   selectorCursor: number;
@@ -263,8 +274,9 @@ export interface ModeState {
 export function createModeState(modes: TableModes): ModeState {
   const count = modes.elements.length;
   const armed = new Uint8Array(count);
-  // The game-start lamps. RECONSTRUCTION — the derivation, and why it is one,
-  // is at `TableModes.litAtGameStart`.
+  // The game-start lamps, DECODED: the per-GAME reset at main.seg00 +0x004052
+  // arms — for every player — every element whose flags bit 1 is set, and
+  // writes its countdown to -1. See `TableModes.litAtGameStart`.
   for (const element of modes.litAtGameStart) armed[element] = 1;
   return {
     armed,
@@ -287,32 +299,50 @@ export function createModeState(modes: TableModes): ModeState {
     waitTimeoutPc: -1,
     loop: 0,
     resumePc: -1,
-    introTicks: 0,
+    ballSaveTicks: 0,
     selectorCursor: 0,
     played: new Uint8Array(modes.missions.length),
   };
 }
 
 /**
- * What a new ball clears.
+ * What a new ball clears — DECODED, from the per-BALL reset at
+ * `main.seg00 +0x003F80` (one caller, `+0x0050C2`).
  *
- * The mission and the queue, because neither survives a drain in this
- * reconstruction (see the divergence note in the header). The DONE bits are per
- * player and per game and are NOT cleared, exactly as the scoring layer's flag
- * bytes are not: a shot a player has finished stays finished across a ball.
- * The effect-6 ladder counters are per game too — nothing in the engine resets
- * them per ball — and the game-start lamps come back on, because clearing the
- * armed bits at all is this reconstruction's own divergence and a ball that
- * started with its lock lamps dark could never advance the multiball ladder.
+ * It is the per-game walk of `+0x004052` with two extra tests, both on the
+ * element's flags byte at element +$00:
+ *
+ *   `+0x003F9A`  flags bit 5 ($20) — the DONE bit is KEPT, not cleared
+ *   `+0x003FA4`  flags bit 0 ($01) — the ARMED bit is KEPT, not cleared
+ *   `+0x003FB0`  flags bit 1 ($02) — re-armed for every player, countdown -1,
+ *                and the START lamp relit
+ *
+ * So a DONE bit is cleared by default and survives only where the table says
+ * so, which is the opposite of what this function used to do (it never touched
+ * `done` at all). The effect-6 ladder counters stay per game — nothing in the
+ * engine resets them per ball.
+ *
+ * DIVERGENCE, STATED: `awardLit` (the lamp's +$05 always-on mask) is cleared
+ * wholesale here. `+0x003F10` preserves it for lamps in a GROUP whose flags
+ * byte has bit 2 set — Law 'n Justice group 8; BabeWatch 7, 11, 15, 17, 25;
+ * Extreme Sports 17, 20 — and the exporter does not ship the group table yet,
+ * so there is nothing here to test the bit against. When
+ * `*.lamps.json` grows its `groups[]` this becomes a filter like the two above.
  */
 export function resetModesForNewBall(modes: TableModes, state: ModeState): void {
-  state.armed.fill(0);
-  for (const element of modes.litAtGameStart) state.armed[element] = 1;
-  // RECONSTRUCTION: the award-relight latches go out with the ball, exactly as
-  // the armed bits do — clearing either at all is this reconstruction's own
-  // divergence (see the header), and the two lamp states should not diverge
-  // from each other across a drain.
+  const keepArmed = new Set(modes.keepArmedAcrossBall);
+  const keepDone = new Set(modes.keepDoneAcrossBall);
+  const lit = new Set(modes.litAtGameStart);
+  for (let index = 0; index < state.armed.length; index += 1) {
+    if (!keepDone.has(index)) state.done[index] = 0;
+    if (!keepArmed.has(index)) state.armed[index] = 0;
+    if (lit.has(index)) state.armed[index] = 1;
+  }
   state.awardLit.fill(0);
+  // The original writes $FFFF — "no countdown" — into +$2E for everything the
+  // reset arms; this state machine spells "not counting" as 0, and it clears
+  // every element's timer rather than only the armed ones, which is the same
+  // thing here because a timer only ever runs on an armed element.
   state.timers.fill(0);
   state.queue.fill(-1);
   state.queueWrite = 0;
@@ -557,6 +587,11 @@ function startElement(
 ): void {
   const element = elementAt(modes, index);
   if (element === null) return;
+  // DECODED, main.seg00 +0x005A36: the handler is `bset.b d6,$1(a2)` followed
+  // by a branch that leaves on the OLD bit — a START on an element that is
+  // already armed for this player is a COMPLETE no-op, with no timer rewrite
+  // and no re-blink. The DONE test at +0x005A2C is the same shape.
+  if (state.armed[index] === 1 || state.done[index] === 1) return;
   state.armed[index] = 1;
   state.timers[index] = seconds > 0 ? seconds * TICKS_PER_SECOND : 0;
   out.elementStarts.push(index);
@@ -704,8 +739,18 @@ function step(
       const index = args[0] ?? -1;
       if (index >= 0) {
         state.done[index] = 1;
-        state.armed[index] = 0;
-        state.timers[index] = 0;
+        // DECODED, main.seg00 +0x005B88: the handler sets DONE and puts the
+        // lamp out, but its `bclr` of the armed bit at +0x005B9C is SKIPPED for
+        // a bit-1 element — a permanently lit shot stays armed — and is also
+        // skipped when the element's countdown at +$2E is negative, which the
+        // resets write for everything they arm. So in practice COMPLETE only
+        // disarms an element that some script armed with a live timer.
+        const element = elementAt(modes, index);
+        const permanent = element !== null && (element.flags & ELEMENT_FLAG_LIT_AT_GAME_START) !== 0;
+        if (!permanent && state.timers[index] !== 0) {
+          state.armed[index] = 0;
+          state.timers[index] = 0;
+        }
       }
       return next;
     }
@@ -722,6 +767,12 @@ function step(
 
     case OP_LAMP_OFF: {
       const index = args[0] ?? -1;
+      // DECODED, main.seg00 +0x005A10: the handler REFUSES a bit-1 element and
+      // returns without touching it. Now that bit-1 elements are armed from the
+      // first frame this is load-bearing: one LAMP_OFF would otherwise kill an
+      // always-lit shot for the rest of the game.
+      const element = elementAt(modes, index);
+      if (element !== null && (element.flags & ELEMENT_FLAG_LIT_AT_GAME_START) !== 0) return next;
       if (index >= 0) {
         state.armed[index] = 0;
         state.timers[index] = 0;
@@ -785,8 +836,10 @@ function step(
     case OP_JMP:
       return args[0] ?? -1;
 
-    case OP_SET_INTRO:
-      state.introTicks = Math.max(0, args[0] ?? 0) * TICKS_PER_SECOND;
+    case OP_SET_BALL_SAVE:
+      // Opcode 11 is SET BALL SAVE SECONDS, not "set intro". Law 'n Justice's
+      // scripts re-arm it with 2, 10 and 30-second operands.
+      state.ballSaveTicks = Math.max(0, args[0] ?? 0) * TICKS_PER_SECOND;
       return next;
 
     case OP_MESSAGE:
@@ -795,7 +848,11 @@ function step(
 
     case OP_JMP_IF_UNLIT: {
       const index = args[0] ?? -1;
-      const unlit = index < 0 || (state.armed[index] === 0 && state.done[index] === 0);
+      // DECODED, main.seg00 +0x005C90: the branch is taken when the element is
+      // DONE **or** not armed — not when both are false. The old reading
+      // (`armed === 0 && done === 0`) fell through on a finished shot, which is
+      // exactly the case the missions use it to skip.
+      const unlit = index < 0 || state.done[index] === 1 || state.armed[index] === 0;
       return unlit ? (args[1] ?? -1) : next;
     }
 

@@ -3,8 +3,10 @@
  *
  * The original front-end starts its one module the moment the menus come up
  * and keeps it running under every screen the shell owns; the table takes
- * over when play begins. This controller reproduces that shape over the
- * synthesized song: music sounds in every shell phase except the two that sit
+ * over when play begins. This controller reproduces that shape over THE
+ * ORIGINAL'S OWN MODULE, decoded from the operator's disks and loaded at
+ * runtime as a gated asset (`src/audio/shell-music.ts`): music sounds in every
+ * shell phase except the two that sit
  * on the playfield (`play` and `quit-confirm`, which is a paused game with a
  * question drawn over it), starts from the top whenever the shell comes back
  * from the table, and loops via the stream's own restart point in between.
@@ -38,8 +40,9 @@ import {
   startTracker,
   stopTracker,
 } from "../audio/tracker-output.js";
-import type { TrackerHost, TrackerOutput } from "../audio/tracker-output.js";
-import { shellMusicStream } from "../audio/song-stream.js";
+import type { InstrumentBank, TrackerHost, TrackerOutput } from "../audio/tracker-output.js";
+import { songStreamFor } from "../audio/song-stream.js";
+import type { ShellMusicAsset } from "../audio/shell-music.js";
 
 /** `KeyboardEvent.code` / `.key` of the mute toggle. See the header for why. */
 export const MUSIC_TOGGLE_CODE = "Backquote";
@@ -70,6 +73,15 @@ export interface ShellMusic {
   /** The output object, exposed for the host's resume plumbing and for tests. */
   readonly output: TrackerOutput;
   /**
+   * Hands over the decoded module once the fetch lands.
+   *
+   * Until it does, `update` is a no-op in every phase: silence is a correct
+   * outcome, exactly as it is for a shell whose skin has not arrived. Called
+   * once from `main.ts`; a second call replaces the song, which is what a
+   * re-fetch after a failure would want.
+   */
+  useAsset(asset: ShellMusicAsset | null): void;
+  /**
    * Follows the shell. Call once per animation frame with the current phase:
    * entering a musical phase from a silent one starts the song from the top,
    * entering a silent one stops it dead, and every musical frame pumps the
@@ -98,7 +110,12 @@ export function createShellMusic(
   storage: MusicStorage,
   hostFactory: () => TrackerHost | null = defaultTrackerHostFactory,
 ): ShellMusic {
-  const output = createTrackerOutput(hostFactory);
+  // The bank is a box the asset fills in: `createTrackerOutput` takes the
+  // resolver once, and pointing the box at the loaded instruments is what makes
+  // the music start without rebuilding the output.
+  let bank: InstrumentBank = () => null;
+  const output = createTrackerOutput(hostFactory, (id) => bank(id));
+  let asset: ShellMusicAsset | null = null;
 
   let stored: string | null = null;
   try {
@@ -114,11 +131,17 @@ export function createShellMusic(
 
   return {
     output,
+    useAsset(next: ShellMusicAsset | null): void {
+      asset = next;
+      bank = next === null ? () => null : next.bank;
+      // A stretch that began before the asset landed starts on the next frame.
+      if (wanted) wanted = false;
+    },
     update(phase: ShellPhase): void {
-      const wants = musicWantedFor(phase);
-      if (wants && !wanted) {
+      const wants = musicWantedFor(phase) && asset !== null;
+      if (wants && !wanted && asset !== null) {
         wanted = true;
-        startTracker(output, shellMusicStream());
+        startTracker(output, songStreamFor(asset.song, asset.voices));
       } else if (!wants && wanted) {
         wanted = false;
         stopTracker(output);

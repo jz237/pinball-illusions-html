@@ -191,14 +191,23 @@ export const EXTREME_SPORTS_SHOOTER_LANE: ShooterLane = Object.freeze({
 });
 
 /**
- * How far above the bottom of the channel a served ball appears.
+ * How far above the bottom of the channel a served ball appears: NOT AT ALL.
  *
- * One ball radius. Serving hard against the floor of the lane would put the
- * probe ring in contact on the very first tick, and the ball would resolve that
- * contact before the player ever touched the launch key; an inset lets it
- * settle onto the floor under gravity the way the original's serve does.
+ * This was `8` — one ball radius — and the 8 was invented, not measured. The
+ * argument for it was that serving hard against the floor would put the probe
+ * ring in contact on the very first tick. The film says the original does
+ * exactly that: on `babewatch-take1` the resting silver at f331 has a bounding
+ * box of y 546.0..557.5, centroid 551.3, and the frame-difference against f332
+ * puts the centre at 550.8 — i.e. on `bottomY` (552), not eight pixels above
+ * it. The inset is removed and the constant is kept at 0 so the derivation
+ * stays visible rather than disappearing into `serveRow = lane.bottomY`.
+ *
+ * It is inert by design: the serve loop pins the lane ball to this row every
+ * tick until the launch, so the ball never contacts anything from it. That was
+ * CONFIRMED rather than assumed — `tests/plays.test.ts`'s per-table play hashes
+ * and the census scores are unchanged by this edit.
  */
-export const SERVE_INSET_PIXELS = 8;
+export const SERVE_INSET_PIXELS = 0;
 
 /**
  * Per-table lanes, all three now measured off their own shipped map rather than
@@ -266,7 +275,10 @@ export function plungerConfigForLane(
   }
   const centreX = (lane.minCentreX + lane.maxCentreX) >> 1;
   const serveRow = lane.bottomY - SERVE_INSET_PIXELS;
-  if (serveRow < lane.topY) {
+  // With the inset gone the serve row IS `bottomY`, so it can no longer fall
+  // above `topY`; what is still worth refusing is a lane with no runway at all,
+  // which would serve and launch onto the same row.
+  if (serveRow <= lane.topY) {
     throw new RangeError(`shooter lane is too short to serve into: ${JSON.stringify(lane)}`);
   }
   return {

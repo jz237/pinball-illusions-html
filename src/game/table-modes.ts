@@ -87,6 +87,15 @@ export interface ModeScript {
 }
 
 /**
+ * The three bits of an element's flags byte (element +$00) that the two reset
+ * routines read. Decoded at `main.seg00 +0x004052` (per game) and `+0x003F80`
+ * (per ball); see `litAtGameStart` and its two companions below.
+ */
+export const ELEMENT_FLAG_ARMED_SURVIVES_BALL = 0x01;
+export const ELEMENT_FLAG_LIT_AT_GAME_START = 0x02;
+export const ELEMENT_FLAG_DONE_SURVIVES_BALL = 0x20;
+
+/**
  * One playfield element: a shot a mission can arm, award and wait on.
  *
  * `score` and `bonus` are the packed-BCD fields at +$1E and +$26 read as decimal
@@ -213,29 +222,56 @@ export interface TableModes {
   /** The decoded effect-6 count ladders. See `ModeLadder`. */
   readonly ladders: readonly ModeLadder[];
   /**
-   * RECONSTRUCTION: the lock-ladder lamps lit at game start.
+   * DECODED: the elements armed — and their START lamps lit — at game start.
    *
-   * The MECHANISM is decoded — a lock only advances the multiball ladder while
-   * its lock-lit lamp element is armed (the capture script's `AWARD` refuses an
-   * unlit element), and the lamp relights itself after every award (`flags &
-   * $A` at 0x5CA8) until a `LAMP_OFF` puts it out. What is NOT located is the
-   * site that lights those lamps for the first time in a fresh game: no
-   * game-init script does it, so it is presumably the per-table native init in
-   * slot 6, which is not decoded.
+   * THE GAME-START LAMP STATE IS TABLE DATA, NOT THE MODE VM. It is bit 1
+   * (mask $02) of the element's flags byte at element +$00, read by the
+   * per-GAME reset at `main.seg00 +0x004052` (its one caller is `+0x0045B2`,
+   * inside NEW GAME at `+0x004558`). That routine walks the descriptor's
+   * element table at descriptor +$3C — `$232A(a5)` after the 76-word copy at
+   * `+0x0032EE` — clearing DONE (`clr.b $2(a1)`) and ARMED (`clr.b $1(a1)`)
+   * for every player, then `btst.b #$1,(a1)`: clear leaves the element dark,
+   * set does `st.b $1(a1)` (armed for every player), writes countdown +$2E =
+   * -1, and, when the element carries a START lamp at +$04, lights that lamp
+   * for the player with BLINKING set (`ori.b #$2,$2(a2)`), phase on and blink
+   * reload 8.
    *
-   * The rule used instead, computed from the shipped scripts: a MULTIBALL
-   * ladder's feeder that a LOCK capture script awards, and that no script
-   * directly bound to a physical trigger ever STARTs, is lit at game start. On
-   * the shipped tables that lights BabeWatch's three lock lamps (29/30/31 —
-   * only the selectable jackpot missions relight them, which matches the
-   * operator's finding that the first lock of a game already starts the 2-ball
-   * multiball) plus the two of its five mission-ladder lamps its lock scripts
-   * award (23/25); it leaves Law 'n Justice's jail lamp (26) OUT, because its
-   * lighting is fully decoded — device surface ids 128/129 fire the script
-   * that STARTs it — and lights nothing on Extreme Sports, whose lock-fed
-   * multiball goes through award effect 17, which is not decoded.
+   * That bit means "permanently lit shot" everywhere else too: `LAMP_OFF`
+   * (opcode 14, `+0x005A10`) refuses to act on a bit-1 element, `AWARD`
+   * (`+0x005CA8`) re-arms on `flags & $0A`, and `COMPLETE` (`+0x005B88`) skips
+   * its `bclr` at `+0x005B9C`. Every element's on-disk +$01/+$02/+$03 and
+   * every lamp's +$00/+$05 are zero on all three tables, so the reset is the
+   * only source of light.
+   *
+   * This REPLACES a reconstruction that guessed the set from the lock scripts.
+   * That guess lit BabeWatch's 23/25/29/30/31, whose real flags are $01 and
+   * $09 — bit 1 clear in all five — and handed the player five pre-lit lock
+   * lamps whose AWARD paid the element's own score on the first capture; it is
+   * the whole of that table's 42,245,000 census outlier. It also left the 43 /
+   * 32 / 25 elements that really are armed from the first frame dark, so every
+   * AWARD on them (including Law 'n Justice's 5,000,000..50,000,000 mission
+   * jackpots) refused and paid nothing.
+   *
+   * The exporter's element pool is a superset of the descriptor's own table
+   * (+4 / +9 / +2 entries) and every pool-only element has flags $00, so
+   * filtering the pool gives the identical set.
    */
   readonly litAtGameStart: readonly number[];
+  /**
+   * DECODED: elements whose ARMED bit survives a ball, flags bit 0 (mask $01).
+   *
+   * The per-BALL reset at `main.seg00 +0x003F80` (one caller, `+0x0050C2`)
+   * runs the same walk as the per-game one with two extra tests: `+0x003FA4`
+   * keeps the ARMED bit for a bit-0 element instead of clearing it.
+   */
+  readonly keepArmedAcrossBall: readonly number[];
+  /**
+   * DECODED: elements whose DONE bit survives a ball, flags bit 5 (mask $20).
+   *
+   * The other half of the per-ball reset: `+0x003F9A` keeps the DONE bit for a
+   * bit-5 element. A shot completed on ball 1 stays completed on ball 2.
+   */
+  readonly keepDoneAcrossBall: readonly number[];
   /** The script a device surface id fires on one level, or -1. */
   scriptForDevice(level: PlayfieldLevel, surfaceId: number): number;
   /** The script a trigger zone fires, or -1. */
@@ -284,10 +320,6 @@ const OPERAND_KINDS: readonly string[] = ["e", "s", "m", "o", "l", "w", "c", "i"
 /** The two opcodes that bracket a mission's use of an arm element. */
 const OPCODE_COMPLETE = 3;
 const OPCODE_CLEAR_DONE = 12;
-/** The opcodes the game-start lamp derivation reads. See `litAtGameStart`. */
-const OPCODE_START = 1;
-const OPCODE_START_TIMED = 2;
-const OPCODE_AWARD = 5;
 const OPCODE_MODE_START = 9;
 
 /** Expands one document into a `TableModes`, checking every cross-reference. */
@@ -595,42 +627,20 @@ export function parseTableModesDocument(doc: TableModesDocument): TableModes {
   }
   armElements.sort((a, b) => a - b);
 
-  // --- the game-start lamps, derived ---------------------------------------
+  // --- the reset sets, DECODED from the element flags byte ------------------
   //
-  // RECONSTRUCTION, and the derivation is the label: see `litAtGameStart` on
-  // the interface. Three conditions, all computed from the shipped data:
-  //
-  //   1. the element feeds a MULTIBALL ladder (above);
-  //   2. a LOCK capture script AWARDs it, so it is a lock-lit lamp;
-  //   3. no script directly bound to a physical trigger STARTs it — where one
-  //      does, the lighting is decoded and the shot is the rule (Law 'n
-  //      Justice's jail lamp 26, lit by device surface ids 128/129).
-  const triggerScripts = new Set<number>([
-    ...deviceTriggers.values(),
-    ...zoneTriggers.values(),
-    ...lockTriggers.values(),
-  ]);
-  const triggerStarted = new Set<number>();
-  for (const at of triggerScripts) {
-    for (const op of scripts[at]?.ops ?? []) {
-      const operand = op.args[0] ?? -1;
-      if ((op.op === OPCODE_START || op.op === OPCODE_START_TIMED) && operand >= 0) {
-        triggerStarted.add(operand);
-      }
-    }
-  }
-  const litAtGameStart: number[] = [];
-  for (const script of lockTriggers.values()) {
-    for (const op of scripts[script]?.ops ?? []) {
-      const operand = op.args[0] ?? -1;
-      if (op.op !== OPCODE_AWARD || operand < 0) continue;
-      const element = elements[operand];
-      if (element === undefined || !multiballLadders.has(element.ladder)) continue;
-      if (triggerStarted.has(operand) || litAtGameStart.includes(operand)) continue;
-      litAtGameStart.push(operand);
-    }
-  }
-  litAtGameStart.sort((a, b) => a - b);
+  // Not a derivation any more: three bits of the byte at element +$00, read by
+  // the two reset walks over the descriptor's element table at descriptor +$3C.
+  // See `litAtGameStart` on the interface for the citations.
+  const litAtGameStart = elements
+    .filter((element) => (element.flags & ELEMENT_FLAG_LIT_AT_GAME_START) !== 0)
+    .map((element) => element.index);
+  const keepArmedAcrossBall = elements
+    .filter((element) => (element.flags & ELEMENT_FLAG_ARMED_SURVIVES_BALL) !== 0)
+    .map((element) => element.index);
+  const keepDoneAcrossBall = elements
+    .filter((element) => (element.flags & ELEMENT_FLAG_DONE_SURVIVES_BALL) !== 0)
+    .map((element) => element.index);
 
   return Object.freeze({
     tableId,
@@ -644,6 +654,8 @@ export function parseTableModesDocument(doc: TableModesDocument): TableModes {
     armElements: Object.freeze(armElements),
     ladders: Object.freeze(ladders),
     litAtGameStart: Object.freeze(litAtGameStart),
+    keepArmedAcrossBall: Object.freeze(keepArmedAcrossBall),
+    keepDoneAcrossBall: Object.freeze(keepDoneAcrossBall),
     scriptForDevice(level: PlayfieldLevel, surfaceId: number): number {
       return deviceTriggers.get(`${level === 1 ? 1 : 0}:${surfaceId}`) ?? -1;
     },

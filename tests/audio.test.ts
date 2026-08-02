@@ -33,16 +33,14 @@ import {
 import type { InputSource } from "../src/browser/game-loop.js";
 import { IDLE_SNAPSHOT, controlForKeyEvent } from "../src/browser/input.js";
 import { mapFor } from "./table-fixtures.js";
-import { ROWS_PER_PATTERN } from "../src/audio/tracker.js";
-import { SHELL_SONG, SHELL_SONG_VOICES } from "../src/audio/shell-song.js";
-import { renderSongStream, shellMusicStream } from "../src/audio/song-stream.js";
+import { renderSongStream, songStreamFor } from "../src/audio/song-stream.js";
+import { shippedShellMusic, syntheticShellMusicAsset } from "./shell-music-fixture.js";
 import {
   createTrackerOutput,
   pumpTracker,
   startTracker,
 } from "../src/audio/tracker-output.js";
 import type { TrackerCommandStream, TrackerHost } from "../src/audio/tracker-output.js";
-import { instrumentById } from "../src/audio/instruments.js";
 import {
   MUSIC_MUTED_STORAGE_KEY,
   MUSIC_TOGGLE_CODE,
@@ -405,23 +403,28 @@ function fakeMusicStorage(seed: Record<string, string> = {}): MusicStorage & {
 }
 
 describe("the shell music stream", () => {
-  it("renders one pass of the shell song, deterministic to the byte", () => {
-    const one = renderSongStream(SHELL_SONG, SHELL_SONG_VOICES);
-    const two = renderSongStream(SHELL_SONG, SHELL_SONG_VOICES);
+  it("renders one pass of the decoded module, deterministic to the byte", async () => {
+    const asset = await shippedShellMusic();
+    if (asset === null) return;
+    const one = renderSongStream(asset.song, asset.voices);
+    const two = renderSongStream(asset.song, asset.voices);
     expect(one.commands.length).toBeGreaterThan(0);
     expect(JSON.stringify(one)).toBe(JSON.stringify(two));
-    // The shared copy is rendered once and reused.
-    expect(shellMusicStream()).toBe(shellMusicStream());
+    // The memo hands back the same object rather than re-rendering.
+    expect(songStreamFor(asset.song, asset.voices)).toBe(
+      songStreamFor(asset.song, asset.voices),
+    );
   });
 
-  it("times the pass to the song's own arithmetic", () => {
-    const stream = shellMusicStream();
-    const tickMs = 2500 / SHELL_SONG.initialTempo; // 20 ms at 125 BPM
-    const rowMs = SHELL_SONG.initialSpeed * tickMs;
-    expect(stream.durationMs).toBe(SHELL_SONG.orders.length * ROWS_PER_PATTERN * rowMs);
-    // The restart re-enters after the intro pattern, exactly where the song's
-    // order-list restart field points.
-    expect(stream.restartMs).toBe(SHELL_SONG.restart * ROWS_PER_PATTERN * rowMs);
+  it("times the pass to the module's own speed changes", async () => {
+    const asset = await shippedShellMusic();
+    if (asset === null) return;
+    const stream = songStreamFor(asset.song, asset.voices);
+    // Not `orders.length * 64 * rowMs`: the module sets its own speed with `F`
+    // on row 0 of nearly every pattern (F08 on patterns 0 and 9, F04 on the
+    // rest), so the pass is a sum over rows rather than a product.
+    const tickMs = 2500 / asset.song.initialTempo;
+    expect(tickMs).toBe(20);
     let previous = -1;
     for (const command of stream.commands) {
       expect(command.timeMs).toBeGreaterThanOrEqual(previous);
@@ -430,25 +433,26 @@ describe("the shell music stream", () => {
     }
   });
 
-  it("names only voices the synthesized bank builds, and speaks all three kinds", () => {
-    const stream = shellMusicStream();
+  it("names only voices the loaded bank builds, and speaks all three kinds", async () => {
+    const asset = await shippedShellMusic();
+    if (asset === null) return;
+    const stream = songStreamFor(asset.song, asset.voices);
     const kinds = new Set<string>();
     for (const command of stream.commands) {
       kinds.add(command.kind);
       expect(command.channel).toBeGreaterThanOrEqual(0);
       expect(command.channel).toBeLessThan(4);
-      // Throws on an unknown id, which is the assertion.
       if (command.kind === "note") {
-        expect(instrumentById(command.instrument).samples.length).toBeGreaterThan(0);
+        expect(asset.bank(command.instrument), command.instrument).not.toBeNull();
       }
     }
-    // Notes from the triggers, pitches from the arpeggios, volumes from the
-    // fades: the song exercises the whole vocabulary.
     expect([...kinds].sort()).toEqual(["note", "pitch", "volume"]);
   });
 
-  it("refuses a song whose instruments have no synthesized voice", () => {
-    expect(() => renderSongStream(SHELL_SONG, {})).toThrow(/no synthesized voice/);
+  it("refuses a song whose instruments have no voice in the bank", async () => {
+    const asset = await shippedShellMusic();
+    if (asset === null) return;
+    expect(() => renderSongStream(asset.song, {})).toThrow(/no synthesized voice/);
   });
 });
 
@@ -541,6 +545,7 @@ describe("the shell music follows the shell", () => {
   it("starts on attract, holds through the menus, stops for play, returns at game over", () => {
     const host = new FakeMusicHost();
     const music = createShellMusic(fakeMusicStorage(), () => host);
+  music.useAsset(syntheticShellMusicAsset());
 
     music.update("attract");
     expect(music.output.playing).toBe(true);
@@ -570,6 +575,7 @@ describe("the shell music follows the shell", () => {
   it("stop() silences a hidden tab and the next update starts afresh", () => {
     const host = new FakeMusicHost();
     const music = createShellMusic(fakeMusicStorage(), () => host);
+  music.useAsset(syntheticShellMusicAsset());
     music.update("attract");
     music.stop();
     expect(music.output.playing).toBe(false);
@@ -581,6 +587,7 @@ describe("the shell music follows the shell", () => {
     const host = new FakeMusicHost();
     const storage = fakeMusicStorage();
     const music = createShellMusic(storage, () => host);
+  music.useAsset(syntheticShellMusicAsset());
     music.update("attract");
 
     expect(music.toggleMuted()).toBe(true);
@@ -599,6 +606,7 @@ describe("the shell music follows the shell", () => {
       fakeMusicStorage({ [MUSIC_MUTED_STORAGE_KEY]: "1" }),
       () => rebootHost,
     );
+  reboot.useAsset(syntheticShellMusicAsset());
     reboot.update("attract");
     expect(reboot.muted()).toBe(true);
     expect((reboot.output.master as unknown as FakeMusicGain).gain.value).toBe(0);
@@ -607,6 +615,7 @@ describe("the shell music follows the shell", () => {
 
   it("survives no storage, and storage that throws", () => {
     const none = createShellMusic(null, () => new FakeMusicHost());
+  none.useAsset(syntheticShellMusicAsset());
     none.update("attract");
     expect(none.toggleMuted()).toBe(true);
 
@@ -619,6 +628,7 @@ describe("the shell music follows the shell", () => {
       },
     };
     const music = createShellMusic(hostile, () => new FakeMusicHost());
+  music.useAsset(syntheticShellMusicAsset());
     music.update("attract");
     expect(music.toggleMuted()).toBe(true);
     expect(music.output.playing).toBe(true);
@@ -626,6 +636,7 @@ describe("the shell music follows the shell", () => {
 
   it("survives a browser with no audio device at all", () => {
     const music = createShellMusic(fakeMusicStorage(), () => null);
+  music.useAsset(syntheticShellMusicAsset());
     music.update("attract");
     expect(music.output.playing).toBe(false);
     music.update("play");

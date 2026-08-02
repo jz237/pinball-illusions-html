@@ -12,10 +12,21 @@
  * (ft0 = 856..113). That FORMAT and ENGINE BEHAVIOUR is decoded functional
  * knowledge, and it is what this module implements.
  *
- * What this module does NOT contain, and must never contain: the original's
- * song. No pattern data, no order list, no PCM enters this file or any file
- * that feeds it. The song this core will play is a NEW composition on
- * synthesized instruments, authored elsewhere. This file is engine only.
+ * WHAT THIS FILE CONTAINS, AND WHAT IT DOES NOT. It is ENGINE ONLY: no pattern
+ * data, no order list and no PCM is a literal anywhere in it. That is a
+ * structural rule about where data lives, not a rights rule — the song IS the
+ * original's, decoded from the operator's own disks by
+ * `scripts/export-shell-music.mjs` and loaded at runtime as a gated asset under
+ * the `disk-derived-shell-music` class, exactly like the artwork, the maps and
+ * the sound effects.
+ *
+ * This header used to say the opposite: "the original's song ... must never
+ * enter this file or any file that feeds it. The song this core will play is a
+ * NEW composition on synthesized instruments." That rule has been REVERSED by
+ * the operator and the stand-in composition is deleted. The synthesized
+ * instrument bank in `instruments.ts` stays, because a bank is now a parameter
+ * (see `song-stream.ts`) and the synthesized one is what a build with no
+ * authorized assets falls back to.
  *
  * ---------------------------------------------------------------------------
  * PURITY — REPO LAW
@@ -42,10 +53,22 @@
  *   D pattern break       (next order — or B's target — at row 10x + y)
  *   F set speed/tempo     (param < 0x20 is ticks/row, else BPM; F00 ignored)
  *
+ *   4 vibrato             (sine table, depth/speed memory, per-tick)
+ *   6 vibrato + volume slide
+ *   9 sample offset       (start the note 256*param bytes in)
+ *   E6 pattern loop       (E60 marks, E6x jumps back x times)
+ *   EA/EB fine volume slide up/down (tick 0 only, once)
+ *
  * ACCEPTED BUT IGNORED (valid in song data, note still triggers, no effect):
- *   4 vibrato, 6 vibrato + volume slide, 7 tremolo, 8 (unused in PT),
- *   9 sample offset, E extended (all sub-commands). F00 — ProTracker halts;
- *   this player keeps the current speed, because shell music loops forever.
+ *   7 tremolo, 8 (unused in PT), and the E sub-commands other than 6, A and B.
+ *   F00 — ProTracker halts; this player keeps the current speed, because the
+ *   shell's music loops forever.
+ *
+ * The five that were added are the five the FRONT-END MODULE ACTUALLY USES:
+ * a census of its 11 decoded patterns counts 4 x103, 6 x26, 9 x6, EA x94,
+ * EB x48 and E6 x2, against 1 x24, 2 x1, 3 x13, A x35, B x1, C x183 and F x19
+ * for the ones that were already here. Leaving them accepted-but-ignored would
+ * have shipped an audible deviation on every bar that vibratos.
  */
 
 // ---------------------------------------------------------------------------
@@ -66,13 +89,25 @@ export const MAX_PERIOD = 856;
 /** Channel volume is 0..64, a plain linear multiplier — Paula's own register. */
 export const TRACKER_MAX_VOLUME = 64;
 
-/** Effects this core acts on. */
+/** Effects this core acts on. `0xe` is partial: sub-commands 6, A and B. */
 export const IMPLEMENTED_EFFECTS: ReadonlySet<number> = new Set([
-  0x0, 0x1, 0x2, 0x3, 0x5, 0xa, 0xb, 0xc, 0xd, 0xf,
+  0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x9, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf,
 ]);
 
 /** Effects the validator accepts but the player deliberately does nothing with. */
-export const IGNORED_EFFECTS: ReadonlySet<number> = new Set([0x4, 0x6, 0x7, 0x8, 0x9, 0xe]);
+export const IGNORED_EFFECTS: ReadonlySet<number> = new Set([0x7, 0x8]);
+
+/**
+ * ProTracker's own vibrato table: a quarter sine in 32 steps, 0..255.
+ *
+ * Written out rather than computed, for the reason `instruments.ts` gives —
+ * transcendentals may differ between JS engines and this core's output is
+ * hashed. The player reads it as `table[pos & 31]`, negating above 31.
+ */
+const VIBRATO_TABLE: readonly number[] = [
+  0, 24, 49, 74, 97, 120, 141, 161, 180, 197, 212, 224, 235, 244, 250, 253,
+  255, 253, 250, 244, 235, 224, 212, 197, 180, 161, 141, 120, 97, 74, 49, 24,
+];
 
 /**
  * The 16-finetune x 36-note period table — the table at main.seg00 $A198
@@ -314,6 +349,12 @@ export type TrackerCommand =
       readonly instrument: number;
       readonly frequencyHz: number;
       readonly volume: number;
+      /**
+       * Effect 9's start point, in BYTES into the instrument's PCM: `9xx`
+       * starts the note 256*xx bytes in. 0 for every other note, which is the
+       * ordinary "start at the beginning".
+       */
+      readonly sampleOffsetBytes: number;
     }
   | { readonly channel: number; readonly action: "pitch"; readonly frequencyHz: number }
   | { readonly channel: number; readonly action: "volume"; readonly volume: number };
@@ -330,6 +371,11 @@ interface ChannelState {
   target: number;
   /** Effect 3 speed memory: `3xx` with x = 0 reuses the last speed. */
   portaSpeed: number;
+  /** Effect 4/6 memory: `4x0`/`40y` reuse the last speed/depth. */
+  vibratoSpeed: number;
+  vibratoDepth: number;
+  /** Vibrato table position, 0..63; reset by a note without effect 4/6. */
+  vibratoPos: number;
   volume: number;
   /** True once a note has actually triggered; silent channels emit nothing. */
   active: boolean;
@@ -350,6 +396,20 @@ export interface TrackerPlayer {
   /** Row-end jump requests (effects B and D), consumed when the row ends. */
   pendingJump: number | null;
   pendingBreak: number | null;
+  /**
+   * Effect E6's state: the row `E60` marked and how many jumps back are left.
+   *
+   * ProTracker keeps these per channel; this core keeps one pair, because the
+   * shipped module uses E6 on ONE channel of ONE pattern (pattern 0, `E60` at
+   * row 48 and `E62` at row 63, which plays rows 48..63 three times) and a
+   * per-channel model would be four times the state for no shipped behaviour.
+   * Stated rather than assumed: a song that ran two channels' loops at once
+   * would need the split.
+   */
+  loopRow: number;
+  loopCount: number;
+  /** Set by an E6x that still owes a jump; consumed when the row ends. */
+  pendingLoop: boolean;
 }
 
 /** Wall-clock length of one tick: 2.5 / BPM seconds (125 BPM = 50 ticks/s). */
@@ -379,6 +439,9 @@ export function createTrackerPlayer(song: TrackerSong, startOrder = 0): TrackerP
       noteIndex: -1,
       target: 0,
       portaSpeed: 0,
+      vibratoSpeed: 0,
+      vibratoDepth: 0,
+      vibratoPos: 0,
       volume: 0,
       active: false,
       emittedPeriod: 0,
@@ -395,11 +458,15 @@ export function createTrackerPlayer(song: TrackerSong, startOrder = 0): TrackerP
     tempo: song.initialTempo,
     pendingJump: null,
     pendingBreak: null,
+    loopRow: 0,
+    loopCount: 0,
+    pendingLoop: false,
   };
 }
 
-/** Tick-0 work for one cell. Returns true when a note actually triggers. */
-function applyRowStart(player: TrackerPlayer, state: ChannelState, at: TrackerCell): boolean {
+/** Tick-0 work for one cell. Returns the byte offset a triggered note starts at,
+ * or -1 when no note triggered. */
+function applyRowStart(player: TrackerPlayer, state: ChannelState, at: TrackerCell): number {
   const { effect, param } = at;
   if (at.instrument !== 0) {
     // The validator proved this id is declared.
@@ -408,7 +475,7 @@ function applyRowStart(player: TrackerPlayer, state: ChannelState, at: TrackerCe
     state.finetune = instrument.finetune;
     state.volume = instrument.volume;
   }
-  let triggered = false;
+  let triggered = -1;
   if (at.note !== 0) {
     const noteIndex = at.note - 1;
     const period = periodFor(state.finetune, noteIndex);
@@ -420,9 +487,14 @@ function applyRowStart(player: TrackerPlayer, state: ChannelState, at: TrackerCe
       state.period = period;
       state.noteIndex = noteIndex;
       state.target = 0;
+      // ProTracker restarts the vibrato table on a retrigger UNLESS the row
+      // carries vibrato itself, which is what lets a held vibrato survive a
+      // re-articulation.
+      if (effect !== 0x4 && effect !== 0x6) state.vibratoPos = 0;
       if (state.instrument !== 0) {
         state.active = true;
-        triggered = true;
+        // Effect 9: start `256 * param` bytes into the sample.
+        triggered = effect === 0x9 ? param * 256 : 0;
       }
     }
   }
@@ -430,6 +502,41 @@ function applyRowStart(player: TrackerPlayer, state: ChannelState, at: TrackerCe
     case 0x3:
       if (param !== 0) state.portaSpeed = param;
       break;
+    case 0x4:
+    case 0x6: {
+      // `4xy`: x is speed, y is depth, and a zero nibble reuses the memory.
+      // Effect 6 carries no vibrato operands at all — its param is the volume
+      // slide — so it always runs on the remembered pair.
+      if (effect === 0x4) {
+        const speed = param >> 4;
+        const depth = param & 0xf;
+        if (speed !== 0) state.vibratoSpeed = speed;
+        if (depth !== 0) state.vibratoDepth = depth;
+      }
+      break;
+    }
+    case 0xe: {
+      const command = param >> 4;
+      const operand = param & 0xf;
+      if (command === 0x6) {
+        // E60 marks the loop row; E6x jumps back to it x times. The counter is
+        // set on the FIRST E6x seen and decremented after, so `E62` plays the
+        // marked span three times in all.
+        if (operand === 0) player.loopRow = player.row;
+        else if (player.loopCount === 0) {
+          player.loopCount = operand;
+          player.pendingLoop = true;
+        } else {
+          player.loopCount -= 1;
+          if (player.loopCount > 0) player.pendingLoop = true;
+        }
+      } else if (command === 0xa) {
+        state.volume = Math.min(state.volume + operand, TRACKER_MAX_VOLUME);
+      } else if (command === 0xb) {
+        state.volume = Math.max(state.volume - operand, 0);
+      }
+      break;
+    }
     case 0xb:
       player.pendingJump = param < player.song.orders.length ? param : 0;
       break;
@@ -470,10 +577,24 @@ function slideVolume(state: ChannelState, param: number): void {
   else state.volume = Math.max(state.volume - down, 0);
 }
 
+/** The vibrato table's signed value at the channel's current position. */
+function vibratoOffset(state: ChannelState): number {
+  const magnitude = VIBRATO_TABLE[state.vibratoPos & 31] as number;
+  const swing = ((magnitude * state.vibratoDepth) / 128) | 0;
+  return state.vibratoPos < 32 ? swing : -swing;
+}
+
 /** Per-tick effect work (ticks 1..speed-1 of a row). */
 function applyTickEffect(state: ChannelState, at: TrackerCell): void {
   const { effect, param } = at;
   switch (effect) {
+    case 0x4:
+      state.vibratoPos = (state.vibratoPos + state.vibratoSpeed) & 63;
+      break;
+    case 0x6:
+      state.vibratoPos = (state.vibratoPos + state.vibratoSpeed) & 63;
+      slideVolume(state, param);
+      break;
     case 0x1:
       if (state.period > 0) state.period = Math.max(state.period - param, MIN_PERIOD);
       break;
@@ -499,6 +620,14 @@ function advance(player: TrackerPlayer): void {
   player.tick += 1;
   if (player.tick < player.speed) return;
   player.tick = 0;
+  // E6's jump is decided before B and D, exactly as ProTracker orders them:
+  // the loop is inside the pattern and a position jump leaves it.
+  if (player.pendingLoop && player.pendingJump === null && player.pendingBreak === null) {
+    player.pendingLoop = false;
+    player.row = player.loopRow;
+    return;
+  }
+  player.pendingLoop = false;
   if (player.pendingJump !== null || player.pendingBreak !== null) {
     player.order = player.pendingJump ?? player.order + 1;
     player.row = player.pendingBreak ?? 0;
@@ -527,7 +656,7 @@ export function stepTracker(player: TrackerPlayer): TrackerCommand[] {
   for (let ch = 0; ch < TRACKER_CHANNELS; ch += 1) {
     const state = player.channels[ch] as ChannelState;
     const at = row[ch] as TrackerCell;
-    let triggered = false;
+    let triggered = -1;
     if (player.tick === 0) triggered = applyRowStart(player, state, at);
     else applyTickEffect(state, at);
 
@@ -539,14 +668,20 @@ export function stepTracker(player: TrackerPlayer): TrackerCommand[] {
       if (phase === 1) effective = periodFor(state.finetune, state.noteIndex + (at.param >> 4));
       else if (phase === 2) effective = periodFor(state.finetune, state.noteIndex + (at.param & 0xf));
     }
+    // Vibrato bends the OUTPUT period the same way arpeggio does — state.period
+    // is untouched, so the effect leaves nothing behind when the row ends.
+    if ((at.effect === 0x4 || at.effect === 0x6) && state.period > 0) {
+      effective = Math.min(Math.max(state.period + vibratoOffset(state), MIN_PERIOD), MAX_PERIOD);
+    }
 
-    if (triggered) {
+    if (triggered >= 0) {
       commands.push({
         channel: ch,
         action: "trigger",
         instrument: state.instrument,
         frequencyHz: periodToHz(effective),
         volume: state.volume,
+        sampleOffsetBytes: triggered,
       });
       state.emittedPeriod = effective;
       state.emittedVolume = state.volume;

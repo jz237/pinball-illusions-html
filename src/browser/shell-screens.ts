@@ -10,13 +10,25 @@
  * smoothing off, so one 1995 pixel is always an exact square block of device
  * pixels.
  *
- * The drawing language is the original's too. `main.bin` interprets a
- * big-endian opcode stream: 0x0001 LINE(x1,y1,x2,y2), 0x0002 TEXT(x, y, asciiz)
- * and 0x0003 end of page, with an alignment word choosing left, right or centred
- * on x. `fill`, `box` and `glyphs` below are those primitives — the lines are
- * only ever axis-aligned, so they are filled spans rather than stroked paths,
- * which is what keeps a 1-px rule exactly one pixel rather than two half-lit
- * ones. Everything else in the file is a page written in them.
+ * The drawing language is the original's too, and the opcode table this header
+ * used to give was wrong. The page interpreter is `main.seg00 +0x1CB8`: it
+ * reads a big-endian word, `cmpi.w #3` ends the page, and anything else indexes
+ * the jump table at `+0x1CB2`, word-aligning `a0` after each record
+ * (`+0x1CCA..+0x1CD4`). THERE IS NO LINE OPCODE. All four entries are:
+ *
+ *     0x0000  `+0x1CDA`  TEXT left-aligned    u16 x, u16 y, asciiz
+ *     0x0001  `+0x1CEA`  TEXT right-aligned   (`+0x1CF8 sub.w d4,d0`)
+ *     0x0002  `+0x1D04`  TEXT centred         (`+0x1D12 lsr.w #1,d4`, sub)
+ *     0x0003  `+0x1CD8`  end of page
+ *
+ * The "LINE" idea came from the MENU's rectangles, which are a separate
+ * polyline list at h0+0xCF58 drawn by h0+0x1274 (called at +0x130E), not by the
+ * page interpreter at all. Width measurement is `+0x1D20` over the byte-per-
+ * character advance table at h0+0x1E16, which is what `measureShellText` and
+ * `alignShellText` in `shell-art.ts` implement. `fill`, `box` and `glyphs`
+ * below are the primitives — the menu's lines are only ever axis-aligned, so
+ * they are filled spans rather than stroked paths, which is what keeps a 1-px
+ * rule exactly one pixel rather than two half-lit ones.
  *
  * WHAT IS THE DISK'S AND WHAT IS NOT
  * ---------------------------------------------------------------------------
@@ -43,12 +55,17 @@
  * text ramp. Every coordinate below that carries a "measured" note was read off
  * the filmed original at native resolution.
  *
- * NOT THE DISK'S AT ALL: the attract PAGE TEXT (the original's nineteen pages
- * are the developers' own credit and greeting prose, which does not ship; the
- * pages here are written fresh and set in the decoded font at the decoded
- * pitch), the hint lines naming keys, and every screen the film never caught —
- * table select, the info screen, the ladder and the cards over the playfield.
- * Those are marked screen by screen below.
+ * ALSO THE DISK'S, as of this round: the ATTRACT PAGE TEXT and its geometry.
+ * The twelve pages of the credit roll are decoded from the page display lists
+ * in `menudata.bin` hunk 4 and every line carries the record's own x, y and
+ * alignment word — see `ATTRACT_PAGES` in `shell.ts`, which also records what
+ * from that array deliberately does NOT ship. This replaces a set of pages the
+ * reconstruction wrote for itself under an earlier rights rule.
+ *
+ * NOT THE DISK'S AT ALL: the hint lines naming keys (the original prints
+ * nothing on row 224), and every screen the film never caught — table select,
+ * the info screen, the ladder and the cards over the playfield. Those are
+ * marked screen by screen below.
  *
  * Without the skin — assets still fetching, or fetch failed — every screen
  * falls back to the browser-font placeholder rendering, so the shell is never
@@ -68,6 +85,7 @@ import {
   SHELL_TEXT,
 } from "./palette.js";
 import {
+  ATTRACT_ERASE_START_TICK,
   ATTRACT_PAGES,
   MENU_ITEMS,
   SHELL_TABLES,
@@ -77,7 +95,13 @@ import {
 import type { ShellState } from "./shell.js";
 import { shellBackdropFrame } from "./shell-skin.js";
 import type { ShellSkin, SkinFontKey } from "./shell-skin.js";
-import { FONT_ATLAS_WIDTH, STRIP_PITCH, STRIP_WIDTH, alignShellText } from "../game/shell-art.js";
+import {
+  FONT_ATLAS_WIDTH,
+  STRIP_PITCH,
+  STRIP_WIDTH,
+  alignShellText,
+  shellCharCode,
+} from "../game/shell-art.js";
 import type { ShellFont } from "../game/shell-art.js";
 import type { HighScoreEntry } from "../game/high-scores.js";
 import type { TableId } from "../game/contracts.js";
@@ -142,45 +166,70 @@ const BAND_HEIGHT = 32;
 const BAND_COUNT = SHELL_HEIGHT / BAND_HEIGHT;
 
 /**
- * The base scroll under the sine wobble.
+ * The base scroll under the sine wobble — C, and how fast it moves.
  *
- * Measured: every band offset read off the seven filmed pages fits
- * `C + sine[(p + 10*band) & 255]` with C a MULTIPLE OF 32 — the base scroll is
- * quantised to whole objects and the sine supplies the sub-object wobble. The
- * code walks a counter 0..62 once per frame and takes `(counter >> 1) * 32`, so
- * the base steps one whole object every two frames and cycles 0..992.
+ * Measured on stills: every band offset read off seven filmed pages fits
+ * `C + sine[(p + 10*band) & 255]` with C a MULTIPLE OF 32, so the base is
+ * quantised to whole objects and the sine supplies the sub-object wobble.
  *
- * `STRIP_MARGIN` is the constant the base sits on. The film pins C to multiples
- * of 32 in the range 256..992 but not the constant itself; 64 is the smallest
- * multiple of 32 that keeps the whole travel — base 0..992, wobble ±64, window
- * 288 wide — inside the 1472-px strip at both ends (leftmost 1, rightmost 1408),
- * so the strip never has to wrap. That choice is this file's, the shape is the
- * film's.
+ * MEASURED ON FILM, and this is the part single frames could not give: C IS NOT
+ * STATIC AND IT DOES NOT STEP EVERY TWO FRAMES. It advances one whole 32-px
+ * object every 128 frames — 0.25 px/frame — and the picture drifts LEFT. The
+ * measurement compares object silhouettes at lags where the sine contributes
+ * identically: over 256 frames (one sine period) the pattern is displaced
+ * exactly 64 px = 2 objects, in 212 of the 225 usable windows across a 400 s
+ * recording, and over 512 frames exactly 128 px. C never deviated from that
+ * rate and never jumped at a strip swap.
+ *
+ * THE REASON EVERY EARLIER ROUND MISSED IT is that the step is exactly the
+ * object pitch, so it is completely invisible to any measurement made modulo
+ * the pitch — which is what a still gives you. It only shows in WHICH CELLS of
+ * the pre-rendered tumble animation are on screen. This file used to step the
+ * base one object every TWO frames, i.e. 64 times too fast.
+ *
+ * The window into the strip moves RIGHT as the picture moves LEFT, so `base`
+ * increases. `STRIP_MARGIN` is the constant it sits on, and the absolute value
+ * of C is only known modulo 32 px — the film says so explicitly — so any whole
+ * object is a legal start. 64 is the smallest multiple of 32 that keeps the
+ * whole travel (base 0..992, wobble ±64, window 288 wide) inside the 1472-px
+ * strip at both ends, so the strip never has to wrap.
  */
 const STRIP_BASE_STEP = STRIP_PITCH;
-const STRIP_BASE_COUNTER = 63;
+/** Frames C spends on one object before stepping to the next. */
+export const STRIP_BASE_FRAMES_PER_OBJECT = 128;
+/** Objects C walks before it returns to where it started: 0..992 in 32s. */
+const STRIP_BASE_OBJECTS = 32;
 const STRIP_MARGIN = 64;
 
 /** The copper's sine indexing: 10 per band, 1 per tick. */
 const SINE_STEP_PER_BAND = 10;
 
 /**
- * The page-reveal wipe.
+ * The dithered front, and it is an ERASE.
  *
- * Two filmed stills caught an attract page mid-transition and both obey exactly
+ * Two filmed stills first caught an attract page mid-transition and both obey
  *
  *     row y is visible  iff  y >= front - 7 * (y mod 8)
  *
  * with `front` a multiple of 8 — eight interleaved fronts, one per (y mod 8)
  * phase, staggered 7 rows apart. Measured front = 160 on one still and 128 on
- * the other. What the film does NOT say is the direction (revealing upward or
- * erasing downward) or the rate, because a single frame cannot show either, so
- * the rate below is this file's: the front drops 8 rows a tick, which walks a
- * three-line credits block on in about a third of a second.
+ * the other. That rule is EXACTLY RIGHT and is kept verbatim.
+ *
+ * What a single frame could not say was the direction and the rate. A 399 s
+ * continuous capture (`researchiew
+eference\session3`) says both: the
+ * front runs DOWNWARD at 4 rows a frame, and it erases the page that is going
+ * away rather than revealing the one arriving. The clock is
+ * `attractEraseFront`; the same staircase run the other way is what fills the
+ * backdrop in once per boot, which is the only place a REVEAL happens at all.
+ *
+ * The rule is algebraically the original's own band sweep at `+0x30B6`: base
+ * row 16, 30 bands, rows cleared on step k are y = 16 + 7b + k for
+ * max(0,k-7) <= b <= min(29,k), and 16 == 0 (mod 8) is what makes the two
+ * forms identical.
  */
 const WIPE_PHASE_STAGGER = 7;
 const WIPE_PHASES = 8;
-const WIPE_ROWS_PER_TICK = 8;
 
 type Align = "left" | "center" | "right";
 
@@ -342,7 +391,7 @@ function glyphs(
   let pen = alignShellText(data, value, x, align);
   ctx.imageSmoothingEnabled = false;
   for (let i = 0; i < value.length; i += 1) {
-    const glyph = data.glyphs[value.charCodeAt(i)];
+    const glyph = data.glyphs[shellCharCode(value, i)];
     if (glyph === undefined) continue;
     if (glyph.height > 0) {
       ctx.drawImage(
@@ -364,12 +413,15 @@ function glyphs(
 /**
  * Where band `band` reads the strip at `tick`.
  *
- * `base + sine[(tick + 10*band) & 255]`, exactly the shape every filmed page
- * fits, with the base stepping one whole 32-px object every two frames.
+ * `C(tick) + sine[(tick + 10*band) & 255]`, exactly the shape every filmed page
+ * fits, with C stepping one whole 32-px object every 128 frames (see
+ * `STRIP_BASE_FRAMES_PER_OBJECT`) and the sine advancing one table entry a
+ * frame — a 256-frame wobble, fitted at 0.99998 steps/frame over 1900 frames.
  */
 export function shellBandOffset(sine: readonly number[], tick: number, band: number): number {
-  const counter = ((tick % STRIP_BASE_COUNTER) + STRIP_BASE_COUNTER) % STRIP_BASE_COUNTER;
-  const base = STRIP_MARGIN + (counter >> 1) * STRIP_BASE_STEP;
+  const period = STRIP_BASE_OBJECTS * STRIP_BASE_FRAMES_PER_OBJECT;
+  const counter = ((tick % period) + period) % period;
+  const base = STRIP_MARGIN + Math.floor(counter / STRIP_BASE_FRAMES_PER_OBJECT) * STRIP_BASE_STEP;
   return base + (sine[(tick + band * SINE_STEP_PER_BAND) & 0xff] ?? 0);
 }
 
@@ -701,20 +753,26 @@ function imageSize(image: CanvasImageSource): { width: number; height: number } 
 /**
  * The credits roll.
  *
- * MEASURED off the film: the frame and its navy surround; the field of tumbling
- * objects behind the text; the line tops, which are y = 104, 134 and 164 on a
- * 30-px pitch and are TOP-ANCHORED — a two-line page uses 104 and 134 and does
- * not centre itself between them; the centring arithmetic; the white ink.
+ * DECODED AND MEASURED: the frame and its navy surround; the field of tumbling
+ * objects behind the text; THE WORDS, and every line's own x, y and alignment
+ * word, which come out of the page display lists in `menudata.bin` hunk 4 —
+ * see `ATTRACT_PAGES` in `shell.ts` for the decode, the twelve-page roll, and
+ * for what deliberately does not ship; the centring arithmetic; the white ink;
+ * and the erase.
  *
- * NOT the film's: the words. The original's nineteen pages are the developers'
- * own credit and greeting prose and do not ship (see the header), so these
- * pages are written fresh and set in the decoded font on the decoded ladder.
- * Nor is the hint line at the bottom, which names keys the original's manual
- * named instead; it is in the small font, in the ramp's darkest step, clear of
- * the text block and well inside the frame.
+ * NOT the original's: the hint line at the bottom. The original prints nothing
+ * there — its row 224 is bare — and the keys this reconstruction names were in
+ * the manual instead. It is in the small font, in the ramp's darkest step,
+ * clear of every page's text and well inside the frame.
+ *
+ * THE TRANSITION RUNS DOWNWARD AND IT ERASES THE OUTGOING PAGE. That is the
+ * thing no single still could show and a continuous capture settles: the text
+ * appears COMPLETE IN ONE FRAME, is held bit-identical, and is then dissolved
+ * from the top down at four rows a frame. This file used to model it as an
+ * upward REVEAL of the incoming page, which is the same dithered pattern run
+ * backwards, and the ladder it drew the lines on could not represent a page of
+ * more than three lines.
  */
-const ATTRACT_LINE_TOP = 104;
-const ATTRACT_LINE_PITCH = 30;
 /** The reconstruction's own hint row, below every page's last line. */
 const HINT_Y = 224;
 const HINT_ATTRACT = "PRESS SPACE - F1-F3 GO STRAIGHT TO A TABLE";
@@ -725,30 +783,51 @@ export function shellWipeShowsRow(front: number, y: number): boolean {
 }
 
 /**
- * The wipe front `ticks` into a page, or null once the page is fully on.
+ * The erase front `ticks` into a page, or null while the page is still fully up.
  *
- * Starts far enough below the block that every row is hidden and drops
- * `WIPE_ROWS_PER_TICK` a tick until every row is shown. Both ends are computed
- * from the block itself rather than fixed, so a taller page takes longer.
+ * MEASURED, `session3	elemetry\wipe-erase-front.csv`: the front is quantised
+ * to multiples of 8, it changes on alternate frames, and it starts at 0 exactly
+ * 101 frames after the page appeared —
+ *
+ *     F(t) = 8 * floor((t - 101) / 2)
+ *
+ * — which is ATTRACT_ERASE_ROWS_PER_TICK = 4 rows a frame, INCREASING. The
+ * bracket the visible rows imply for F collapses to one value at every erase
+ * frame of every one of the 113 filmed page instances, and it is this value.
+ *
+ * F would have to reach 272 to clear all 224 rows, i.e. t = 169, seven frames
+ * before the next page appears.
+ *
+ * THIS IS IN PICTURE ROWS, where the field's first row is 0, because that is the
+ * space the film was measured in. `shellWipeShowsRow` is fed `y` in SCREEN rows,
+ * where the same row is FIELD_Y = 16, so the caller adds FIELD_Y. Keeping the
+ * conversion at the call site rather than in here is deliberate: the numbers
+ * above are a measurement and should read as one.
+ *
+ * That conversion was missing and it cost four frames. Because 16 is itself a
+ * multiple of 8 the two forms are algebraically identical apart from the
+ * constant — same staircase, same stagger, same quantisation — so nothing looked
+ * wrong; every page simply held its text four frames too long and the field
+ * cleared at t = 173 instead of 169. It was caught by diffing whole frames
+ * against session3, not by any invariant: the filmed erase stills are
+ * bit-identical to this renderer at t + 4 and differ at every same-t pair, and
+ * solving for the front actually run gave F_recon = F_film - 16 exactly, on all
+ * 324 erase frames of all twelve pages.
  */
-function attractWipeFront(ticks: number, top: number, bottom: number): number | null {
-  const start = bottom + WIPE_PHASE_STAGGER * (WIPE_PHASES - 1) + WIPE_ROWS_PER_TICK;
-  const front = start - Math.max(0, ticks) * WIPE_ROWS_PER_TICK;
-  return front <= top ? null : front;
+export function attractEraseFront(ticks: number): number | null {
+  if (ticks < ATTRACT_ERASE_START_TICK) return null;
+  return 8 * Math.floor((ticks - ATTRACT_ERASE_START_TICK) / 2);
 }
 
 function drawAttract(ctx: ShellContext, scale: number, state: ShellState, skin: ShellSkin | null): void {
   backdrop(ctx, scale, skin, state.ticks);
 
   const page = ATTRACT_PAGES[state.attractPage] ?? [];
-  const lines = page.length;
   if (skin === null) {
     frame(ctx, scale);
-    for (let i = 0; i < lines; i += 1) {
-      const value = page[i];
-      if (value === undefined) continue;
-      const y = ATTRACT_LINE_TOP + i * ATTRACT_LINE_PITCH;
-      text(ctx, scale, 160, y, value, i === 0 ? SHELL_HIGHLIGHT : SHELL_TEXT, FONT_BIG, "center");
+    for (const [i, line] of page.entries()) {
+      const ink = i === 0 ? SHELL_HIGHLIGHT : SHELL_TEXT;
+      text(ctx, scale, line.x, line.y, line.text, ink, FONT_BIG, line.align);
     }
     text(ctx, scale, 160, HINT_Y, HINT_ATTRACT, SHELL_DIM, FONT_TINY, "center");
     return;
@@ -756,8 +835,7 @@ function drawAttract(ctx: ShellContext, scale: number, state: ShellState, skin: 
 
   frame(ctx, scale, SKIN_WHITE);
 
-  const bottom = ATTRACT_LINE_TOP + (lines - 1) * ATTRACT_LINE_PITCH + 24;
-  const front = attractWipeFront(state.attractTicks, ATTRACT_LINE_TOP, bottom);
+  const front = attractEraseFront(state.attractTicks);
   ctx.save();
   ctx.beginPath();
   if (front === null) {
@@ -767,20 +845,24 @@ function drawAttract(ctx: ShellContext, scale: number, state: ShellState, skin: 
     // border rather than printed over it.
     ctx.rect(px(FIELD_X, scale), py(FIELD_Y, scale), FIELD_WIDTH * scale, FIELD_HEIGHT * scale);
   } else {
-    // Strictly per-scanline and all-or-nothing across the width, which is what
-    // the two mid-transition stills show. One clip path of 1-px rows does it.
-    for (let y = ATTRACT_LINE_TOP; y <= bottom; y += 1) {
-      if (shellWipeShowsRow(front, y)) {
+    // THE WHOLE FIELD, not the text block's extent. The original's erase is a
+    // 30-band sweep over the entire picture, and the roll's pages put lines
+    // anywhere from row 44 to row 194; clipping to a block computed from the
+    // lines would give each page its own private schedule instead of the one
+    // the machine runs. Strictly per-scanline and all-or-nothing across the
+    // width, which is what the mid-transition stills show.
+    // `front` is in picture rows and `y` is in screen rows; FIELD_Y converts.
+    // Omitting it ran the erase four frames late — see `attractEraseFront`.
+    const screenFront = front + FIELD_Y;
+    for (let y = FIELD_Y; y < FIELD_Y + FIELD_HEIGHT; y += 1) {
+      if (shellWipeShowsRow(screenFront, y)) {
         ctx.rect(px(FIELD_X, scale), py(y, scale), FIELD_WIDTH * scale, scale);
       }
     }
   }
   ctx.clip();
-  for (let i = 0; i < lines; i += 1) {
-    const value = page[i];
-    if (value === undefined) continue;
-    const y = ATTRACT_LINE_TOP + i * ATTRACT_LINE_PITCH;
-    glyphs(ctx, skin, "font1", scale, 160, y, value, SKIN_WHITE, "center");
+  for (const line of page) {
+    glyphs(ctx, skin, "font1", scale, line.x, line.y, line.text, SKIN_WHITE, line.align);
   }
   ctx.restore();
 

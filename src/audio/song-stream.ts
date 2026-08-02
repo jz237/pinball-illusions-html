@@ -21,9 +21,7 @@ import {
   tickDurationSeconds,
 } from "./tracker.js";
 import type { TrackerSong } from "./tracker.js";
-import type { InstrumentId } from "./instruments.js";
 import type { TrackerCommand as StreamCommand, TrackerCommandStream } from "./tracker-output.js";
-import { SHELL_SONG, SHELL_SONG_VOICES } from "./shell-song.js";
 
 /** A hard stop against a song whose order list never wraps. */
 const MAX_TICKS_PER_PASS = 1_000_000;
@@ -32,8 +30,9 @@ const MAX_TICKS_PER_PASS = 1_000_000;
  * Renders one full pass of `song` — from order 0 to the moment the position
  * wraps back into the order list — as a timed command stream.
  *
- * `voices` maps the song's instrument numbers to the synthesized bank's ids,
- * the way `SHELL_SONG_VOICES` does; a note on an unmapped instrument is a
+ * `voices` maps the song's instrument numbers to the ids of whatever BANK the
+ * output layer was built with — the synthesized one, or the twelve PCM voices
+ * decoded out of the front-end module. A note on an unmapped instrument is a
  * throw, because a silently dropped voice is the bug that survives for
  * months. `restartMs` is the elapsed time at which the player first stood on
  * the song's restart position, so the output layer's repeat re-enters exactly
@@ -41,7 +40,7 @@ const MAX_TICKS_PER_PASS = 1_000_000;
  */
 export function renderSongStream(
   song: TrackerSong,
-  voices: Readonly<Record<number, InstrumentId>>,
+  voices: Readonly<Record<number, string>>,
 ): TrackerCommandStream {
   const player = createTrackerPlayer(song);
   const commands: StreamCommand[] = [];
@@ -81,6 +80,7 @@ export function renderSongStream(
             instrument: voice,
             frequencyHz: command.frequencyHz,
             volume: command.volume,
+            sampleOffsetBytes: command.sampleOffsetBytes,
           });
           break;
         }
@@ -113,15 +113,24 @@ export function renderSongStream(
   return { commands, durationMs: elapsedMs, restartMs };
 }
 
-let cachedShellStream: TrackerCommandStream | null = null;
-
 /**
- * The shell song, rendered once and shared. ~3840 ticks of arithmetic — cheap,
- * but there is no reason to redo it on every trip through the attract screen.
+ * `renderSongStream` memoised on the song object.
+ *
+ * The shell renders its stream once and replays it every time the attract
+ * screen comes back; a few thousand ticks of arithmetic is cheap but there is
+ * no reason to redo it. Keyed on the song rather than held in a module-level
+ * variable, because there is no longer exactly ONE song — the front-end module
+ * is loaded at runtime and a test may render a fixture beside it.
  */
-export function shellMusicStream(): TrackerCommandStream {
-  if (cachedShellStream === null) {
-    cachedShellStream = renderSongStream(SHELL_SONG, SHELL_SONG_VOICES);
-  }
-  return cachedShellStream;
+const STREAMS = new WeakMap<TrackerSong, TrackerCommandStream>();
+
+export function songStreamFor(
+  song: TrackerSong,
+  voices: Readonly<Record<number, string>>,
+): TrackerCommandStream {
+  const cached = STREAMS.get(song);
+  if (cached !== undefined) return cached;
+  const stream = renderSongStream(song, voices);
+  STREAMS.set(song, stream);
+  return stream;
 }

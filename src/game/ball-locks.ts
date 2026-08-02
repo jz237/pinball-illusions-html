@@ -50,10 +50,15 @@
  *       `$23E4(a5)` are ornaments — written, never read — exactly as the
  *       earlier decode concluded; the live counter is in the table package.
  *
- *   RECONSTRUCTED, and labelled as such wherever it appears
- *     - WHICH LOCK LAMPS ARE LIT AT GAME START. The gate is measured (AWARD
- *       refuses an unlit lamp), the initial lighting site is not located; see
- *       `litAtGameStart` in table-modes.ts for the derived stand-in.
+ *   DECODED IN ROUND 7, and it retires a reconstruction
+ *     - WHICH LAMPS ARE LIT AT GAME START. The gate was already measured (AWARD
+ *       refuses an unlit lamp); the lighting site is now found and it is not a
+ *       script at all. The per-game reset at `main.seg00 +0x004052` walks the
+ *       descriptor's element table at +$3C and arms every element whose flags
+ *       bit 1 is set. BabeWatch's lock lamps are NOT among them — their flags
+ *       are $09, bit 1 clear — so a fresh game's first grid capture counts
+ *       nothing, exactly as Law 'n Justice's first jail capture does not. See
+ *       `litAtGameStart` in table-modes.ts.
  *
  *   RETIRED IN ROUND 6, and this is the headstone
  *     - "capturing the last ball in play serves a replacement" and "an ejected

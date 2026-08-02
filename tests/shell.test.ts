@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
+import { attractEraseFront } from "../src/browser/shell-screens.js";
 import {
+  ATTRACT_ERASE_ROWS_PER_TICK,
+  ATTRACT_LAP_TICKS,
   ATTRACT_PAGES,
   ATTRACT_PAGE_TICKS,
+  ATTRACT_ROLL_PAGES,
   GAME_OVER_TICKS,
   HIGHSCORE_FANFARE_TICKS,
   INFO_LINE_CHARACTERS,
@@ -432,23 +436,114 @@ describe("the table's own attract screen", () => {
 });
 
 describe("the attract roll", () => {
-  it("turns the page every two seconds and wraps", () => {
+  it("turns the page every 176 frames and laps in 2112", () => {
+    // MEASURED, not "one page every two seconds": every one of the 112
+    // start-to-start intervals in the 399 s take and all 55 in an independent
+    // cold boot measured 176 frames, with no variation and no dependence on how
+    // much text the page carries.
     const store = fakeStore();
     const state = createShell(store);
+    expect(ATTRACT_PAGE_TICKS).toBe(176);
+    expect(ATTRACT_LAP_TICKS).toBe(2112);
     expect(state.attractPage).toBe(0);
-    shellTick(state, store, ATTRACT_PAGE_TICKS);
+    shellTick(state, store, ATTRACT_PAGE_TICKS - 1);
+    expect(state.attractPage, "the 176th frame is still the first page").toBe(0);
+    shellTick(state, store, 1);
     expect(state.attractPage).toBe(1);
-    shellTick(state, store, ATTRACT_PAGE_TICKS * (ATTRACT_PAGES.length - 1));
-    expect(state.attractPage).toBe(0);
+    shellTick(state, store, ATTRACT_LAP_TICKS);
+    expect(state.attractPage, "one full lap of twelve pages returns to page 1").toBe(1);
   });
 
-  it("fits the original's three-line page ladder", () => {
-    // The film pins the credits block to y = 104, 134, 164, top-anchored — three
-    // slots and no more. (This used to allow six, from a reading of the display
-    // list before the pages themselves had been seen.)
-    for (const page of ATTRACT_PAGES) {
-      expect(page.length).toBeGreaterThan(0);
-      expect(page.length).toBeLessThanOrEqual(3);
+  it("holds the text up for 101 frames, then erases it 4 rows a frame", () => {
+    // MEASURED, `session3	elemetry\wipe-erase-front.csv`: the page appears
+    // COMPLETE in one frame, is bit-identical for the whole hold, and the erase
+    // front leaves zero on frame 101 and advances 8 rows every two frames. The
+    // bracket the visible rows imply for the front collapses onto exactly this
+    // value at every erase frame of all 113 filmed page instances.
+    expect(attractEraseFront(0)).toBeNull();
+    expect(attractEraseFront(100)).toBeNull();
+    expect(attractEraseFront(101)).toBe(0);
+    expect(attractEraseFront(102)).toBe(0);
+    expect(attractEraseFront(103)).toBe(8);
+    expect(attractEraseFront(125)).toBe(96);
+    expect(attractEraseFront(169)).toBe(272);
+    expect(ATTRACT_ERASE_ROWS_PER_TICK).toBe(4);
+    // And the per-page hold really is 101 + 2*(K_min + 1) frames, which is what
+    // makes the film's four different "full display" figures one law: K_min is
+    // the smallest erase key K(y) = (y div 8) + (y mod 8) over the rows the
+    // page's text actually occupies. The four row spans below are the film's
+    // own, measured off the text mask.
+    const holdOf = (from: number, to: number): number => {
+      let kMin = Infinity;
+      for (let y = from; y <= to; y += 1) kMin = Math.min(kMin, Math.floor(y / 8) + (y % 8));
+      return 101 + 2 * (kMin + 1);
+    };
+    expect(holdOf(104, 122), "Pinball Illusions, K_min 13").toBe(129);
+    expect(holdOf(88, 141), "the nine two-line pages, K_min 11").toBe(125);
+    expect(holdOf(58, 171), "Game Testing, K_min 8").toBe(119);
+    expect(holdOf(27, 201), "Thanx to, K_min 4").toBe(111);
+    // Every one of those is inside the 176-frame cycle with frames to spare.
+    for (const hold of [129, 125, 119, 111]) expect(hold).toBeLessThan(ATTRACT_PAGE_TICKS);
+  });
+
+  it("is the disk's twelve pages, verbatim, with the disk's own y ladder", () => {
+    // Decoded from menudata h4+0x0B84 and film-confirmed: 221 page instances
+    // across four cold boots hashed to exactly these twelve bitmaps in exactly
+    // this order. The strings and the y words are pinned here as literals so a
+    // re-decode that changed either has to say so.
+    //
+    // This replaces "fits the original's three-line page ladder", which allowed
+    // at most three lines on a 30-px ladder anchored at 104. The disk has a
+    // one-line page at 120 and a six-line page from 44 to 194; neither fits
+    // that model, and the model was inferred from four filmed pages rather than
+    // read off the display list.
+    expect(ATTRACT_PAGES).toHaveLength(ATTRACT_ROLL_PAGES);
+    expect(ATTRACT_ROLL_PAGES).toBe(12);
+    const rendered = ATTRACT_PAGES.map((page) =>
+      page.map((line) => `${line.align} ${line.x},${line.y} ${line.text}`),
+    );
+    expect(rendered).toEqual([
+      ["center 160,120 Pinball Illusions"],
+      ["center 160,104 Concept and Design by", "center 160,134 Digital Illusions"],
+      ["center 160,104 Programming by", "center 160,134 Andreas Axelsson"],
+      ["center 160,104 Graphics by", "center 160,134 Markus Nyström"],
+      ["center 160,104 Music & Soundeffects by", "center 160,134 Olof Gustafsson"],
+      ["center 160,104 Managing by", "center 160,134 Fredrik Liliegren"],
+      ["center 160,104 Produced by", "center 160,134 Barry Simpson"],
+      ["center 160,104 Additional Graphics by", "center 160,134 Patrik Bergdahl"],
+      ["center 160,104 Intro Coding by", "center 160,134 Thomas Andersson"],
+      ["center 160,104 Packing Algorithms by", "center 160,134 Stefan Boberg"],
+      [
+        "center 160,74 Game Testing by",
+        "center 160,104 Digital Illusions",
+        "center 160,134 &",
+        "center 160,164 21st Century Entertainment",
+      ],
+      [
+        "center 160,44 Thanx to (in no order)",
+        "center 160,74 Lisa",
+        "center 160,104 Nicho",
+        "center 160,134 Skåning",
+        "center 160,164 Tvilling",
+        "center 160,194 Inga & Bosse",
+      ],
+    ]);
+    // The y set is exactly the words in the data — no ladder reproduces it.
+    const ys = new Set(ATTRACT_PAGES.flatMap((page) => page.map((line) => line.y)));
+    expect([...ys].sort((a, b) => a - b)).toEqual([44, 74, 104, 120, 134, 164, 194]);
+  });
+
+  it("ships no HELP branch: the roll is the only thing reachable", () => {
+    // The disk's page array is longer than the roll and the rest of it is
+    // reached by holding HELP and typing a code word. The operator has decided
+    // none of those pages ship, so there is no HELP key kind at all and no page
+    // index outside 0..11 exists to reach. See ATTRACT_PAGES.
+    const store = fakeStore();
+    const state = createShell(store);
+    for (let tick = 0; tick < ATTRACT_LAP_TICKS * 2; tick += 1) {
+      shellTick(state, store, 1);
+      expect(state.attractPage).toBeGreaterThanOrEqual(0);
+      expect(state.attractPage).toBeLessThan(ATTRACT_ROLL_PAGES);
     }
   });
 

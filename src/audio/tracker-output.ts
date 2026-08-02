@@ -39,6 +39,32 @@
 import type { ChipInstrument, InstrumentId } from "./instruments.js";
 import { instrumentById, playbackRateFor } from "./instruments.js";
 
+/**
+ * WHICH BANK A STREAM PLAYS ON.
+ *
+ * The instrument bank used to be a closed union — `InstrumentId` and the
+ * module-level `instrumentById` — which was fine while there was exactly one
+ * bank, the synthesized one. There are now two: the synthesized voices, and the
+ * TWELVE PCM INSTRUMENTS decoded out of the front-end module and shipped as
+ * WAVs under the `disk-derived-shell-music` gate. So a bank is a parameter: a
+ * resolver from the id a command names to the buffer to play, defaulting to the
+ * synthesized one so every existing caller is unchanged.
+ *
+ * A resolver that answers null means "this stream names a voice this bank does
+ * not have", and the note is dropped rather than throwing — a shell whose music
+ * asset half-loaded should go quiet, not take the page down.
+ */
+export type InstrumentBank = (id: string) => ChipInstrument | null;
+
+/** The synthesized bank, as a resolver. */
+export const SYNTHESIZED_BANK: InstrumentBank = (id) => {
+  try {
+    return instrumentById(id as InstrumentId);
+  } catch {
+    return null;
+  }
+};
+
 // ---------------------------------------------------------------------------
 // The command stream — the pure core's output format
 // ---------------------------------------------------------------------------
@@ -55,10 +81,17 @@ export interface TrackerNoteCommand {
   readonly timeMs: number;
   /** 0..TRACKER_CHANNELS-1. */
   readonly channel: number;
-  readonly instrument: InstrumentId;
+  /**
+   * The bank's own id for the voice. A plain string rather than the closed
+   * `InstrumentId` union, because the disk bank names its voices by instrument
+   * number ("disk-11") and a union cannot hold both banks.
+   */
+  readonly instrument: string;
   readonly frequencyHz: number;
   /** 0..TRACKER_MAX_VOLUME. */
   readonly volume: number;
+  /** Effect 9's start point in BYTES into the PCM; 0 for an ordinary note. */
+  readonly sampleOffsetBytes?: number;
 }
 
 /**
@@ -154,12 +187,14 @@ interface ChannelVoice {
 
 export interface TrackerOutput {
   readonly hostFactory: () => TrackerHost | null;
+  /** Where a command's instrument id is resolved. See `InstrumentBank`. */
+  bank: InstrumentBank;
   /** Null until `startTracker` first needs it; stays null if the factory fails. */
   host: TrackerHost | null;
   /** Master gain every voice feeds; mute and master volume both live here. */
   master: GainNode | null;
   /** Instrument buffers, built once per host. */
-  readonly buffers: Map<InstrumentId, AudioBuffer>;
+  readonly buffers: Map<string, AudioBuffer>;
   /** The sounding voice per channel, so the next note can replace it. */
   readonly channels: (ChannelVoice | null)[];
   stream: TrackerCommandStream | null;
@@ -191,12 +226,14 @@ export function defaultTrackerHostFactory(): TrackerHost | null {
 /** Builds the output. Touches no Web Audio; the factory waits for `startTracker`. */
 export function createTrackerOutput(
   hostFactory: () => TrackerHost | null = defaultTrackerHostFactory,
+  bank: InstrumentBank = SYNTHESIZED_BANK,
 ): TrackerOutput {
   return {
     hostFactory,
+    bank,
     host: null,
     master: null,
-    buffers: new Map<InstrumentId, AudioBuffer>(),
+    buffers: new Map<string, AudioBuffer>(),
     channels: Array.from({ length: TRACKER_CHANNELS }, () => null),
     stream: null,
     startContextTime: 0,
@@ -221,10 +258,14 @@ function ensureHost(output: TrackerOutput): TrackerHost | null {
   return output.host;
 }
 
-function bufferFor(output: TrackerOutput, host: TrackerHost, id: InstrumentId): AudioBuffer {
+function bufferFor(
+  output: TrackerOutput,
+  host: TrackerHost,
+  id: string,
+  instrument: ChipInstrument,
+): AudioBuffer {
   const cached = output.buffers.get(id);
   if (cached !== undefined) return cached;
-  const instrument = instrumentById(id);
   const buffer = host.createBuffer(1, instrument.samples.length, instrument.sampleRate);
   buffer.getChannelData(0).set(instrument.samples);
   output.buffers.set(id, buffer);
@@ -249,12 +290,14 @@ function scheduleNote(
   when: number,
 ): void {
   if (command.channel < 0 || command.channel >= TRACKER_CHANNELS) return;
-  const instrument: ChipInstrument = instrumentById(command.instrument);
+  const instrument = output.bank(command.instrument);
+  // A voice this bank does not have: drop the note. See `InstrumentBank`.
+  if (instrument === null) return;
 
   stopVoice(output.channels[command.channel] ?? null, when);
 
   const source = host.createBufferSource();
-  source.buffer = bufferFor(output, host, command.instrument);
+  source.buffer = bufferFor(output, host, command.instrument, instrument);
   source.playbackRate.value = playbackRateFor(instrument, command.frequencyHz);
   if (instrument.loopStart >= 0) {
     source.loop = true;
@@ -266,7 +309,16 @@ function scheduleNote(
   gain.gain.value = gainFor(command.volume);
   source.connect(gain);
   if (output.master !== null) gain.connect(output.master);
-  source.start(when);
+  // Effect 9 starts the note part-way into the PCM. The command carries BYTES
+  // because that is what `9xx` means on Paula; the buffer is one sample a byte
+  // for a disk instrument, so the two agree, and a synthesized instrument never
+  // carries the field at all.
+  const offsetBytes = command.sampleOffsetBytes ?? 0;
+  if (offsetBytes > 0 && offsetBytes < instrument.samples.length) {
+    source.start(when, offsetBytes / instrument.sampleRate);
+  } else {
+    source.start(when);
+  }
 
   output.channels[command.channel] = { source, gain, instrument };
 }

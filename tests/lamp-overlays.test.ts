@@ -246,6 +246,40 @@ describe("what drives a lamp", () => {
     expect(driven.every((mode) => mode === LAMP_OFF)).toBe(true);
   });
 
+  /**
+   * WHAT A FRESH GAME LIGHTS, against the film.
+   *
+   * BabeWatch's first serve shows exactly two blinking inserts and nothing
+   * else — lamp 9 at (94,320) from f346-354 and lamp 25 at (167,196) from
+   * f368-378 of `session2\babewatch-take1-newgame`, replicated on take 2 at
+   * f266/f272 and f292. Law 'n Justice (`lawnjustice-fullgame-3balls`, kick
+   * f301) and Extreme Sports (`session2\extremesports-take1-newgame`, kick
+   * f333) show every insert dark through the plunger wait and the camera pan.
+   *
+   * It falls straight out of the flags bit-1 sets: of the 43 / 32 / 25 elements
+   * the per-game reset at `main.seg00 +0x004052` arms, only BabeWatch's 15 and
+   * 56 own a START lamp at element +$04, and they own exactly those two.
+   */
+  it("lights exactly BabeWatch's two filmed inserts on a fresh game, and none elsewhere", () => {
+    const expected: Readonly<Record<string, readonly number[]>> = {
+      "law-n-justice": [],
+      babewatch: [9, 25],
+      "extreme-sports": [],
+    };
+    for (const tableId of ["law-n-justice", "babewatch", "extreme-sports"] as const) {
+      const lamps = lampsFor(tableId);
+      const driven = lampModes(lamps, createModeState(modesFor(tableId)));
+      const blinking = [...driven]
+        .map((mode, index) => (mode === LAMP_BLINKING ? index : -1))
+        .filter((index) => index >= 0);
+      expect(blinking, tableId).toEqual(expected[tableId]);
+      expect([...driven].some((mode) => mode === LAMP_STEADY), tableId).toBe(false);
+    }
+    // And they really are the two positions the film measures.
+    expect(lampsFor("babewatch").lamps[9]).toMatchObject({ x: 94, y: 320 });
+    expect(lampsFor("babewatch").lamps[25]).toMatchObject({ x: 167, y: 196 });
+  });
+
   it("blinks at the measured 8-on / 8-off and holds steady lamps steady", () => {
     // MEASURED: START writes 8 into the blink reload byte; the servicer
     // toggles the phase each time the countdown runs out.
