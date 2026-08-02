@@ -73,16 +73,54 @@ import type {
  */
 const DEFAULT_CENSUS_TICKS = 40_000;
 const BALLS_PER_GAME = 3;
-/** Plunge holds swept, inclusive. 90 games a table. */
-const FIRST_PULL = 8;
-const LAST_PULL = 97;
+
+/**
+ * THE PLUNGE LADDER IS DEAD, AND THIS IS ITS OBITUARY.
+ *
+ * This census used to sweep the plunger hold from 8 to 97 ticks, one game per
+ * hold, and that sweep WAS the variance: ninety different launch speeds sent the
+ * ball ninety different ways. Round 4 decoded the launcher (`plunger.ts`: the
+ * kick at 0x663A is `subi.w #$1770,$10(ball)`, a FIXED 6000 units however long
+ * the key is held) and the ladder stopped meaning anything. Ninety games with
+ * ninety holds became fourteen distinct games repeated six and a half times,
+ * because the only thing still varying with the hold was the bat cadence derived
+ * from it — and a census whose sample is six copies of fourteen games is not a
+ * ninety-game census.
+ *
+ * So the variance is now where the variance actually is: THE PLAYER. Each game
+ * gets its own (cadence, phase, tap length, nudge beat) from the game index, and
+ * the four periods are pairwise coprime-ish so no two of the ninety games run the
+ * same bat pattern. The plunge is a single fixed tap, which is what the machine
+ * does.
+ */
+const CENSUS_GAMES = 90;
 /** Bat cadence range, cycled per game so no single beat frequency is special. */
 const MIN_CADENCE = 17;
 const MAX_CADENCE = 30;
-/** Ticks the bats are held on each tap. */
-const TAP_TICKS = 3;
-/** Ticks added to the pull when a plunge hands the ball straight back. */
-const PULL_HARDER_TICKS = 4;
+/** Tap lengths cycled per game, in ticks. */
+const TAP_TICKS = [2, 3, 4, 5] as const;
+/** Nudge periods cycled per game, in ticks. */
+const NUDGE_PERIODS = [700, 900, 1100] as const;
+/** Ticks the plunger is held. The kick is fixed, so this is a tap and no more. */
+const PLUNGE_TICKS = 6;
+
+/** The player for census game `index`, all four periods derived from it. */
+export function censusPlayer(index: number): {
+  readonly cadence: number;
+  readonly phase: number;
+  readonly tap: number;
+  readonly nudgePeriod: number;
+} {
+  const span = MAX_CADENCE - MIN_CADENCE + 1;
+  const cadence = MIN_CADENCE + (index % span);
+  return {
+    cadence,
+    // Coprime-ish stride so the phase walks the whole cadence before repeating.
+    phase: (index * 5) % cadence,
+    tap: TAP_TICKS[Math.floor(index / span) % TAP_TICKS.length] ?? 3,
+    nudgePeriod: NUDGE_PERIODS[index % NUDGE_PERIODS.length] ?? 700,
+  };
+}
 
 /**
  * The map, with the table's ramp drive AND scoring layer registered as side
@@ -149,6 +187,16 @@ export interface CensusResult {
   readonly writtenOff: number;
   readonly sites: readonly (readonly [string, number])[];
   readonly stalls: readonly string[];
+  /**
+   * FINAL SCORE PER GAME, ascending. A census that reports only where balls die
+   * cannot see a table that plays perfectly and awards nothing, which is exactly
+   * the state round 5 opened in: Law 'n Justice scored 0 in all ninety games
+   * while the film scored continuously from the first descent. Scores are the
+   * other half of "the playfield gave the ball back".
+   */
+  readonly scores: readonly number[];
+  /** Ball-1 score per game, ascending: the figure the film timeline compares to. */
+  readonly ballOneScores: readonly number[];
 }
 
 export function aggressiveCensus(
@@ -161,26 +209,29 @@ export function aggressiveCensus(
   let games = 0;
   const sites = new Map<string, number>();
   const stalls: string[] = [];
+  const scores: number[] = [];
+  const ballOneScores: number[] = [];
 
-  for (let hold = FIRST_PULL; hold <= LAST_PULL; hold += 1) {
+  for (let index = 0; index < CENSUS_GAMES; index += 1) {
     games += 1;
-    const cadence = MIN_CADENCE + ((hold - FIRST_PULL) % (MAX_CADENCE - MIN_CADENCE + 1));
+    const player = censusPlayer(index);
     const game = createGame(mapFor(tableId), { ballsPerGame: BALLS_PER_GAME });
     startGame(game);
 
-    let pull = hold;
-    let inFlight = false;
     const input = new ScriptedInput((tick) => {
       const controls: Control[] = [];
       const phase = tick % 400;
-      if (phase >= 40 && phase < 40 + pull) controls.push("plunger");
+      if (phase >= 40 && phase < 40 + PLUNGE_TICKS) controls.push("plunger");
       // The aggressive part: the bats fire on their own beat, not the ball's.
-      if (tick % cadence < TAP_TICKS) controls.push("leftFlipper", "rightFlipper");
-      if (tick > 0 && tick % 700 < 3) controls.push("nudgeLeft");
+      if ((tick + player.phase) % player.cadence < player.tap) {
+        controls.push("leftFlipper", "rightFlipper");
+      }
+      if (tick > 0 && tick % player.nudgePeriod < 3) controls.push("nudgeLeft");
       return controls;
     });
 
     let last = new Map<number, { x: number; y: number; level: number }>();
+    let ballOneScore = -1;
     for (let tick = 0; tick < censusTicks; tick += 1) {
       const report = runTicks(game, input, 1)[0];
       const retired = new Set(report?.writtenOff ?? []);
@@ -199,16 +250,8 @@ export function aggressiveCensus(
       }
       last = new Map();
       const state = debugSnapshot(game);
+      if (ballOneScore < 0 && state.ballsServed > 1) ballOneScore = state.score;
 
-      if (report?.launched === true) inFlight = true;
-      else if (inFlight && state.laneBallId !== null) {
-        pull += PULL_HARDER_TICKS;
-        inFlight = false;
-      }
-      if (report?.served === true) {
-        pull = hold;
-        inFlight = false;
-      }
       for (const ball of state.balls) {
         if (!ball.active) continue;
         last.set(ball.id, { x: ball.pixelX, y: ball.pixelY, level: ball.level });
@@ -217,11 +260,14 @@ export function aggressiveCensus(
     }
 
     const end = debugSnapshot(game);
+    scores.push(end.score);
+    ballOneScores.push(ballOneScore < 0 ? end.score : ballOneScore);
     if (end.phase === "game-over" && end.ballsServed === BALLS_PER_GAME) completed += 1;
     else {
       const ball = end.balls.find((one) => one.active);
       stalls.push(
-        `pull ${hold}: ${end.ballsServed} balls served, ball left at ` +
+        `game ${index} (cadence ${player.cadence}/${player.tap} phase ${player.phase}): ` +
+          `${end.ballsServed} balls served, ball left at ` +
           (ball === undefined ? "nowhere" : `(${ball.pixelX},${ball.pixelY}) on level ${ball.level}`),
       );
     }
@@ -236,7 +282,17 @@ export function aggressiveCensus(
     writtenOff,
     stalls,
     sites: [...sites.entries()].sort((a, b) => b[1] - a[1]),
+    scores: [...scores].sort((a, b) => a - b),
+    ballOneScores: [...ballOneScores].sort((a, b) => a - b),
   };
+}
+
+/** Median of an ALREADY SORTED list; 0 for an empty one. */
+export function medianOf(sorted: readonly number[]): number {
+  if (sorted.length === 0) return 0;
+  const middle = sorted.length >> 1;
+  if (sorted.length % 2 === 1) return sorted[middle] ?? 0;
+  return Math.round(((sorted[middle - 1] ?? 0) + (sorted[middle] ?? 0)) / 2);
 }
 
 function main(argv: readonly string[]): number {
@@ -259,6 +315,18 @@ function main(argv: readonly string[]): number {
       `${tableId.padStart(15)}  completed ${result.completed}/${result.games}  ` +
         `ends ${ends}  drained ${result.drained}  written off ${result.writtenOff} ` +
         `(${(rate * 100).toFixed(1)}%)  @${result.censusTicks} ticks`,
+    );
+    const scores = result.scores;
+    const distinct = new Set(scores).size;
+    console.log(
+      `${" ".repeat(17)}score  median ${medianOf(scores).toLocaleString()}  ` +
+        `min ${(scores[0] ?? 0).toLocaleString()}  max ${(scores[scores.length - 1] ?? 0).toLocaleString()}  ` +
+        `zeros ${scores.filter((one) => one === 0).length}/${scores.length}  distinct ${distinct}`,
+    );
+    const first = result.ballOneScores;
+    console.log(
+      `${" ".repeat(17)}ball 1 median ${medianOf(first).toLocaleString()}  ` +
+        `zeros ${first.filter((one) => one === 0).length}/${first.length}`,
     );
     for (const [site, count] of result.sites.slice(0, 8)) {
       console.log(`${" ".repeat(17)}${site} x${count}  (${((count / ends) * 100).toFixed(1)}% of ends)`);

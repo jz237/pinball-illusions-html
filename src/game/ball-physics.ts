@@ -770,14 +770,90 @@ export function reflectVelocity(
   // it. Each has a minimum approach speed and below it the surface is an ordinary
   // wall: 50 units for a bumper, 100 for a slingshot.
   const elasticity = surface === null ? behaviour.elasticity : surface.elasticity;
+  // The along-surface speed the GRAZE TEST sees. The original takes its ratio at
+  // +0x00B554, before either coil has touched `d2`, so this is the raw tangent
+  // and the slingshot's throw at +0x00B5E6 is folded in further down.
+  const rawTangentSpeed = integerSqrt(tangentX * tangentX + tangentY * tangentY);
+  // ---------------------------------------------------------------------------
+  // `$34`, THE GRAZE GATE, IS THE FIRST TEST THE ORIGINAL MAKES — before the
+  // coils, before the restitution
+  // ---------------------------------------------------------------------------
+  // Read straight off the responder, main.seg00 +0x00B552:
+  //
+  //     00b552  neg.w  d0            ; d0 = -(inward normal speed)
+  //     00b554  move.w d2, d1        ; d2 = along-surface speed
+  //     00b558  asl.l  #4, d1
+  //     00b55a  divs.w d0, d1        ; d1 = (vt << 4) / vn
+  //     00b55c  bvs.b  $b568         ; overflow counts as a graze
+  //     00b55e  bpl.b  $b562
+  //     00b560  neg.w  d1            ; |...|
+  //     00b562  cmp.w  $34(a4), d1
+  //     00b566  blt.b  $b56e         ; STEEPER than the limit -> take the bounce
+  //     00b568  moveq  #0, d0        ; SHALLOWER -> normal component killed
+  //     00b56a  bra.w  $b626         ;   and jump PAST the bumper/slingshot code
+  //
+  // Three consequences this port used to miss, all of them measured on the
+  // shipped tables in round 5:
+  //
+  //   1. There is NO PRECONDITION. The port gated the graze on the contact
+  //      having been hard enough to bounce, and that guard swallowed exactly the
+  //      contacts the rule exists for: on BabeWatch's top-right channel eleven
+  //      consecutive wall grazes with ratios 49, 64, 126, 230, 280, 1309 and up
+  //      — every one of them past the plain wall's limit of 34 — were charged
+  //      the rolling-friction rule instead and took the ball from 7.52 to 3.40
+  //      px/tick along a corridor the film crosses at 6.5.
+  //   2. A GRAZE DOES NOT FIRE A COIL. The branch jumps past the bumper and
+  //      slingshot handlers entirely, so a ball that slides along a bumper's rim
+  //      is not kicked. The port had the kick win instead.
+  //   3. The overflow case (`bvs`) is a graze too: a divide whose quotient will
+  //      not fit a word means the tangential speed dwarfs the normal one, which
+  //      is the shallowest contact there is.
+  //
+  // The velocity scale cancels — the rule is a RATIO — so the comparison is made
+  // in Q10 exactly as the original makes it in its own units.
+  const approachSpeed = -normalSpeedIn;
+  const grazed =
+    surface !== null &&
+    Math.trunc((rawTangentSpeed * 16) / approachSpeed) >= surface.constants.grazeLimit;
   const fires =
-    surface !== null && surface.kick > 0 && -normalSpeedIn >= surface.kickThreshold;
+    surface !== null && !grazed && surface.kick > 0 && approachSpeed >= surface.kickThreshold;
   const drivenIn = fires && surface !== null ? normalSpeedIn - surface.kick : normalSpeedIn;
+
+  // ---------------------------------------------------------------------------
+  // A SLINGSHOT ALSO THROWS ALONG ITS FACE, AND ONLY WHEN ITS COIL FIRED
+  // ---------------------------------------------------------------------------
+  // `add.w $6(a4),d2` at +0x00B5E6 is reached by exactly one route: falling
+  // through the slingshot's own threshold test at +0x00B5E0. FOUR branches jump
+  // past it — the graze (`bra.w $b626` at +0x00B56A), the `$38` too-soft gate
+  // (`bra.w $b626` at +0x00B576), a bumper that fired (`bra.b $b620` at
+  // +0x00B5D2) and a slingshot contact under its own threshold (`bgt.b $b620`
+  // at +0x00B5E0) — so the throw is a property of the COIL, not of the surface.
+  // Round 5 applied it on every contact with a slingshot id, which let a graze
+  // ADD speed on the one path the original guarantees is lossy: a ball entering
+  // sling id 22 at (1000,-7600) Q10 with the face's outward normal came out at
+  // 8955 Q10 against 7666 in, 17% more than it arrived with.
+  //
+  // The direction is the outward normal turned a quarter turn, so it is a
+  // property of the SURFACE and not of how the ball happened to arrive; a ball
+  // that comes in dead square still gets thrown along the face, which is what a
+  // kicker arm does. Which of the two rotations the original called positive is
+  // not recoverable from the data — only that the two faces of one slingshot
+  // disagree — so the handedness is this port's and the ANTISYMMETRY is the
+  // original's.
+  //
+  // It goes in BEFORE the friction, not after: +0x00B5E6 precedes +0x00B626 and
+  // the slip and the decay below are charged on the KICKED tangential speed.
+  const tangentKick = fires && surface !== null ? surface.tangentKick : 0;
+  const kickedTangentX = tangentX - q10Multiply(tangentKick, normalY);
+  const kickedTangentY = tangentY + q10Multiply(tangentKick, normalX);
+  const tangentSpeed =
+    tangentKick === 0
+      ? rawTangentSpeed
+      : integerSqrt(kickedTangentX * kickedTangentX + kickedTangentY * kickedTangentY);
 
   const bounced = -q10Multiply(drivenIn, elasticity);
   // A ball creeping into the surface under gravity must settle, not chatter.
   const deflected = bounced <= restThreshold ? 0 : bounced;
-  const normalSpeedOut = deflected + (surface === null ? behaviour.kick : 0);
 
   // The surface's reaction: the ball's approach killed, plus whatever of it is
   // handed back elastically. Never negative, so the friction budget cannot be.
@@ -892,55 +968,82 @@ export function reflectVelocity(
   // device layer this reconstruction does not have yet.
   const budget = q10Multiply(friction, normalImpulse);
   const full = friction > 0 && normalImpulse > 0 ? Math.max(1, budget) : budget;
-  const tangentSpeed = integerSqrt(tangentX * tangentX + tangentY * tangentY);
   const resting = passiveDeflected === 0 && friction > 0 && normalImpulse > 0;
+  // A grazed contact keeps its tangential speed and has its inward normal
+  // component killed by the wall it is sliding along — `moveq #0,d0` and nothing
+  // handed back. The velocity always changes (the inward component was nonzero),
+  // so the no-progress guard in `integrateBall` never sees a graze as a stall.
+  const normalSpeedOut = grazed ? 0 : deflected + (surface === null ? behaviour.kick : 0);
   // ---------------------------------------------------------------------------
-  // A FIRED COIL TAKES THE ORIGINAL'S OWN TANGENTIAL TOLL, NOT COULOMB'S
+  // ON EVERY SURFACE CONTACT THE TANGENTIAL TOLL IS THE ORIGINAL'S OWN, NOT
+  // COULOMB'S: `$3A` SLIP PLUS A FIXED PER-CONTACT DECAY
   // ---------------------------------------------------------------------------
-  // At a powered contact the original's tangential rule is at 0xB626-0xB660:
-  // the slip exchange against ball spin, "and a 1/16+1 per-contact decay" —
-  // the along-surface speed PASSES THROUGH a bumper hit nearly intact. The
-  // Coulomb budget above, charged on a bumper's enormous normal impulse, took
-  // ~60% of it instead, and that difference is the whole of the B3 trap: two
-  // facing bumper rims are CONVEX, so any drift along the channel between them
-  // is amplified bounce over bounce and walks the ball out — the original's
-  // escape mechanism, fed by gravity's fresh 128 Q10 of drift every tick — but
-  // a 60% scrub per hit killed the drift faster than the geometry amplified
-  // it, re-centring the orbit onto the head-on line forever. Reproduced from
-  // the sweep's own pinch site: ±(10868, 4370) Q10 between Extreme Sports'
-  // bumpers 16/17 for 3000+ ticks with Coulomb, out in a few hundred with the
-  // original's decay. The spin half of the exchange still needs a spin state
-  // this port does not have (see the long note above); the decay half is
-  // adopted exactly, and it is the half that decides the trap.
-  const drop = fires
-    ? Math.min(tangentSpeed, (tangentSpeed >> 4) + 1)
-    : resting
-      ? Math.max(1, Math.min(budget, q10Multiply(ROLLING_SLIP_FRICTION, tangentSpeed)))
-      : full;
+  // 0x00B626 is where ALL FOUR outcomes converge — graze, too-soft contact,
+  // plain bounce and fired coil alike — and the whole of what happens there is
+  //
+  //     00b626  move.w  $3a(a4), d5
+  //     00b62a  move.w  $26(a4), d3     ; ball SPIN
+  //     00b62e  sub.w   d2, d3          ;  - tangential speed = the SLIP
+  //     00b632  asl.l   #8, d3
+  //     00b634  divs.w  d5, d3          ;  / $3a
+  //     00b636  move.w  d3, d4
+  //     00b638  asl.w   #2, d3
+  //     00b63a  add.w   d4, d3          ; x5
+  //     00b63c  asr.w   #3, d3          ; /8
+  //     00b63e  add.w   d3, d2          ; tangential += 5/8 of it
+  //     00b640  sub.w   d4, $26(a4)     ; spin -= the same
+  //     ...
+  //     00b64c  rol.w   #4, d3          ; d3 = |vt|
+  //     00b64e  andi.w  #$f, d3         ; -> |vt| >> 12, four bits
+  //     00b652  addq.w  #1, d3
+  //     00b654  add.w   d3, d2          ; and |tangential| -= (|vt|>>12) + 1
+  //
+  // TWO TERMS, both adopted:
+  //
+  //   THE SLIP, in its spinless limit. With no spin state the `5*256/(8*$3A)`
+  //   fraction of the slip becomes `tangent * 160 / $3A` per contact — 0.74% on
+  //   a plain wall, 3.1% on rubber. That is the MOST the decoded rule can ever
+  //   take (a real ball's spin only reduces the slip against the surface), and
+  //   it replaces a Coulomb bite of 15%+ that the original does not have.
+  //
+  //   THE FIXED DECAY, `(|vt| >> 12) + 1` in RESPONDER units, which are twice
+  //   the ball's own — `d2` at +0x00B64C is still inside the doubled contact
+  //   frame, see `surface-physics.ts`'s RESPONDER_VELOCITY_SCALE. One responder
+  //   unit is two Q10, so the decay is `((|vt_q10| >> 13) + 1) * 2`: two Q10 per
+  //   contact below 8 px/tick and four above it. It is not a friction
+  //   coefficient at all; it is the floor that guarantees a ball sliding along a
+  //   surface reaches zero in finite time, and it is what stops a grazed ball
+  //   sliding along a flat floor for ever now that the graze rule keeps the rest
+  //   of its speed. This used to be written `(vt >> 4) + 1` in Q10 — 6.25%
+  //   rather than 0.4%, off by the 256 between the two velocity scales — and
+  //   applied only to a fired coil; round 5 fixed the size and read the shift at
+  //   the ball's scale rather than the responder's.
+  //
+  // Both are confined to maps that HAVE a surface layer, because only there is
+  // there a `$3A` to read; a synthetic-map contact keeps this port's own Coulomb
+  // model bit-for-bit, which is what every physics unit test measures.
+  const slipDrop =
+    surface === null
+      ? 0
+      : Math.trunc((tangentSpeed * 160) / surface.constants.slipDivisor) +
+        (((tangentSpeed >> 13) + 1) << 1);
+  const drop =
+    surface !== null
+      ? Math.min(tangentSpeed, slipDrop)
+      : fires
+        ? Math.min(tangentSpeed, (tangentSpeed >> 4) + 1)
+        : resting
+          ? Math.max(1, Math.min(budget, q10Multiply(ROLLING_SLIP_FRICTION, tangentSpeed)))
+          : full;
   // Friction opposes sliding; it cannot reverse it, so the loss stops at rest.
   const keep =
     tangentSpeed <= drop ? 0 : Math.trunc(((tangentSpeed - drop) * Q10_ONE) / tangentSpeed);
 
-  // A SLINGSHOT ALSO THROWS ALONG ITS FACE. The original's `add.w $6(a4),d2` at
-  // +0x00B5E4 adds +400 or -400 to the tangential speed, the sign chosen by
-  // whether the surface id is even or odd — a slingshot is two ids, one per
-  // face, and the sign is which way that face throws.
-  //
-  // The direction used is the outward normal turned a quarter turn, so it is a
-  // property of the SURFACE and not of how the ball happened to arrive; a ball
-  // that comes in dead square still gets thrown along the face, which is what a
-  // kicker arm does. Which of the two rotations the original called positive is
-  // not recoverable from the data — only that the two faces of one slingshot
-  // disagree — so the handedness is this port's and the ANTISYMMETRY is the
-  // original's. Added after the friction for the reason the header already gives
-  // for the normal kick: a coil's energy must not be charged to the tangential
-  // friction budget.
-  const tangentKick = surface === null ? 0 : surface.tangentKick;
   ball.velocityX = clampVelocity(
-    q10Multiply(tangentX, keep) + q10Multiply(normalSpeedOut, normalX) - q10Multiply(tangentKick, normalY),
+    q10Multiply(kickedTangentX, keep) + q10Multiply(normalSpeedOut, normalX),
   );
   ball.velocityY = clampVelocity(
-    q10Multiply(tangentY, keep) + q10Multiply(normalSpeedOut, normalY) + q10Multiply(tangentKick, normalX),
+    q10Multiply(kickedTangentY, keep) + q10Multiply(normalSpeedOut, normalY),
   );
 }
 
@@ -1525,10 +1628,19 @@ function applyLevelZones(ball: BallState, surfaces: SurfaceIdMap | null): void {
  *
  * Both stop at the reach below, past which there is nothing sensible left to try
  * and the ball is left where it is. One ball diameter covers everything the
- * geometry can produce — but not a ball placed inside the VIRTUAL TOP WALL,
- * which is 26 rows deep on Law 'n Justice, so the reach has to clear that too.
- * A ball that cannot be freed is not merely stuck: it repeats the whole search
- * on every tick for the rest of the game.
+ * geometry can produce. A ball that cannot be freed is not merely stuck: it
+ * repeats the whole search on every tick for the rest of the game.
+ *
+ * THE REACH USED TO BE `max(2*radius, topWallRows + radius)` AND THAT WAS A BUG,
+ * not a widening. Nothing about penetration recovery has anything to do with the
+ * virtual top wall; the coupling gave Law 'n Justice a 34 px relocation budget
+ * over the WHOLE table against 16 px on the other two, and it is the amplifier
+ * that turned a 2 px wall breach at the upper-left bat into a 31 px teleport
+ * through the wall and out the far side — (46,329) to (30,319) to (16,291) in
+ * two ticks, into off-playfield art. The enlarged reach is now scoped to the
+ * rows the virtual wall actually occupies, which is the only place a ball can
+ * be buried that deep, and everywhere else it is one diameter as it always
+ * should have been.
  */
 function recoverPenetration(
   ball: BallState,
@@ -1542,10 +1654,10 @@ function recoverPenetration(
   if (centreIsFree(map, passable, ball.x, ball.y)) return;
 
   const radiusPixels = Math.max(1, Math.round(options.radius / Q10_ONE));
-  const maximum = Math.max(
-    2 * radiusPixels,
-    options.topWallRows + radiusPixels,
-  );
+  const insideTopWall = q10ToPixel(ball.y) < options.topWallRows;
+  const maximum = insideTopWall
+    ? Math.max(2 * radiusPixels, options.topWallRows + radiusPixels)
+    : 2 * radiusPixels;
 
   const probe = probeRing(map, materials, passable, ring, ball.x, ball.y);
   if (probe.contactIndex >= 0) {
@@ -1738,6 +1850,39 @@ export type PushClamp = (ball: BallState, deltaX: Q10, deltaY: Q10) => { x: Q10;
  * The centre sweep then still applies, so the remainder cannot cross solid
  * material either.
  */
+/**
+ * The push clamp for a whole table, built from the same public inputs
+ * `stepBalls` takes.
+ *
+ * Exported because the FLIPPERS need it. `resolveFlipperContacts` makes two
+ * positional writes of exactly this class — the crossing-point rewind and
+ * `separate()` — and round 5 handed it `null`, on the reasoning that "a bat can
+ * push a ball at most its own penetration, a few pixels, and `recoverPenetration`
+ * walks it back out next tick". That is false where a bat's capsule OVERLAPS the
+ * collision line, which Law 'n Justice's upper-left bat does: its pivot is
+ * (37,302) and the level-0 boundary wall is 14 px away, against a boss radius of
+ * 5 plus a ball radius of 8. Measured on that bat before the clamp, over a grid
+ * of every free level-0 centre in x 38..80, y 295..360 released from rest: 295
+ * of 2,748 ended their FIRST tick with the centre inside level-0 solid, having
+ * jumped 11 to 17 px, and `recoverPenetration` then pushed them through the 2 px
+ * wall into the off-playfield shaft on its far side, where they stranded at
+ * (8,388). Building the clamp here rather than in `game-loop.ts` keeps it one
+ * rule with one implementation.
+ */
+export function pushClampForMap(
+  map: TableMap,
+  materials: MaterialTable,
+  options?: Partial<SimulationOptions>,
+): PushClamp {
+  const resolved = resolveOptions(map, options);
+  return pushClampFor(
+    levelViewsFor(map, resolved.topWallRows),
+    materials,
+    passabilityOf(materials),
+    ringOffsetsFor(resolved.radius),
+  );
+}
+
 function pushClampFor(
   views: LevelViews,
   materials: MaterialTable,

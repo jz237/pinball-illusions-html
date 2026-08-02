@@ -77,6 +77,7 @@ function reportAt(tick: number, over: Partial<GameTickReport> = {}): GameTickRep
     writtenOff: [],
     swallowed: [],
     locked: [],
+    ejected: [],
     multiballStarted: false,
     missionStarted: -1,
     missionEnded: false,

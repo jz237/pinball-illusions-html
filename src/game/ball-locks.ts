@@ -20,8 +20,12 @@
  *     - that a lock is a "zone type 4" and what its handler does: hold one ball,
  *       flag it, award score and bonus, run the device's own script
  *     - that a held ball is frozen and invisible to the physics
- *     - that release puts the ball back in the SERVE QUEUE rather than kicking
- *       it out of the saucer
+ *     - that the two scripted releases are DIFFERENT DOORS. `BALL_REMOVE`
+ *       (opcode $68, +0x005B4E) puts the ball back in the SERVE QUEUE;
+ *       `PUSH` (+0x005BFC) queues the saucer's own record for the popper at
+ *       +0x006F72, which spits the ball back onto the playfield at the record's
+ *       authored position and impulse after 50 or 76 frames. Both are decoded
+ *       end to end and the eject words now ship — see `ZoneEject`.
  *     - that the multiball opcode is a TOP-UP to a requested ball count, and
  *       that it refuses any count above THREE
  *     - HOW LOCKS START MULTIBALL — decoded end to end, and it is script data
@@ -47,16 +51,21 @@
  *       earlier decode concluded; the live counter is in the table package.
  *
  *   RECONSTRUCTED, and labelled as such wherever it appears
- *     - that capturing the last ball in play serves a replacement.
- *       See `BALL_LOCK_RULES_NOTE`.
- *     - WHERE AN EJECTED BALL REAPPEARS. The decoded eject (PUSH's popper,
- *       0x7078) kicks the ball out of the saucer in place, using authored
- *       position and impulse words at device+$06..$0D that are not yet
- *       exported; this port returns it through the trough and the serve queue
- *       instead, like every other release. See `runModes` in game-loop.ts.
  *     - WHICH LOCK LAMPS ARE LIT AT GAME START. The gate is measured (AWARD
  *       refuses an unlit lamp), the initial lighting site is not located; see
  *       `litAtGameStart` in table-modes.ts for the derived stand-in.
+ *
+ *   RETIRED IN ROUND 6, and this is the headstone
+ *     - "capturing the last ball in play serves a replacement" and "an ejected
+ *       lock ball returns through the trough". Both were round-4/5 stand-ins
+ *       for the eject words at lock_object+$06..$0D and +$30, which are now
+ *       exported and applied. The capture handler at +0x00552A never decrements
+ *       the live-ball count `$D7E(a5)`, so the machine owes nothing for a held
+ *       ball; and the popper never touches the trough. Together the two
+ *       stand-ins made a saucer a state reset — the ball came back on the rod
+ *       at a fixed position with a fixed kick — which on Extreme Sports closed
+ *       an exact 742-tick limit cycle through the bowl saucer, 26 locks and
+ *       9,325,000 points inside 20,000 ticks with ball 1 never ending.
  *
  * ---------------------------------------------------------------------------
  * THE ENGINE'S CAPTURE PATH, WHICH THIS IMPLEMENTS
@@ -169,12 +178,11 @@ export const MAX_SIMULTANEOUS_BALLS = 3;
 
 /** Says out loud which parts of the lock behaviour are invented. For the UI and for tests. */
 export const BALL_LOCK_RULES_NOTE =
-  "Lock rectangles, capture, freeze, release-to-serve-queue, the three-ball " +
-  "ceiling and the multiball lock ladder (award effect 6: the Nth counted " +
-  "lock runs the Nth launcher script) are decoded from the original. That " +
-  "capturing the last ball in play serves a replacement, that an ejected " +
-  "lock ball returns through the trough rather than being kicked from the " +
-  "saucer, and which lock lamps are lit at game start are " +
+  "Lock rectangles, capture, freeze, BALL_REMOVE's return to the serve queue, " +
+  "PUSH's in-place eject at the record's own authored position, impulse and " +
+  "50-or-76-frame hold, the three-ball ceiling and the multiball lock ladder " +
+  "(award effect 6: the Nth counted lock runs the Nth launcher script) are all " +
+  "decoded from the original. Which lock lamps are lit at game start is " +
   "reconstruction, not decoded fact.";
 
 // ---------------------------------------------------------------------------

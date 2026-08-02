@@ -14,6 +14,7 @@ import type {
 import { TABLE_IDS } from "../src/game/contracts.js";
 import { parseTableMapDocument } from "../src/game/table-map.js";
 import { materialTableFor } from "../src/game/materials.js";
+import { upperLevelViewFor } from "../src/game/playfield-levels.js";
 import { createBall, createBallSet, stepBalls } from "../src/game/ball-physics.js";
 import { ANGLE_UNITS_PER_TURN, BALL_RADIUS_PIXELS, angleDelta } from "../src/game/collision-probe.js";
 import { Q10_ONE, pixelsToQ10, q10Multiply, q10ToPixel } from "../src/core/fixed-point.js";
@@ -56,6 +57,9 @@ import {
   FLIPPER_UP_TICKS,
   LOWER_FLIPPER_PIVOT_COLUMNS,
   LOWER_FLIPPER_PIVOT_ROW,
+  UPPER_FLIPPER_RECORDS,
+  BAT_ANGLE_UNITS_PER_POSE,
+  poseToAngleUnits,
   QUARTER_TURN_UNITS,
   BAT_ANGLE_UNITS_PER_TURN,
   FLIPPER_UP_MAX_RATE,
@@ -920,10 +924,20 @@ describe("placement", () => {
     }
   });
 
-  it("sweeps both bats through open playfield at every point of the stroke", () => {
+  it("sweeps every bat through open playfield at every point of the stroke", () => {
     for (const id of TABLE_IDS) {
-      const map = mapFor(id);
+      // EACH BAT AGAINST ITS OWN COLLISION LEVEL. The three lower pairs and Law
+      // 'n Justice's upper bat live on the main playfield; BabeWatch's and
+      // Extreme Sports' upper bats live on the raised one, and a raised-level
+      // bat sweeping over main-level scenery is not a collision at all — see
+      // `UPPER_FLIPPER_RECORDS` for the bank pointers that say which is which,
+      // and `resolveFlipperContacts` for the gate that enforces it.
+      const views: Record<number, TableMap> = {
+        0: mapFor(id),
+        1: upperLevelViewFor(mapFor(id)),
+      };
       for (const config of flipperConfigsFor(id)) {
+        const map = views[config.level] ?? mapFor(id);
         for (let stroke = 0; stroke <= config.sweep; stroke += 17) {
           const state: FlipperState = batAt(stroke);
           const angle = flipperAngle(config, state);
@@ -953,7 +967,9 @@ describe("placement", () => {
     // one of them.
     expect(FLIPPER_PLACEMENT_NOTE).toContain("flipdat1.bin");
     expect(FLIPPER_PLACEMENT_NOTE).toContain("inferred");
-    expect(FLIPPER_PLACEMENT_NOTE).toContain("upper flipper located");
+    // REPLACED with what the note now has to say: the upper bat is not
+    // "located and not wired in" any more, it is measured and running.
+    expect(FLIPPER_PLACEMENT_NOTE).toContain("UPPER bat every table ships is measured");
     // The file's own split: 85 poses, a 48-row gap, then the remaining 24.
     expect(FLIPPER_FIRST_BANK_FRAMES).toBe(85);
     expect(FLIPPER_FRAME_COUNT - FLIPPER_FIRST_BANK_FRAMES).toBe(24);
@@ -986,21 +1002,83 @@ describe("placement", () => {
     }
   });
 
-  it("declares itself inferred, and says so about the missing upper flipper", () => {
+  it("ships THREE bats a table, the lower pair inferred and the upper measured", () => {
+    // REPLACED, not weakened, and the measurement is in the table packages:
+    // the four-slot flipper array (stride 0x1FA) starts at hunk4 +0x18D8 on Law
+    // 'n Justice, +0x18D0 on BabeWatch and +0x18D4 on Extreme Sports, and read
+    // at each table's OWN base all three carry three records with type byte 1.
+    // This test used to assert two configs and `hasUpperFlipper === false`,
+    // which was the earlier decode reading BabeWatch and Extreme Sports at Law
+    // 'n Justice's base and finding a blank slot. See UPPER_FLIPPER_RECORDS.
     for (const id of TABLE_IDS) {
       const configs = flipperConfigsFor(id);
-      expect(configs).toHaveLength(2);
-      expect(configs.map((c) => c.role)).toEqual(["left", "right"]);
+      expect(configs).toHaveLength(3);
+      expect(configs.slice(0, 2).map((c) => c.role)).toEqual(["left", "right"]);
+      expect(hasUpperFlipper(id)).toBe(true);
       for (const config of configs) {
-        // The CONFIGURATION stays inferred — the rest bearing is still this
-        // port's own — but the bat's restitution is now the hunk-8 id-1..4
-        // row (115/256 = 460 Q10), so the surface reads measured.
-        expect(config.confidence).toBe("inferred");
         expect(config.surface.confidence).toBe("measured");
         expect(config.surface.elasticity).toBe(460);
       }
-      expect(hasUpperFlipper(id)).toBe(false);
+      for (const config of configs.slice(0, 2)) {
+        // The lower CONFIGURATION stays inferred — the rest bearing and the
+        // pivot row are still this port's own.
+        expect(config.confidence).toBe("inferred");
+        expect(config.level).toBe(0);
+      }
+      const upper = configs[2] as FlipperConfig;
+      // The upper bat has no map anchor to infer a pivot from, so it runs on
+      // the disk numbers outright and says so.
+      expect(upper.id).toBe("upper");
+      expect(upper.confidence).toBe("measured");
+      const record = UPPER_FLIPPER_RECORDS[id];
+      expect(q10ToPixel(upper.pivotX)).toBe(record.pivotXPixels);
+      expect(q10ToPixel(upper.pivotY)).toBe(record.pivotYPixels);
+      expect(upper.role).toBe(record.role);
+      expect(upper.level).toBe(record.level);
+      expect(upper.sweep).toBe(record.sweepPoses * BAT_ANGLE_UNITS_PER_POSE);
+      expect(upper.restAngle).toBe(poseToAngleUnits(record.restPose));
+      // Handedness IS which way the poses count, and it agrees with the key.
+      expect(upper.direction).toBe(record.role === "right" ? 1 : -1);
     }
+  });
+
+  it("binds each upper bat to its own side's button, there being no third one", () => {
+    // MEASURED at main.seg00 +0xBD6C: `cmpi.w #0,$A(a0) / beq` sends key word 0
+    // to the RIGHT-button test at +0xBE04 and anything else to the LEFT one at
+    // +0xBD76. The records read 1 on Law 'n Justice and 0 on the other two.
+    expect(UPPER_FLIPPER_RECORDS["law-n-justice"].role).toBe("left");
+    expect(UPPER_FLIPPER_RECORDS.babewatch.role).toBe("right");
+    expect(UPPER_FLIPPER_RECORDS["extreme-sports"].role).toBe("right");
+
+    const leftOnly = flipperInputFrom(true, false, "left");
+    expect(leftOnly.get("upper")).toBe(true);
+    expect(flipperInputFrom(false, true, "left").get("upper")).toBe(false);
+    const rightOnly = flipperInputFrom(false, true, "right");
+    expect(rightOnly.get("upper")).toBe(true);
+    expect(flipperInputFrom(true, false, "right").get("upper")).toBe(false);
+  });
+
+  it("keeps an upper-level bat off a ball riding the main playfield", () => {
+    // BabeWatch's upper bat is at (205,115) on the RAISED level. A ball rolling
+    // across the main playfield under it must not be struck, and before the
+    // level gate in `resolveFlipperContacts` it was: every bat was tested
+    // against every ball.
+    const configs = flipperConfigsFor("babewatch");
+    const upper = configs[2] as FlipperConfig;
+    expect(upper.level).toBe(1);
+    const at = (level: 0 | 1): BallState => ({
+      id: 0,
+      // Resting on the bat's striking face, mid-bat, so a contact is certain.
+      ...ballRestingOn(upper, FLIPPER_AT_REST, 20),
+      velocityX: 0,
+      velocityY: 0,
+      active: true,
+      heldBy: null,
+      level,
+    });
+    const sweep = tickFlipper(upper, FLIPPER_AT_REST, true);
+    expect(resolveFlipperContacts([at(1)], [sweep], BALL_RADIUS)).toHaveLength(1);
+    expect(resolveFlipperContacts([at(0)], [sweep], BALL_RADIUS)).toHaveLength(0);
   });
 
   it("uses the mirrored rest angle on the right flipper", () => {

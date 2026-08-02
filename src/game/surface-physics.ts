@@ -46,34 +46,57 @@
  *        spin -= d3` at +0x00B626..+0x00B640. Friction on SLIP, not on speed.
  *
  * ---------------------------------------------------------------------------
- * WHICH OF THEM THIS PORT ADOPTS, AND WHY THE OTHER TWO ARE LEFT ON THE PAGE
+ * WHICH OF THEM THIS PORT ADOPTS — THREE OF THE FOUR, SINCE ROUND 5
  * ---------------------------------------------------------------------------
  * ADOPTED: $36, the restitution. It is a pure RATIO, so it crosses between the
  * two velocity scales exactly and needs no bridge: Q10 elasticity = w1 * 4,
  * because Q10_ONE/256 = 4. Every `elasticity` this module answers is that
  * number and is `"measured"`.
  *
- * NOT ADOPTED, and this is a result rather than an omission:
+ * ADOPTED IN ROUND 5, on film evidence: $34 and $3A, both consumed by
+ * `reflectVelocity` and both only on maps that HAVE a surface layer, so the
+ * synthetic-map contact model the physics tests measure is untouched.
  *
- *   $3A IS NOT A FRICTION COEFFICIENT THIS PORT CAN HOLD. The original's
- *   tangential rule is a fraction of the SLIP between the ball's spin and its
- *   along-surface speed, so a ball rolling without slipping loses nothing and no
- *   slope, however shallow, can ever hold a ball. `BallState` has no spin, and
- *   dropping the spin term turns the rule into a percentage of the whole
- *   tangential speed — which `reflectVelocity` already measured and rejected,
- *   because it caps a ball on a slope at `g*sin(theta)/f` instead of letting it
- *   accelerate. So `WALL_FRICTION` stays what it is: a coefficient of THIS
- *   model, chosen, and still labelled provisional. The negative is the finding —
- *   there is no per-surface friction number in the original to import.
+ *   $34, THE GRAZE GATE. The responder cancels any contact shallower than
+ *   atan(16/$34) off the surface — no restitution, no slip, the ball slides
+ *   on. This port used to resolve every oblique ring contact with full
+ *   restitution plus Coulomb friction, losing 15-48% per graze that the
+ *   original loses nothing on; the filmed consequences (a launched BabeWatch
+ *   ball dying 180 px under the top corridor it crosses on film, Law 'n
+ *   Justice's apron carom kept at 52% against a filmed 85%) are the ROUND 5
+ *   scoring defect, because the natural paths never reached the award sites.
  *
- *   $34 AND $38 ARE PARAMETERS OF A DIFFERENT CONTACT MODEL. The original
- *   evaluates one bounce per collision pass against a mean normal and uses those
- *   two words to decide whether that single event counts at all. This port
- *   sweeps to first contact, resolves up to eight contacts a tick, and has its
- *   own `restThreshold` doing $38's job on a different velocity scale. Importing
- *   two words of one model into another is not measurement, it is mixing, so
- *   they are recorded here in full and applied nowhere. Anyone who later gives
- *   the ball a spin state should come back for all four at once.
+ *   $3A, THE SLIP RULE, adopted in its spinless limit: with no spin state the
+ *   `5*256/(8*$3A)` fraction of the slip becomes `tangent * 160 / $3A` per
+ *   bounce — the MOST the rule can take, 0.74% on a plain wall — and it
+ *   replaces the Coulomb bite. It replaces it on EVERY surface contact,
+ *   resting ones included, and that is not a simplification: +0x00B626 is
+ *   where all four outcomes converge and it is not gated on anything at all.
+ *   A future spin state should still come back for the exchange half
+ *   (spin -= what the surface hands the ball).
+ *
+ *   ROUND 5 SHIPPED THIS HEADER SAYING "resting contacts keep the
+ *   Coulomb-capped rolling rule `reflectVelocity` derived in round 3", and the
+ *   code it shipped beside it did not: `drop` tests `surface !== null` before
+ *   it tests `resting`, so on all three shipped tables — every one of which
+ *   has a surface layer — the resting branch was unreachable. Round 6 kept the
+ *   CODE and corrected the SENTENCE, because the disassembly is on the code's
+ *   side. The round-3 rolling rule survives where it is still the only rule
+ *   there is: on a synthetic map with no surface layer, which is what every
+ *   physics unit test measures.
+ *
+ * NOT ADOPTED: $38, the minimum normal impact. Decoded and recorded as
+ * `minImpact`; the branch is `cmp.w $38(a4),d0 / blt.b $b57a` at +0x00B56E and
+ * its fall-through is `moveq #0,d0 / bra.w $b626`, i.e. a contact softer than
+ * the row's minimum is killed exactly as a graze is — no bounce, no coil, slip
+ * only. This port's `restThreshold` gates the same event on its own velocity
+ * scale and carrying both would gate it twice. The two are not equivalent and
+ * the difference is recorded rather than hidden: on the plain-wall row `$38` is
+ * -800 responder units = 1.56 px/tick of approach, where `restThreshold`
+ * (853 Q10 on the OUTGOING bounce, so 2.80 px/tick of approach at that row's
+ * restitution) is nearly twice as strict; on the bumper row `$38` is 0, so the
+ * original's pop bumper fires however gently it is touched. Adopting `$38`
+ * needs a before-and-after census, not a patch.
  *
  * ---------------------------------------------------------------------------
  * THE VELOCITY BRIDGE, WHICH WAS INHERITED, CIRCULAR AND WRONG
@@ -95,10 +118,17 @@
  * Worked, and it is the disproof of the old bridge rather than a restatement of
  * it: at 0.75 Q10 the slingshot's 3500 units became 2625 Q10/tick, which against
  * the old gravity of 24 throws a ball 2625^2/(2*24) = 143,000 Q10 = 3987 px up
- * the table — six and a half table lengths. At 4 Q10 against the measured
- * gravity of 128 it is 14,000 Q10 and 766 px, which is a slingshot. The same
- * arithmetic puts the pop bumper's 5500 at 22,000 Q10 and 1890 px, about three
- * table lengths, which is what a 2-3 m/s pop bumper does on a shallow table.
+ * the table — six and a half table lengths. The bridge itself is unchanged by
+ * the responder-scale correction below; what changes is that 3500 is 1750 in
+ * the ball's units, so the kick is 7,000 Q10 and the EXIT it produces — the
+ * kick is scaled by the row's own restitution at +0x00B620 before the ball
+ * ever sees it — is `0.598 * 7000 = 4184 Q10 = 4.09 px/tick`, which lifts a
+ * ball 4184^2/(2*128) = 68,400 Q10 = 67 px. The pop bumper's 5500 is 2750 =
+ * 11,000 Q10, exiting at `0.348 * 11000 = 3824 Q10 = 3.73 px/tick` for 56 px
+ * of rise. Both sit inside the film: Law 'n Justice's four measured slingshot
+ * exits are 4.85 to 8.41 game px/frame, all above the 4.09 floor, and the
+ * three-bumper cluster's filmed rattle exits at or under 6 px/f, which the
+ * 3.73 floor allows and a 7.47 floor does not.
  */
 
 import type { Q10 } from "../core/fixed-point.js";
@@ -171,24 +201,67 @@ export function slingshotIndexOf(id: number): number {
 //   00b5d6  move.b   $5(a4), d3          ; slingshot index
 //   00b5da  cmpi.w   #$ff9c, d0          ; needs <= -100
 //   00b5e0  subi.w   #$dac, d0           ; 3500 more inward
-//   00b5e4  add.w    $6(a4), d2          ; and +-400 ALONG the surface
+//   00b5e6  add.w    $6(a4), d2          ; and +-400 ALONG the surface
 //
 // Both go in before the `muls.w $36(a4)` at +0x00B620, so the original scales
 // the kick by the surface's own restitution. That is reproduced.
+//
+// ---------------------------------------------------------------------------
+// AND EVERY ONE OF THEM READS AT TWICE THE BALL'S OWN VELOCITY SCALE
+// ---------------------------------------------------------------------------
+// ROUND 6, and it is the same doubled contact frame `flippers.ts` already
+// accounts for in the flipper impulse. The responder rotates the ball's
+// velocity into the contact frame and back with tables at scale 16384 —
+// `cos` at main.seg01+0x4B8 and `sin` at +0xB8, both reached through the two
+// hunk-1 relocations at main.seg00 offsets 0xB4BC and 0xB4C2 — and the two
+// halves of the rotation are NOT inverse in gain:
+//
+//   FORWARD  +0x00B50A  muls.w (a0,d4.w*2),d0   ; x 16384
+//            +0x00B520  asl.l  #3, d0           ; x 8
+//            +0x00B524  swap   d0               ; >> 16    => NET x2
+//
+//   REVERSE  +0x00B66A  muls.w (a0,d4.w*2),d0   ; x 16384
+//            +0x00B680  swap   d2               ; >> 16
+//            +0x00B684  rol.l  #1, d2           ; x 2      => NET / 2
+//
+// The pair round-trips exactly, which is why nothing here ever looked wrong.
+// But every constant the responder COMPARES TO or ADDS TO `d0`/`d2` lives
+// between those two operations, so each is written at twice the scale the
+// ball's own `$0E/$10` velocity words use. `RESPONDER_VELOCITY_SCALE` is that
+// factor, and the raw disassembly numbers are kept beside each constant so the
+// citation survives the correction.
+//
+// WHAT IS AND IS NOT AFFECTED. Affected: the two kicks, the two kick
+// thresholds, the tangential throw, `$38`'s minimum approach, and the `+1` of
+// the per-contact decay. UNAFFECTED, because they are dimensionless and the
+// two scales cancel: `$34` (a ratio), `$36` (a ratio), `$3A` (the slip is
+// `(spin - vt)` over it, both doubled), and the `16` of the graze divide.
+//
+// THE CONTROL THAT PROVES THE BRIDGE IN `timebase.ts` IS STILL RIGHT. The
+// plunger kick is `subi.w #$1770,$10(a0)` at +0x00663A, written straight onto
+// the ball's own velocity word OUTSIDE the rotation. It is therefore NOT
+// doubled, and it needs no correction: 6000 units clamps to 4095 = 15.996
+// px/frame against the film's measured 14.85-15.80 px/f lane ascent
+// (research\view\fixround\INDEX.txt line 53). Same class of constant, applied
+// on the other side of the rotation, and the film agrees with it untouched.
+// One original velocity unit is still four Q10 per tick.
+export const RESPONDER_VELOCITY_SCALE = 2;
 
 /** Inward normal speed a bumper needs before it fires, in Q10 per tick. */
-export const BUMPER_KICK_THRESHOLD: Q10 = originalVelocityToQ10(50);
+export const BUMPER_KICK_THRESHOLD: Q10 = originalVelocityToQ10(50 / RESPONDER_VELOCITY_SCALE);
 /** Added to the inward normal speed before restitution. */
-export const BUMPER_KICK: Q10 = originalVelocityToQ10(5500);
-export const SLINGSHOT_KICK_THRESHOLD: Q10 = originalVelocityToQ10(100);
-export const SLINGSHOT_KICK: Q10 = originalVelocityToQ10(3500);
+export const BUMPER_KICK: Q10 = originalVelocityToQ10(5500 / RESPONDER_VELOCITY_SCALE);
+export const SLINGSHOT_KICK_THRESHOLD: Q10 = originalVelocityToQ10(100 / RESPONDER_VELOCITY_SCALE);
+export const SLINGSHOT_KICK: Q10 = originalVelocityToQ10(3500 / RESPONDER_VELOCITY_SCALE);
 /**
  * The slingshot's along-surface push. EVEN ids get +400 and ODD ids -400 — the
  * jump table sends 22, 24, 26, 28, 30 to +0x00B226 (`move.w #$190,$6(a4)`) and
  * 23, 25, 27, 29, 31 to +0x00B22E (`move.w #$FE70,$6(a4)`). A slingshot is two
  * ids, one per face, and the sign is which way that face throws.
  */
-export const SLINGSHOT_TANGENT_KICK: Q10 = originalVelocityToQ10(400);
+export const SLINGSHOT_TANGENT_KICK: Q10 = originalVelocityToQ10(
+  400 / RESPONDER_VELOCITY_SCALE,
+);
 
 /** +1 or -1: which way along the surface this slingshot face throws. */
 export function slingshotTangentSign(id: number): number {
@@ -201,13 +274,21 @@ export function slingshotTangentSign(id: number): number {
 
 /** One row of main.seg08, exactly as the four words read. */
 export interface SurfaceConstants {
-  /** `$34` grazing limit, in sixteenths of a tangent. Recorded, not applied. */
+  /**
+   * `$34` grazing limit, in sixteenths of a tangent: a contact with
+   * `|vt| * 16 >= grazeLimit * |vn|` is cancelled outright. Applied by
+   * `reflectVelocity` on surface-mapped contacts since round 5.
+   */
   readonly grazeLimit: number;
   /** `$36` restitution, 1/256ths. */
   readonly restitution: number;
   /** `$38` minimum normal impact velocity, negative. Recorded, not applied. */
   readonly minImpact: number;
-  /** `$3A` spin/friction divisor. Recorded, not applied — see the header. */
+  /**
+   * `$3A` spin/friction divisor: an impact takes `tangent * 160 / $3A` in the
+   * spinless limit. Applied by `reflectVelocity` on surface-mapped impacts
+   * since round 5 — see the header.
+   */
   readonly slipDivisor: number;
   /** Ids this row governs, as inclusive ranges. */
   readonly ids: readonly (readonly [number, number])[];

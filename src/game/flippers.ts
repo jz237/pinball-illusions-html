@@ -154,7 +154,7 @@
  * a copy that drifts a unit or two at some angles.
  */
 
-import type { BallState, MaterialBehaviour, TableId } from "./contracts.js";
+import type { BallState, MaterialBehaviour, PlayfieldLevel, TableId } from "./contracts.js";
 import type { PushClamp } from "./ball-physics.js";
 import { DEFAULT_SIMULATION_OPTIONS, reflectVelocity } from "./ball-physics.js";
 import {
@@ -169,6 +169,7 @@ import {
   ORIGINAL_ANGLE_UNITS_PER_POSE,
   ORIGINAL_ANGLE_UNITS_PER_TURN,
   ORIGINAL_FLIPPER_STEPS_PER_FRAME,
+  ORIGINAL_POSES_PER_TURN,
   VELOCITY_CLAMP_Q10,
   originalVelocityToQ10,
 } from "./timebase.js";
@@ -573,6 +574,15 @@ export interface FlipperConfig {
   readonly downAcceleration: number;
   readonly downMaxRate: number;
   readonly surface: MaterialBehaviour;
+  /**
+   * The COLLISION LEVEL this bat lives on. A ball riding the other one is not
+   * struck by it.
+   *
+   * The three lower pairs and Law 'n Justice's upper bat are on the main level;
+   * the BabeWatch and Extreme Sports upper bats are on the raised playfield. See
+   * `UPPER_FLIPPER_RECORDS` for the evidence and for exactly how strong it is.
+   */
+  readonly level: PlayfieldLevel;
   /** Where the pivot and angles came from. */
   readonly confidence: "measured" | "inferred";
 }
@@ -635,9 +645,11 @@ export interface FlipperConfig {
 export const FLIPPER_PLACEMENT_NOTE =
   "Bat geometry measured from pkg/flipdat1.bin; sweep and both stroke rates " +
   "measured from the per-table flipper records at $2346(a5) (Table00N.seg04); " +
-  "pivots inferred from measured map anchors (guide tips row 556, free " +
+  "LOWER pivots inferred from measured map anchors (guide tips row 556, free " +
   "ball-centre span row 558) and cross-checked against those records to within " +
-  "two pixels; upper flipper located on Law 'n Justice and not wired in.";
+  "two pixels; the UPPER bat every table ships is measured outright - pivot, " +
+  "both poses and all four stroke rates straight off its record, there being " +
+  "no map anchor to infer one from.";
 
 /** Rest bearing of a left flipper: 152 units below horizontal, 26.7 degrees. */
 export const FLIPPER_REST_ANGLE_UNITS = 152;
@@ -678,25 +690,178 @@ export const MEASURED_FLIPPER_PIVOTS: Readonly<
 });
 
 /**
- * Law 'n Justice's UPPER-LEFT flipper, measured and deliberately not wired in.
+ * ALL THREE TABLES SHIP A THIRD BAT, and this file used to say two of them did
+ * not. That claim was an ALIGNMENT ARTEFACT and it is worth spelling out,
+ * because the same mistake is available to anyone who re-reads these records.
  *
- * Record 0 of its flipper array: pivot (37,302), rest pose 23, flipped pose 12,
- * so an ELEVEN pose sweep — 33 degrees, two thirds of a lower bat — with the
- * same coil and spring rates as the lower pair. BabeWatch and Extreme Sports
- * have no such record; their arrays carry the two lower bats only.
+ * The four-slot array (stride 0x1FA, surface id n selecting slot n-1 through the
+ * `adda.w #0/$1FA/$3F4/$5EE` at main.seg00 +0xAE80/86/90/9A onto `$2346(a5)`)
+ * starts at a DIFFERENT hunk-4 body offset on each table: Law 'n Justice
+ * 0x18D8, BabeWatch 0x18D0, Extreme Sports 0x18D4. Read at Law 'n Justice's base
+ * the other two tables' slot 1 lands eight and four bytes out and reads as
+ * blank. Read at each table's own base, every one of the twelve slots parses
+ * against the same field map, and all three tables carry THREE records with type
+ * byte 1 and ONE with type byte 3 — the unused marker the bat loop skips with
+ * `cmpi.b #3,(a0) / beq` at +0xBD62.
  *
- * `hasUpperFlipper` still answers false and `flipperConfigsFor` still returns
- * two. Giving one table a third bat changes how it plays, needs its surface id
- * (the jump table's entry 1..4 to record mapping) confirmed, and belongs in its
- * own change with its own census run.
+ * THE FIELD MAP, verified against all twelve records:
+ *
+ *   +0  type byte      1 = active, 3 = unused slot
+ *   +1  handler        sub-handler family n, at $B036 + 0x3C*n
+ *   +2  pivot x word   +4  pivot y word, whole pixels
+ *   +6  rest pose      +8  flipped pose, on the 120-pose/3-degree flipdat scale
+ *   +A  KEY BINDING    1 = LEFT button, 0 = RIGHT button
+ *   +C  spring accel   +E  spring cap, signed
+ *   +16 coil accel     +18 coil cap, signed
+ *   +1C longword, relocated into the table's hunk 2: the pose/mask bank
+ *
+ * THE KEY BINDING IS MEASURED, at +0xBD6C: `cmpi.w #0,$A(a0) / beq` takes the
+ * RIGHT path at +0xBE04, which tests `$23F4(a5)` (built at +0xBD5A from key
+ * `$EF3(a5)` or joystick `$EF7(a5)`); anything nonzero falls into the LEFT path
+ * at +0xBD76 testing `$23F3(a5)`. THERE IS NO THIRD BUTTON. An upper bat fires
+ * on the same shift key as the lower bat on its side.
+ *
+ * THE LEVEL IS A READING AND NOT A MEASUREMENT, and is labelled so wherever it
+ * is used. The +0x1C bank pointer is hunk2+0 for every main-level bat and
+ * hunk2+0x65B8 for the BabeWatch and Extreme Sports upper bats. 0x65B8 = 26040 =
+ * 42 bytes a row x 620 rows, exactly one more 336-px-wide one-bit-per-pixel
+ * plane, and hunk 2's body of 0x19050 = 42 x 2440 rows decomposes as
+ * 620+620+600+600 on all three tables. The arithmetic is exact; that the two
+ * banks ARE the two collision levels' bat masks was not confirmed from code, and
+ * the hunk-2 consumers were not traced. What supports it independently is the
+ * geometry: BabeWatch's (205,115) has upper-level walls around it and nothing at
+ * all on the main level there.
+ *
+ * THE SUB-HANDLER FAMILIES (+1) are eight 0x3C-byte handlers at +0xB036 whose
+ * CODE is byte-identical; only a trailing 8-byte octant mask differs, and
+ * `mask_n[k] = mask_0[(k+n) mod 8]` with `mask_0 = 00 00 00 00 01 01 01 01`. The
+ * mask gates which contact octants the stroke imparts into, which is the
+ * original's way of saying "only the face the bat sweeps through". This port
+ * gates analytically on the approach side in `touchAt`, which subsumes it, so
+ * the family byte is recorded and not used.
  */
-export const LAW_N_JUSTICE_UPPER_FLIPPER = Object.freeze({
-  pivotXPixels: 37,
-  pivotYPixels: 302,
-  restPose: 23,
-  flippedPose: 12,
-  sweepPoses: 11,
+export const UPPER_FLIPPER_RECORDS: Readonly<
+  Record<
+    TableId,
+    {
+      readonly pivotXPixels: number;
+      readonly pivotYPixels: number;
+      readonly restPose: number;
+      readonly flippedPose: number;
+      readonly sweepPoses: number;
+      readonly role: FlipperRole;
+      readonly handlerFamily: number;
+      readonly upAcceleration: number;
+      readonly upMaxRate: number;
+      readonly downAcceleration: number;
+      readonly downMaxRate: number;
+      readonly level: PlayfieldLevel;
+    }
+  >
+> = Object.freeze({
+  // Slot 0, id 1, hunk4 +0x18D8. Key word 1 = LEFT. Poses run DOWN, 23 -> 12,
+  // so eleven of them: 33 degrees, two thirds of a lower bat. Bank hunk2+0 =
+  // the main playfield.
+  "law-n-justice": Object.freeze({
+    pivotXPixels: 37,
+    pivotYPixels: 302,
+    restPose: 23,
+    flippedPose: 12,
+    sweepPoses: 11,
+    role: "left" as FlipperRole,
+    handlerFamily: 7,
+    upAcceleration: 20,
+    upMaxRate: 120,
+    downAcceleration: 30,
+    downMaxRate: 50,
+    level: 0 as PlayfieldLevel,
+  }),
+  // Slot 1, id 2, hunk4 +0x18D0. Key word 0 = RIGHT. Poses run UP, 35 -> 48,
+  // thirteen of them, 39 degrees. SOFTER than a lower bat in both directions —
+  // coil acceleration 10 against 20, spring 15 against 30 — with the same caps.
+  babewatch: Object.freeze({
+    pivotXPixels: 205,
+    pivotYPixels: 115,
+    restPose: 35,
+    flippedPose: 48,
+    sweepPoses: 13,
+    role: "right" as FlipperRole,
+    handlerFamily: 5,
+    upAcceleration: 10,
+    upMaxRate: 120,
+    downAcceleration: 15,
+    downMaxRate: 50,
+    level: 1 as PlayfieldLevel,
+  }),
+  // Slot 1, id 2, hunk4 +0x18D4. Key word 0 = RIGHT. A FULL eighteen-pose
+  // sweep on the same pose numbers as a lower-right bat, softened coil.
+  "extreme-sports": Object.freeze({
+    pivotXPixels: 182,
+    pivotYPixels: 194,
+    restPose: 50,
+    flippedPose: 68,
+    sweepPoses: 18,
+    role: "right" as FlipperRole,
+    handlerFamily: 4,
+    upAcceleration: 15,
+    upMaxRate: 120,
+    downAcceleration: 20,
+    downMaxRate: 50,
+    level: 1 as PlayfieldLevel,
+  }),
 });
+
+/**
+ * Kept under its old name because other modules and the dossier cite it.
+ * Superseded by `UPPER_FLIPPER_RECORDS`, which carries all three tables.
+ */
+export const LAW_N_JUSTICE_UPPER_FLIPPER = UPPER_FLIPPER_RECORDS["law-n-justice"];
+
+/** A flipdat pose index as a bearing on the 2048-unit scale. 120 poses a turn. */
+export function poseToAngleUnits(pose: number): number {
+  return Math.round((pose * ANGLE_UNITS_PER_TURN) / ORIGINAL_POSES_PER_TURN);
+}
+
+/**
+ * The third bat, built from its table's record.
+ *
+ * PROVENANCE IS MIXED and the config says `measured` because the parts that
+ * decide where the bat is and how it moves all come off the disk: pivot, both
+ * poses, and all four stroke constants. The lower pairs deliberately run on
+ * INFERRED pivots (row 558 against the disk's 556) because there is a shipped
+ * asset the placement tests can re-derive them from; there is no such anchor for
+ * an upper bat, so the disk pivot is used directly. What is still this port's is
+ * the bat's own geometry — length 45, boss 5, tip 1, taper 6, from
+ * pkg/flipdat1.bin — and its elasticity, and those are shared with the lower
+ * bats: there is no mini-flipper art in the package, flipdat1 holds 109 poses of
+ * ONE 45 px bat, and the record carries no length field.
+ */
+function upperFlipper(tableId: TableId): FlipperConfig {
+  const record = UPPER_FLIPPER_RECORDS[tableId];
+  const mirrored = record.role === "right";
+  return {
+    id: "upper",
+    role: record.role,
+    pivotX: pixelsToQ10(record.pivotXPixels),
+    pivotY: pixelsToQ10(record.pivotYPixels),
+    restAngle: poseToAngleUnits(record.restPose),
+    sweep: record.sweepPoses * BAT_ANGLE_UNITS_PER_POSE,
+    // Whether the poses count up or down IS the handedness, and it agrees with
+    // the key binding on all three records.
+    direction: mirrored ? 1 : -1,
+    length: pixelsToQ10(FLIPPER_LENGTH_PIXELS),
+    bossRadius: pixelsToQ10(FLIPPER_BOSS_RADIUS_PIXELS),
+    tipRadius: pixelsToQ10(FLIPPER_TIP_RADIUS_PIXELS),
+    taperStart: pixelsToQ10(FLIPPER_TAPER_START_PIXELS),
+    upAcceleration: record.upAcceleration,
+    upMaxRate: record.upMaxRate,
+    downAcceleration: record.downAcceleration,
+    downMaxRate: record.downMaxRate,
+    surface: FLIPPER_SURFACE,
+    level: record.level,
+    confidence: "measured",
+  };
+}
 
 function lowerFlipper(
   id: string,
@@ -727,6 +892,10 @@ function lowerFlipper(
     downAcceleration: FLIPPER_DOWN_ACCELERATION,
     downMaxRate: FLIPPER_DOWN_MAX_RATE,
     surface: FLIPPER_SURFACE,
+    // Both lower bats are on the main playfield on all three tables: their
+    // records' +0x1C bank pointers are hunk2+0, the same bank, and they sit on
+    // the drain row where there is no raised level at all.
+    level: 0,
     // The pivot, the sweep and both stroke rates are read off the table
     // package now. What is still this port's own is the REST BEARING and the
     // bat's elasticity, so the configuration as a whole is not yet "measured".
@@ -734,21 +903,23 @@ function lowerFlipper(
   };
 }
 
-/** The flippers this table can currently be played with. */
+/** The flippers this table is played with: two lower bats and one upper. */
 export function flipperConfigsFor(tableId: TableId): readonly FlipperConfig[] {
   const columns = LOWER_FLIPPER_PIVOT_COLUMNS[tableId];
   return Object.freeze([
     lowerFlipper("lower-left", "left", columns.left, LOWER_FLIPPER_PIVOT_ROW),
     lowerFlipper("lower-right", "right", columns.right, LOWER_FLIPPER_PIVOT_ROW),
+    upperFlipper(tableId),
   ]);
 }
 
 /**
- * False on every table, and deliberately visible rather than silent: the third
- * flipper exists on the real machine and its pivot has not been located.
+ * TRUE ON EVERY TABLE since round 5. Each of the three ships one active upper
+ * bat in its flipper array — see `UPPER_FLIPPER_RECORDS` for the twelve records
+ * and for the base offset that used to hide two of them.
  */
 export function hasUpperFlipper(_tableId: TableId): boolean {
-  return false;
+  return true;
 }
 
 /** Rejects a configuration that could not produce a sane stroke. */
@@ -1035,7 +1206,26 @@ function touchAt(
 
   const batRadius = batRadiusAt(config, along);
   const touchDistance = batRadius + ballRadius;
-  if (distanceSquared >= touchDistance * touchDistance) return null;
+  // STRICTLY OUTSIDE is not touching; EXACTLY ON THE BOUNDARY IS.
+  //
+  // This used to be `>=`, and `separate()` below lifts a ball out by exactly its
+  // penetration — which lands it at distance == touchDistance, i.e. the one
+  // distance the old test called "not touching". A ball a bat had just pushed
+  // was therefore invisible to the bat on the NEXT tick, by construction. The
+  // lower bats hid it because gravity pulls a cradled ball back inside the
+  // capsule every tick; a raised upper bat, whose ball is held from below by the
+  // map, does not. Two measured consequences, both closed by the one character:
+  //
+  //   - Extreme Sports' upper bat at full stroke moved a ball at (184,181)L1 to
+  //     (184.124, 180.721) and then reported ZERO contacts there, so the ball
+  //     search saw a cradle as a strand and pulsed its coils at it.
+  //   - Law 'n Justice's upper bat sits 13 px — boss 5 plus ball 8, exactly the
+  //     touch distance — from a notch at (25,307) between the rubber post at
+  //     (23-24,305-307) and the top of the level-0 boundary wall at (25,308). A
+  //     ball pressed into it was at distance exactly 13.0 and so could neither
+  //     be seen as cradled NOR be struck by the bat sweeping past it. Three of
+  //     270 census balls ended up there.
+  if (distanceSquared > touchDistance * touchDistance) return null;
 
   // The bat's perpendicular, unit length because the axis is: the reference
   // both side tests below are signed against.
@@ -1205,6 +1395,13 @@ export function resolveFlipperContacts(
   for (const ball of balls) {
     if (!ball.active) continue;
     for (const sweep of sweeps) {
+      // THE LEVEL GATE. A bat's pixels are on one collision level, and a ball
+      // riding the other one passes under or over it untouched. This was
+      // harmless while every bat was at the drain — there is no raised
+      // playfield down there — and became load-bearing the moment BabeWatch's
+      // (205,115) and Extreme Sports' (182,194) upper bats were wired: both sit
+      // over main-level playfield a ball rolls across.
+      if (sweep.config.level !== ball.level) continue;
       const contact = resolveOne(
         ball,
         sweep,
@@ -1284,8 +1481,15 @@ function resolveOne(
       // first met the bat, not at wherever the map integration finished. The
       // discarded remainder of the tick is at most one pass's travel — the
       // same granularity the original loses between its own collision passes.
-      ball.x = sampleX;
-      ball.y = sampleY;
+      //
+      // CLAMPED, like `separate()` below and for the same reason: this is a
+      // positional write with no collision test of its own, and on a bat whose
+      // capsule overlaps the collision line — Law 'n Justice's upper-left one —
+      // it can put the ball's centre inside a wall just as surely as the
+      // separation can. Round 5 left both unclamped and the two together drove
+      // 10.7% of at-rest balls near that bat through a 2 px boundary into the
+      // off-playfield shaft behind it.
+      moveTo(ball, sampleX, sampleY, clamp);
 
       // THE GATE, +0x00AEAC and the eight octant masks at $B036+0x3C*n: the bat
       // imparts only when it is sweeping toward the face the ball is on. A rate
@@ -1379,9 +1583,17 @@ function resolveOne(
  */
 function separate(ball: BallState, touch: BatTouch, clamp: PushClamp | null): void {
   if (touch.penetration <= 0) return;
+  // Exactly the penetration, which lands the ball ON the capsule boundary. That
+  // is a TOUCH — see `touchAt`, whose test is strict — so the bat still sees the
+  // ball it has just separated on the next tick and can strike it.
   const deltaX = q10Multiply(touch.penetration, touch.normalX);
   const deltaY = q10Multiply(touch.penetration, touch.normalY);
   if (deltaX === 0 && deltaY === 0) return;
+  moveBy(ball, deltaX, deltaY, clamp);
+}
+
+/** Moves a ball by an offset, as far as the map allows. */
+function moveBy(ball: BallState, deltaX: Q10, deltaY: Q10, clamp: PushClamp | null): void {
   if (clamp === null) {
     ball.x = (ball.x + deltaX) | 0;
     ball.y = (ball.y + deltaY) | 0;
@@ -1390,6 +1602,11 @@ function separate(ball: BallState, touch: BatTouch, clamp: PushClamp | null): vo
   const placed = clamp(ball, deltaX, deltaY);
   ball.x = placed.x;
   ball.y = placed.y;
+}
+
+/** Moves a ball TO a point, as far as the map allows. */
+function moveTo(ball: BallState, x: Q10, y: Q10, clamp: PushClamp | null): void {
+  moveBy(ball, (x - ball.x) | 0, (y - ball.y) | 0, clamp);
 }
 
 // ---------------------------------------------------------------------------
@@ -1476,10 +1693,23 @@ export function applyFlipperReactions(
   return { configs: bank.configs, states };
 }
 
-/** Button state built from the abstract control names the input layer uses. */
-export function flipperInputFrom(left: boolean, right: boolean): FlipperInput {
+/**
+ * Button state built from the abstract control names the input layer uses.
+ *
+ * The upper bat takes THE SAME BOOLEAN as the lower bat on its side, because
+ * that is what its record's key word says and there is no third button on the
+ * machine: `cmpi.w #0,$A(a0)` at main.seg00 +0xBD6C routes the record to the
+ * right-button test or the left one and to nothing else. Law 'n Justice's upper
+ * bat is bound LEFT; BabeWatch's and Extreme Sports' are bound RIGHT.
+ */
+export function flipperInputFrom(
+  left: boolean,
+  right: boolean,
+  upperRole: FlipperRole = "left",
+): FlipperInput {
   return new Map<string, boolean>([
     ["lower-left", left],
     ["lower-right", right],
+    ["upper", upperRole === "right" ? right : left],
   ]);
 }

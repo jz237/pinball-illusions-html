@@ -368,15 +368,17 @@ describe("how fast a launched ball climbs", () => {
   }
 
   it("orders the machine's three kicks the way the disassembly does", () => {
-    // Launch 6000 > bumper 5500 > slingshot 3500, all in the original's own
-    // velocity units — and only the launch is past the ±4095 clamp, so it is
-    // the one kick the limiter actually cuts (to exactly 16 px a tick, the
-    // 800 px/s the film shows as a flat 770-775 px/s ascent after gravity and
-    // the lane drive trim it).
+    // Launch 6000 > bumper 5500 > slingshot 3500 as the three `subi.w` operands
+    // read, and the order survives the responder-scale correction because both
+    // coils are halved by the same 2. What the correction DOES move is which of
+    // them the ±4095 clamp cuts, and the new answer is the sharper one: THE
+    // LAUNCH ALONE is past the clamp, which is exactly what the film shows —
+    // a flat 770-775 px/s lane ascent, i.e. the limiter's own 16 px a tick,
+    // where no bumper or slingshot exit in the footage is anywhere near it.
     expect(LAUNCH_KICK).toBeGreaterThan(BUMPER_KICK);
     expect(BUMPER_KICK).toBeGreaterThan(SLINGSHOT_KICK);
     expect(LAUNCH_KICK).toBeGreaterThan(VELOCITY_CLAMP_Q10);
-    expect(BUMPER_KICK).toBeGreaterThan(VELOCITY_CLAMP_Q10);
+    expect(BUMPER_KICK).toBeLessThan(VELOCITY_CLAMP_Q10);
     expect(SLINGSHOT_KICK).toBeLessThan(VELOCITY_CLAMP_Q10);
   });
 });
@@ -520,21 +522,37 @@ describe("how far the coils throw a ball", () => {
   const rise = (speed: number): number =>
     (speed * speed) / (2 * SIMULATION_GRAVITY) / 1024;
 
-  it("throws a slingshot's ball most of a table and a bumper's about three", () => {
-    // Ballistic, against the measured gravity, in whole pixels. These are the
-    // brackets that independently exclude the old bridge: at 0.75 Q10 per
-    // original unit the slingshot threw a ball 3,987 px — six and a half table
-    // lengths — which is what "the ball is in space" looks like in a number.
-    expect(rise(SLINGSHOT_KICK)).toBeGreaterThan(400);
-    expect(rise(SLINGSHOT_KICK)).toBeLessThan(900);
-    expect(rise(BUMPER_KICK)).toBeGreaterThan(2 * PLAYFIELD_HEIGHT);
-    expect(rise(BUMPER_KICK)).toBeLessThan(5 * PLAYFIELD_HEIGHT);
+  it("throws a slingshot's ball a third of a table and a bumper's a quarter", () => {
+    // Ballistic, against the measured gravity, in whole pixels — and measured on
+    // the speed the ball ACTUALLY LEAVES WITH, which is what the film can be
+    // held against. The raw kick was never an exit velocity: `subi.w` goes into
+    // the inward normal at +0x00B588/+0x00B5E2 and `muls.w $36(a4),d0` scales
+    // the sum at +0x00B620, so a slingshot's exit floor is `0.598 * 7000` and a
+    // bumper's `0.348 * 11000`.
+    //
+    // This bracket is what independently excludes BOTH wrong constants. At 0.75
+    // Q10 per original unit the old bridge threw a ball 3,987 px, six and a half
+    // table lengths. At the doubled responder constants round 5 shipped, the
+    // floor was 8.17 px/tick and 268 px of rise — and the film's own three-bumper
+    // rattle exits at or under 6 px/f, which a 7.47 px/f floor cannot produce at
+    // all.
+    const slingExit = (SLINGSHOT_KICK * 612) / 1024;
+    const bumperExit = (BUMPER_KICK * 356) / 1024;
+    expect(Math.trunc(slingExit)).toBe(4183);
+    expect(Math.trunc(bumperExit)).toBe(3824);
+    expect(rise(slingExit)).toBeGreaterThan(50);
+    expect(rise(slingExit)).toBeLessThan(90);
+    expect(rise(bumperExit)).toBeGreaterThan(40);
+    expect(rise(bumperExit)).toBeLessThan(80);
+    // Both are a fraction of a table, not several of them.
+    expect(rise(slingExit)).toBeLessThan(PLAYFIELD_HEIGHT / 4);
+    expect(rise(bumperExit)).toBeLessThan(PLAYFIELD_HEIGHT / 4);
   });
 
   it("keeps every impulse in the game inside the machine's own clamp", () => {
     // The kicks go in BEFORE restitution, so the raw value may exceed the clamp;
-    // what may not is the speed a ball actually leaves with. A bumper's 22,000
-    // through its own 356/1024 restitution is 7,648, well inside.
+    // what may not is the speed a ball actually leaves with. A bumper's 11,000
+    // through its own 356/1024 restitution is 3,824, well inside.
     const bumperOut = (BUMPER_KICK * 356) / 1024;
     const slingOut = (SLINGSHOT_KICK * 612) / 1024;
     expect(bumperOut).toBeLessThan(VELOCITY_CLAMP_Q10);

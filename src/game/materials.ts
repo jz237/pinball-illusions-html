@@ -389,15 +389,15 @@ const BEHAVIOURS: readonly MaterialBehaviour[] = [
  * still exactly one place to read a rebound number off.
  *
  *   rubber     ids 15 and 22..63, restitution 153/256 -> 612 Q10
- *   slingshot  ids 22..31, the SAME rubber row, plus 3500 units of normal kick
- *              and +-400 along the surface
+ *   slingshot  ids 22..31, the SAME rubber row, plus 3500 RESPONDER units of
+ *              normal kick and +-400 along the surface
  *   bumper     ids 16..21, restitution 89/256 -> 356 Q10, plus 5500 of kick
  *
  * Three of this project's long-standing guesses are refuted by that and it is
  * worth naming them: rubber was 845 where nothing in the game exceeds 612;
  * the slingshot was modelled as LESS bouncy than a wall when it is in fact the
  * bounciest surface on the table, twice a wall; and the kicks were 420 and 560
- * against a real 14000 and 22000 Q10 per tick. `friction` is the one field here
+ * against a real 7000 and 11000 Q10 per tick. `friction` is the one field here
  * that is still this port's own — see `WALL_FRICTION` for why there is no
  * per-surface friction number in the original to import.
  *
@@ -405,8 +405,16 @@ const BEHAVIOURS: readonly MaterialBehaviour[] = [
  * HAVE. They are the original's `$36` word times four, and `$36` is a pure ratio
  * — 153/256, 89/256 — so it crosses between the two velocity scales exactly.
  * The KICKS are velocities and moved by the full 4x of the corrected bridge:
- * 2625 -> 14000 and 4125 -> 22000. See `surface-physics.ts` for the bridge and
- * `timebase.ts` for why it is four.
+ * 2625 -> 14000 and 4125 -> 22000.
+ *
+ * ROUND 6 HALVED BOTH AGAIN, to 7000 and 11000, and the reason is not the
+ * bridge: the responder writes those two constants inside a contact frame whose
+ * forward rotation has a gain of 2 and whose inverse has a gain of 1/2, so
+ * 3500 and 5500 are twice their value in the ball's own velocity words. See
+ * `RESPONDER_VELOCITY_SCALE` in `surface-physics.ts` for the four instructions
+ * that fix it, and note that these three rows are only reachable on a SYNTHETIC
+ * map with no surface layer; the shipped tables read `surface-physics.ts`
+ * directly. They are corrected here anyway so the error is not re-planted.
  */
 export const DEVICE_PRESETS: Readonly<Record<string, Omit<MaterialBehaviour, "index">>> = {
   rubber: {
@@ -422,7 +430,7 @@ export const DEVICE_PRESETS: Readonly<Record<string, Omit<MaterialBehaviour, "in
     passable: false,
     elasticity: 612,
     friction: WALL_FRICTION,
-    kick: 14000,
+    kick: 7000,
     confidence: "measured",
   },
   bumper: {
@@ -430,7 +438,7 @@ export const DEVICE_PRESETS: Readonly<Record<string, Omit<MaterialBehaviour, "in
     passable: false,
     elasticity: 356,
     friction: WALL_FRICTION,
-    kick: 22000,
+    kick: 11000,
     confidence: "measured",
   },
 };

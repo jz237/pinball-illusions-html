@@ -58,7 +58,7 @@ import {
   releaseLock,
 } from "../src/game/ball-locks.js";
 import { queueScript } from "../src/game/mode-vm.js";
-import { modesFor } from "./table-fixtures.js";
+import { devicesFor, modesFor } from "./table-fixtures.js";
 import type { BallLock } from "../src/game/ball-locks.js";
 import { createBallSet, freeBallCount, spawnBall, stepBalls } from "../src/game/ball-physics.js";
 import { SIMULATION_GRAVITY } from "../src/game/timebase.js";
@@ -677,24 +677,37 @@ describe("the zero-deadlock guarantee, restated for locks", () => {
       expect(heldBallCount(game.locks), `${tableId} capture`).toBe(1);
       expect(freeBallCount(game.balls), `${tableId} table emptied`).toBe(0);
 
-      // The machine owes a replacement and pays it.
-      expect(debugSnapshot(game).pendingServes, `${tableId} replacement queued`).toBe(1);
+      // AND THE MACHINE OWES NOTHING FOR IT. R6: the capture handler at
+      // +0x00552A never decrements the live-ball count `$D7E(a5)`, so a held
+      // ball is still a ball in play and the trough stays shut. Round 4's
+      // "capture buys a replacement" reconstruction is retired; what gives the
+      // ball back is the saucer's own script, which ends in `PUSH` on all three
+      // of these locks, and the popper that `PUSH` queues it for.
+      expect(debugSnapshot(game).pendingServes, `${tableId} owes nothing for a held ball`).toBe(0);
 
       // Watched every tick rather than sampled at the end, and the difference is
-      // the timebase. A replacement the MACHINE owes is auto-launched — the
-      // player is not asked to wind a spring for a ball they did not lose — and
-      // at the measured gravity that ball can complete its whole trip and drain
-      // inside the four hundred ticks this waits, leaving the table empty again
-      // with a fresh serve pending. That is the machine working, and the sample
-      // at the end read it as the machine never having paid at all.
+      // the timebase. At the measured gravity the returned ball can complete its
+      // whole trip and drain inside the four hundred ticks this waits, leaving
+      // the table empty again; that is the machine working, and the sample at
+      // the end read it as the machine never having paid at all.
       let everFree = 0;
+      let cameBackAt = -1;
       for (let tick = 0; tick < 400; tick += 1) {
-        runTicks(game, idleInput(), 1);
+        const report = runTicks(game, idleInput(), 1)[0];
+        if ((report?.ejected.length ?? 0) > 0 && cameBackAt < 0) cameBackAt = tick;
         everFree = Math.max(everFree, freeBallCount(game.balls));
       }
       const state = debugSnapshot(game);
       expect(state.phase, `${tableId} phase`).toBe("in-play");
-      expect(everFree, `${tableId} never got its replacement ball`).toBeGreaterThan(0);
+      expect(everFree, `${tableId} never got its ball back`).toBeGreaterThan(0);
+      // Out of the SAUCER, not out of the trough: the eject is the decoded one.
+      expect(cameBackAt, `${tableId} never ejected from the saucer`).toBeGreaterThanOrEqual(0);
+      const eject = devicesFor(tableId).lockEjectFor(device.level, device.zoneIndex);
+      expect(eject, `${tableId} lock ${device.id} has no authored eject`).not.toBeNull();
+      // The hold is the record's own 50 or 76 frames plus however long the
+      // saucer's script takes to reach its PUSH, so this bounds it rather than
+      // pinning it: it must not be instant and it must not be a serve delay.
+      expect(cameBackAt).toBeGreaterThanOrEqual(eject!.holdTicks);
     });
 
     it(`${tableId} ends the ball when the last one drains with a saucer still full`, () => {

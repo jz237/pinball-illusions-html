@@ -187,6 +187,70 @@ const ZONE_TRIGGER_REPEAT = 0x20;
 const ZONE_TRIGGER_FLAG = 0x0a;
 const ZONE_LOCK_SCORE = 0x1e;
 const ZONE_LOCK_BONUS = 0x26;
+/**
+ * THE SAUCER'S AUTHORED EJECT, at lock_object +$06..+$0D and +$30.
+ *
+ * Decoded from the popper — the service that empties a saucer a `PUSH` has
+ * queued. `PUSH` (main.seg00 +0x005BFC) only pushes the lock's own record onto
+ * the stack at `$23DC(a5)`; the pop service at +0x006F72 arms it and the eject
+ * itself is +0x0070F6:
+ *
+ *     0070F6  movem.w  $6(a0), d0-d1      ; the authored POSITION, ball TOP-LEFT
+ *     0070FC  movem.w  d0-d1, $12(a4)     ;   -> the ball's own position words
+ *     007102  moveq    #$a, d2
+ *     007104  lsl.l    d2, d0             ; << 10 — the sub-pixel accumulators
+ *     007108  movem.l  d0-d1, $1e(a4)     ;   are Q10, like this port's
+ *     00710E  movem.w  $a(a0), d0-d1      ; the authored IMPULSE
+ *     007114  andi.l   #$ff00ff, $e(a4)   ; keep only the low byte of each
+ *     00711C  add.w    d0, $e(a4)         ;   velocity word, then add the impulse
+ *     007120  add.w    d1, $10(a4)
+ *
+ * and the HOLD LENGTH is chosen at +0x00707C by whether the longword at +$30 is
+ * a pointer: non-zero arms `$4(a0) = $4C` (76, counting down at +0x007008) and
+ * zero arms `$FFCE` (-50, counting up at +0x006FFE), both ejecting when the
+ * counter reaches zero. On the 76-frame flavour the position is written at 60,
+ * i.e. sixteen frames in, and the held flag is cleared at 0; on the 50-frame
+ * flavour +0x0070BA does both in one pass. Either way the ball is released from
+ * the authored position, at the authored velocity, 50 or 76 frames after the
+ * `PUSH`.
+ *
+ * Position is exported as the ball CENTRE so that everything in this document
+ * shares the one coordinate system the zone rectangles already use: the engine
+ * adds 8 to the stored top-left before it tests a rectangle (+0x0052E6:
+ * `movem.w $12(a4),d0-d1 / addq.w #$8,d0 / addq.w #$8,d1`), so a rectangle is
+ * centre-space and a raw eject word is not.
+ *
+ * AND THE EJECT ALSO CHOOSES THE PLAYFIELD LEVEL, which is what the last
+ * instruction of the eject is for:
+ *
+ *     007124  move.w  $e(a0), d1
+ *     007128  jmp     ([$712e, pc, d1.w * 4])
+ *
+ * The table at +0x00712E is `{ $53C6, $53F4, ... }` and those two are the
+ * bodies of the zone list's own LEVEL handlers, entered one instruction past
+ * the occupancy clear they share: +0x0053C6 writes the six LOWER plane
+ * pointers and `clr.b $8(a4)`, +0x0053F4 writes the six UPPER ones and
+ * `st.b $8(a4)`. So `+$0E == 1` puts the ejected ball on the UPPER line and
+ * anything else on the LOWER one, whichever line the saucer itself is on.
+ *
+ * The shipped data corroborates it three ways: BabeWatch's four grid saucers
+ * — three on level 0 and `upper-deck` on level 1 — all carry `+$0E = 0` and the
+ * same (71,98), so all four deliver to the same place on the MAIN playfield,
+ * which is not something four independent records do by accident; and nine of
+ * the ten eject centres have a completely clear radius-8 ring on the level
+ * `+$0E` names, where reading the level off the saucer instead leaves Law 'n
+ * Justice's jail (which is `+$0E = 1`) dropping its ball into a level-0 funnel
+ * too narrow for a 16 px ball to leave.
+ */
+const ZONE_LOCK_EJECT_POSITION = 0x06;
+const ZONE_LOCK_EJECT_IMPULSE = 0x0a;
+const ZONE_LOCK_EJECT_LEVEL = 0x0e;
+const ZONE_LOCK_HOLD_POINTER = 0x30;
+/** Half a 17 px ball: the engine's own top-left-to-centre conversion. */
+const BALL_CENTRE_OFFSET = 8;
+/** `$4(a0)` armed from +$30: zero counts up from -50, a pointer down from 76. */
+const ZONE_LOCK_HOLD_WITH_POINTER = 76;
+const ZONE_LOCK_HOLD_WITHOUT_POINTER = 50;
 
 /** Packed-BCD award fields are six bytes, twelve digits, like the player score. */
 const BCD_BYTES = 6;
@@ -559,6 +623,32 @@ function decodeZones(pkg, base, level) {
       zone.score = readBcd(pkg, object, ZONE_LOCK_SCORE);
       zone.bonus = readBcd(pkg, object, ZONE_LOCK_BONUS);
       zone.repeatable = false;
+      const ejectLevelWord = readU16(pkg, object, ZONE_LOCK_EJECT_LEVEL);
+      if (ejectLevelWord > 1) {
+        throw new Error(
+          `${pkg.stem}: lock zone ${index} on level ${level} has +$0E = ${ejectLevelWord}; only ` +
+            `0 (eject to the lower line) and 1 (upper) are handlers this decode knows`,
+        );
+      }
+      zone.eject = {
+        // Ball CENTRE, from the record's top-left words. See the constants.
+        x: readU16(pkg, object, ZONE_LOCK_EJECT_POSITION) + BALL_CENTRE_OFFSET,
+        y: readU16(pkg, object, ZONE_LOCK_EJECT_POSITION + 2) + BALL_CENTRE_OFFSET,
+        // Signed original velocity units: 256 units is one pixel a frame.
+        velocityX: readS16(pkg, object, ZONE_LOCK_EJECT_IMPULSE),
+        velocityY: readS16(pkg, object, ZONE_LOCK_EJECT_IMPULSE + 2),
+        level: ejectLevelWord,
+        holdTicks:
+          readU32(pkg, object, ZONE_LOCK_HOLD_POINTER) === 0
+            ? ZONE_LOCK_HOLD_WITHOUT_POINTER
+            : ZONE_LOCK_HOLD_WITH_POINTER,
+      };
+      if (zone.eject.x >= WIDTH || zone.eject.y >= HEIGHT) {
+        throw new Error(
+          `${pkg.stem}: lock zone ${index} on level ${level} ejects to ` +
+            `(${zone.eject.x},${zone.eject.y}), outside the ${WIDTH}x${HEIGHT} playfield`,
+        );
+      }
     } else {
       // A level transition carries no object and no award.
       zone.repeatable = false;
@@ -740,6 +830,29 @@ function decode(pkg, table, mapDocument) {
       `${table.tableId}: the map carries ${slingshotIds.size} slingshot pairs but the record list ` +
         `has ${slingshots.length} entries`,
     );
+  }
+
+  // CHECK 6 — every saucer ejects its ball into free space on its OWN level.
+  //
+  // The eject writes a position straight into the ball's record with no
+  // collision test of any kind (+0x0070FC), so a misread field would place a
+  // ball inside a wall and this reconstruction would have to dig it out again.
+  // Ten records, ten free centres, and nine of the ten with a clear radius-8
+  // ring: that is not what a wrong offset produces.
+  const solidByLevel = [
+    solidPixelsOf(mapDocument, 0, table.tableId),
+    solidPixelsOf(mapDocument, 1, table.tableId),
+  ];
+  for (const zone of zones) {
+    if (zone.eject === undefined) continue;
+    const { x, y, level: destination } = zone.eject;
+    const solid = solidByLevel[destination];
+    if (solid[y * WIDTH + x] === 1) {
+      throw new Error(
+        `${table.tableId}: lock zone ${zone.index} on level ${zone.level} ejects to (${x},${y}) ` +
+          `on level ${destination}, which is solid there`,
+      );
+    }
   }
 
   // The cross-level devices are stated, so a new one shows up as a failure

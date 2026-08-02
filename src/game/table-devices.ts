@@ -103,6 +103,36 @@ export interface HitRecord {
   readonly score: number;
 }
 
+/**
+ * A saucer's authored eject: where the ball reappears, how hard, and how long
+ * the saucer holds it first.
+ *
+ * DECODED, from the popper the `PUSH` opcode queues its lock record for —
+ * `movem.w $6(a0),d0-d1 / movem.w d0-d1,$12(a4)` at +0x0070F6 for the position,
+ * `movem.w $a(a0),d0-d1` at +0x00710E for the impulse, and the branch at
+ * +0x00707C on the longword at record+$30 for the 50-or-76-frame hold. See the
+ * long note over `ZONE_LOCK_EJECT_POSITION` in `scripts/export-table-devices.mjs`.
+ *
+ * `x`/`y` are ball-CENTRE pixels (the exporter adds the engine's own 8), and
+ * `velocityX/Y` are signed ORIGINAL velocity units — 256 to the pixel a frame —
+ * so a consumer runs them through `originalVelocityToQ10`.
+ *
+ * `level` is the PLAYFIELD LINE the ball lands on, which the eject chooses for
+ * itself: its last instruction is `move.w $e(a0),d1 / jmp ([$712e,pc,d1.w*4])`
+ * and the two table entries are the zone list's own level handlers, +0x0053C6
+ * (lower) and +0x0053F4 (upper). It is NOT the level the saucer sits on —
+ * BabeWatch's `upper-deck` saucer is on the upper line and delivers to the main
+ * one, at the same (71,98) its three level-0 sisters use.
+ */
+export interface ZoneEject {
+  readonly x: number;
+  readonly y: number;
+  readonly velocityX: number;
+  readonly velocityY: number;
+  readonly level: PlayfieldLevel;
+  readonly holdTicks: number;
+}
+
 /** One rectangle of a per-level zone list. */
 export interface ZoneRecord {
   readonly level: PlayfieldLevel;
@@ -116,6 +146,8 @@ export interface ZoneRecord {
   readonly bonus: number;
   readonly repeatScore: number;
   readonly repeatable: boolean;
+  /** Lock zones only; null on every other kind. */
+  readonly eject: ZoneEject | null;
 }
 
 /** One table's scoring layer, expanded and indexed. */
@@ -156,6 +188,14 @@ export interface TableDevices {
    * the shipped data wins.
    */
   levelChangeAt(level: PlayfieldLevel, x: number, y: number): PlayfieldLevel | null;
+  /**
+   * The authored eject of the lock zone filed at `index` on `level`, or null.
+   *
+   * Keyed by the zone's own list index because that is the name the rest of the
+   * machine already knows a saucer by: `BallLock.zoneIndex`, the mission
+   * document's `triggers.locks`, and the `PUSH`/`BALL_REMOVE` reports.
+   */
+  lockEjectFor(level: PlayfieldLevel, index: number): ZoneEject | null;
 }
 
 function describeValue(value: unknown): string {
@@ -335,6 +375,24 @@ export function parseTableDevicesDocument(doc: TableDevicesDocument): TableDevic
     const minY = requireWholeNumber(item["minY"], `${where} minY`, 0, 0xffff);
     const maxX = requireWholeNumber(item["maxX"], `${where} maxX`, minX, 0xffff);
     const maxY = requireWholeNumber(item["maxY"], `${where} maxY`, minY, 0xffff);
+    const rawEject = item["eject"];
+    let eject: ZoneEject | null = null;
+    if (rawEject !== undefined) {
+      if (kind !== "lock") throw new Error(`${where} is a ${kind} zone but carries an eject record`);
+      const fields = rawEject as Record<string, unknown>;
+      eject = Object.freeze({
+        x: requireWholeNumber(fields["x"], `${where} eject x`, 0, PLAYFIELD_WIDTH - 1),
+        y: requireWholeNumber(fields["y"], `${where} eject y`, 0, PLAYFIELD_HEIGHT - 1),
+        velocityX: requireWholeNumber(fields["velocityX"], `${where} eject velocityX`, -32768, 32767),
+        velocityY: requireWholeNumber(fields["velocityY"], `${where} eject velocityY`, -32768, 32767),
+        level: requireLevel(fields["level"], `${where} eject level`),
+        holdTicks: requireWholeNumber(fields["holdTicks"], `${where} eject holdTicks`, 1, 600),
+      });
+    } else if (kind === "lock") {
+      throw new Error(
+        `${where} is a lock zone with no eject record; re-run scripts/export-table-devices.mjs`,
+      );
+    }
     zones.push(
       Object.freeze({
         level: requireLevel(item["level"], `${where} level`),
@@ -353,6 +411,7 @@ export function parseTableDevicesDocument(doc: TableDevicesDocument): TableDevic
           Number.MAX_SAFE_INTEGER,
         ),
         repeatable: item["repeatable"] === true,
+        eject,
       }),
     );
   }
@@ -383,6 +442,10 @@ export function parseTableDevicesDocument(doc: TableDevicesDocument): TableDevic
   const levelChanges = frozenZones.filter(
     (zone) => zone.kind === "to-upper" || zone.kind === "to-lower",
   );
+  const ejects = new Map<string, ZoneEject>();
+  for (const zone of frozenZones) {
+    if (zone.eject !== null) ejects.set(`${zone.level}:${zone.index}`, zone.eject);
+  }
 
   return Object.freeze({
     tableId,
@@ -417,6 +480,9 @@ export function parseTableDevicesDocument(doc: TableDevicesDocument): TableDevic
         return zone.kind === "to-upper" ? 1 : 0;
       }
       return null;
+    },
+    lockEjectFor(level: PlayfieldLevel, index: number): ZoneEject | null {
+      return ejects.get(`${level === 1 ? 1 : 0}:${index}`) ?? null;
     },
   });
 }

@@ -37,7 +37,8 @@ import {
 import type { InputSource } from "../src/browser/game-loop.js";
 import { CONTROLS, IDLE_SNAPSHOT } from "../src/browser/input.js";
 import type { Control, ControlEdges, ControlSnapshot } from "../src/browser/input.js";
-import { mapFor, modesFor } from "./table-fixtures.js";
+import { devicesFor, mapFor, modesFor } from "./table-fixtures.js";
+import { pixelsToQ10 } from "../src/core/fixed-point.js";
 
 /**
  * One tick of a player who plunges early and taps both bats on fixed beats.
@@ -46,18 +47,18 @@ import { mapFor, modesFor } from "./table-fixtures.js";
  * mission can be inspected between frames, and a router that remembered its own
  * previous sample would report every press twice.
  */
-function playingInput(tick: number): InputSource {
+function playingInput(tick: number, left = 23, right = 29): InputSource {
   const wanted = new Set<Control>();
   const phase = tick % 400;
   if (phase >= 40 && phase < 100) wanted.add("plunger");
-  if (tick % 23 < 4) wanted.add("leftFlipper");
-  if ((tick + 11) % 29 < 4) wanted.add("rightFlipper");
+  if (tick % left < 4) wanted.add("leftFlipper");
+  if ((tick + 11) % right < 4) wanted.add("rightFlipper");
   const previous = new Set<Control>();
   const priorPhase = (tick - 1 + 400) % 400;
   if (tick > 0) {
     if (priorPhase >= 40 && priorPhase < 100) previous.add("plunger");
-    if ((tick - 1) % 23 < 4) previous.add("leftFlipper");
-    if ((tick + 10) % 29 < 4) previous.add("rightFlipper");
+    if ((tick - 1) % left < 4) previous.add("leftFlipper");
+    if ((tick + 10) % right < 4) previous.add("rightFlipper");
   }
   const controls = {} as Record<Control, ControlEdges>;
   for (const control of CONTROLS) {
@@ -517,34 +518,156 @@ describe("on the shipped Law 'n Justice data", () => {
 // ---------------------------------------------------------------------------
 
 describe("the missions, wired into a real game", () => {
-  it("start from a shot, announce themselves and pay in the tick report", () => {
-    // The end-to-end claim, and the one this whole layer exists for: a played
-    // game reaches a mission without anybody putting it there by hand.
-    const game = createGame(mapFor("law-n-justice"), { ballsPerGame: 3 });
-    startGame(game);
-
-    let started = 0;
-    const titles = new Set<string>();
-    const modeAwards: number[] = [];
-    let running = -1;
-    for (let tick = 0; tick < 20_000; tick += 1) {
-      const before = game.modeState === null ? -1 : game.modeState.mission;
-      const report = runTicks(game, playingInput(tick), 1)[0];
-      if (report === undefined) break;
-      for (const award of report.awards) {
-        if (award.source === "mode") modeAwards.push(award.score);
-      }
-      const mission = runningMission(game);
-      if (mission !== null && before < 0) {
-        started += 1;
-        if (mission.title.length > 0) titles.add(mission.title);
-      }
-      if (mission !== null) running = mission.index;
+  /**
+   * Every shot on Law 'n Justice that can start a mission, straight off the
+   * disk: the zones whose script reaches an element in `modes.armElements`.
+   *
+   * There are exactly three — the two right-inlane rollovers L0#10 and L0#11,
+   * each bound to a `START_TIMED(13,5)`, and the upper-level box L1#9, whose
+   * script contains `START(10)`. L0#8, L0#9 and L0#12 bind to scripts that are
+   * a bare `END` and cannot start anything.
+   */
+  function armingZones(): readonly { level: 0 | 1; index: number }[] {
+    const modes = modesFor("law-n-justice");
+    const armed = new Set(modes.armElements);
+    const found: { level: 0 | 1; index: number }[] = [];
+    for (const zone of devicesFor("law-n-justice").zones) {
+      const index = modes.scriptForZone(zone.level, zone.index);
+      const script = index < 0 ? undefined : modes.scripts[index];
+      if (script === undefined) continue;
+      // START (1) and START_TIMED (2) are the two opcodes that put an element on
+      // the machine; an arm element is one every mission COMPLETEs and
+      // CLEAR_DONEs, which is what `armElements` derives.
+      const starts = script.ops.some(
+        (op) =>
+          (op.op === 1 || op.op === 2) && op.args[0] !== undefined && armed.has(op.args[0] as number),
+      );
+      if (starts) found.push({ level: zone.level, index: zone.index });
     }
+    return found;
+  }
 
-    expect(started, "no mission ever started in twenty thousand ticks").toBeGreaterThan(0);
-    expect(titles.size, "no mission announced itself").toBeGreaterThan(0);
-    expect(running).toBeGreaterThanOrEqual(0);
+  it("start from EVERY shot on the disk that arms one, one shot at a time", () => {
+    // THE MECHANISM TEST, and it replaces a blind-cadence one that was really a
+    // coin flip. Round 5 found the old single 23/29 player no longer reaching a
+    // mission and widened the test to "any of four cadences". Measured on three
+    // fully-specified grids (Law 'n Justice, 3 balls, 20,000 ticks each, every
+    // ordered pair of bat cadences from the set, diagonal excluded):
+    //
+    //   {17,19,23,29,31,37}                        HEAD 18/30    now 15/30
+    //   {13,17,19,21,23,25,27,29,31,33,35,37}      HEAD 60/132   now 61/132
+    //   {17,19,23,29,31,37,41,43,47,53,59,61}      HEAD 53/132   now 43/132
+    //
+    // Note what those three disagree about: whether the rate went DOWN at all
+    // depends on which cadences you happen to pick — flat on the second grid,
+    // down a fifth on the third. That is the whole argument. A randomly chosen
+    // cadence is close to a coin flip on either tree, "at least one of four"
+    // passes by luck most of the time WHATEVER the physics does, and a quantity
+    // whose sign is set by the choice of probe cannot pin a regression.
+    //
+    // So the end-to-end claim is split in two. This half is deterministic and
+    // names every shot: the ball is pinned inside each arming rectangle in turn
+    // — the pattern `scoring-play.test.ts` uses for the lock award — and each
+    // must pay its zone and put a mission on the machine. It is strictly
+    // stronger than the cadence pin it replaces, which could only ever have
+    // exercised whichever one shot that cadence happened to find.
+    const zones = armingZones();
+    expect(zones.length, "the disk's arming shots").toBe(3);
+    expect(zones).toEqual([
+      { level: 0, index: 10 },
+      { level: 0, index: 11 },
+      { level: 1, index: 9 },
+    ]);
+
+    const devices = devicesFor("law-n-justice");
+    for (const where of zones) {
+      const zone = devices.zones.find(
+        (one) => one.level === where.level && one.index === where.index,
+      );
+      expect(zone, `zone ${where.level}-${where.index} is in the shipped list`).toBeDefined();
+      if (zone === undefined) continue;
+
+      const game = createGame(mapFor("law-n-justice"), { ballsPerGame: 3 });
+      startGame(game);
+      runTicks(game, { sample: () => IDLE_SNAPSHOT }, 60);
+      const ball = game.balls.balls[0];
+      expect(ball).toBeDefined();
+      if (ball === undefined) continue;
+      // Off the rod first, or the loop pins it back to the serve point.
+      game.laneBallId = null;
+      ball.x = pixelsToQ10(Math.floor((zone.minX + zone.maxX) / 2));
+      ball.y = pixelsToQ10(Math.floor((zone.minY + zone.maxY) / 2));
+      ball.velocityX = 0;
+      ball.velocityY = 0;
+      ball.level = where.level;
+
+      // Long enough for the longest of the three scripts to reach its start:
+      // L1#9's script 56 runs eleven ops before its `START(10)`.
+      const paid: number[] = [];
+      for (let tick = 0; tick < 40; tick += 1) {
+        const report = runTicks(game, { sample: () => IDLE_SNAPSHOT }, 1)[0];
+        for (const award of report?.awards ?? []) paid.push(award.score);
+      }
+      expect(paid, `zone ${where.level}-${where.index} paid nothing`).toContain(zone.score);
+      const mission = runningMission(game);
+      expect(mission, `zone ${where.level}-${where.index} started no mission`).not.toBeNull();
+      expect(mission?.title.length, `mission from ${where.level}-${where.index} is nameless`)
+        .toBeGreaterThan(0);
+    }
+  });
+
+  it("are reached by blind play often enough to be part of the game", () => {
+    // THE RATE HALF, stated as a rate with its budget the way this project
+    // states a census. BUDGET: Law 'n Justice, 30 blind players — every ordered
+    // pair of bat cadences from {17, 19, 23, 29, 31, 37} except the diagonal —
+    // 3 balls each, 20,000 ticks each. MEASURED: HEAD 18 of 30, this tree 15 of
+    // 30 — but see the three grids quoted on the test above, which disagree
+    // about the sign of that change. This number carries cadence-choice noise,
+    // not just physics.
+    //
+    // What physics it does carry is priced in rather than a defect: round 6
+    // halved every coil constant after finding the responder works at twice the
+    // ball's velocity scale, and the four filmed slingshot junctions went from
+    // 4.23 to 0.25 px/f RMS against the original. Where the machine got harder
+    // it got harder because the original IS harder, and census medians moved the
+    // same way for the same reason.
+    //
+    // The floor is two thirds of the measured 15, so it tolerates that noise but
+    // catches any further third lost — and it goes to zero the moment one of the
+    // three arming shots stops firing, which is the regression it exists to
+    // catch.
+    const cadences = [17, 19, 23, 29, 31, 37];
+    const modeAwards: number[] = [];
+    let players = 0;
+    let cells = 0;
+    const titles = new Set<string>();
+    for (const left of cadences) {
+      for (const right of cadences) {
+        if (left === right) continue;
+        cells += 1;
+        const game = createGame(mapFor("law-n-justice"), { ballsPerGame: 3 });
+        startGame(game);
+        let started = false;
+        for (let tick = 0; tick < 20_000; tick += 1) {
+          const before = game.modeState === null ? -1 : game.modeState.mission;
+          const report = runTicks(game, playingInput(tick, left, right), 1)[0];
+          if (report === undefined) break;
+          for (const award of report.awards) {
+            if (award.source === "mode") modeAwards.push(award.score);
+          }
+          const mission = runningMission(game);
+          if (mission !== null && before < 0) {
+            started = true;
+            if (mission.title.length > 0) titles.add(mission.title);
+          }
+        }
+        if (started) players += 1;
+      }
+    }
+    expect(cells).toBe(30);
+    expect(players, `only ${players} of ${cells} blind players reached a mission`)
+      .toBeGreaterThanOrEqual(10);
+    expect(titles.size, "no mission announced itself to any player").toBeGreaterThan(0);
     // Every value paid is an element score off the disks, checked the same way
     // `scoring-play.test.ts` checks the device layer.
     const permitted = new Set(modesFor("law-n-justice").elements.map((element) => element.score));

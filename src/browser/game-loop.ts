@@ -94,16 +94,17 @@
  * back to the trough first.
  *
  * ---------------------------------------------------------------------------
- * WHY `resolveFlipperContacts` IS CALLED WITHOUT A PUSH CLAMP
+ * `resolveFlipperContacts` IS CALLED WITH THE MAP'S OWN PUSH CLAMP
  * ---------------------------------------------------------------------------
- * `ball-physics.ts` builds the map-aware clamp it hands to `resolveBallCollisions`
- * in a private factory, so there is nothing to pass here and rewriting one would
- * be a second, subtly different implementation of a rule that already exists.
- * The unclamped case is recoverable rather than fatal: a bat can push a ball at
- * most its own penetration — a few pixels — into a wall, and `stepBalls` runs
- * `recoverPenetration` on the very next tick, which walks a ball whose centre is
- * inside solid material back out. Exporting the clamp factory would remove even
- * that, and is the right fix when ball-physics.ts is next opened.
+ * Round 5 passed `null` here and argued the unclamped case was recoverable: a
+ * bat can push a ball at most its own penetration, a few pixels, and `stepBalls`
+ * runs `recoverPenetration` on the next tick. Both halves turned out to be
+ * wrong on Law 'n Justice's upper-left bat, whose capsule OVERLAPS the level-0
+ * boundary wall (pivot (37,302), wall 14 px away, boss 5 + ball 8 = 13), and
+ * whose recovery walk is 34 px wide on that table rather than 16 because the
+ * budget was tied to the virtual top wall. `ball-physics.ts` now exports
+ * `pushClampForMap`, so there is one clamp with one implementation and the bat
+ * cannot write a ball through a wall in the first place.
  */
 
 import type { Control, ControlSnapshot } from "./input.js";
@@ -137,9 +138,9 @@ import type {
 } from "../game/contracts.js";
 import { PLAYFIELD_WIDTH } from "../game/contracts.js";
 import type { Q10 } from "../core/fixed-point.js";
-import { q10ToPixel } from "../core/fixed-point.js";
+import { pixelsToQ10, q10ToPixel } from "../core/fixed-point.js";
 import { FixedStepScheduler, millisecondsToNanos } from "../core/fixed-step-scheduler.js";
-import type { BallSet, SimulationOptions } from "../game/ball-physics.js";
+import type { BallSet, PushClamp, SimulationOptions } from "../game/ball-physics.js";
 import {
   DEFAULT_SIMULATION_OPTIONS,
   activeBalls,
@@ -149,15 +150,18 @@ import {
   freeBallCount,
   freeBalls,
   pruneInactiveBalls,
+  pushClampForMap,
   stepBalls,
 } from "../game/ball-physics.js";
 import type { LockBank } from "../game/ball-locks.js";
+import type { BallLock } from "../game/ball-locks.js";
 import {
   MAX_SIMULTANEOUS_BALLS,
   ballsToTopUp,
   captureBalls,
   createLockBank,
   heldBallCount,
+  heldBallIn,
   lockCovers,
   lockForZone,
   releaseHeldBalls,
@@ -168,6 +172,7 @@ import { SLINGSHOT_KICK } from "../game/surface-physics.js";
 import type { FlipperBank } from "../game/flippers.js";
 import {
   FLIPPER_BOSS_RADIUS_PIXELS,
+  UPPER_FLIPPER_RECORDS,
   applyFlipperReactions,
   createFlipperBank,
   flipperEndpoints,
@@ -176,7 +181,9 @@ import {
   tickFlipperBank,
 } from "../game/flippers.js";
 import { materialTableFor } from "../game/materials.js";
-import type { TableDevices } from "../game/table-devices.js";
+import type { TableDevices, ZoneEject } from "../game/table-devices.js";
+import { DEVICE_ID_BASE } from "../game/surface-physics.js";
+import { originalVelocityToQ10 } from "../game/timebase.js";
 import { tableDevicesFor } from "../game/table-devices.js";
 import type { Award, ScoringState } from "../game/scoring.js";
 import {
@@ -575,14 +582,20 @@ export interface Game {
   /** True from the moment a multiball starts until it is back down to one ball. */
   multiball: boolean;
   /**
-   * Saucers whose held ball the machine has ALREADY replaced: the device ids
-   * marked when a capture left nothing rolling and a replacement serve was
-   * owed. When the lock's script later ejects that ball, the eject does not
-   * owe a second serve — the replacement already stands in for it — which is
-   * what keeps the decoded eject path and the reconstruction's replacement
-   * rule from together minting a ball the player never had.
+   * Saucers whose script has run `PUSH` and which are counting down to spitting
+   * their ball back onto the playfield, newest first.
+   *
+   * This is the original's element stack at `$23DC(a5)`: `PUSH` (+0x005BFC)
+   * pushes the lock's record and the pop service at +0x006F72 works ONE element
+   * at a time, so a second `PUSH` while an eject is in flight waits its turn and
+   * the last one pushed is served first. `lockEjecting` is `$23E0(a5)`, the
+   * element currently counting.
    */
-  lockDebts: Set<string>;
+  lockEjectStack: string[];
+  /** The saucer currently counting down, and how many ticks are left. */
+  lockEjecting: { deviceId: string; ticksLeft: number } | null;
+  /** The map's push clamp, built on first use. See `pushClampFor`. */
+  pushClamp: PushClamp | null;
   /**
    * Ticks until the auto-launcher fires the ball in the lane, or 0 when it is
    * not armed. Armed only for balls the machine owes itself.
@@ -650,6 +663,12 @@ export interface GameTickReport {
   readonly swallowed: readonly number[];
   /** Ids a lock swallowed this tick, in device order. */
   readonly locked: readonly number[];
+  /**
+   * Ids a saucer spat back onto the playfield this tick, at the record's own
+   * authored position and impulse. Never more than one: the popper serves one
+   * element at a time. These are NOT serves — the ball never left play.
+   */
+  readonly ejected: readonly number[];
   /** True on the tick a multiball was lit and the saucers gave their balls back. */
   readonly multiballStarted: boolean;
   /** Index into the table's mission list started this tick, or -1. */
@@ -714,7 +733,9 @@ export function createGame(map: TableMap, options?: Partial<GameOptions>): Game 
     locks: createLockBank(map.tableId),
     pendingServes: 0,
     multiball: false,
-    lockDebts: new Set<string>(),
+    lockEjectStack: [],
+    lockEjecting: null,
+    pushClamp: null,
     autoLaunchCountdown: 0,
     ballsLocked: 0,
     scoring: createScoringState(),
@@ -750,7 +771,8 @@ export function startGame(game: Game): void {
   game.locks = createLockBank(game.map.tableId);
   game.pendingServes = 0;
   game.multiball = false;
-  game.lockDebts = new Set<string>();
+  game.lockEjectStack = [];
+  game.lockEjecting = null;
   game.autoLaunchCountdown = 0;
   game.ballsLocked = 0;
   // A fresh board rather than a cleared one: the flag bytes that decide whether
@@ -769,6 +791,22 @@ export function startGame(game: Game): void {
   game.stillAnchors = [];
   game.tilt = resetTiltForNewBall();
   game.flippers = createFlipperBank(game.map.tableId);
+  // THE CAMERA IS RESET HERE, AND TO THE TOP OF THE TABLE.
+  //
+  // Round 5 deleted this line, and it did not need to. What made the filmed
+  // serve snap impossible was that `INITIAL_CAMERA.scrollY` was the BOTTOM STOP
+  // — the framing the first serve ENDS at — so resetting to it left the window
+  // already where it would finish. Round 5 also changed the constant to 0, the
+  // top of the playfield, which is what the attract display frames (INDEX.txt
+  // 41-43, track10 f54); with that fixed the reset ARMS the snap instead of
+  // killing it, and removing it only broke the second game.
+  //
+  // Measured on one `Game` played twice, which is exactly how `main.ts` drives
+  // it: `opened` caches the assembled table and both the start button and
+  // `restart()` call `startGame` on that same object. Without this line game 1
+  // stepped 47, 42, 38, 34, 31, 28, 25, 22, 20, 18, 16, 15, 8 down to the stop
+  // and game 2 stepped nothing at all, opening on the framing the last ball of
+  // the previous game died at. With it, game 2's sequence is game 1's exactly.
   game.camera = INITIAL_CAMERA;
   game.paused = false;
 }
@@ -789,6 +827,16 @@ function ballRadiusOf(game: Game): Q10 {
 
 function restThresholdOf(game: Game): number {
   return game.options.simulation.restThreshold ?? DEFAULT_SIMULATION_OPTIONS.restThreshold;
+}
+
+/**
+ * The map-aware push clamp the bats write their positions through. Built once
+ * per game and kept, because it expands both level views and the probe ring and
+ * this runs on every tick. See `pushClampForMap` for why the flippers need it.
+ */
+function pushClampFor(game: Game): PushClamp {
+  game.pushClamp ??= pushClampForMap(game.map, game.materials, game.options.simulation);
+  return game.pushClamp;
 }
 
 function cameraOptionsFor(game: Game): CameraOptions {
@@ -844,6 +892,7 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     writtenOff: [],
     swallowed: [],
     locked: [],
+    ejected: [],
     multiballStarted: false,
     missionStarted: -1,
     missionEnded: false,
@@ -873,7 +922,26 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
   let served = false;
   if (game.laneBallId === null) {
     const owed = game.pendingServes > 0;
-    if (owed || freeBallCount(game.balls) === 0) {
+    // A SAUCER THAT IS ABOUT TO SPIT THE BALL BACK IS NOT AN EMPTY TABLE.
+    //
+    // The capture handler at +0x00552A leaves the live-ball count `$D7E(a5)`
+    // alone, so in the original a held ball is still a ball in play and the
+    // machine serves nothing for it. This port cannot read `$D7E` — a held ball
+    // is not a FREE ball here — so it tests the popper's own queue instead:
+    // while an element is stacked or counting, the ball is coming back and the
+    // lane stays shut. Round 5 needed no such test because its `PUSH` went to
+    // the trough and paid its own serve; with the decoded in-place eject, and
+    // without this, a saucer that swallowed the last ball served a FOURTH ball
+    // into a three-ball game.
+    //
+    // A saucer whose script KEEPS the ball — Law 'n Justice's right crater with
+    // its lock lamp lit, BabeWatch's lower bowl on the same branch — stacks
+    // nothing, so the countdown below runs out and the player gets another ball
+    // to play with. That replacement is the one piece of the round-4 lock
+    // reconstruction that survives, and it is charged as a MACHINE serve rather
+    // than as one of the player's three.
+    const returning = game.lockEjecting !== null || game.lockEjectStack.length > 0;
+    if (owed || (freeBallCount(game.balls) === 0 && !returning)) {
       if (game.serveCountdown > 0) {
         game.serveCountdown -= 1;
         // Still run the rest of the tick: the camera has to keep easing and the
@@ -888,6 +956,12 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
           game.pendingServes -= 1;
           game.autoLaunchCountdown = AUTO_LAUNCH_DELAY_TICKS;
           if (game.pendingServes > 0) game.serveCountdown = game.options.serveDelayTicks;
+        } else if (heldBallCount(game.locks) > 0) {
+          // The table is empty only because a saucer is KEEPING the player's
+          // ball. Replacing it costs the player nothing — the ball they were
+          // given is still on the machine — so the tilt and the per-ball
+          // counters stand with it.
+          game.autoLaunchCountdown = AUTO_LAUNCH_DELAY_TICKS;
         } else {
           game.ballsServed += 1;
           game.tilt = resetTiltForNewBall();
@@ -977,6 +1051,8 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     flipperInputFrom(
       live && isDown(snapshot, "leftFlipper"),
       live && isDown(snapshot, "rightFlipper"),
+      // The third bat rides its own side's button — there is no third button.
+      UPPER_FLIPPER_RECORDS[game.map.tableId].role,
     ),
   );
   game.flippers = bankTick.bank;
@@ -1012,7 +1088,7 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     game.balls.balls,
     bankTick.sweeps,
     ballRadiusOf(game),
-    null,
+    pushClampFor(game),
     restThresholdOf(game),
     flipperStarts,
   );
@@ -1075,6 +1151,13 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
   const modeTick = runModes(game, awards);
   awards.push(...modeAwardsAsAwards(modeTick));
 
+  // ---- the popper --------------------------------------------------------
+  //
+  // One tick of a saucer's hold timer and, at its end, the authored eject.
+  // AFTER `runModes`, because `PUSH` is what queues an element; BEFORE the ball
+  // search, so a ball just spat back onto the playfield is never counted still.
+  const ejected = runLockEjects(game);
+
   // ---- ball search -------------------------------------------------------
   //
   // A ball a bat is holding up is CONTROLLED, not lost: the player is cradling
@@ -1107,7 +1190,8 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
       // ball across the end of a ball would leave the machine one short on the
       // next one, and this reconstruction has no rule saying which tables do that.
       releaseHeldBalls(game.locks, game.balls.balls);
-      game.lockDebts.clear();
+      game.lockEjectStack = [];
+      game.lockEjecting = null;
       pruneInactiveBalls(game.balls);
       // The mission goes with the ball. The original refuses to END THE BALL
       // while a mission is running instead (0x4F12-0x4F28 will not advance the
@@ -1147,6 +1231,7 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     writtenOff: lost,
     swallowed: search.swallowed,
     locked: lockTick.locked,
+    ejected,
     multiballStarted: game.multiball && !wasMultiball,
     missionStarted: modeTick.missionStarted,
     missionEnded: modeTick.missionEnded,
@@ -1178,6 +1263,52 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
  * every other device KEEP scoring on the way down — measured on film, twice —
  * so filtering more than ids 16..31 here would be less authentic, not more.
  */
+/**
+ * THE KICKER LAW: a device whose record carries a velocity pair WRITES IT OVER
+ * the ball's velocity.
+ *
+ * Decoded from the device chain's own type table. The chain at main.seg00 body
+ * +0x55A0 reads the device's type word and jumps through the table at +0x55C8;
+ * type 2 lands at +0x56B0 and is four instructions long:
+ *
+ *     0056b0  movea.l $2(a0), a2        ; the device's flag object
+ *     0056b4  movem.w $dbe(a5), d6-d7   ; the player bit
+ *     0056ba  btst.l  d6, $1(a2)        ; ARMED for this player?
+ *     0056be  beq.b   $56d2             ;   no -> nothing happens at all
+ *     0056c0  movem.w $6(a0), d0-d1     ; the record's two velocity words
+ *     0056c6  movem.w d0-d1, $e(a4)     ; -> straight over the ball's vx, vy
+ *     0056cc  jsr     $5cac.l
+ *
+ * `movem.w` to `$e(a4)`, not `add` — the ball leaves at the record's velocity
+ * whatever it arrived with. The words are in the original's own velocity units
+ * and go through the plain 4x bridge, so BabeWatch's surface 64 (0, -3000)
+ * becomes 12,000 Q10 a tick upward: a 549 px ejection, which is the kickback
+ * lane's whole length.
+ *
+ * NOT REPRODUCED, and it is the reason this can only ever be an upper bound: the
+ * `btst` gate. Which lamp object arms a kicker, and when, is in the device's
+ * `$2(a0)` pointer, and the exporter does not carry it. This port fires the
+ * kicker on every touch. On the three shipped tables the only record with a
+ * velocity at all is BabeWatch's kickback, whose real gate is presumably its own
+ * "kickback lit" lamp, so the visible consequence is a kickback that is always
+ * lit rather than one that is sometimes lit.
+ */
+function applyKickers(
+  devices: TableDevices,
+  ball: BallState,
+  touched: readonly number[],
+): void {
+  for (const id of touched) {
+    if (id < DEVICE_ID_BASE) continue;
+    const device = devices.deviceFor(ball.level, id);
+    if (device === null) continue;
+    if (device.velocityX === 0 && device.velocityY === 0) continue;
+    ball.velocityX = originalVelocityToQ10(device.velocityX);
+    ball.velocityY = originalVelocityToQ10(device.velocityY);
+    return;
+  }
+}
+
 function runScoring(
   game: Game,
   surfaces: ReadonlyMap<number, readonly number[]>,
@@ -1198,6 +1329,7 @@ function runScoring(
       if (touched.length === 0) continue;
     }
     awards.push(...scoreSurfaces(game.scoring, devices, ball.level, touched));
+    applyKickers(devices, ball, touched);
   }
 
   const centres = freeBalls(game.balls)
@@ -1272,34 +1404,41 @@ function runModes(game: Game, awards: readonly Award[]): ModeTickReport {
   if (report.messages.length > 0) game.modeMessages = report.messages;
   if (report.missionEnded) game.modeMessages = [];
 
-  // THE DECODED LOCK RELEASES. `BALL_REMOVE` takes the named lock's held ball
-  // off the table into the trough with nothing owed for it — the `BALLS_UP_TO`
-  // that follows it in every script that uses it counts live and queued balls,
-  // so the removed ball comes back as part of the top-up. A `PUSH` eject gives
-  // the ball back on its own: the machine owes a serve for it, unless the
-  // capture already bought a replacement (see `Game.lockDebts`).
+  // THE TWO DECODED LOCK RELEASES, AND THEY ARE NOT THE SAME DOOR.
   //
-  // WHERE the ejected ball reappears is this port's one divergence from the
-  // decoded mechanism, and it is labelled: the popper at 0x7078 kicks the ball
-  // out of the saucer in place with authored per-device impulse words that are
-  // not yet exported, and this reconstruction returns it through the trough
-  // and the plunger lane like every other release instead. Same ball count,
-  // different door.
+  // `BALL_REMOVE` (opcode $68, +0x005B4E) is the TROUGH: `jsr $c060` unhooks
+  // the sprite, `subq.w #$1,$d7e(a5)` takes the ball out of play and
+  // `addq.w #$1,$d86(a5)` queues it for the lane. Nothing is owed on top,
+  // because the `BALLS_UP_TO` that follows it in every script that uses it
+  // counts live and queued balls and the removed ball comes back inside the
+  // top-up.
+  //
+  // `PUSH` (+0x005BFC) is the SAUCER'S OWN MOUTH and it never goes near the
+  // trough: it pushes the lock's record onto the element stack at `$23DC(a5)`
+  // and the popper at +0x006F72 spits the ball back onto the playfield at the
+  // record's authored position and impulse, `holdTicks` frames later. The ball
+  // never leaves play, so no serve is owed and no replacement is minted.
+  //
+  // ROUND 5 RAN `PUSH` THROUGH THE TROUGH, and that closed a limit cycle: an
+  // ejected ball reappeared on the plunger rod at a fixed position with a fixed
+  // kick, which is a total state reset, and on Extreme Sports it took the same
+  // lap back into the same saucer every 742 ticks — 26 locks and 9,325,000
+  // points inside 20,000 ticks with ball 1 never ending. The authored eject is
+  // now exported (`ZoneEject`), so the ball comes back where the machine puts
+  // it and the lap cannot repeat.
   let released = false;
   for (const eject of report.lockEjects) {
     const device = lockForZone(game.locks, eject.level, eject.index);
     if (device === null) continue;
-    const ballId = releaseLock(game.locks, device.id, game.balls.balls);
-    if (ballId === null) continue;
-    released = true;
-    if (game.lockDebts.delete(device.id)) continue;
-    oweServes(game, 1);
+    if (heldBallIn(game.locks, device.id) === null) continue;
+    // LIFO, like `move.l a2,-(a0)` against `movea.l (a1)+,a0`.
+    if (!game.lockEjectStack.includes(device.id)) game.lockEjectStack.unshift(device.id);
   }
   for (const remove of report.lockRemoves) {
     const device = lockForZone(game.locks, remove.level, remove.index);
     if (device === null) continue;
     if (releaseLock(game.locks, device.id, game.balls.balls) !== null) released = true;
-    game.lockDebts.delete(device.id);
+    cancelLockEject(game, device.id);
   }
   if (released) pruneInactiveBalls(game.balls);
 
@@ -1378,13 +1517,15 @@ function oweServes(game: Game, count: number): void {
  * rule that used to live here is replaced by that mechanism — see the
  * headstone comment in `ball-locks.ts`.
  *
- * RECONSTRUCTION: a capture that leaves nothing rolling buys the player a
- * replacement ball, which keeps the promise that a game always ends — a
- * swallowed launcher (`MODE_START` while another mode runs eats the start but
- * the ladder still counts, a measured consequence) or a modeless table would
- * otherwise leave the table empty with no way forward. The saucer is marked in
- * `lockDebts` so a later scripted eject of the same ball does not owe a second
- * serve on top of the replacement.
+ * A CAPTURE DOES NOT BUY A REPLACEMENT, and round 5's rule that it did is gone.
+ * The capture handler at +0x00552A never touches the live-ball count `$D7E(a5)`
+ * — a held ball is still a live ball — so the machine owes nothing for it and
+ * the trough stays shut. The replacement existed because round 5's `PUSH` sent
+ * the ball to the trough instead of out of the saucer, so a saucer that swallowed
+ * the last ball could leave the table empty; with the decoded eject the ball is
+ * always back inside `ZoneEject.holdTicks` frames and the reconstruction has
+ * nothing left to insure against. `endOfBall` still gives a held ball back to the
+ * trough, which is the one place a saucer can strand a game.
  */
 function runLocks(game: Game): {
   readonly locked: readonly number[];
@@ -1420,14 +1561,95 @@ function runLocks(game: Game): {
     }
   }
 
-  if (freeBallCount(game.balls) === 0) {
-    oweServes(game, 1);
-    // The replacement stands in for the FIRST held ball of this tick's
-    // captures: when its saucer's script ejects it later, no second serve.
-    const deviceId = captured[0]?.deviceId;
-    if (deviceId !== undefined) game.lockDebts.add(deviceId);
+  // A SAUCER THAT EMPTIES THE TABLE RE-ARMS THE SERVE COUNTDOWN.
+  //
+  // The countdown is normally set by the end-of-ball path, so between balls it
+  // sits at zero — and a capture empties the table without a drain. Without
+  // this, the serve gate above fires on the very tick the saucer swallowed the
+  // last ball, before the saucer's script has had a single frame to run its
+  // `PUSH`, and the machine hands out a ball it is about to get back. Arming it
+  // gives the script its delay; a saucer that genuinely KEEPS the ball still
+  // gets the player a replacement when the countdown runs out.
+  if (freeBallCount(game.balls) === 0 && game.laneBallId === null && game.serveCountdown === 0) {
+    game.serveCountdown = game.options.serveDelayTicks;
   }
   return { locked, awards };
+}
+
+/**
+ * Runs the popper: the saucer's hold timer and the authored eject.
+ *
+ * ONE ELEMENT AT A TIME, because the original's pop service at +0x006F72 only
+ * arms a new one when `$23E0(a5)` is clear, and the stack it pops from is LIFO.
+ * The hold is 50 or 76 frames, chosen per record — see `ZoneEject`.
+ *
+ * THE EJECT ITSELF, +0x0070F6..+0x007120: the ball's position becomes the
+ * record's authored one (the sub-pixel accumulators are set from it too, which
+ * is why this assigns Q10 directly rather than snapping a pixel), its velocity
+ * becomes the record's authored impulse, the held flag is cleared and the
+ * saucer is freed. Nothing goes near the trough or the serve queue.
+ *
+ * AND THE EJECT CHOOSES THE LEVEL, which is what its last instruction does:
+ * `move.w $e(a0),d1 / jmp ([$712e,pc,d1.w*4])` lands on +0x0053C6 or +0x0053F4,
+ * the bodies of the zone list's own to-lower and to-upper handlers. So Law 'n
+ * Justice's jail puts its ball on the UPPER ramp at (300,375) — on the main
+ * line those coordinates are a funnel a 16 px ball cannot leave, which is how
+ * the level word was found — and BabeWatch's upper-deck saucer, which sits on
+ * the upper line, delivers to the MAIN one at the same (71,98) its three
+ * level-0 sisters use.
+ */
+function runLockEjects(game: Game): readonly number[] {
+  if (game.lockEjecting === null) {
+    const next = game.lockEjectStack.shift();
+    if (next === undefined) return [];
+    const lock = game.locks.locks.find((one) => one.id === next);
+    const eject = lock === undefined ? null : ejectFor(game, lock);
+    // A saucer whose eject data did not survive (a synthetic devices document,
+    // or a lock the exporter has no record for) falls back to the trough rather
+    // than holding the ball for ever.
+    if (eject === null) {
+      if (releaseLock(game.locks, next, game.balls.balls) !== null) {
+        oweServes(game, 1);
+        pruneInactiveBalls(game.balls);
+      }
+      return [];
+    }
+    game.lockEjecting = { deviceId: next, ticksLeft: eject.holdTicks };
+    return [];
+  }
+
+  game.lockEjecting.ticksLeft -= 1;
+  if (game.lockEjecting.ticksLeft > 0) return [];
+
+  const deviceId = game.lockEjecting.deviceId;
+  game.lockEjecting = null;
+  const ballId = heldBallIn(game.locks, deviceId);
+  const lock = game.locks.locks.find((one) => one.id === deviceId);
+  if (ballId === null || lock === undefined) return [];
+  const eject = ejectFor(game, lock);
+  if (eject === null) return [];
+  const ball = ballById(game.balls, ballId);
+  game.locks.held.delete(deviceId);
+  if (ball === undefined) return [];
+  ball.heldBy = null;
+  ball.x = pixelsToQ10(eject.x);
+  ball.y = pixelsToQ10(eject.y);
+  ball.velocityX = originalVelocityToQ10(eject.velocityX);
+  ball.velocityY = originalVelocityToQ10(eject.velocityY);
+  ball.level = eject.level;
+  return [ballId];
+}
+
+/** The authored eject of a saucer, from the shipped devices document. */
+function ejectFor(game: Game, lock: BallLock): ZoneEject | null {
+  return game.devices?.lockEjectFor(lock.level, lock.zoneIndex) ?? null;
+}
+
+/** Forgets a queued or in-flight eject, for a saucer emptied another way. */
+function cancelLockEject(game: Game, deviceId: string): void {
+  const at = game.lockEjectStack.indexOf(deviceId);
+  if (at >= 0) game.lockEjectStack.splice(at, 1);
+  if (game.lockEjecting?.deviceId === deviceId) game.lockEjecting = null;
 }
 
 /**

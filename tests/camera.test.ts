@@ -6,6 +6,7 @@ import {
   ORIGINAL_NARROW_WINDOW_ROWS,
   ORIGINAL_SCROLL_DIVISOR_DEFAULT,
   ORIGINAL_TOP_EASE_ROWS,
+  SERVE_FRAMING_SCROLL,
   VIEWPORT_HEIGHT,
   clampScroll,
   followRow,
@@ -21,6 +22,12 @@ import type { CameraOptions, CameraState } from "../src/browser/camera.js";
 import { PLAYFIELD_HEIGHT } from "../src/game/contracts.js";
 import type { BallState } from "../src/game/contracts.js";
 import { pixelsToQ10 } from "../src/core/fixed-point.js";
+import { createGame, debugSnapshot, runTicks, startGame } from "../src/browser/game-loop.js";
+import type { InputSource } from "../src/browser/game-loop.js";
+import { IDLE_SNAPSHOT } from "../src/browser/input.js";
+import { mapFor } from "./table-fixtures.js";
+
+const idleInput = (): InputSource => ({ sample: () => IDLE_SNAPSHOT });
 
 function ball(id: number, y: number, active = true, heldBy: string | null = null): BallState {
   // The camera frames a ball by its y alone, so which collision level it rides
@@ -294,8 +301,13 @@ describe("mapping points into the viewport", () => {
     // has no step cap to lift, so the only way to outrun it is to move a ball
     // faster than the engine can move one — which is a statement about the
     // fixture, not about the camera. 16 px a tick IS the engine's clamp.
-    let camera = INITIAL_CAMERA;
-    let y = PLAYFIELD_HEIGHT - VIEWPORT_HEIGHT + ORIGINAL_CAMERA_ANCHOR_ROWS;
+    // Started from the framing that already holds the ball at its anchor, so
+    // this measures the FOLLOW and nothing else. It used to start from
+    // INITIAL_CAMERA, which happened to be that framing until the filmed serve
+    // snap moved INITIAL_CAMERA to the top of the table; a camera that has to
+    // travel 414 rows before the follow even begins is a test of the snap.
+    let camera: CameraState = { scrollY: SERVE_FRAMING_SCROLL, mode: "scrolling" };
+    let y = SERVE_FRAMING_SCROLL + ORIGINAL_CAMERA_ANCHOR_ROWS;
     for (const leg of [-14, -12, 16, 12, -8, 8]) {
       for (let tick = 0; tick < 45; tick += 1) {
         y = Math.min(PLAYFIELD_HEIGHT - 1, Math.max(0, y + leg));
@@ -343,8 +355,101 @@ describe("mapping sizes into the viewport", () => {
 });
 
 describe("initial state", () => {
-  it("starts at the bottom of the table, where the ball is served", () => {
+  // REPLACED, not weakened. This used to assert the window starts at the bottom
+  // stop, which was the port's own choice and the capture contradicts it:
+  // research/view/reference/INDEX.txt lines 41-43 and telemetry/track10.csv f54
+  // show the ATTRACT screen framing the TOP of the playfield, and the first half
+  // second of a game is the window running DOWN to the lane. Starting at the
+  // bottom stop meant that run had nowhere to run from and never happened.
+  it("starts at the top of the table, which is what the attract screen frames", () => {
     expect(INITIAL_CAMERA.mode).toBe("scrolling");
-    expect(INITIAL_CAMERA.scrollY).toBe(PLAYFIELD_HEIGHT - VIEWPORT_HEIGHT);
+    expect(INITIAL_CAMERA.scrollY).toBe(0);
+    expect(SERVE_FRAMING_SCROLL).toBe(PLAYFIELD_HEIGHT - VIEWPORT_HEIGHT);
+  });
+
+  it("runs down to the serve framing in the filmed decaying sequence", () => {
+    // The filmed serve snap, produced by NOTHING but the shipped follower law:
+    // step = trunc((target - viewTop - 70) / 5), halved again on the way down,
+    // so the error decays by a factor of 0.90 a tick.
+    //
+    // Filmed (the session sequence, screen px / 2 = game px):
+    //   51, 38, 34, 31, 28, 26, 23, 21, 20, 18, 17, 15
+    // Produced here from a stationary ball on the serve row 544 (plunger.ts:
+    // bottomY 552 - SERVE_INSET 8):
+    //   47, 42, 38, 34, 31, 28, 25, 22, 20, 18, 16, 15
+    //
+    // THE RESIDUALS, STATED, because round 5's dossier said "within 1-2 px a
+    // frame from the second frame on" and that is not what they are. Frame by
+    // frame from index 1: +4, +4, +3, +3, +2, +2, +1, 0, 0, -1, 0. So the two
+    // sequences agree to within FOUR px a frame, worst at frames 1-2, inside one
+    // px from frame 7 on, and 14 px apart in total over the twelve (336 against
+    // 322). The shape is the same decaying geometric run and the ratio is the
+    // law's own 0.90; the disagreement is entirely in how much of the drop lands
+    // in the first three frames, and the filmed frame 0 (51) straddles the
+    // attract-to-game display switch and chains into no fixed-target law at all.
+    const serveRow = 544;
+    let camera: CameraState = INITIAL_CAMERA;
+    const steps: number[] = [];
+    for (let tick = 0; tick < 14; tick += 1) {
+      const next = updateCamera(camera, [ball(0, serveRow)], OPTIONS);
+      steps.push(next.scrollY - camera.scrollY);
+      camera = next;
+    }
+    expect(steps.slice(0, 12)).toEqual([47, 42, 38, 34, 31, 28, 25, 22, 20, 18, 16, 15]);
+    // Every step is 0.85..0.96 of the one before it — the law's own 1 - 1/(2*5).
+    for (let i = 1; i < 12; i += 1) {
+      const ratio = (steps[i] ?? 0) / (steps[i - 1] ?? 1);
+      expect(ratio, `step ${i}`).toBeGreaterThan(0.85);
+      expect(ratio, `step ${i}`).toBeLessThan(0.96);
+    }
+    // And it settles on the bottom stop inside 14 ticks, 0.28 s, against the
+    // filmed 0.4-0.5 s: the port's 256-row window stops 26 rows short of the
+    // machine's 230-row one, which truncates the tail of the approach.
+    expect(camera.scrollY).toBe(SERVE_FRAMING_SCROLL);
+    // The residuals above, pinned so the claim in the comment cannot rot.
+    const filmed = [51, 38, 34, 31, 28, 26, 23, 21, 20, 18, 17, 15];
+    const worst = Math.max(
+      ...steps.slice(1, 12).map((step, i) => Math.abs(step - (filmed[i + 1] ?? 0))),
+    );
+    expect(worst, "largest per-frame residual against the film").toBe(4);
+  });
+
+  it("arms the snap once per GAME, not once per page load", () => {
+    // R6. `main.ts` caches the assembled table in `opened` and both the start
+    // button and `restart()` call `startGame` on that same `Game`, so a camera
+    // reset that only happens in `createGame` happens once in a session. Round 5
+    // deleted the reset from `startGame` — the line was there to slam the window
+    // to the bottom stop, which is what used to kill the snap — and with
+    // `INITIAL_CAMERA` now at the top of the table it is what ARMS it.
+    //
+    // Driven with IDLE input so the run is fully deterministic: the served ball
+    // sits on the rod and the follower runs to the stop and stays.
+    const game = createGame(mapFor("law-n-justice"), { ballsPerGame: 3 });
+    const trace = (): number[] => {
+      const seen: number[] = [];
+      for (let tick = 0; tick < 80; tick += 1) {
+        runTicks(game, idleInput(), 1);
+        seen.push(debugSnapshot(game).camera.scrollY);
+      }
+      return seen;
+    };
+
+    startGame(game);
+    expect(debugSnapshot(game).camera.scrollY, "first game opens at the top").toBe(0);
+    const first = trace();
+    expect(first.at(-1)).toBe(SERVE_FRAMING_SCROLL);
+
+    startGame(game);
+    expect(
+      debugSnapshot(game).camera.scrollY,
+      "second game opened on the framing the first one ended at",
+    ).toBe(0);
+    const second = trace();
+    expect(second).toEqual(first);
+    // And it really is the filmed run, from both games: the same non-zero steps
+    // this file's other case pins from `updateCamera` directly.
+    const nonZeroSteps = (rows: readonly number[]): number[] =>
+      rows.map((row, i) => row - (i === 0 ? 0 : (rows[i - 1] ?? 0))).filter((step) => step !== 0);
+    expect(nonZeroSteps(second)).toEqual([47, 42, 38, 34, 31, 28, 25, 22, 20, 18, 16, 15, 8]);
   });
 });

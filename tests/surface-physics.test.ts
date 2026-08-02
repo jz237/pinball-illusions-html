@@ -17,9 +17,11 @@ import {
   FLIPPER_ID_MIN,
   LEVEL_TO_LOWER_ID,
   LEVEL_TO_UPPER_ID,
+  RESPONDER_VELOCITY_SCALE,
   SLINGSHOT_ID_MAX,
   SLINGSHOT_ID_MIN,
   SLINGSHOT_KICK,
+  SLINGSHOT_KICK_THRESHOLD,
   SLINGSHOT_TANGENT_KICK,
   SURFACE_CONSTANT_ROWS,
   bumperIndexOf,
@@ -177,10 +179,22 @@ describe("the unit bridges", () => {
     // acceleration unit per substep is TICKS_PER_ORIGINAL_UNIT Q10 per tick, and
     // a frame is ORIGINAL_SUBSTEPS_PER_FRAME substeps.
     expect(originalVelocityToQ10(ORIGINAL_SUBSTEPS_PER_FRAME)).toBe(TICKS_PER_ORIGINAL_UNIT);
-    expect(BUMPER_KICK).toBe(originalVelocityToQ10(5500));
-    expect(SLINGSHOT_KICK).toBe(originalVelocityToQ10(3500));
-    expect(SLINGSHOT_TANGENT_KICK).toBe(originalVelocityToQ10(400));
-    expect(BUMPER_KICK_THRESHOLD).toBe(originalVelocityToQ10(50));
+    // AND THE RESPONDER'S OWN CONSTANTS ARE HALVED ON TOP OF IT. `subi.w #$157c`
+    // and `subi.w #$dac` are written inside a contact frame whose forward
+    // rotation has a gain of 2 (+0x00B50A muls x16384, +0x00B520 asl.l #3,
+    // +0x00B524 swap) and whose inverse has a gain of 1/2 (+0x00B66A muls,
+    // +0x00B680 swap, +0x00B684 rol.l #1), so each reads at twice the scale of
+    // the ball's own velocity words. Pinned as the raw operand over the scale so
+    // the disassembly stays visible in the failure message.
+    expect(RESPONDER_VELOCITY_SCALE).toBe(2);
+    expect(BUMPER_KICK).toBe(originalVelocityToQ10(5500 / RESPONDER_VELOCITY_SCALE));
+    expect(SLINGSHOT_KICK).toBe(originalVelocityToQ10(3500 / RESPONDER_VELOCITY_SCALE));
+    expect(SLINGSHOT_TANGENT_KICK).toBe(originalVelocityToQ10(400 / RESPONDER_VELOCITY_SCALE));
+    expect(BUMPER_KICK_THRESHOLD).toBe(originalVelocityToQ10(50 / RESPONDER_VELOCITY_SCALE));
+    expect(SLINGSHOT_KICK_THRESHOLD).toBe(originalVelocityToQ10(100 / RESPONDER_VELOCITY_SCALE));
+    // Spelt out once in Q10 as well, because these five numbers are what every
+    // filmed slingshot and bumper exit in the acceptance table is measured from.
+    expect([BUMPER_KICK, SLINGSHOT_KICK, SLINGSHOT_TANGENT_KICK]).toEqual([11000, 7000, 800]);
   });
 
   it("makes a pop bumper harder than a slingshot, as the two subi operands do", () => {

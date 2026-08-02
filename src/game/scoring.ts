@@ -422,13 +422,55 @@ function isScoringZone(zone: ZoneRecord): boolean {
 }
 
 /**
+ * The FIRST zone in shipped list order whose rectangle holds this ball centre —
+ * the only zone the original will DISPATCH for that ball this frame.
+ *
+ * The walk at main.seg00 body +0x52E6 runs the level's zone list from the top,
+ * tests the ball's centre (the word pair at `ball+$12/$14`, plus the 8 that
+ * turns the sprite's top-left into its centre) against each rectangle, and on
+ * the first hit jumps through the type table at +0x53A8. The rest of the list is
+ * still visited but only to RELEASE the occupancy of rectangles the ball has
+ * left. Overlapping rectangles are therefore not all triggered: the one earlier
+ * in the shipped list wins and shadows the others for as long as the ball is
+ * inside it.
+ *
+ * Every kind is searched, not only the scoring ones, because the original's list
+ * is one list — a level-change or lock rectangle earlier in the order shadows a
+ * trigger later in it.
+ *
+ * ROUND 5 CITED A CASE FOR THAT THAT DOES NOT EXIST, and round 6 removed it
+ * rather than replacing it with another. The claim was "BabeWatch's 250,000 zone
+ * 0-13 sitting directly above the to-upper box 0-4"; on the shipped data BW L0#13
+ * is a 10,000 trigger at (269,450)-(279,465) and L0#4 a to-upper at
+ * (288,379)-(298,389), which neither overlap nor stack. Scanned exhaustively,
+ * the shipped tables contain THREE same-level overlapping rectangle pairs in
+ * total, all on Extreme Sports and all of them harmless: L0 #2 (to-upper) over
+ * #3 (a trigger scoring 0), L0 #5 (to-upper) over #14 (a trigger scoring 0), and
+ * L1 #4 over #5, both to-lower. So the rule is a NO-OP on the data that ships,
+ * and it is here because it is what the walk does, not because anything on these
+ * three tables needs it.
+ */
+export function firstZoneUnder(
+  devices: TableDevices,
+  level: PlayfieldLevel,
+  x: number,
+  y: number,
+): ZoneRecord | undefined {
+  for (const zone of devices.zones) {
+    if (zoneCovers(zone, level, x, y)) return zone;
+  }
+  return undefined;
+}
+
+/**
  * Scores the trigger zones one ball is inside, and maintains the occupancy
  * debounce for every zone the ball has left.
  *
- * `ballIds` is every ball still in play, so a ball that drained releases the
+ * `balls` is every ball still in play, so a ball that drained releases the
  * zone it was sitting in. The rule is the original's `+$00 = occupying ball id`
  * with its "0 means empty": one ball at a time, scored on entry, released on
- * exit.
+ * exit — and, since round 5, ONE ZONE PER BALL PER FRAME, the first in shipped
+ * list order. See `firstZoneUnder` for the walk that says so.
  */
 export function scoreZones(
   state: ScoringState,
@@ -436,6 +478,14 @@ export function scoreZones(
   balls: readonly { readonly id: number; readonly level: PlayfieldLevel; readonly x: number; readonly y: number }[],
 ): Award[] {
   const awards: Award[] = [];
+
+  // Which single zone each ball dispatches this frame, resolved before any of
+  // them is scored so that the answer cannot depend on the order the zones are
+  // walked in below.
+  const dispatched = new Map<number, ZoneRecord | undefined>();
+  for (const ball of balls) {
+    dispatched.set(ball.id, firstZoneUnder(devices, ball.level, ball.x, ball.y));
+  }
 
   for (const zone of devices.zones) {
     if (!isScoringZone(zone)) continue;
@@ -447,6 +497,21 @@ export function scoreZones(
     // over, and it would if the test were merely "is some ball inside", because
     // which ball the scan finds first is an accident of the set's order. A ball
     // that drained is simply not in `balls`, so the rectangle frees itself.
+    //
+    // Occupancy is held and released on GEOMETRY ALONE, so a ball that moves
+    // from a shadowed zone into the shadowing one does not re-arm the shadowed
+    // zone underneath it.
+    //
+    // THAT IS NOT QUITE WHAT THE ORIGINAL DOES, and round 5's comment claimed it
+    // was. On a MISS (+0x00538E) the original releases conditionally and keeps
+    // testing; but after a DISPATCH (+0x005342..+0x005378) it walks the whole
+    // remainder of the list releasing occupancy UNCONDITIONALLY, with no
+    // rectangle test at all. So a ball inside both A (earlier) and B (later) has
+    // B released while it is still inside B, and B re-scores when it leaves A.
+    // This port holds B. The difference is unreachable on the shipped data —
+    // the only same-level overlaps anywhere are Extreme Sports' three, and every
+    // shadowed member of them scores 0 — so it is recorded rather than
+    // reproduced, and `firstZoneUnder` above says why the overlaps are so rare.
     if (occupant !== undefined) {
       const held = balls.some(
         (ball) => ball.id === occupant && zoneCovers(zone, ball.level, ball.x, ball.y),
@@ -455,7 +520,7 @@ export function scoreZones(
       state.occupants.delete(key);
     }
 
-    const entrant = balls.find((ball) => zoneCovers(zone, ball.level, ball.x, ball.y));
+    const entrant = balls.find((ball) => dispatched.get(ball.id) === zone);
     if (entrant === undefined) continue;
 
     state.occupants.set(key, entrant.id);

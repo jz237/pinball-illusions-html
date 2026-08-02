@@ -142,10 +142,45 @@ export const DEFAULT_CAMERA_OPTIONS: CameraOptions = {
   anchorRows: ORIGINAL_CAMERA_ANCHOR_ROWS,
 };
 
+/**
+ * THE CAMERA A FRESH GAME HOLDS: the TOP of the table, which is what the attract
+ * screen frames.
+ *
+ * FILMED, and the film is why this is no longer the bottom stop. In
+ * `research/view/reference` (INDEX.txt lines 41-43, telemetry/track10.csv) the
+ * attract display frames the top of the playfield — track10 f54 tracks a blob at
+ * game row 121 — and the first half-second of a game is the WINDOW RUNNING DOWN
+ * to the lane in a decaying sequence, 102, 76, 68, 62, 56, 52, 46, 42, 40, 36,
+ * 34, 30 screen px per frame (screen px / 2 = game px), settling 0.4-0.5 s after
+ * start. This port opened at the bottom stop AND reset to it again at
+ * `startGame`, so the window was already where it would end and the snap did not
+ * exist at all.
+ *
+ * Nothing else was needed to produce it. The decay is the SHIPPED FOLLOWER LAW
+ * of `updateCamera` below: its downward branch halves the step (`asr #1`) on top
+ * of the option record's divisor of 5, so the error decays by a factor of
+ * 1 - 1/(2*5) = 0.90 per tick, which is the filmed ratio. Fitted against the
+ * filmed run's frames 1..11 the residual is 8 px in total, under a pixel a
+ * frame; track10's own tail (42, 40, 36, 34, 30, 26, 24, 16 screen px) fits
+ * inside 5 px over 8 frames. Divisor 6 fits that single run marginally better (3
+ * px) and the measured ratio of 0.911 sits between the two, but the option
+ * record's default is 5 and the capture ran on defaults, so 5 is what is used.
+ * Frame 0's 102 px does not chain into frame 1 under any fixed target and is the
+ * attract-to-game display switch, which track10 shows as tracker garbage
+ * (f55-60).
+ */
 export const INITIAL_CAMERA: CameraState = {
-  scrollY: PLAYFIELD_HEIGHT - VIEWPORT_HEIGHT,
+  scrollY: 0,
   mode: "scrolling",
 };
+
+/**
+ * The bottom stop, where a served ball's follow converges. Recorded because it
+ * is what the serve snap runs TO, and because the port's 256-row window puts it
+ * at 344 against the machine's 370 — the documented window difference, which
+ * truncates the last ~26 rows of the filmed approach.
+ */
+export const SERVE_FRAMING_SCROLL = PLAYFIELD_HEIGHT - VIEWPORT_HEIGHT;
 
 /** Clamps the window so it never shows anything off the playfield. */
 export function clampScroll(scrollY: number): number {
