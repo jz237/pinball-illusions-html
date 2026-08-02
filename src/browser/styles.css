@@ -81,39 +81,3 @@ body {
   display: none;
 }
 
-.controls {
-  margin: 0;
-  padding: 0;
-  list-style: none;
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: center;
-  gap: 6px 18px;
-  max-width: 640px;
-  color: var(--ink-dim);
-}
-
-.controls li {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  white-space: nowrap;
-}
-
-kbd {
-  font: inherit;
-  background: var(--key);
-  border: 1px solid var(--edge);
-  border-bottom-width: 2px;
-  border-radius: 3px;
-  padding: 1px 6px;
-  color: var(--ink);
-}
-
-/* Short windows: the control list is reference material, not gameplay, so it is
-   what gives way when there is no room for both. */
-@media (max-height: 560px) {
-  .controls {
-    display: none;
-  }
-}

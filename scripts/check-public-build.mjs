@@ -116,6 +116,14 @@ const DERIVED_MARKERS = [
   { class: "disk-derived-scoring-devices", noun: "device and award table" },
   { class: "disk-derived-mode-scripts", noun: "mission and mode bytecode" },
   { class: "disk-derived-lamp-overlays", noun: "lamp overlay" },
+  // The two moving sprites. Both ship their pixels INSIDE the JSON — three
+  // packed bitplanes a pose for the bats, 289 palette-index bytes for the ball —
+  // so neither needs a MEDIA_MARKERS entry: there is no raster file beside them
+  // for the "media file with no manifest" rule to catch. If either ever ships a
+  // PNG atlas instead, it needs a MEDIA_MARKERS entry on the same class plus a
+  // claim() branch naming the file and its sha256.
+  { class: "disk-derived-flipper-sprites", noun: "flipper bat sprite" },
+  { class: "disk-derived-ball-sprite", noun: "ball sprite" },
   { class: "disk-derived-panel-animations", noun: "score panel animation" },
   { class: "disk-derived-audio", noun: "sound effect" },
   { class: "disk-derived-shell-artwork", noun: "shell artwork" },

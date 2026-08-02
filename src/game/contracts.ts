@@ -223,6 +223,57 @@ export interface TableAudioDocument {
   readonly triggers: readonly Readonly<Record<string, unknown>>[];
 }
 
+/**
+ * On-disk shape of `public/generated/flipper-bats.json`: the 3-bitplane pose
+ * bank every bat on every table is drawn from, plus each table's decoded
+ * flipper records. ONE shared document — the raster is table-independent, which
+ * is a decoded fact the exporter asserts. See `flipper-bats.ts` for what it
+ * means, `moving-sprites.ts` for what draws it, and
+ * `scripts/export-flipper-bats.mjs` for where it comes from.
+ */
+export interface FlipperBatsDocument {
+  readonly schema: "pinball-illusions/flipper-bats/v1";
+  readonly provenance: {
+    readonly sourceClass: string;
+    readonly description: string;
+    readonly authorizationRequired: boolean;
+  };
+  readonly source: Readonly<Record<string, unknown>>;
+  readonly posesPerTurn: number;
+  readonly degreesPerPose: number;
+  readonly angleUnitsPerPose: number;
+  readonly planes: number;
+  readonly plane2RowOffset: number;
+  readonly poses: readonly Readonly<Record<string, unknown>>[];
+  readonly tables: readonly Readonly<Record<string, unknown>>[];
+}
+
+/**
+ * On-disk shape of `public/generated/tables/<id>.ball.json`: the 17x17
+ * 8-bitplane steel ball sprite as palette indices into the table's own artwork
+ * palette, the shared 221-pixel disc mask, and the two per-level structure
+ * bitmaps the original cookie-cuts it against. See `table-ball.ts` for what it
+ * means and `scripts/export-table-ball.mjs` for where it comes from.
+ */
+export interface TableBallDocument {
+  readonly schema: "pinball-illusions/table-ball/v1";
+  readonly tableId: TableId;
+  readonly displayName: string;
+  readonly provenance: {
+    readonly sourceClass: string;
+    readonly description: string;
+    readonly authorizationRequired: boolean;
+  };
+  readonly width: number;
+  readonly height: number;
+  readonly anchor: { readonly centreX: number; readonly centreY: number };
+  readonly source: Readonly<Record<string, unknown>>;
+  readonly mask: Readonly<Record<string, unknown>>;
+  readonly pixels: string;
+  readonly indicesUsed: readonly number[];
+  readonly occluders: Readonly<Record<string, unknown>>;
+}
+
 /** One ball in flight. Positions are Q10; velocities are signed 16-bit. */
 export interface BallState {
   readonly id: number;

@@ -50,6 +50,8 @@ import { loadTableAcceleration } from "./game/table-accel.js";
 import { loadTableDevices } from "./game/table-devices.js";
 import { loadTableModes } from "./game/table-modes.js";
 import { loadTableLamps } from "./game/table-lamps.js";
+import { loadTableBall } from "./game/table-ball.js";
+import { loadFlipperBats } from "./game/flipper-bats.js";
 import { loadTablePanel, tablePanelFor } from "./game/table-panel.js";
 import { PanelDisplay } from "./browser/panel-display.js";
 import { loadTableAudio } from "./game/table-audio.js";
@@ -390,32 +392,40 @@ async function boot(): Promise<void> {
   // -------------------------------------------------------------------------
 
   /**
-   * Five files, and all five are required. The map is the collision geometry the
-   * physics reads; the artwork is the picture the player sees; the ramp drive is
-   * the per-block acceleration that carries the ball along surfaces too shallow
-   * for gravity to move it against friction, without which a ball reaching an
-   * arch stops there for the rest of the game; the scoring layer is the
-   * SURFACE-ID MAP plus the device, bumper, slingshot and zone records — which
-   * is not only what makes the score move, but what the contact model reads its
-   * restitution out of, what makes a pop bumper kick, and what hands a ball from
-   * a habitrail back to the playfield; and the mission layer is the bytecode
-   * that starts a mode, counts it down and ends it.
+   * Eight files, and seven of them are required. The map is the collision
+   * geometry the physics reads; the artwork is the picture the player sees; the
+   * ramp drive is the per-block acceleration that carries the ball along
+   * surfaces too shallow for gravity to move it against friction, without which
+   * a ball reaching an arch stops there for the rest of the game; the scoring
+   * layer is the SURFACE-ID MAP plus the device, bumper, slingshot and zone
+   * records — which is not only what makes the score move, but what the contact
+   * model reads its restitution out of, what makes a pop bumper kick, and what
+   * hands a ball from a habitrail back to the playfield; the mission layer is
+   * the bytecode that starts a mode, counts it down and ends it; and the bat
+   * pose bank and the ball sprite are the two things on the table that move,
+   * which are drawn from the disk's own pixels or not at all.
    *
    * Fetched together because none depends on the others, and all awaited before
    * a game is assembled — the renderer refuses to draw a table whose artwork is
    * missing, and `createGame` refuses to assemble one whose drive is missing,
-   * rather than either of them inventing a substitute.
+   * rather than either of them inventing a substitute. The sprites are required
+   * for the same reason: without them the renderer draws magenta markers, which
+   * is deliberately unmistakable rather than quietly plausible.
    */
   const assemble = async (tableId: TableId): Promise<LoadedTable> => {
     const [map, artwork] = await Promise.all([
       loadTableMap(tableId),
       loadTableArt(tableId),
-      // These four register themselves; `createGame` reads them back out of
-      // their registries.
+      // These six register themselves; `createGame` and the renderer read them
+      // back out of their registries.
       loadTableAcceleration(tableId),
       loadTableDevices(tableId),
       loadTableModes(tableId),
       loadTableLamps(tableId),
+      loadTableBall(tableId),
+      // One shared document for all three tables: the raster is
+      // table-independent and only the palette differs.
+      loadFlipperBats(),
       // The panel heap registers itself too, but tolerantly: it is
       // presentation only, so a table whose panel document will not fetch
       // still plays an identical ball and shows the score as text.

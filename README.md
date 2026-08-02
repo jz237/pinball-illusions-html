@@ -90,6 +90,43 @@ And the **playfield lamps** are decoded and shipped in
   every tick, once never touching them — and asserts identical state, so lamp
   state cannot feed back into the physics.
 
+And the **two things that move** — the flipper bats and the ball — are decoded
+and shipped in `public/generated/flipper-bats.json` and
+`public/generated/tables/*.ball.json`:
+
+- `pkg/flipdat1.bin` is a **three-bitplane** pose bank, not the two planes plus a
+  fill mask this project believed for five rounds. The third run in each unit is
+  bitplane 2, and it is what turns a red-outlined blob into the slim grey-bodied
+  blade the original draws: `plane0 | plane1<<1 | plane2<<2` into entries 0..7 of
+  the table's own artwork palette, with plane 2 inset two rows top and bottom. One
+  136,288-byte file serves all three tables; only the palette differs.
+- 120 poses to a turn at 3 degrees, 109 stored (the eleven with the tip pointing
+  up are absent because no bat reaches them), and **64 shipped** — the union of
+  the four arcs, derived by walking each table's flipper records rather than
+  listed. The blit anchor is not in the file; it is `A = (8, 8)` on whichever end
+  the boss cap is, `W-7` / `H-7` on the other, a rule that reproduces all 34
+  anchors measured pixel-exact off filmed WinUAE frames.
+- The **ball is a per-table 17x17 sprite**, the last 544 bytes of slot 6, eight
+  line-interleaved bitplanes, shipped as 289 palette indices. Not 16: the disc is
+  odd-sized with a true centre pixel, which is exactly the reconstruction's
+  `BALL_RADIUS_PIXELS = 8`. Its footprint is main.bin's shared 221-pixel disc, and
+  the original draws it LAST and cookie-cuts it against the level's structure
+  layer — map bit 2 or bit 3 — which is how ramps pass in front of it.
+- `scripts/export-flipper-bats.mjs` and `scripts/export-table-ball.mjs` are the
+  generators of record, same `<segment-dir>` and `--check` interface, with eleven
+  and eight fatal self-checks. `src/game/moving-sprites.ts` decides the pixels
+  (pure, node-testable); `src/browser/sprite-layer.ts` blits them through the same
+  `playfieldBlitGeometry` the artwork and the lamps use, so every sprite pixel is
+  a uniform SxS block at integer scale S — measured, zero non-uniform blocks over
+  the 327x228 comparison window, where the procedural bats and ball scored 599 /
+  559 / 621. When a sprite document is absent the renderer draws a **magenta
+  outline**, not a plausible substitute.
+- Two numbers the picture and the simulation still disagree on, both stated in
+  `src/game/flipper-bats.ts`: the records put every lower pivot on **row 556**
+  where the simulation collides on the inferred 558, and they rest at **pose 10 /
+  pose 50 — exactly 30 degrees** where the simulation rests at 26.7. The drawn bat
+  uses the record; closing the gap moves the ball and belongs in its own round.
+
 And the **sound effects** are decoded and shipped in
 `public/generated/tables/*.audio.json` plus one WAV per sample:
 
@@ -115,8 +152,9 @@ A Q10 fixed-point N-ball simulation, a 50 Hz fixed-step scheduler, ring-based
 collision against the decoded map on BOTH of its collision levels, three
 flippers, a plunger, nudge and tilt, a scrolling camera that reframes to the
 whole table during multiball, a Canvas2D renderer that blits the decoded 336x600
-playfield artwork at integer scale with smoothing off, and a game loop — strict
-`tsc` clean and `npm run build` green.
+playfield artwork, its lamp overlays, its flipper bats and its ball at integer
+scale with smoothing off — every pixel on screen a decoded pixel — and a game
+loop — strict `tsc` clean and `npm run build` green.
 
 A ball serves in the shooter lane, a full plunge carries it up the lane and round
 the top arch onto the playfield, the flippers send it back up the table, it
@@ -321,6 +359,15 @@ this project draws is between **functional geometry** and **creative content**:
   decoded into `public/generated/tables/*.lamps.json` under the
   `disk-derived-lamp-overlays` marker. Functional presentation data: no audio,
   no executable code.
+- **The flipper bats and the ball are disk-derived, and gated the same way.** The
+  bat pose bank goes into `public/generated/flipper-bats.json` under the
+  `disk-derived-flipper-sprites` marker and each table's ball into
+  `public/generated/tables/*.ball.json` under `disk-derived-ball-sprite`, both
+  carrying the sha256 of the source bytes. Still images only: no audio, no
+  executable code, and no palette — both draw through the artwork palette that
+  already ships. The pixels live INSIDE the JSON, so there is no extra raster file
+  beside them, and `npm run guard:public` refuses a build containing either
+  unless the authorization variable is set.
 - **THE SOUND EFFECTS ARE DISK-DERIVED. This changed, and the change matters.**
   This section used to say audio was "newly created — synthesised or
   independently recreated rather than sampled", and while the missions were being

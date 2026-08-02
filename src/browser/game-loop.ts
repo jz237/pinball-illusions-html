@@ -114,21 +114,10 @@ import {
   DEFAULT_CAMERA_OPTIONS,
   INITIAL_CAMERA,
   VIEWPORT_HEIGHT,
-  toViewport,
   updateCamera,
-  viewScale,
 } from "./camera.js";
 import { drawPlayfield } from "./playfield-renderer.js";
-import {
-  BALL_FILL,
-  BALL_HIGHLIGHT,
-  BALL_SHADE,
-  FLIPPER_EDGE,
-  FLIPPER_FILL,
-  HUD_ALERT,
-  HUD_TEXT,
-  SURROUND,
-} from "./palette.js";
+import { HUD_ALERT, HUD_TEXT, SURROUND } from "./palette.js";
 import type {
   BallState,
   MaterialTable,
@@ -171,11 +160,9 @@ import { BALL_RADIUS_PIXELS, DEFAULT_PROBE_RADIUS } from "../game/collision-prob
 import { SLINGSHOT_KICK } from "../game/surface-physics.js";
 import type { FlipperBank } from "../game/flippers.js";
 import {
-  FLIPPER_BOSS_RADIUS_PIXELS,
   UPPER_FLIPPER_RECORDS,
   applyFlipperReactions,
   createFlipperBank,
-  flipperEndpoints,
   flipperInputFrom,
   resolveFlipperContacts,
   tickFlipperBank,
@@ -204,6 +191,10 @@ import { tableModesFor } from "../game/table-modes.js";
 import type { TableLamps } from "../game/table-lamps.js";
 import { tableLampsFor } from "../game/table-lamps.js";
 import { drawLampOverlays } from "./lamp-layer.js";
+import { flipperBats } from "../game/flipper-bats.js";
+import { tableBallFor } from "../game/table-ball.js";
+import { drawMovingSprites } from "./sprite-layer.js";
+import type { BallFrameState, BatFrameState } from "../game/moving-sprites.js";
 import type { ModeState, ModeTickReport } from "../game/mode-vm.js";
 import {
   EMPTY_MODE_TICK,
@@ -2204,73 +2195,45 @@ export function canvasSizeFor(scale: number): { readonly width: number; readonly
   return { width: PLAYFIELD_WIDTH * scale, height: VIEWPORT_HEIGHT * scale };
 }
 
-function screenPoint(
-  game: Game,
-  scale: number,
-  x: Q10,
-  y: Q10,
-): { readonly x: number; readonly y: number } {
-  const view = toViewport(game.camera, q10ToPixel(x), q10ToPixel(y));
-  return { x: view.x * scale, y: view.y * scale };
-}
-
-function drawBall(
-  context: CanvasRenderingContext2D,
-  game: Game,
-  scale: number,
-  ball: BallState,
-): void {
-  const centre = screenPoint(game, scale, ball.x, ball.y);
-  const radius = BALL_RADIUS_PIXELS * viewScale(game.camera.mode) * scale;
-
-  context.beginPath();
-  context.arc(centre.x, centre.y, radius, 0, Math.PI * 2);
-  context.fillStyle = BALL_SHADE;
-  context.fill();
-
-  context.beginPath();
-  context.arc(centre.x - radius * 0.15, centre.y - radius * 0.15, radius * 0.8, 0, Math.PI * 2);
-  context.fillStyle = BALL_FILL;
-  context.fill();
-
-  context.beginPath();
-  context.arc(centre.x - radius * 0.35, centre.y - radius * 0.4, radius * 0.28, 0, Math.PI * 2);
-  context.fillStyle = BALL_HIGHLIGHT;
-  context.fill();
-}
-
 /**
- * Draws the bats as tapered capsules.
+ * The bats, as the sprite layer needs to see them.
  *
- * Two strokes rather than a polygon: the flipper silhouette measured off
- * `flipdat1.bin` is a rounded bar 10 px across at the boss narrowing toward the
- * tip, and a round-capped line of that width is the same shape to within the
- * pixel the silhouette was measured at.
+ * The STROKE is the whole of the state a drawn bat depends on: the pose is
+ * `restPose + ((direction * stroke) >> 6)` off the bat's own disk record, which
+ * is the original's `asr.w #$6` at main.seg00 +0xBDB8. The pivot travels only so
+ * a bat with no record can still put a fallback marker somewhere sensible — a
+ * drawn bat is placed on its RECORD's pivot, not this one. See the note in
+ * `flipper-bats.ts` about the two pixels and the 3.3 degrees the picture and the
+ * simulation disagree by.
  */
-function drawFlippers(context: CanvasRenderingContext2D, game: Game, scale: number): void {
-  const zoom = viewScale(game.camera.mode) * scale;
+function batFrameStates(game: Game): BatFrameState[] {
+  const states: BatFrameState[] = [];
   for (const config of game.flippers.configs) {
     const state = game.flippers.states.get(config.id);
     if (state === undefined) continue;
-    const ends = flipperEndpoints(config, state);
-    const pivot = screenPoint(game, scale, ends.pivotX, ends.pivotY);
-    const tip = screenPoint(game, scale, ends.tipX, ends.tipY);
-
-    context.lineCap = "round";
-    context.beginPath();
-    context.moveTo(pivot.x, pivot.y);
-    context.lineTo(tip.x, tip.y);
-    context.lineWidth = 2 * FLIPPER_BOSS_RADIUS_PIXELS * zoom;
-    context.strokeStyle = FLIPPER_EDGE;
-    context.stroke();
-
-    context.beginPath();
-    context.moveTo(pivot.x, pivot.y);
-    context.lineTo(tip.x, tip.y);
-    context.lineWidth = Math.max(1, (2 * FLIPPER_BOSS_RADIUS_PIXELS - 2) * zoom);
-    context.strokeStyle = FLIPPER_FILL;
-    context.stroke();
+    states.push({
+      id: config.id,
+      stroke: state.stroke,
+      sweep: config.sweep,
+      pivotX: config.pivotX,
+      pivotY: config.pivotY,
+    });
   }
+  return states;
+}
+
+/**
+ * Every ball on the table, INCLUDING the ones sitting in saucers: a locked ball
+ * is still a steel ball the player can see, and drawing only the ones in play
+ * would make a lock look like a drain.
+ */
+function ballFrameStates(game: Game): BallFrameState[] {
+  return activeBalls(game.balls).map((ball) => ({
+    id: ball.id,
+    x: ball.x,
+    y: ball.y,
+    level: ball.level,
+  }));
 }
 
 /**
@@ -2366,13 +2329,21 @@ export function renderGame(
   if (game.lamps !== null) {
     drawLampOverlays(context, game.map, game.camera, scale, game.lamps, game.modeState, game.tick);
   }
-  drawFlippers(context, game, scale);
-  // Every ball on the table, INCLUDING the ones sitting in saucers: a locked
-  // ball is still a steel ball the player can see, and drawing only the ones in
-  // play would make a lock look like a drain.
-  for (const ball of activeBalls(game.balls)) {
-    drawBall(context, game, scale, ball);
-  }
+  // The bats and the balls, as decoded SPRITES on the playfield's own pixel
+  // grid — one overlay, bats first and balls over them, which is the original's
+  // own order at main.seg00 $4B20. Both used to be canvas vector calls at device
+  // resolution: wrong shape, wrong colours, and off the 2x2 grid every other
+  // pixel on screen sits on. See `src/game/moving-sprites.ts`.
+  drawMovingSprites(
+    context,
+    game.map,
+    game.camera,
+    scale,
+    flipperBats(),
+    tableBallFor(game.map.tableId),
+    batFrameStates(game),
+    ballFrameStates(game),
+  );
 
   // The score panel strip, above the playfield view. Drawn after the balls so
   // it sits over them the way the original's panel plane does — a ball rolling

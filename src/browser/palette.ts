@@ -15,11 +15,18 @@
  * What remains is the handful of things the disk does not supply and the
  * renderer therefore has to invent:
  *
- *   - the ball and the flippers, which are sprites in the original and are not
- *     in the playfield bitmap at all (the flippers are not even in the collision
- *     map — see the shooter-lane note in `game-loop.ts`);
  *   - the HUD, which is instrumentation, not artwork;
  *   - the cabinet surround, i.e. the canvas outside the scaled playfield.
+ *
+ * THE BALL AND THE FLIPPERS USED TO BE HERE and are not any more. Both were
+ * invented colours for procedural canvas drawings — three concentric circles
+ * and two round-capped strokes — and both are now decoded sprites drawn through
+ * the TABLE'S OWN palette: the bats out of `pkg/flipdat1.bin` into artwork
+ * palette entries 0..7, the ball out of the tail of slot 6. Choosing a colour
+ * for either of them here would mean overruling the original, which is the exact
+ * mistake this file exists to stop. See `src/game/moving-sprites.ts`. The one
+ * colour that survives the move is the FALLBACK MARKER, and it lives there
+ * because it is a diagnostic rather than a palette entry.
  *
  * Sprite and HUD colours are hex strings because that is what a canvas
  * `fillStyle` and `strokeStyle` take; `CABINET_BLACK` is an `Rgb` triple because
@@ -53,32 +60,6 @@ export const CABINET_BLACK: Rgb = [5, 7, 12];
 
 /** The same colour as a canvas fill style. */
 export const SURROUND = toHex(CABINET_BLACK);
-
-// ---------------------------------------------------------------------------
-// The ball
-// ---------------------------------------------------------------------------
-
-/**
- * A steel ball is a mirror: it reads as a bright body, a shaded lower rim and a
- * single hard specular dot. Three flat tones, drawn as three offset circles —
- * which is how the original's ball sprite is shaded too, at this size there is
- * no room for anything subtler.
- */
-export const BALL_FILL = "#e8eef6";
-export const BALL_SHADE = "#7d8797";
-export const BALL_HIGHLIGHT = "#ffffff";
-
-// ---------------------------------------------------------------------------
-// The flippers
-// ---------------------------------------------------------------------------
-
-/**
- * Red bats with a yellow edge, the way the AGA release draws them. Warm enough
- * to stay legible over any of the three playfields, which are variously blue
- * (Law 'n Justice), sandy (BabeWatch) and grey-green (Extreme Sports).
- */
-export const FLIPPER_FILL = "#d8452f";
-export const FLIPPER_EDGE = "#f7c948";
 
 // ---------------------------------------------------------------------------
 // The HUD

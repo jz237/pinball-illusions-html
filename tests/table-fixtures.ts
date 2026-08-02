@@ -30,8 +30,14 @@ import { parseTableModesDocument, registerTableModes } from "../src/game/table-m
 import type { TableModes } from "../src/game/table-modes.js";
 import { parseTableLampsDocument, registerTableLamps } from "../src/game/table-lamps.js";
 import type { TableLamps } from "../src/game/table-lamps.js";
+import { parseTableBallDocument } from "../src/game/table-ball.js";
+import type { TableBall } from "../src/game/table-ball.js";
+import { parseFlipperBatsDocument } from "../src/game/flipper-bats.js";
+import type { FlipperBats } from "../src/game/flipper-bats.js";
 import type {
+  FlipperBatsDocument,
   TableAccelDocument,
+  TableBallDocument,
   TableDevicesDocument,
   TableId,
   TableLampsDocument,
@@ -40,7 +46,10 @@ import type {
   TableModesDocument,
 } from "../src/game/contracts.js";
 
-function documentUrl(tableId: TableId, kind: "map" | "accel" | "devices" | "modes" | "lamps"): URL {
+function documentUrl(
+  tableId: TableId,
+  kind: "map" | "accel" | "devices" | "modes" | "lamps" | "ball",
+): URL {
   return new URL(`../public/generated/tables/${tableId}.${kind}.json`, import.meta.url);
 }
 
@@ -70,6 +79,21 @@ export function modesFor(tableId: TableId): TableModes {
 export function lampsFor(tableId: TableId): TableLamps {
   const doc = JSON.parse(readFileSync(documentUrl(tableId, "lamps"), "utf8")) as TableLampsDocument;
   return parseTableLampsDocument(doc);
+}
+
+/** The shipped ball sprite for one table, parsed. */
+export function ballFor(tableId: TableId): TableBall {
+  const doc = JSON.parse(readFileSync(documentUrl(tableId, "ball"), "utf8")) as TableBallDocument;
+  return parseTableBallDocument(doc);
+}
+
+/**
+ * The shipped flipper bat pose bank, parsed. ONE document for all three tables:
+ * the raster is table-independent and only the palette differs.
+ */
+export function flipperBatsFixture(): FlipperBats {
+  const url = new URL("../public/generated/flipper-bats.json", import.meta.url);
+  return parseFlipperBatsDocument(JSON.parse(readFileSync(url, "utf8")) as FlipperBatsDocument);
 }
 
 /**
