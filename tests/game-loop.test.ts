@@ -128,7 +128,11 @@ describe("the ball lifecycle", () => {
     expect(ball?.velocityY).toBe(0);
   });
 
-  it("launches the served ball up the lane when the plunger is released", () => {
+  it("launches the served ball up the lane on the press edge, once per hold", () => {
+    // A1: the original's RETURN byte is edge-consumed — the kick fires the
+    // frame the press is seen, and however long the key stays down there is no
+    // second launch. This test used to pin release-fires, which was the
+    // invented spring's behaviour.
     const game = startedGame();
     const input = new ScriptedInput((tick, router) => {
       if (tick === 4) router.press("plunger");
@@ -136,20 +140,35 @@ describe("the ball lifecycle", () => {
     });
 
     const reports = runTicks(game, input, 40);
-    const launch = reports.find((report) => report.launched);
+    const launches = reports.filter((report) => report.launched);
 
-    expect(launch, "the plunger never fired").toBeDefined();
-    expect(launch?.tick).toBe(37);
+    expect(launches, "the launcher never fired").toHaveLength(1);
+    expect(launches[0]?.tick).toBe(5);
     // The ball is off the rod, so nothing pins it any more.
     expect(game.laneBallId).toBeNull();
 
     const ball = game.balls.balls[0];
     expect(ball?.active).toBe(true);
-    expect(ball?.velocityY, "the launch must be upward, i.e. negative y").toBeLessThan(0);
     expect(q10ToPixel(ball?.y ?? 0)).toBeLessThan(q10ToPixel(SERVE.y));
   });
 
-  it("does not fire on a release with nothing served", () => {
+  it("launches on ENTER too: a start press during play is the launch edge", () => {
+    // The original's RETURN both starts from the shell and launches in play;
+    // the loop aliases a `start` press to the launch while a game is running.
+    const game = startedGame();
+    const input = new ScriptedInput((tick, router) => {
+      if (tick === 4) router.tap("start");
+    });
+
+    const reports = runTicks(game, input, 10);
+    expect(reports.some((report) => report.launched)).toBe(true);
+    expect(game.laneBallId).toBeNull();
+    // And it did not restart the game: the same ball count is in progress.
+    expect(game.phase).toBe("in-play");
+    expect(game.ballsServed).toBe(1);
+  });
+
+  it("does not fire on a press with nothing served", () => {
     const game = startedGame({ firstServeDelayTicks: 40 });
     const input = new ScriptedInput((tick, router) => {
       if (tick === 2) router.press("plunger");
@@ -159,6 +178,12 @@ describe("the ball lifecycle", () => {
     const reports = runTicks(game, input, 20);
     expect(reports.some((report) => report.launched)).toBe(false);
     expect(game.balls.balls).toHaveLength(0);
+
+    // And the edge was CONSUMED, not banked: when the serve finally lands, the
+    // stale press from before it must not fire the ball on its own.
+    const later = runTicks(game, input, 40);
+    expect(later.some((report) => report.served)).toBe(true);
+    expect(later.some((report) => report.launched)).toBe(false);
   });
 
   it("replaces a drained ball with the next one", () => {
@@ -226,15 +251,22 @@ describe("nudge and tilt", () => {
   });
 
   it("kills the flippers once the table tilts", () => {
-    // THREE shoves inside half a second, which is the measured rule: option
-    // record 3 adds 100 to a warning counter that trips at 200 and drains four a
-    // tick. This used to be five shoves eleven ticks apart, against a chosen
-    // allowance of five and a chosen ten-tick cooldown; the machine is roughly
-    // twice as touchy than the port used to be, and `src/game/tilt.ts` has the
-    // disassembly for why. Three ticks apart clears the measured two-tick
-    // recentring window, so every one of them is accepted.
-    const nudgeTicks = new Set([5, 8, 11]);
+    // FIVE shoves at the filmed cadence, with a ball rolling: the calibrated
+    // trip (see tilt.ts — the decoded add-100/trip-200 model predicted press 3
+    // and the running machine trips at press 5 at both filmed cadences). The
+    // ball is freed from the rod by hand because the counter only warms while
+    // a ball is IN PLAY — also filmed: shoves with the ball waiting on the
+    // plunger never tilt.
+    const nudgeTicks = new Set([5, 8, 11, 14, 17]);
     const game = startedGame();
+    runTicks(game, new ScriptedInput(), 3);
+    game.laneBallId = null;
+    const free = game.balls.balls[0];
+    expect(free).toBeDefined();
+    if (free !== undefined) {
+      free.x = pixelsToQ10(150);
+      free.y = pixelsToQ10(120);
+    }
     const input = new ScriptedInput((tick, router) => {
       if (nudgeTicks.has(tick)) router.tap("nudgeLeft");
       if (tick === 55) router.press("leftFlipper");

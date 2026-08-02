@@ -80,7 +80,7 @@ import type { FlipperConfig } from "../src/game/flippers.js";
 import { BALL_RADIUS_PIXELS } from "../src/game/collision-probe.js";
 import { q10Multiply } from "../src/core/fixed-point.js";
 import { BUMPER_KICK, SLINGSHOT_KICK } from "../src/game/surface-physics.js";
-import { MAX_LAUNCH_SPEED } from "../src/game/plunger.js";
+import { LAUNCH_KICK } from "../src/game/plunger.js";
 import {
   createGame,
   debugSnapshot,
@@ -346,19 +346,19 @@ function plungeFlight(tableId: TableId): { ticks: number; topY: number } {
   return { ticks: topTick - launchTick, topY };
 }
 
-describe("how fast a plunged ball climbs", () => {
+describe("how fast a launched ball climbs", () => {
   for (const tableId of TABLE_IDS) {
-    it(`${tableId} carries a full plunge to the top of the table in under a second and a half`, () => {
-      // A full plunge is 14 px a tick, and the climb from the serve row at 544 to
-      // the top arch is about 510 px, so the ballistic answer is v/g = 112 ticks
-      // to the apex if nothing were in the way and rather less once the lane's
-      // own ramp drive and the arch's rails are. Measured: 49 / 39 / 44 ticks to
-      // the highest point on the three tables.
+    it(`${tableId} carries the launch to the top of the table in under a second and a half`, () => {
+      // The launch is the original's fixed kick: 6000 velocity units cut to
+      // the ±4095 clamp = 16 px a tick, and the climb from the serve row at
+      // 544 to the top arch is about 510 px, so the ballistic answer is v/g =
+      // 128 ticks to the apex if nothing were in the way and rather less once
+      // the lane's own ramp drive and the arch's rails are.
       //
       // The bound that matters is the UPPER one — a shot that takes three
-      // seconds to get up the table is the defect this file is about — and there
-      // is a lower bound too, because a plunge that arrives instantly would mean
-      // the launch speed had been raised to hide something.
+      // seconds to get up the table is the defect this file is about — and
+      // there is a lower bound too, because a launch that arrives instantly
+      // would mean the speed had been raised to hide something.
       const { ticks, topY } = plungeFlight(tableId);
       expect(ticks).toBeGreaterThan(15);
       expect(ticks).toBeLessThan(75);
@@ -367,13 +367,17 @@ describe("how fast a plunged ball climbs", () => {
     });
   }
 
-  it("keeps the full plunge inside the machine's own velocity clamp", () => {
-    // 14 px a tick is 3,584 of the original's velocity units — harder than a
-    // slingshot coil and softer than a pop bumper, which is the right ordering
-    // for a plunger and is one the old constant had backwards.
-    expect(MAX_LAUNCH_SPEED).toBeLessThan(VELOCITY_CLAMP_Q10);
-    expect(MAX_LAUNCH_SPEED).toBeGreaterThan(SLINGSHOT_KICK);
-    expect(MAX_LAUNCH_SPEED).toBeLessThan(BUMPER_KICK);
+  it("orders the machine's three kicks the way the disassembly does", () => {
+    // Launch 6000 > bumper 5500 > slingshot 3500, all in the original's own
+    // velocity units — and only the launch is past the ±4095 clamp, so it is
+    // the one kick the limiter actually cuts (to exactly 16 px a tick, the
+    // 800 px/s the film shows as a flat 770-775 px/s ascent after gravity and
+    // the lane drive trim it).
+    expect(LAUNCH_KICK).toBeGreaterThan(BUMPER_KICK);
+    expect(BUMPER_KICK).toBeGreaterThan(SLINGSHOT_KICK);
+    expect(LAUNCH_KICK).toBeGreaterThan(VELOCITY_CLAMP_Q10);
+    expect(BUMPER_KICK).toBeGreaterThan(VELOCITY_CLAMP_Q10);
+    expect(SLINGSHOT_KICK).toBeLessThan(VELOCITY_CLAMP_Q10);
   });
 });
 

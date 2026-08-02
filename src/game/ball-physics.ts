@@ -400,6 +400,17 @@ export interface SimulationOptions {
    */
   readonly rampDrive: TableAcceleration | null;
   /**
+   * False while the table is TILTED: the coils are dead.
+   *
+   * The original gates the bumper latch (+0x00B216) and the slingshot latch
+   * (+0x00B234) on the tilt flag, so a tilted table's powered faces impart no
+   * kick and no tangential throw — but they keep their own restitution,
+   * because the surface-row load runs before either gate. This flag reproduces
+   * exactly that: with it false, `surfaceResponseFor(id, false)` answers the
+   * disarmed row and nothing else about the contact changes.
+   */
+  readonly poweredKicksLive: boolean;
+  /**
    * The table's SURFACE-ID MAP: one byte per pixel per level, naming what the
    * ball is touching rather than merely whether it is solid.
    *
@@ -461,6 +472,7 @@ export const DEFAULT_SIMULATION_OPTIONS: SimulationOptions = {
   drainY: null,
   topWallRows: null,
   ballToBall: true,
+  poweredKicksLive: true,
   rampDrive: null,
   surfaces: null,
 };
@@ -472,6 +484,7 @@ interface ResolvedOptions {
   readonly drainY: Q10;
   readonly topWallRows: number;
   readonly ballToBall: boolean;
+  readonly poweredKicksLive: boolean;
   readonly rampDrive: TableAcceleration | null;
   readonly surfaces: SurfaceIdMap | null;
 }
@@ -503,6 +516,7 @@ function resolveOptions(map: TableMap, options?: Partial<SimulationOptions>): Re
     drainY: options?.drainY ?? pixelsToQ10(map.height),
     topWallRows,
     ballToBall: options?.ballToBall ?? DEFAULT_SIMULATION_OPTIONS.ballToBall,
+    poweredKicksLive: options?.poweredKicksLive ?? DEFAULT_SIMULATION_OPTIONS.poweredKicksLive,
     rampDrive: options?.rampDrive ?? DEFAULT_SIMULATION_OPTIONS.rampDrive,
     surfaces: options?.surfaces ?? DEFAULT_SIMULATION_OPTIONS.surfaces,
   };
@@ -880,9 +894,29 @@ export function reflectVelocity(
   const full = friction > 0 && normalImpulse > 0 ? Math.max(1, budget) : budget;
   const tangentSpeed = integerSqrt(tangentX * tangentX + tangentY * tangentY);
   const resting = passiveDeflected === 0 && friction > 0 && normalImpulse > 0;
-  const drop = resting
-    ? Math.max(1, Math.min(budget, q10Multiply(ROLLING_SLIP_FRICTION, tangentSpeed)))
-    : full;
+  // ---------------------------------------------------------------------------
+  // A FIRED COIL TAKES THE ORIGINAL'S OWN TANGENTIAL TOLL, NOT COULOMB'S
+  // ---------------------------------------------------------------------------
+  // At a powered contact the original's tangential rule is at 0xB626-0xB660:
+  // the slip exchange against ball spin, "and a 1/16+1 per-contact decay" —
+  // the along-surface speed PASSES THROUGH a bumper hit nearly intact. The
+  // Coulomb budget above, charged on a bumper's enormous normal impulse, took
+  // ~60% of it instead, and that difference is the whole of the B3 trap: two
+  // facing bumper rims are CONVEX, so any drift along the channel between them
+  // is amplified bounce over bounce and walks the ball out — the original's
+  // escape mechanism, fed by gravity's fresh 128 Q10 of drift every tick — but
+  // a 60% scrub per hit killed the drift faster than the geometry amplified
+  // it, re-centring the orbit onto the head-on line forever. Reproduced from
+  // the sweep's own pinch site: ±(10868, 4370) Q10 between Extreme Sports'
+  // bumpers 16/17 for 3000+ ticks with Coulomb, out in a few hundred with the
+  // original's decay. The spin half of the exchange still needs a spin state
+  // this port does not have (see the long note above); the decay half is
+  // adopted exactly, and it is the half that decides the trap.
+  const drop = fires
+    ? Math.min(tangentSpeed, (tangentSpeed >> 4) + 1)
+    : resting
+      ? Math.max(1, Math.min(budget, q10Multiply(ROLLING_SLIP_FRICTION, tangentSpeed)))
+      : full;
   // Friction opposes sliding; it cannot reverse it, so the loss stops at rest.
   const keep =
     tangentSpeed <= drop ? 0 : Math.trunc(((tangentSpeed - drop) * Q10_ONE) / tangentSpeed);
@@ -1224,13 +1258,14 @@ function logContacts(
 function surfaceResponseOf(
   probe: RingProbe,
   surfaceAt: ((x: number, y: number) => number) | null,
+  powered: boolean,
 ): SurfaceResponse | null {
   if (surfaceAt === null) return null;
   let best: SurfaceResponse | null = null;
   for (const point of probe.contacts) {
     const id = surfaceAt(point.x, point.y);
     if (id === SURFACE_ID_NONE) continue;
-    const response = surfaceResponseFor(id);
+    const response = surfaceResponseFor(id, powered);
     if (best === null) {
       best = response;
       continue;
@@ -1633,7 +1668,7 @@ function integrateBall(
         stop.blocker.normalX,
         stop.blocker.normalY,
         options.restThreshold,
-        surfaceResponseOf(stop.blocker, surfaceAt),
+        surfaceResponseOf(stop.blocker, surfaceAt, options.poweredKicksLive),
       );
     } else if (!stop.clamped) {
       // The path ran out with nothing in the way; `remaining` is zero and the

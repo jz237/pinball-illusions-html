@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import type { SimulationForces, TableMap, TableMapDocument } from "../src/game/contracts.js";
 import { materialTableFor } from "../src/game/materials.js";
 import { parseTableMapDocument } from "../src/game/table-map.js";
-import { Q10_ONE, pixelsToQ10, q10ToPixel } from "../src/core/fixed-point.js";
+import { q10ToPixel } from "../src/core/fixed-point.js";
 import {
   VIRTUAL_TOP_WALL_ROWS,
   createBallSet,
@@ -15,54 +15,36 @@ import {
 import { channelRunAt, freeCentre, levelViewsOf } from "../src/game/level-scan.js";
 import {
   DEFAULT_PLUNGER_CONFIG,
-  FULL_PLUNGE_SPEED_BY_TABLE,
-  INITIAL_PLUNGER,
+  LAUNCH_KICK,
   LAW_N_JUSTICE_SHOOTER_LANE,
-  MAX_LAUNCH_SPEED,
-  MIN_LAUNCH_SPEED,
-  PLUNGER_CHARGE_RATE,
-  PLUNGER_CHARGE_TICKS,
-  PLUNGER_FULL_CHARGE,
+  ORIGINAL_LAUNCH_KICK_UNITS,
   PLUNGER_IDLE,
   SERVE_INSET_PIXELS,
   SHOOTER_LANE_BY_TABLE,
-  chargeLevel,
-  chargeTicksToFull,
+  autoLaunchOutcome,
   launchBall,
-  launchSpeedFor,
   plungerConfigFor,
   plungerConfigForLane,
-  resetPlunger,
   serveBall,
   servePosition,
   shooterLaneFor,
-  tickPlunger,
+  tickLauncher,
   validatePlungerConfig,
 } from "../src/game/plunger.js";
-import { SIMULATION_GRAVITY, VELOCITY_CLAMP_Q10 } from "../src/game/timebase.js";
-import type { PlungerConfig, PlungerInput, PlungerOutcome } from "../src/game/plunger.js";
+import {
+  SIMULATION_GRAVITY,
+  VELOCITY_CLAMP_Q10,
+  originalVelocityToQ10,
+} from "../src/game/timebase.js";
+import type { PlungerInput } from "../src/game/plunger.js";
+import { BUMPER_KICK } from "../src/game/surface-physics.js";
 
 const CONFIG = DEFAULT_PLUNGER_CONFIG;
 
 const PRESS: PlungerInput = { pressed: true, released: false, held: true };
 const HOLD: PlungerInput = { pressed: false, released: false, held: true };
 const RELEASE: PlungerInput = { pressed: false, released: true, held: false };
-
-/**
- * Holds the plunger for `heldTicks` ticks and then lets go on the next one.
- *
- * The release tick charges too — the key was down for part of it — so the
- * banked charge is one rate step more than the hold alone would suggest. That
- * is deliberate and is what makes a sub-tick tap fire at all, so the tests
- * assert against the real total rather than papering over it.
- */
-function pullAndRelease(heldTicks: number, config: PlungerConfig = CONFIG): PlungerOutcome {
-  let state = INITIAL_PLUNGER;
-  for (let tick = 0; tick < heldTicks; tick += 1) {
-    state = tickPlunger(state, tick === 0 ? PRESS : HOLD, config).state;
-  }
-  return tickPlunger(state, RELEASE, config);
-}
+const TAP: PlungerInput = { pressed: true, released: true, held: false };
 
 describe("the shooter lane", () => {
   it("serves inside the measured free span of Law 'n Justice's lane", () => {
@@ -79,7 +61,7 @@ describe("the shooter lane", () => {
     const lane = LAW_N_JUSTICE_SHOOTER_LANE;
     expect(q10ToPixel(CONFIG.serveY)).toBe(lane.bottomY - SERVE_INSET_PIXELS);
     // Well below the halfway point: a ball served mid-lane would have half the
-    // runway and a full plunge would not reach the top.
+    // runway and the launch shot would not reach the top.
     expect(q10ToPixel(CONFIG.serveY)).toBeGreaterThan((lane.topY + lane.bottomY) / 2);
   });
 
@@ -104,118 +86,6 @@ describe("the shooter lane", () => {
     // Measured, and therefore no longer all identical.
     expect(shooterLaneFor("babewatch").minCentreX).toBe(321);
     expect(shooterLaneFor("extreme-sports").minCentreX).toBe(322);
-  });
-
-  it("gives each table the full-plunge speed its launch SHOT demands", () => {
-    // The table is still per-table — the three lanes are separately measured and
-    // a per-table launch measurement has to have somewhere to land — but it holds
-    // one value, and that value is DERIVED rather than fitted.
-    //
-    // THE DERIVATION THIS TEST USED TO ASSERT WAS THE WRONG ONE. It said: against
-    // g = 24 a launch at v rises v^2/(2g) - v/2, so the 536 px climb from the
-    // serve point to the top of Law 'n Justice's lane needs v >= 5145 Q10, and
-    // six pixels a tick is the smallest whole pixel above that floor — and then
-    // it checked `MAX_LAUNCH_SPEED > 5145`, which is a ballistic climb up an
-    // empty column. The shot is not the lane. The ball has to cross the top arch
-    // on the upper collision line, rubbing both rails, and still be moving on the
-    // far side. Swept through the real loop on the shipped maps, the shot first
-    // completes at hold 28 / 22 / 26 of 32, i.e. launches of 5504 / 4544 / 5184
-    // Q10 — every one of them ABOVE the 5145 the old floor allowed, so the old
-    // check could have passed on a ceiling that no longer made the shot.
-    //
-    // What is asserted now is the measured requirement, per table. It is the
-    // strictly stronger statement, and it is the one that breaks if gravity, the
-    // friction model or a map is ever re-measured.
-    //
-    // ------------------------------------------------------------------------
-    // AND IT DID BREAK, TWICE, WHEN THE RAMP DRIVE LANDED. RE-MEASURED, AND THE
-    // ASSERTION IS NOW BRACKETED RATHER THAN ONE-SIDED
-    // ------------------------------------------------------------------------
-    // Two things moved under this test and both are physics rather than fitting:
-    //
-    //  1. THE LANE GOT STEEPER ON TWO TABLES. The ramp drive decoded from slot 4
-    //     gives Law 'n Justice's and Extreme Sports' shooter lanes 50 and 105
-    //     driven blocks, every one of them (0,2) — half a gravity of extra
-    //     downward acceleration up the whole climb — while BabeWatch's lane has
-    //     none. See FULL_PLUNGE_SPEED_BY_TABLE, which is why Extreme Sports is on
-    //     seven pixels a tick and the other two are still on six.
-    //  2. BABEWATCH'S SHOT GOT ONE TICK CHEAPER. `reflectVelocity` no longer lets
-    //     the Coulomb budget arrest a ball on a resting contact, so its ball
-    //     keeps a little more speed through the bend above y=400 that `plunger.ts`
-    //     already identifies as the expensive part of that shot.
-    //
-    // AND IT BROKE AGAIN WHEN GRAVITY WAS MEASURED, which is exactly what it is
-    // for. Every number in it was swept honestly in the real loop against a
-    // gravity of 24 that had never been measured at all; at the true 128 a full
-    // plunge of six pixels a tick reaches y=403 of a 510 px climb and no table
-    // completes its shot at any pull. The ceiling is re-swept, not rescaled —
-    // and it could not have been rescaled, because a fixed climb makes launch
-    // speed go as sqrt(g), 2.309x, not as the 5.33x every decoded velocity moved
-    // by. See MAX_LAUNCH_SPEED.
-    //
-    // Re-swept through the real loop on the shipped maps at gravity 128 and a
-    // ceiling of 14 px/tick, the shot first completes at hold 29 / 17 / 27 of 32
-    // — launches of 13,184 / 8,576 / 12,416 Q10, which is 90.6% / 53.1% / 84.4%
-    // of the pull, all three ranges contiguous to 32.
-    //
-    // THE TWO-THIRDS LINE IS GONE AND WHAT REPLACES IT IS STRICTLY STRONGER. The
-    // old check was "a two-thirds pull must not complete", one-sided and against a
-    // round number nothing derived; BabeWatch passed it by 2.4% before and would
-    // fail it by 1.1% now, which says more about 2/3 being a round number than
-    // about the machine. In its place the threshold is BRACKETED — the pull one
-    // tick below it must fail AND a full pull must succeed — which pins the
-    // requirement from both sides instead of one, and the aiming property is
-    // asserted directly as "the shot needs most of the pull" against the measured
-    // fractions. `tests/plays.test.ts` independently proves the thing two-thirds
-    // was standing in for: that an under-plunge always gives the ball back, at
-    // every starting pull on every table.
-    const SHOT_REQUIRES: Readonly<Record<string, number>> = {
-      "law-n-justice": 13184,
-      babewatch: 8576,
-      "extreme-sports": 12416,
-    };
-    /** The plunge hold, of 32, at which each table's shot first completes. */
-    const THRESHOLD_HOLD: Readonly<Record<string, number>> = {
-      "law-n-justice": 29,
-      babewatch: 17,
-      "extreme-sports": 27,
-    };
-    for (const tableId of ["law-n-justice", "babewatch", "extreme-sports"] as const) {
-      const config = plungerConfigFor(tableId);
-      const requires = SHOT_REQUIRES[tableId] as number;
-      const hold = THRESHOLD_HOLD[tableId] as number;
-      const chargeAfter = (ticks: number): number =>
-        Math.min(PLUNGER_FULL_CHARGE, ticks * config.chargeRate);
-
-      // A full pull makes the shot on this table.
-      expect(launchSpeedFor(PLUNGER_FULL_CHARGE, config)).toBeGreaterThanOrEqual(requires);
-      // The threshold hold is exactly that: it reaches the requirement...
-      expect(launchSpeedFor(chargeAfter(hold), config)).toBeGreaterThanOrEqual(requires);
-      // ...and one tick less does not. Bracketed, so the number cannot drift in
-      // either direction without this failing.
-      expect(launchSpeedFor(chargeAfter(hold - 1), config)).toBeLessThan(requires);
-      // And the shot needs most of the pull on the two tables whose lanes the
-      // ramp map drives, which is where pull length does its aiming: 29 and 27
-      // of 32. BabeWatch is the exception and it is a geometric one rather than
-      // a slack one — its lane is the only one the drive map does not touch and
-      // its `topY` is 384 rather than 34, because BabeWatch's lower line loses
-      // the channel half way up and the upper line carries the rest. A shorter
-      // climb needs a slower ball. See MAX_LAUNCH_SPEED.
-      expect(hold).toBeGreaterThanOrEqual(tableId === "babewatch" ? 17 : 27);
-      // Inside the engine's own measured velocity clamp, so a full plunge is
-      // never silently truncated. (This used to say `< pixelsToQ10(16)`, which
-      // was a guard against the signed-16-bit limit; the real bound is the
-      // +-4095 the original clamps to, which is 16,380 and slightly tighter.)
-      expect(config.maxLaunchSpeed).toBeLessThan(VELOCITY_CLAMP_Q10);
-      expect(config.maxLaunchSpeed).toBe(FULL_PLUNGE_SPEED_BY_TABLE[tableId]);
-      validatePlungerConfig(config);
-    }
-    // One ceiling serves all three again: on the corrected timebase every table
-    // completes contiguously from it, so there is nothing for a per-table value
-    // to buy. See FULL_PLUNGE_SPEED_BY_TABLE for the two and three it has been.
-    expect(FULL_PLUNGE_SPEED_BY_TABLE["law-n-justice"]).toBe(MAX_LAUNCH_SPEED);
-    expect(FULL_PLUNGE_SPEED_BY_TABLE.babewatch).toBe(MAX_LAUNCH_SPEED);
-    expect(FULL_PLUNGE_SPEED_BY_TABLE["extreme-sports"]).toBe(MAX_LAUNCH_SPEED);
   });
 
   it("has a lane for every table", () => {
@@ -292,7 +162,7 @@ describe("the shooter lane", () => {
       });
 
       // topY: the top of the unbroken run through the lane column ending at
-      // bottomY. This is what says how much runway a plunge has.
+      // bottomY. This is what says how much runway the launch has.
       let topY = bottomY;
       for (let y = bottomY; y >= 0; y -= 1) {
         if (!freeCentre(views, 0, laneX, y)) break;
@@ -323,283 +193,79 @@ describe("the shooter lane", () => {
   });
 });
 
-describe("charging", () => {
-  it("gains exactly one rate step per tick while held", () => {
-    let state = tickPlunger(INITIAL_PLUNGER, PRESS, CONFIG).state;
-    expect(state.charge).toBe(PLUNGER_CHARGE_RATE);
-    expect(state.pulling).toBe(true);
+describe("the fixed kick", () => {
+  // A1. The original has no plunger: the launch is `subi.w #$1770` — a fixed
+  // 6000-unit kick — behind an edge-consumed RETURN byte (main.seg00 0x65EE /
+  // 0x663A), and the film shows a 120 ms tap and a 2000 ms hold producing
+  // frame-identical launches on all three tables. These tests pin that model;
+  // the charge/pull tests they replace tested a mechanism the machine does not
+  // have.
 
-    state = tickPlunger(state, HOLD, CONFIG).state;
-    expect(state.charge).toBe(PLUNGER_CHARGE_RATE * 2);
-
-    state = tickPlunger(state, HOLD, CONFIG).state;
-    expect(state.charge).toBe(PLUNGER_CHARGE_RATE * 3);
+  it("carries the disassembled constant through the measured bridge", () => {
+    expect(ORIGINAL_LAUNCH_KICK_UNITS).toBe(6000);
+    expect(LAUNCH_KICK).toBe(originalVelocityToQ10(6000));
+    // The kick is written PRE-clamp, past the engine's own ±4095-unit limit —
+    // deliberately: the effective speed is the clamp's, not this number's.
+    expect(LAUNCH_KICK).toBeGreaterThan(VELOCITY_CLAMP_Q10);
+    // And it is a harder hit than even the pop bumper's 5500-unit coil, which
+    // is the ordering the disassembly gives the machine's three kicks.
+    expect(LAUNCH_KICK).toBeGreaterThan(BUMPER_KICK);
   });
 
-  it("does not charge while nothing is holding it", () => {
-    const outcome = tickPlunger(INITIAL_PLUNGER, PLUNGER_IDLE, CONFIG);
-    expect(outcome.state.charge).toBe(0);
-    expect(outcome.state.pulling).toBe(false);
-    expect(outcome.fired).toBe(false);
+  it("fires on the press edge and only on the press edge", () => {
+    expect(tickLauncher(PRESS, CONFIG).fired).toBe(true);
+    expect(tickLauncher(TAP, CONFIG).fired).toBe(true);
+    // A held key is not a stream of launches: the byte was consumed.
+    expect(tickLauncher(HOLD, CONFIG).fired).toBe(false);
+    // A release fires nothing — the original consumes the byte on key-DOWN.
+    expect(tickLauncher(RELEASE, CONFIG).fired).toBe(false);
+    expect(tickLauncher(PLUNGER_IDLE, CONFIG).fired).toBe(false);
   });
 
-  it("clamps at a full pull and stays there however long it is held", () => {
-    let state = tickPlunger(INITIAL_PLUNGER, PRESS, CONFIG).state;
-    for (let tick = 1; tick < PLUNGER_CHARGE_TICKS; tick += 1) {
-      state = tickPlunger(state, HOLD, CONFIG).state;
-    }
-    expect(state.charge).toBe(PLUNGER_FULL_CHARGE);
-
-    for (let tick = 0; tick < 500; tick += 1) {
-      state = tickPlunger(state, HOLD, CONFIG).state;
-      expect(state.charge).toBe(PLUNGER_FULL_CHARGE);
-    }
-  });
-
-  it("reaches a full pull in exactly the advertised number of ticks", () => {
-    expect(chargeTicksToFull(CONFIG)).toBe(PLUNGER_CHARGE_TICKS);
-    // The rate divides the ceiling exactly, so "full" is an equality, not a
-    // near-miss that a clamp quietly rescues.
-    expect(PLUNGER_CHARGE_RATE * PLUNGER_CHARGE_TICKS).toBe(PLUNGER_FULL_CHARGE);
-  });
-
-  it("adopts a pull that was already in progress when the state was made", () => {
-    // held without a press edge: the router was created mid-hold.
-    const outcome = tickPlunger(INITIAL_PLUNGER, { pressed: false, released: false, held: true });
-    expect(outcome.state.pulling).toBe(true);
-    expect(outcome.state.charge).toBe(PLUNGER_CHARGE_RATE);
-  });
-
-  it("reports charge as a 0..1 level for the meter", () => {
-    expect(chargeLevel(INITIAL_PLUNGER)).toBe(0);
-    expect(chargeLevel({ charge: PLUNGER_FULL_CHARGE, pulling: true })).toBe(1);
-    expect(chargeLevel({ charge: PLUNGER_FULL_CHARGE / 2, pulling: true })).toBeCloseTo(0.5, 10);
-    let state = INITIAL_PLUNGER;
-    for (let tick = 0; tick < PLUNGER_CHARGE_TICKS * 2; tick += 1) {
-      state = tickPlunger(state, tick === 0 ? PRESS : HOLD, CONFIG).state;
-      const level = chargeLevel(state);
-      expect(level).toBeGreaterThan(0);
-      expect(level).toBeLessThanOrEqual(1);
+  it("launches identically for a tap and for any length of hold", () => {
+    // The acceptance line from the reference capture: tap and 2 s hold
+    // frame-identical. Hold length cannot enter: the outcome is a pure
+    // function of the press edge.
+    const tap = tickLauncher(TAP, CONFIG);
+    const press = tickLauncher(PRESS, CONFIG);
+    expect(tap).toEqual(press);
+    // And ticks of holding after the press contribute nothing.
+    for (let tick = 0; tick < 100; tick += 1) {
+      expect(tickLauncher(HOLD, CONFIG).fired).toBe(false);
     }
   });
 
-  it("stops winding when the key-up is lost, rather than charging to full alone", () => {
-    // An alt-tab or an unplugged pad can swallow the release edge. The spring
-    // must not keep winding on its own while the player is not touching it.
-    let state = tickPlunger(INITIAL_PLUNGER, PRESS, CONFIG).state;
-    state = tickPlunger(state, HOLD, CONFIG).state;
-    const banked = state.charge;
-
-    for (let tick = 0; tick < 200; tick += 1) {
-      state = tickPlunger(state, PLUNGER_IDLE, CONFIG).state;
+  it("kicks every table with the same engine constant", () => {
+    // One launch routine, engine-shared: measured on film for all three
+    // tables and read in the disassembly as a single code path.
+    for (const tableId of ["law-n-justice", "babewatch", "extreme-sports"] as const) {
+      const config = validatePlungerConfig(plungerConfigFor(tableId));
+      expect(config.launchKick).toBe(LAUNCH_KICK);
+      expect(tickLauncher(PRESS, config).launchVelocityY).toBe(-LAUNCH_KICK);
     }
-    expect(state.charge).toBe(banked);
-    // Still armed, so the plunge the player asked for is not thrown away: it
-    // fires when a release finally arrives, such as the one a blur synthesises.
-    expect(state.pulling).toBe(true);
-
-    const fired = tickPlunger(state, RELEASE, CONFIG);
-    expect(fired.fired).toBe(true);
-    expect(fired.launchCharge).toBe(banked + PLUNGER_CHARGE_RATE);
   });
 
-  it("throws away the charge on reset", () => {
-    expect(resetPlunger()).toEqual(INITIAL_PLUNGER);
-  });
-});
-
-describe("firing", () => {
-  it("launches up the table, never down it", () => {
-    const outcome = pullAndRelease(10);
-    expect(outcome.fired).toBe(true);
-    expect(outcome.launchVelocityY).toBeLessThan(0);
-  });
-
-  it("launches at full speed from a full pull", () => {
-    const outcome = pullAndRelease(PLUNGER_CHARGE_TICKS);
-    expect(outcome.launchCharge).toBe(PLUNGER_FULL_CHARGE);
-    expect(outcome.launchVelocityY).toBe(-MAX_LAUNCH_SPEED);
-  });
-
-  it("scales the launch linearly with charge", () => {
-    expect(launchSpeedFor(0, CONFIG)).toBe(MIN_LAUNCH_SPEED);
-    expect(launchSpeedFor(PLUNGER_FULL_CHARGE, CONFIG)).toBe(MAX_LAUNCH_SPEED);
-    expect(launchSpeedFor(PLUNGER_FULL_CHARGE / 2, CONFIG)).toBe(
-      MIN_LAUNCH_SPEED + (MAX_LAUNCH_SPEED - MIN_LAUNCH_SPEED) / 2,
-    );
-    expect(launchSpeedFor(PLUNGER_FULL_CHARGE / 4, CONFIG)).toBe(
-      MIN_LAUNCH_SPEED + (MAX_LAUNCH_SPEED - MIN_LAUNCH_SPEED) / 4,
+  it("gives the machine's own serves the identical kick", () => {
+    // $D89's auto path lands on the same `subi.w` the player's edge does.
+    expect(autoLaunchOutcome(CONFIG).launchVelocityY).toBe(
+      tickLauncher(PRESS, CONFIG).launchVelocityY,
     );
   });
 
-  it("is monotonic in charge and never leaves the configured range", () => {
-    let previous = -1;
-    for (let charge = 0; charge <= PLUNGER_FULL_CHARGE; charge += 1) {
-      const speed = launchSpeedFor(charge, CONFIG);
-      expect(speed).toBeGreaterThanOrEqual(previous);
-      expect(speed).toBeGreaterThanOrEqual(MIN_LAUNCH_SPEED);
-      expect(speed).toBeLessThanOrEqual(MAX_LAUNCH_SPEED);
-      previous = speed;
-    }
+  it("clamps the applied velocity to the engine's own limit", () => {
+    const set = createBallSet();
+    const ball = serveBall(set, CONFIG);
+    expect(launchBall(ball, tickLauncher(PRESS, CONFIG))).toBe(true);
+    // 6000 units in, 4095 units out: the ball leaves at exactly the clamp,
+    // 16,380 Q10 = 16 px/tick = 800 px/s, which is what the film's flat
+    // 770–775 px/s ascent is after gravity and the lane drive trim it.
+    expect(ball.velocityY).toBe(-VELOCITY_CLAMP_Q10);
   });
 
-  it("clamps a charge outside the legal range instead of extrapolating", () => {
-    expect(launchSpeedFor(-5000, CONFIG)).toBe(MIN_LAUNCH_SPEED);
-    expect(launchSpeedFor(PLUNGER_FULL_CHARGE * 10, CONFIG)).toBe(MAX_LAUNCH_SPEED);
-  });
-
-  it("gives a longer pull a faster launch", () => {
-    const gentle = pullAndRelease(2);
-    const firm = pullAndRelease(10);
-    const full = pullAndRelease(PLUNGER_CHARGE_TICKS);
-    expect(gentle.launchVelocityY).toBeGreaterThan(firm.launchVelocityY);
-    expect(firm.launchVelocityY).toBeGreaterThan(full.launchVelocityY);
-  });
-
-  it("empties the spring when it fires", () => {
-    const outcome = pullAndRelease(10);
-    expect(outcome.state.charge).toBe(0);
-    expect(outcome.state.pulling).toBe(false);
-  });
-
-  it("keeps the velocity inside the signed 16-bit range the integrator accepts", () => {
-    const outcome = pullAndRelease(PLUNGER_CHARGE_TICKS);
-    expect(Number.isInteger(outcome.launchVelocityY)).toBe(true);
-    expect(outcome.launchVelocityY).toBeGreaterThanOrEqual(-32767);
-  });
-});
-
-describe("firing exactly once", () => {
-  it("ignores a second release after the plunger has already fired", () => {
-    const fired = pullAndRelease(10);
-    expect(fired.fired).toBe(true);
-
-    const again = tickPlunger(fired.state, RELEASE, CONFIG);
-    expect(again.fired).toBe(false);
-    expect(again.launchVelocityY).toBe(0);
-    expect(again.launchCharge).toBe(0);
-    expect(again.state.charge).toBe(0);
-  });
-
-  it("ignores a release that no press ever preceded", () => {
-    const outcome = tickPlunger(INITIAL_PLUNGER, RELEASE, CONFIG);
-    expect(outcome.fired).toBe(false);
-    expect(outcome.state.pulling).toBe(false);
-    expect(outcome.state.charge).toBe(0);
-  });
-
-  it("fires once per pull however many ticks pass in between", () => {
-    let state = INITIAL_PLUNGER;
-    let fires = 0;
-    for (let tick = 0; tick < 200; tick += 1) {
-      // One pull: press at tick 0, release at tick 40, then silence.
-      const input: PlungerInput =
-        tick === 0 ? PRESS : tick < 40 ? HOLD : tick === 40 ? RELEASE : PLUNGER_IDLE;
-      const outcome = tickPlunger(state, input, CONFIG);
-      if (outcome.fired) fires += 1;
-      state = outcome.state;
-    }
-    expect(fires).toBe(1);
-  });
-
-  it("cannot bank a second full launch by re-grabbing after a release", () => {
-    // Full pull, then a release-and-immediate-regrab inside one tick. The new
-    // pull must start from nothing, not from the charge just spent.
-    let state = INITIAL_PLUNGER;
-    for (let tick = 0; tick < PLUNGER_CHARGE_TICKS; tick += 1) {
-      state = tickPlunger(state, tick === 0 ? PRESS : HOLD, CONFIG).state;
-    }
-    const fired = tickPlunger(state, { pressed: true, released: true, held: true }, CONFIG);
-    expect(fired.fired).toBe(true);
-    expect(fired.launchCharge).toBe(PLUNGER_FULL_CHARGE);
-    expect(fired.state.charge).toBe(0);
-    // Still pulling, because the key is down again at the sample point.
-    expect(fired.state.pulling).toBe(true);
-
-    const next = tickPlunger(fired.state, RELEASE, CONFIG);
-    expect(next.launchCharge).toBe(PLUNGER_CHARGE_RATE);
-    expect(next.launchVelocityY).toBeGreaterThan(-MAX_LAUNCH_SPEED);
-  });
-});
-
-describe("taps shorter than a tick", () => {
-  it("still fires when the press and the release land in the same tick", () => {
-    const outcome = tickPlunger(INITIAL_PLUNGER, { pressed: true, released: true, held: false });
-    expect(outcome.fired).toBe(true);
-    expect(outcome.launchCharge).toBe(PLUNGER_CHARGE_RATE);
-    expect(outcome.launchVelocityY).toBeLessThan(0);
-  });
-
-  it("fires a tap feebly, not at full power", () => {
-    const tap = tickPlunger(INITIAL_PLUNGER, { pressed: true, released: true, held: false });
-    const full = pullAndRelease(PLUNGER_CHARGE_TICKS);
-    expect(-tap.launchVelocityY).toBeLessThan(-full.launchVelocityY / 4);
-    expect(-tap.launchVelocityY).toBeGreaterThanOrEqual(MIN_LAUNCH_SPEED);
-  });
-
-  it("leaves the plunger idle afterwards, ready for a fresh pull", () => {
-    const tap = tickPlunger(INITIAL_PLUNGER, { pressed: true, released: true, held: false });
-    expect(tap.state).toEqual(INITIAL_PLUNGER);
-  });
-});
-
-describe("config validation", () => {
-  it("accepts the shipped config", () => {
-    expect(validatePlungerConfig(CONFIG)).toBe(CONFIG);
-  });
-
-  it("rejects a charge rate that would never fill or would fill backwards", () => {
-    expect(() => validatePlungerConfig({ ...CONFIG, chargeRate: 0 })).toThrow(/chargeRate/);
-    expect(() => validatePlungerConfig({ ...CONFIG, chargeRate: -8 })).toThrow(/chargeRate/);
-    expect(() => validatePlungerConfig({ ...CONFIG, chargeRate: 1.5 })).toThrow(/chargeRate/);
-  });
-
-  it("rejects a launch range that runs the wrong way", () => {
-    expect(() => validatePlungerConfig({ ...CONFIG, minLaunchSpeed: -1 })).toThrow(/minLaunch/);
-    expect(() =>
-      validatePlungerConfig({ ...CONFIG, minLaunchSpeed: 5000, maxLaunchSpeed: 100 }),
-    ).toThrow(/maxLaunchSpeed/);
-  });
-
-  it("honours a slower custom charge rate", () => {
-    const slow: PlungerConfig = { ...CONFIG, chargeRate: 8 };
-    expect(chargeTicksToFull(slow)).toBe(128);
-    expect(pullAndRelease(127, slow).launchCharge).toBe(PLUNGER_FULL_CHARGE);
-    expect(pullAndRelease(10, slow).launchCharge).toBeLessThan(PLUNGER_FULL_CHARGE);
-  });
-});
-
-describe("determinism", () => {
-  it("produces bit-identical outcomes for the same input sequence", () => {
-    const script: PlungerInput[] = [];
-    for (let tick = 0; tick < 120; tick += 1) {
-      const held = tick % 17 < 9;
-      const previousHeld = tick > 0 && (tick - 1) % 17 < 9;
-      script.push({ pressed: held && !previousHeld, released: !held && previousHeld, held });
-    }
-
-    const run = (): readonly PlungerOutcome[] => {
-      let state = INITIAL_PLUNGER;
-      const outcomes: PlungerOutcome[] = [];
-      for (const input of script) {
-        const outcome = tickPlunger(state, input, CONFIG);
-        outcomes.push(outcome);
-        state = outcome.state;
-      }
-      return outcomes;
-    };
-
-    expect(run()).toEqual(run());
-  });
-
-  it("keeps every value an integer", () => {
-    let state = INITIAL_PLUNGER;
-    for (let tick = 0; tick < 200; tick += 1) {
-      const outcome = tickPlunger(state, tick % 30 === 29 ? RELEASE : HOLD, CONFIG);
-      expect(Number.isInteger(outcome.state.charge)).toBe(true);
-      expect(Number.isInteger(outcome.launchVelocityY)).toBe(true);
-      state = outcome.state;
-    }
+  it("rejects a config whose kick could not launch", () => {
+    expect(() => validatePlungerConfig({ ...CONFIG, launchKick: 0 })).toThrow(/launchKick/);
+    expect(() => validatePlungerConfig({ ...CONFIG, launchKick: -5 })).toThrow(/launchKick/);
+    expect(() => validatePlungerConfig({ ...CONFIG, launchKick: 1.5 })).toThrow(/launchKick/);
   });
 });
 
@@ -627,17 +293,16 @@ describe("serving and launching a ball", () => {
     const ball = serveBall(set, CONFIG);
     ball.velocityY = 300; // already dribbling downward
     ball.velocityX = -50;
-    const outcome = pullAndRelease(10);
-    expect(launchBall(ball, outcome)).toBe(true);
-    expect(ball.velocityY).toBe(outcome.launchVelocityY);
-    // Sideways rattle is the lane's business, not the plunger's.
+    expect(launchBall(ball, tickLauncher(PRESS, CONFIG))).toBe(true);
+    expect(ball.velocityY).toBe(-VELOCITY_CLAMP_Q10);
+    // Sideways rattle is the lane's business, not the launcher's.
     expect(ball.velocityX).toBe(-50);
   });
 
-  it("does nothing when the plunger did not fire", () => {
+  it("does nothing when the launcher did not fire", () => {
     const set = createBallSet();
     const ball = serveBall(set, CONFIG);
-    const idle = tickPlunger(INITIAL_PLUNGER, HOLD, CONFIG);
+    const idle = tickLauncher(HOLD, CONFIG);
     expect(launchBall(ball, idle)).toBe(false);
     expect(ball.velocityY).toBe(0);
   });
@@ -646,18 +311,16 @@ describe("serving and launching a ball", () => {
     const set = createBallSet();
     const ball = serveBall(set, CONFIG);
     ball.active = false;
-    expect(launchBall(ball, pullAndRelease(10))).toBe(false);
+    expect(launchBall(ball, tickLauncher(PRESS, CONFIG))).toBe(false);
     expect(ball.velocityY).toBe(0);
   });
 });
 
 /**
- * The launch speeds only mean anything against real geometry, so this runs the
- * real integrator up the real Law 'n Justice lane. It asserts the two ends of
- * the range that the constants were chosen to hit — a full plunge reaches the
- * top of the channel, a tap barely moves — because those are the properties a
- * player would notice breaking, and they are what tie MAX_LAUNCH_SPEED to the
- * lane length rather than leaving it an arbitrary number.
+ * The kick only means anything against real geometry, so this runs the real
+ * integrator up the real Law 'n Justice lane and asserts the property the
+ * whole launch exists for: every launch is the SAME launch, and it clears the
+ * lane. There is no weak plunge to test any more — that is the point.
  */
 describe("launching up the real Law 'n Justice lane", () => {
   const MAP_PATH = fileURLToPath(
@@ -674,62 +337,79 @@ describe("launching up the real Law 'n Justice lane", () => {
   };
 
   /** Serves, lets the ball settle on the lane floor, launches, and follows it. */
-  function launchAndTrack(outcome: PlungerOutcome, ticks: number): { minY: number; restY: number } {
+  function launchAndTrack(ticks: number): {
+    minY: number;
+    restY: number;
+    trace: readonly number[];
+  } {
     const set = createBallSet();
     const ball = serveBall(set, CONFIG);
     for (let tick = 0; tick < 30; tick += 1) {
       stepBalls(set, MAP, MATERIALS, GRAVITY);
     }
     const restY = q10ToPixel(ball.y);
-    launchBall(ball, outcome);
+    launchBall(ball, tickLauncher(PRESS, CONFIG));
 
     let minY = q10ToPixel(ball.y);
+    const trace: number[] = [];
     for (let tick = 0; tick < ticks; tick += 1) {
       stepBalls(set, MAP, MATERIALS, GRAVITY);
+      trace.push(ball.y);
       const y = q10ToPixel(ball.y);
       if (y < minY) minY = y;
     }
-    return { minY, restY };
+    return { minY, restY, trace };
   }
 
   it("settles the served ball inside the lane instead of drifting out of it", () => {
-    const { restY } = launchAndTrack(pullAndRelease(1), 1);
+    const { restY } = launchAndTrack(1);
     expect(restY).toBeGreaterThan(q10ToPixel(CONFIG.serveY) - 4);
     // Inclusive, because `bottomY` is documented as "the bottommost FREE CENTRE
     // row of the unbroken channel" — a ball centre on it is in the lane, not out
-    // of it. The strict form happened to hold while the plain wall was a chosen
-    // 0.625 and the ball settled one row higher; at the measured 304 it comes to
-    // rest on the last free row itself, which is where a ball on a rod sits.
+    // of it.
     expect(restY).toBeLessThanOrEqual(LAW_N_JUSTICE_SHOOTER_LANE.bottomY);
   });
 
-  it("sends a full plunge all the way to the top of the channel", () => {
-    const { minY } = launchAndTrack(pullAndRelease(PLUNGER_CHARGE_TICKS), 200);
+  it("sends every launch all the way to the top of the channel", () => {
+    const { minY } = launchAndTrack(200);
     // 26 rows of virtual top wall plus a ball radius is the highest a centre
     // can physically get on this table.
     expect(minY).toBeLessThan(60);
   });
 
-  it("barely moves the ball on a sub-tick tap", () => {
-    const tap = tickPlunger(INITIAL_PLUNGER, { pressed: true, released: true, held: false });
-    const { minY, restY } = launchAndTrack(tap, 200);
-    expect(minY).toBeGreaterThan(restY - 40);
-    expect(minY).toBeLessThan(restY);
+  it("is deterministic: two launches trace the identical path", () => {
+    // The film's three-launches-identical-to-±0.5px, as the exact statement the
+    // integer engine can make: bit-identical.
+    expect(launchAndTrack(200).trace).toEqual(launchAndTrack(200).trace);
   });
 
-  it("carries the ball further the longer the pull, monotonically", () => {
-    const reach = [4, 10, 20, PLUNGER_CHARGE_TICKS].map(
-      (ticks) => launchAndTrack(pullAndRelease(ticks), 200).minY,
-    );
-    for (let index = 1; index < reach.length; index += 1) {
-      expect(reach[index]).toBeLessThan(reach[index - 1] as number);
+  it("climbs the lane at the film's speed", () => {
+    // Reference: 15.5 game px/frame over the lane window, "no measurable
+    // decay" (launch-key-sweep MKV, track8/track10.csv), against a launch at
+    // the 16 px/tick clamp trimmed by gravity and the decoded (0,2) lane
+    // drive. The first ticks of the climb must sit in that band; a charge
+    // model, a wrong clamp or a wrong bridge all land far outside it.
+    const set = createBallSet();
+    const ball = serveBall(set, CONFIG);
+    for (let tick = 0; tick < 30; tick += 1) stepBalls(set, MAP, MATERIALS, GRAVITY);
+    launchBall(ball, tickLauncher(PRESS, CONFIG));
+    let previous = ball.y;
+    const speeds: number[] = [];
+    for (let tick = 0; tick < 8; tick += 1) {
+      stepBalls(set, MAP, MATERIALS, GRAVITY);
+      speeds.push((previous - ball.y) / 1024);
+      previous = ball.y;
+    }
+    for (const speed of speeds) {
+      expect(speed).toBeGreaterThanOrEqual(14.4);
+      expect(speed).toBeLessThanOrEqual(16.0);
     }
   });
 
   it("never drives a launched ball through a lane wall", () => {
     const set = createBallSet();
     const ball = serveBall(set, CONFIG);
-    launchBall(ball, pullAndRelease(PLUNGER_CHARGE_TICKS));
+    launchBall(ball, tickLauncher(PRESS, CONFIG));
     for (let tick = 0; tick < 300; tick += 1) {
       stepBalls(set, MAP, MATERIALS, GRAVITY);
       if (!ball.active) break;
@@ -742,43 +422,5 @@ describe("launching up the real Law 'n Justice lane", () => {
       expect(y).toBeGreaterThanOrEqual(0);
       expect(y).toBeLessThanOrEqual(MAP.height);
     }
-  });
-});
-
-describe("the reference constants", () => {
-  it("keeps the launch ceiling above the speed the lane length demands", () => {
-    // v^2/(2g) - v/2 >= lane travel, with the launch applied before the first
-    // gravity step. If gravity is ever re-measured this is the check that
-    // catches a full plunge quietly failing to clear the lane.
-    //
-    // A LOWER BOUND ONLY, and labelled as one. The lane climb is the cheapest
-    // part of the launch shot — the arch above it costs more, and how much more
-    // is measured rather than modelled: see "gives each table the full-plunge
-    // speed its launch SHOT demands" above. This is kept because it is the one
-    // check that is analytic in g, so it still catches a gravity change; it is
-    // not the requirement.
-    //
-    // `topY` is 34 rather than the bitmap's 8 because the travel that matters is
-    // the travel on the view the physics collides against, and this table's
-    // level-0 view carries a 26-row virtual ceiling.
-    const travel = pixelsToQ10(
-      q10ToPixel(CONFIG.serveY) - LAW_N_JUSTICE_SHOOTER_LANE.topY,
-    );
-    const g = SIMULATION_GRAVITY;
-    const rise = (MAX_LAUNCH_SPEED * MAX_LAUNCH_SPEED) / (2 * g) - MAX_LAUNCH_SPEED / 2;
-    expect(rise).toBeGreaterThan(travel);
-  });
-
-  it("keeps the minimum launch too weak to clear the lane", () => {
-    const travel = pixelsToQ10(
-      q10ToPixel(CONFIG.serveY) - LAW_N_JUSTICE_SHOOTER_LANE.topY,
-    );
-    const g = SIMULATION_GRAVITY;
-    const rise = (MIN_LAUNCH_SPEED * MIN_LAUNCH_SPEED) / (2 * g) - MIN_LAUNCH_SPEED / 2;
-    expect(rise).toBeLessThan(travel / 10);
-  });
-
-  it("expresses a full pull as 1.0 in Q10", () => {
-    expect(PLUNGER_FULL_CHARGE).toBe(Q10_ONE);
   });
 });

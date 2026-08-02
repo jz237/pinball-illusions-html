@@ -110,23 +110,39 @@ describe("serving", () => {
   });
 });
 
-describe("the plunger", () => {
-  it("charges while held and fires on release", () => {
+describe("the launcher", () => {
+  it("fires the fixed kick on the press edge — a hold is one launch", () => {
+    // A1: the original's launch is an edge-consumed RETURN byte and a fixed
+    // 6000-unit kick; tap and two-second hold are frame-identical on film.
     const game = started();
-    // Hold the plunger from tick 60 to 110, then let go.
     const input = new ScriptedInput((t) => (t >= 60 && t < 110 ? ["plunger"] : []));
 
-    runTicks(game, input, 100);
-    expect(debugSnapshot(game).plungerCharge).toBeGreaterThan(0);
+    const reports = runTicks(game, input, 140);
+    // Fired on the press, not the release — and exactly once for the hold.
+    expect(reports.filter((r) => r.launched)).toHaveLength(1);
+    expect(reports.findIndex((r) => r.launched)).toBe(60);
+  });
 
-    const reports = runTicks(game, input, 40);
-    expect(reports.some((r) => r.launched)).toBe(true);
+  it("launches identically for a tap and for a long hold", () => {
+    // The film's acceptance: a 120 ms tap and a 2000 ms hold produce the same
+    // ball. Here that is exact: two games whose only difference is the hold
+    // length must be byte-identical afterwards.
+    const play = (holdTicks: number): string => {
+      const game = started();
+      const input = new ScriptedInput((t) => (t >= 60 && t < 60 + holdTicks ? ["plunger"] : []));
+      runTicks(game, input, 400);
+      return JSON.stringify(debugSnapshot(game).balls);
+    };
+    expect(play(1)).toBe(play(100));
   });
 
   it("sends the ball UP the table, which is the whole point of it", () => {
     const game = started();
     const input = new ScriptedInput((t) => (t >= 60 && t < 110 ? ["plunger"] : []));
-    runTicks(game, input, 110);
+    // Stop at the press: the kick fires on the edge at tick 60, so the launch
+    // row has to be read there — under the old charge model the ball was still
+    // waiting on the rod at tick 110, and reading it there measured nothing.
+    runTicks(game, input, 60);
 
     const atLaunch = liveBalls(game)[0]?.pixelY ?? 0;
 
@@ -242,10 +258,23 @@ describe("the flippers", () => {
   });
 
   it("goes dead once the table tilts", () => {
+    // The tilt counter only warms while a ball is IN PLAY (filmed: shoves at
+    // the ball on the rod never tilt), so the script launches first and then
+    // hammers the cabinet. Tilt clears at the next serve, so the flipper check
+    // is made on the tick the tilt landed rather than at the end of the run.
     const game = started();
-    // Nudge far past the allowance, spacing presses so each one registers.
-    const nudging = new ScriptedInput((t) => (t % 20 < 4 ? ["nudgeLeft"] : []));
-    runTicks(game, nudging, 600);
+    const input = new ScriptedInput((t) => {
+      if (t >= 60 && t < 62) return ["plunger"];
+      if (t >= 70 && t % 10 < 3) return ["nudgeLeft"];
+      return [];
+    });
+
+    let sawTilt = false;
+    for (let block = 0; block < 600 && !sawTilt; block += 1) {
+      const report = runTicks(game, input, 1)[0];
+      if (report?.justTilted === true) sawTilt = true;
+    }
+    expect(sawTilt, "hammering the cabinet never tilted the table").toBe(true);
 
     const state = debugSnapshot(game);
     expect(state.tilt.tilted).toBe(true);
@@ -317,22 +346,37 @@ describe("a whole game", () => {
     expect(leftTheRamp, "the ball never came back down onto the playfield").toBe(true);
   });
 
-  it("puts a ball that failed to clear the arch back on the plunger rod", () => {
-    // A weak plunge dribbles back down the lane. The lane floor is the rod, so
-    // the ball must land back on it and be shootable again; if it merely came to
-    // rest in the lane the game would be over with the ball still in play.
+  it("puts a ball that falls back down the lane onto the rod again", () => {
+    // The fixed kick cannot under-launch (that stall class is gone with the
+    // charge model — A1), but the playfield can still feed a ball back into
+    // the lane from above, and the lane floor IS the rod: the ball must land
+    // back on it and be shootable again, or it strands there with the game
+    // unable to end. The return is staged by hand because no launch produces
+    // it any more.
     const game = started();
-    // Two ticks of hold is nowhere near enough charge to reach the arch.
-    const input = new ScriptedInput((t) => (t >= 60 && t < 62 ? ["plunger"] : []));
-    runTicks(game, input, 400);
+    runTicks(game, idleInput(), 60);
+    const launch = new ScriptedInput((t) => (t < 2 ? ["plunger"] : []));
+    runTicks(game, launch, 4);
+    expect(debugSnapshot(game).laneBallId).toBeNull();
+
+    // Drop the flying ball back into the lane, slow, above the seat.
+    const ball = game.balls.balls[0];
+    expect(ball).toBeDefined();
+    if (ball !== undefined) {
+      ball.x = pixelsToQ10(322);
+      ball.y = pixelsToQ10(500);
+      ball.velocityX = 0;
+      ball.velocityY = 200;
+      ball.level = 0;
+    }
+    runTicks(game, idleInput(), 200);
 
     const state = debugSnapshot(game);
     expect(state.laneBallId).not.toBeNull();
-    expect(state.plungerCharge).toBe(0);
 
     // And it really can be launched again.
-    const second = new ScriptedInput((t) => (t < 50 ? ["plunger"] : []));
-    const reports = runTicks(game, second, 120);
+    const second = new ScriptedInput((t) => (t < 2 ? ["plunger"] : []));
+    const reports = runTicks(game, second, 60);
     expect(reports.some((r) => r.launched)).toBe(true);
   });
 
@@ -1295,6 +1339,27 @@ describe("all three tables", () => {
     //
     // That needs a device this reconstruction has not found in any table module,
     // so the budget stays where it is rather than being invented around.
+    //
+    // ---------------------------------------------------------------------
+    // RESTATED AFTER THE FIDELITY FIX ROUND (B1 swept flippers, A1 fixed-kick
+    // launch, B2 cradle exemption, B3 powered-contact tangential decay, B5
+    // tilt gating). Same harness, re-measured:
+    //
+    //                   completed   drained   written off   bat-crossings
+    //   law-n-justice   30/30       90        0             0
+    //   babewatch       30/30       90        0             0
+    //   extreme-sports  30/30       90        0             0
+    //
+    // "Bat-crossings" is the B1 census metric — ticks with a live ball under
+    // a fully-raised bat's span — and zero is the acceptance the dossier set
+    // (it was 161 crossings in 80 games before the swept contact landed).
+    // Mean game length on this scripted player: 1073 / 1051 / 2030 ticks.
+    // The launch change makes every plunge identical, so the pull-escalation
+    // ladder above never fires any more; it is kept because a ball fed back
+    // into the lane from the playfield still re-arms the rod and the ladder
+    // is the harness's guard against a machine that could hand it back
+    // unlaunchable. The budgets are unchanged — the measurement is 0 — and
+    // this paragraph is the census figure the fix round is accountable to.
     const budget: Readonly<Record<TableId, number>> = {
       "law-n-justice": 0.05,
       babewatch: 0.05,

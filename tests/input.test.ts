@@ -27,13 +27,7 @@ import type {
   KeyEventLike,
   KeyEventSource,
 } from "../src/browser/input.js";
-import {
-  DEFAULT_PLUNGER_CONFIG,
-  INITIAL_PLUNGER,
-  PLUNGER_CHARGE_RATE,
-  tickPlunger,
-} from "../src/game/plunger.js";
-import type { PlungerState } from "../src/game/plunger.js";
+import { DEFAULT_PLUNGER_CONFIG, tickLauncher } from "../src/game/plunger.js";
 
 function key(code: string, extra: Partial<KeyEventLike> = {}): KeyEventLike {
   return { code, ...extra };
@@ -95,18 +89,23 @@ describe("the control vocabulary", () => {
 });
 
 describe("keyboard bindings", () => {
-  it("binds the original's keys", () => {
+  it("binds the original's observed keys", () => {
+    // Filmed under emulation with an input-mark log: SHIFTs are the flippers,
+    // SPACE is the nudge (it shakes the view and feeds the tilt counter), and
+    // RETURN launches — the attract DMD says "RETURN LAUNCHES BALL" outright.
+    // Space used to be this port's invented plunger; that binding is gone.
     expect(controlForKeyEvent(key("KeyZ"))).toBe("leftFlipper");
     expect(controlForKeyEvent(key("Comma"))).toBe("leftFlipper");
     expect(controlForKeyEvent(key("ShiftLeft"))).toBe("leftFlipper");
     expect(controlForKeyEvent(key("Slash"))).toBe("rightFlipper");
     expect(controlForKeyEvent(key("Period"))).toBe("rightFlipper");
     expect(controlForKeyEvent(key("ShiftRight"))).toBe("rightFlipper");
-    expect(controlForKeyEvent(key("Space"))).toBe("plunger");
+    expect(controlForKeyEvent(key("Space"))).toBe("nudgeForward");
     expect(controlForKeyEvent(key("ArrowLeft"))).toBe("nudgeLeft");
     expect(controlForKeyEvent(key("ArrowRight"))).toBe("nudgeRight");
     expect(controlForKeyEvent(key("ArrowUp"))).toBe("nudgeForward");
     expect(controlForKeyEvent(key("Enter"))).toBe("start");
+    expect(controlForKeyEvent(key("NumpadEnter"))).toBe("start");
     expect(controlForKeyEvent(key("Escape"))).toBe("pause");
     expect(controlForKeyEvent(key("F9"))).toBe("toggleWholeTableView");
     expect(controlForKeyEvent(key("F10"))).toBe("toggleWholeTableView");
@@ -126,7 +125,7 @@ describe("keyboard bindings", () => {
     expect(controlForKeyEvent({ key: "z" })).toBe("leftFlipper");
     expect(controlForKeyEvent({ key: "Z" })).toBe("leftFlipper");
     expect(controlForKeyEvent({ key: "/" })).toBe("rightFlipper");
-    expect(controlForKeyEvent({ key: " " })).toBe("plunger");
+    expect(controlForKeyEvent({ key: " " })).toBe("nudgeForward");
     expect(controlForKeyEvent({ key: "ArrowLeft" })).toBe("nudgeLeft");
     expect(controlForKeyEvent({ key: "Escape" })).toBe("pause");
   });
@@ -530,9 +529,9 @@ describe("losing and regaining focus", () => {
     router.releaseAll();
     const snapshot = router.sample();
     expect(isDown(snapshot, "leftFlipper")).toBe(false);
-    // The plunger must SEE the release, or it stays armed and fires later on a
-    // ball the player is not looking at.
-    expect(wasReleased(snapshot, "plunger")).toBe(true);
+    // Every held control must SEE the release, or it stays asserted while the
+    // player is looking at another window.
+    expect(wasReleased(snapshot, "nudgeForward")).toBe(true);
     expect(wasReleased(snapshot, "rightFlipper")).toBe(true);
   });
 
@@ -625,16 +624,16 @@ describe("attaching to a DOM-like target", () => {
     target.fire("keydown", bound);
     target.fire("keydown", unbound);
     expect(prevented).toBe(1);
-    expect(isDown(router.sample(), "plunger")).toBe(true);
+    expect(isDown(router.sample(), "nudgeForward")).toBe(true);
 
     target.fire("keyup", bound);
     expect(prevented).toBe(2);
-    expect(wasReleased(router.sample(), "plunger")).toBe(true);
+    expect(wasReleased(router.sample(), "nudgeForward")).toBe(true);
 
     detach();
     expect(target.counts.get("keydown")).toBe(0);
     target.fire("keydown", bound);
-    expect(pressCount(router.sample(), "plunger")).toBe(0);
+    expect(pressCount(router.sample(), "nudgeForward")).toBe(0);
   });
 
   it("drops held controls when the target reports blur", () => {
@@ -657,17 +656,22 @@ describe("attaching to a DOM-like target", () => {
   });
 });
 
-describe("feeding the plunger", () => {
-  it("translates a snapshot into the plunger's input", () => {
+describe("feeding the launcher", () => {
+  // The launch key on the keyboard is Enter, which the router files under
+  // `start`; the game loop treats a start press in play as the launch edge.
+  // The `plunger` control itself remains for the gamepad face button and the
+  // touch overlay, so the adapter is exercised through a manual press here.
+
+  it("translates a snapshot into the launcher's input", () => {
     const router = new InputRouter();
-    router.handleKeyDown(key("Space"));
+    router.press("plunger");
     expect(plungerInputFrom(router.sample())).toEqual({
       pressed: true,
       released: false,
       held: true,
     });
 
-    router.handleKeyUp(key("Space"));
+    router.release("plunger");
     expect(plungerInputFrom(router.sample())).toEqual({
       pressed: false,
       released: true,
@@ -681,42 +685,34 @@ describe("feeding the plunger", () => {
     });
   });
 
-  it("fires the plunger from a hold that spans several ticks", () => {
+  it("fires exactly once from a hold that spans several ticks", () => {
+    // The original's RETURN byte is edge-consumed: a hold is one launch,
+    // however long it lasts, and the film's 2500 ms hold fired exactly one.
     const router = new InputRouter();
-    let state: PlungerState = INITIAL_PLUNGER;
     let fired = 0;
-    let launchCharge = 0;
-
     const step = (): void => {
-      const outcome = tickPlunger(state, plungerInputFrom(router.sample()), DEFAULT_PLUNGER_CONFIG);
-      state = outcome.state;
-      if (outcome.fired) {
+      if (tickLauncher(plungerInputFrom(router.sample()), DEFAULT_PLUNGER_CONFIG).fired) {
         fired += 1;
-        launchCharge = outcome.launchCharge;
       }
     };
 
-    router.handleKeyDown(key("Space"));
-    for (let tick = 0; tick < 8; tick += 1) step();
-    expect(fired).toBe(0);
-    expect(state.charge).toBe(PLUNGER_CHARGE_RATE * 8);
-
-    router.handleKeyUp(key("Space"));
+    router.press("plunger");
     step();
     expect(fired).toBe(1);
-    expect(launchCharge).toBe(PLUNGER_CHARGE_RATE * 9);
+    for (let tick = 0; tick < 20; tick += 1) step();
+    expect(fired).toBe(1);
 
-    // Ticks of silence afterwards must not fire it again.
+    router.release("plunger");
     for (let tick = 0; tick < 20; tick += 1) step();
     expect(fired).toBe(1);
   });
 
-  it("fires the plunger from a tap that never spans a tick", () => {
+  it("fires from a tap that never spans a tick", () => {
     const router = new InputRouter();
-    router.handleKeyDown(key("Space"));
-    router.handleKeyUp(key("Space"));
+    router.press("plunger");
+    router.release("plunger");
 
-    const outcome = tickPlunger(INITIAL_PLUNGER, plungerInputFrom(router.sample()));
+    const outcome = tickLauncher(plungerInputFrom(router.sample()));
     expect(outcome.fired).toBe(true);
     expect(outcome.launchVelocityY).toBeLessThan(0);
   });

@@ -111,14 +111,49 @@ export const ORIGINAL_TILT_THRESHOLD = 200;
 export const ORIGINAL_TILT_DECAY_PER_PASS = 1;
 
 /**
- * Counts the warning loses per 50 Hz tick: FOUR, one per collision pass.
- *
- * This is the whole difference between "the second nudge tilts" and "the third
- * nudge inside half a second tilts", and it is the reason the rule had to be
- * read out of the call graph rather than out of the routine.
+ * Counts the warning loses per 50 Hz tick under the decoded reading: FOUR, one
+ * per collision pass. Kept as the record of what the code reads as; the
+ * simulation runs the CALIBRATED pair below, which the decoded one failed
+ * against film.
  */
 export const TILT_DECAY_PER_TICK =
   ORIGINAL_TILT_DECAY_PER_PASS * ORIGINAL_COLLISION_PASSES_PER_FRAME;
+
+/**
+ * THE DECODED TRIP MODEL IS REFUTED BY THE RUNNING MACHINE, and these two are
+ * the calibrated replacements.
+ *
+ * The decoded rule — add 100 per press, decay 4 a tick, trip at 200 — predicts
+ * a tilt on the third press inside half a second. The original, filmed with a
+ * millisecond-logged key script, does not do that:
+ *
+ *   BabeWatch       12 presses at ~121 ms  ->  TILT after press 6
+ *   Extreme Sports  12 presses at  250 ms  ->  TILT after press 5
+ *   Extreme Sports  12 presses at ~125 ms  ->  TILT after press 5-6
+ *   Law 'n Justice   2 presses    452 ms apart -> no tilt
+ *   Law 'n Justice   6 presses at  160 ms, ball ON THE PLUNGER -> no tilt
+ *
+ * (DMD display latency est. 2-5 frames, so "after press N" may read one press
+ * late.) Two families fit: threshold ~400-480 with the decoded add, or add
+ * halved against the decoded threshold — the same dynamics at two scales. What
+ * no fit survives with is the decoded decay of 4/tick: at 250 ms cadence that
+ * decay eats half of every press and the fifth press cannot reach any
+ * threshold the ~121 ms runs allow, while the film trips at press 5 at BOTH
+ * cadences — the counter is nearly cadence-insensitive across 120..250 ms.
+ * Threshold 400, add 100 (the decoded default kept), decay 2/tick reproduces
+ * every row above: press 5 lands at 404 (121 ms), 400 (250 ms) and 450
+ * (125 ms), two presses 452 ms apart peak at 155, and the plunger-ball run is
+ * excluded by the ball-in-play gate below. Where the factor of two really
+ * lives — a second counter service, a different shipped option byte — is an
+ * open disassembly question; the numbers are the film's either way.
+ *
+ * THE GATE IS ALSO MEASURED: warming the counter requires a ball IN PLAY. Six
+ * presses at 160 ms with the ball waiting on the plunger rod never tilted,
+ * and the same cadence with a ball rolling does. `nudge` takes that as a
+ * parameter because this module cannot see the ball set.
+ */
+export const MEASURED_TILT_THRESHOLD = 400;
+export const MEASURED_TILT_DECAY_PER_TICK = 2;
 
 export interface NudgeConfig {
   /** Option record 3: counts added to the warning per shove. MEASURED. */
@@ -171,8 +206,8 @@ export const NUDGE_COOLDOWN_TICKS = Math.ceil(
 export function nudgeConfigFor(tableId: TableId): NudgeConfig {
   return {
     sensitivity: TILT_SENSITIVITY_BY_TABLE[tableId],
-    threshold: ORIGINAL_TILT_THRESHOLD,
-    decayPerTick: TILT_DECAY_PER_TICK,
+    threshold: MEASURED_TILT_THRESHOLD,
+    decayPerTick: MEASURED_TILT_DECAY_PER_TICK,
     cooldownTicks: NUDGE_COOLDOWN_TICKS,
     impulse: NUDGE_IMPULSE,
   };
@@ -211,11 +246,18 @@ export interface NudgeOutcome {
  * The order is the original's: add, then test, then let `tickTilt` decay. A
  * shove that lands exactly on the threshold tilts on the shove and not a tick
  * later.
+ *
+ * `ballInPlay` is the measured gate: shoving the cabinet with nothing rolling
+ * — the ball waiting on the plunger rod, or between balls — still moves the
+ * view and still costs the cooldown, but the warning counter does not warm and
+ * the table cannot tilt. Filmed: six SPACE presses at 160 ms with the ball on
+ * the rod never tilted; the same cadence in play does.
  */
 export function nudge(
   state: TiltState,
   direction: NudgeDirection,
   config: NudgeConfig,
+  ballInPlay = true,
 ): NudgeOutcome {
   const refuse = (): NudgeOutcome => ({
     state,
@@ -227,8 +269,8 @@ export function nudge(
 
   if (state.tilted || state.cooldown > 0) return refuse();
 
-  const warning = state.warning + config.sensitivity;
-  const tilted = warning >= config.threshold;
+  const warning = ballInPlay ? state.warning + config.sensitivity : state.warning;
+  const tilted = ballInPlay && warning >= config.threshold;
 
   const next: TiltState = {
     warning,
@@ -262,11 +304,24 @@ export function resetTiltForNewBall(): TiltState {
   return INITIAL_TILT;
 }
 
-/** While tilted the flippers are dead and nothing scores. */
+/** While tilted the flippers are dead: state 8 clears $23F7 every frame. */
 export function flippersLive(state: TiltState): boolean {
   return !state.tilted;
 }
 
-export function scoringLive(state: TiltState): boolean {
+/**
+ * While tilted the POWERED surfaces are dead: no bumper or slingshot kick and
+ * no bumper or slingshot award, the two contact latches the tilt flag gates
+ * (+0x00B216, +0x00B234).
+ *
+ * That is ALL tilt kills. Zone triggers, targets, rollovers and the mission
+ * machine keep scoring on the way down — measured on film twice over (ES ball
+ * 2 accrued +50,000 flipper-dead behind the TILT banner; BW ball 3 +50,000)
+ * and confirmed in the disassembly: the zone walk $52E6 and device walk $558A
+ * run untouched inside the tilted state's service bundle. This function used
+ * to be named for the convention ("nothing scores while tilted") rather than
+ * the machine; the convention was wrong.
+ */
+export function poweredSurfacesLive(state: TiltState): boolean {
   return !state.tilted;
 }

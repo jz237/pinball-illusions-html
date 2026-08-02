@@ -992,8 +992,12 @@ describe("placement", () => {
       expect(configs).toHaveLength(2);
       expect(configs.map((c) => c.role)).toEqual(["left", "right"]);
       for (const config of configs) {
+        // The CONFIGURATION stays inferred — the rest bearing is still this
+        // port's own — but the bat's restitution is now the hunk-8 id-1..4
+        // row (115/256 = 460 Q10), so the surface reads measured.
         expect(config.confidence).toBe("inferred");
-        expect(config.surface.confidence).toBe("inferred");
+        expect(config.surface.confidence).toBe("measured");
+        expect(config.surface.elasticity).toBe(460);
       }
       expect(hasUpperFlipper(id)).toBe(false);
     }

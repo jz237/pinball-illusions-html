@@ -152,13 +152,26 @@ export function plungerInputFrom(snapshot: ControlSnapshot): PlungerInput {
 
 /**
  * Keyboard defaults, by `KeyboardEvent.code` so they follow the physical key
- * rather than the layout. The original played with the shift keys as flippers
- * and space as the plunger; Z and / are the same fingers on a keyboard that
- * has no shift keys where an arcade cabinet would want them, and the comma and
- * full stop are there for the many Amiga ports that used them.
+ * rather than the layout.
  *
- * The upper flipper gets one key per hand — X under the left flipper key, the
- * semicolon beside the right — because which hand is free depends on the table.
+ * THE ORIGINAL'S CONTROLS ARE NOW OBSERVED, not remembered: filmed under
+ * emulation with an input-mark log, RETURN launches the ball (the DMD attract
+ * text says so in as many words), the two SHIFT keys are the flippers, and
+ * SPACE is the NUDGE — it shakes the view a pixel or two and feeds the tilt
+ * counter. Space used to be this port's plunger, which had the one key the
+ * original uses for shoving the table winding an invented spring instead.
+ *
+ * Enter is bound to `start`, and the game loop treats a `start` press during
+ * play as the launch edge — one key, both meanings, exactly as the original's
+ * RETURN both starts from the shell and launches in play. The `plunger`
+ * control remains for the gamepad face button and the on-screen touch button.
+ *
+ * Z and / stay as flipper aliases for keyboards that put the shifts somewhere
+ * unhelpful, and the comma and full stop for the many Amiga ports that used
+ * them; the arrows stay as nudge aliases (they are inert on the original, so
+ * the alias shadows nothing). The upper flipper gets one key per hand — X
+ * under the left flipper key, the semicolon beside the right — because which
+ * hand is free depends on the table.
  */
 export const KEY_CODE_BINDINGS: Readonly<Record<string, Control>> = Object.freeze({
   KeyZ: "leftFlipper",
@@ -169,7 +182,7 @@ export const KEY_CODE_BINDINGS: Readonly<Record<string, Control>> = Object.freez
   ShiftRight: "rightFlipper",
   KeyX: "upperFlipper",
   Semicolon: "upperFlipper",
-  Space: "plunger",
+  Space: "nudgeForward",
   ArrowLeft: "nudgeLeft",
   ArrowRight: "nudgeRight",
   ArrowUp: "nudgeForward",
@@ -196,8 +209,8 @@ export const KEY_NAME_BINDINGS: Readonly<Record<string, Control>> = Object.freez
   ".": "rightFlipper",
   x: "upperFlipper",
   ";": "upperFlipper",
-  " ": "plunger",
-  spacebar: "plunger",
+  " ": "nudgeForward",
+  spacebar: "nudgeForward",
   arrowleft: "nudgeLeft",
   arrowright: "nudgeRight",
   arrowup: "nudgeForward",

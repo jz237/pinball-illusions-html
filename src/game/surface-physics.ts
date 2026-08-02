@@ -352,9 +352,33 @@ function buildTable(): readonly SurfaceResponse[] {
 
 const TABLE = buildTable();
 
-/** The response for one surface id. Throws outside 0..255: the map is bytes. */
-export function surfaceResponseFor(id: number): SurfaceResponse {
-  const found = TABLE[id];
+/**
+ * The same table with every coil DEAD: what a bumper or slingshot face is
+ * while the table is TILTED.
+ *
+ * MEASURED at the contact handlers: tilt ($23ED) is tested at +0x00B216 before
+ * the bumper number is latched and at +0x00B234 before the slingshot's, so the
+ * kick stage never sees either device and neither kick, tangential throw nor
+ * award fires — but the `movem.w` that loads the surface row runs BEFORE the
+ * id range check and is not gated at all, so the face still bounces with its
+ * own restitution. A tilted bumper is a rubber post, not a wall of a different
+ * material.
+ */
+const DISARMED_TABLE: readonly SurfaceResponse[] = Object.freeze(
+  TABLE.map((row) =>
+    row.kick === 0 && row.tangentKick === 0
+      ? row
+      : Object.freeze({ ...row, kick: 0, kickThreshold: 0, tangentKick: 0 }),
+  ),
+);
+
+/**
+ * The response for one surface id. Throws outside 0..255: the map is bytes.
+ *
+ * `powered` false answers the tilted table's row: same restitution, no coil.
+ */
+export function surfaceResponseFor(id: number, powered = true): SurfaceResponse {
+  const found = (powered ? TABLE : DISARMED_TABLE)[id];
   if (found === undefined) {
     throw new RangeError(`surface id ${id} is outside the 256-entry table`);
   }

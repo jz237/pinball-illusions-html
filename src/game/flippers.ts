@@ -510,18 +510,27 @@ export function flipperRateTaken(dx: number, dy: number): number {
  * purpose — a flipper's power comes from the swing, and a fake outward impulse
  * on top would also fire a ball off a bat that is standing still.
  *
- * INFERRED, like every coefficient in `materials.ts`: nothing in the shipped
- * data records restitution. 400 is well below the 845 used for rubber so that a
- * ball can be trapped on a raised flipper instead of chattering off it.
+ * ELASTICITY IS NOW MEASURED. The flipper ids 1..4 select the hunk-8 surface
+ * row with restitution word 115 — the same 256-row table every other surface's
+ * restitution is read from (`surface-physics.ts`, and the disassembly's static
+ * bat model: "a resting or held-at-top bat acts as a static wall with id-1..4
+ * hunk-8 constants: restitution 115/256"). 115 * 4 = 460 Q10. The old 400 was
+ * chosen; the measured value keeps the property it was chosen for — one tick of
+ * gravity bounces at 460/1024 * 128 = 57 Q10, far under the rest threshold, so
+ * a cradled ball still settles instead of chattering.
+ *
+ * Friction stays this port's own 205: the original's tangential rule is a
+ * fraction of the SLIP against ball spin (word $3A = 12800 for the bat), which
+ * a spinless BallState cannot hold — see the long note in `ball-physics.ts`.
  */
 export const FLIPPER_SURFACE: MaterialBehaviour = Object.freeze({
   index: 1,
   kind: "flipper",
   passable: false,
-  elasticity: 400,
+  elasticity: 460,
   friction: 205,
   kick: 0,
-  confidence: "inferred",
+  confidence: "measured",
 });
 
 // ---------------------------------------------------------------------------
@@ -984,10 +993,21 @@ interface BatTouch {
 /**
  * Tests one ball against one bat pose.
  *
- * The degenerate case — a ball centre exactly on the bat's axis, which happens
- * when a bat sweeps up through a ball that was sitting on it — has no normal to
- * read off the geometry, so it falls back to the face the bat sweeps toward.
- * Choosing the other face there would push the ball down through the bat.
+ * `fromX`/`fromY` are the last position the ball was OUTSIDE the bat at — the
+ * previous sample of the swept resolve — and they carry the one fact the
+ * geometry alone cannot: which side the ball came from. When a fast ball's
+ * sample lands past the bat's axis, the nearest-point normal reads off the far
+ * face, and resolving with it is exactly the wrong-side ejection that B1
+ * documented (161 bat-crossings-while-raised in 80 games, all through this
+ * seam). If the geometric normal disagrees with the approach side, the normal
+ * is overridden to the approach side's face and the penetration is measured
+ * through the axis, so `separate` always pushes the ball back out the way it
+ * came in — never through.
+ *
+ * The degenerate case — a ball centre exactly on the bat's axis — has no normal
+ * to read off the geometry either, and takes the approach side too; with no
+ * approach side available it falls back to the face the bat sweeps toward, as
+ * before.
  */
 function touchAt(
   config: FlipperConfig,
@@ -995,6 +1015,8 @@ function touchAt(
   ballX: Q10,
   ballY: Q10,
   ballRadius: Q10,
+  fromX: Q10 = ballX,
+  fromY: Q10 = ballY,
 ): BatTouch | null {
   const axisX = cosineUnits(angle);
   const axisY = sineUnits(angle);
@@ -1015,21 +1037,50 @@ function touchAt(
   const touchDistance = batRadius + ballRadius;
   if (distanceSquared >= touchDistance * touchDistance) return null;
 
+  // The bat's perpendicular, unit length because the axis is: the reference
+  // both side tests below are signed against.
+  const perpX = -axisY | 0;
+  const perpY = axisX;
+  // Which side of the axis the ball approached from: the sign of the last
+  // outside position's perpendicular offset. Zero when unknown (no swept
+  // history, or a start dead on the axis).
+  const fromPerp =
+    q10Multiply(fromX - config.pivotX, perpX) + q10Multiply(fromY - config.pivotY, perpY);
+  const fromSide = fromPerp > 0 ? 1 : fromPerp < 0 ? -1 : 0;
+
   const distance = integerSqrt(distanceSquared);
   let normalX: number;
   let normalY: number;
+  let penetration = touchDistance - distance;
   if (distance === 0) {
-    normalX = (-config.direction * axisY) | 0;
-    normalY = (config.direction * axisX) | 0;
+    if (fromSide !== 0) {
+      normalX = (fromSide * perpX) | 0;
+      normalY = (fromSide * perpY) | 0;
+    } else {
+      normalX = (-config.direction * axisY) | 0;
+      normalY = (config.direction * axisX) | 0;
+    }
   } else {
     normalX = roundHalfAwayFromZero((offsetX * Q10_ONE) / distance) | 0;
     normalY = roundHalfAwayFromZero((offsetY * Q10_ONE) / distance) | 0;
+    if (fromSide !== 0) {
+      const normalPerp = q10Multiply(normalX, perpX) + q10Multiply(normalY, perpY);
+      const normalSide = normalPerp > 0 ? 1 : normalPerp < 0 ? -1 : 0;
+      if (normalSide !== 0 && normalSide !== fromSide) {
+        // The sample crossed the axis between two probes: resolve against the
+        // face the ball came from, and push it back through the axis.
+        const ballPerp = q10Multiply(offsetX, perpX) + q10Multiply(offsetY, perpY);
+        normalX = (fromSide * perpX) | 0;
+        normalY = (fromSide * perpY) | 0;
+        penetration = touchDistance - fromSide * ballPerp;
+      }
+    }
   }
 
   return {
     normalX,
     normalY,
-    penetration: touchDistance - distance,
+    penetration,
     armX: (nearestX + q10Multiply(batRadius, normalX) - config.pivotX) | 0,
     armY: (nearestY + q10Multiply(batRadius, normalY) - config.pivotY) | 0,
     along,
@@ -1106,12 +1157,36 @@ function clampVelocity(value: number): number {
   return q10Clamp(Math.trunc(value), -VELOCITY_LIMIT, VELOCITY_LIMIT);
 }
 
+/** The last position a ball was at before this tick's step, for the sweep. */
+export interface BallStart {
+  readonly x: Q10;
+  readonly y: Q10;
+}
+
 /**
  * Resolves every ball against every flipper for one tick.
  *
  * Runs AFTER `stepBalls`: the bats guard the drain, and a ball must be given its
  * chance to be saved at the position it actually reached this tick rather than
  * the one it started from.
+ *
+ * `starts` is where each ball BEGAN the tick, keyed by ball id, and it is what
+ * makes the contact test SWEPT rather than endpoint-only. This used to test only
+ * the end-of-tick position, and that was the reconstruction's #1 defect (B1): a
+ * ball at 9–16 px/tick crosses the whole bat capsule inside one tick, the
+ * end-of-tick sample sits past the axis, the nearest-point normal reads off the
+ * far face, and the "already leaving" guard then waves it through — 161
+ * bat-crossings-while-raised in 80 census games, all through that seam. With
+ * `starts`, the ball's motion segment is sampled once per collision pass
+ * (matching the original, which tests the bat 4x per frame with at most ~4 px of
+ * ball motion between tests — main.seg00 $A618's pass structure), each sample
+ * against the pose the bat holds at that pass, and the FIRST approaching touch
+ * resolves AT THE CROSSING POINT. Sample spacing (≤4 px of ball travel + ≤4.4 px
+ * of tip travel) is well under the thinnest inflated capsule (ball 8 + tip 1 =
+ * 9 px each side), so no motion the clamp permits can step over the bat.
+ *
+ * Callers that pass no `starts` get the endpoint test, which is still right for
+ * a ball that did not move (unit harnesses that advance balls by hand).
  *
  * `clamp` is the same map-aware push limiter `resolveBallCollisions` takes, and
  * for the same reason: separating a ball from a bat with an unlimited shove can
@@ -1124,12 +1199,20 @@ export function resolveFlipperContacts(
   ballRadius: Q10 = DEFAULT_PROBE_RADIUS,
   clamp: PushClamp | null = null,
   restThreshold: number = DEFAULT_SIMULATION_OPTIONS.restThreshold,
+  starts: ReadonlyMap<number, BallStart> | null = null,
 ): readonly FlipperContact[] {
   const contacts: FlipperContact[] = [];
   for (const ball of balls) {
     if (!ball.active) continue;
     for (const sweep of sweeps) {
-      const contact = resolveOne(ball, sweep, ballRadius, clamp, restThreshold);
+      const contact = resolveOne(
+        ball,
+        sweep,
+        ballRadius,
+        clamp,
+        restThreshold,
+        starts?.get(ball.id) ?? null,
+      );
       if (contact !== null) contacts.push(contact);
     }
   }
@@ -1142,21 +1225,41 @@ function resolveOne(
   ballRadius: Q10,
   clamp: PushClamp | null,
   restThreshold: number,
+  start: BallStart | null,
 ): FlipperContact | null {
   const { config } = sweep;
   const inner = substepsPerStrokeStep(config, ballRadius);
+  const startX = start?.x ?? ball.x;
+  const startY = start?.y ?? ball.y;
+  const deltaX = ball.x - startX;
+  const deltaY = ball.y - startY;
+  const total = sweep.steps.length * inner;
 
   let previous = sweep.from;
+  // The last sample the ball was NOT touching at: the side reference for
+  // `touchAt`, so the resolved face is always the one the ball came from.
+  let freeX = startX;
+  let freeY = startY;
+  let sampled = 0;
   for (const end of sweep.steps) {
     const span = end.stroke - previous.stroke;
-    const samples = span === 0 ? 1 : inner;
-    for (let sample = 1; sample <= samples; sample += 1) {
+    for (let sample = 1; sample <= inner; sample += 1) {
+      sampled += 1;
       // Truncated rather than rounded so the samples advance monotonically and
       // the last one is exactly the pose the step ended on.
-      const stroke = previous.stroke + Math.trunc((span * sample) / samples);
+      const stroke = previous.stroke + Math.trunc((span * sample) / inner);
       const angle = flipperAngle(config, { stroke, rate: end.rate });
-      const touch = touchAt(config, angle, ball.x, ball.y, ballRadius);
-      if (touch === null) continue;
+      // The ball's position at this pass: the tick's displacement is spent
+      // one collision pass at a time, exactly as the original interleaves the
+      // bat's animation with the integrator's sub-steps.
+      const sampleX = (startX + Math.trunc((deltaX * sampled) / total)) | 0;
+      const sampleY = (startY + Math.trunc((deltaY * sampled) / total)) | 0;
+      const touch = touchAt(config, angle, sampleX, sampleY, ballRadius, freeX, freeY);
+      if (touch === null) {
+        freeX = sampleX;
+        freeY = sampleY;
+        continue;
+      }
 
       // The bat's surface velocity at the touched point, in BEARING units per
       // tick: four steps of the rate this step carried. Used for the gate and
@@ -1168,6 +1271,21 @@ function resolveOne(
       const approachSpeed =
         q10Multiply(ball.velocityX - surfaceX, touch.normalX) +
         q10Multiply(ball.velocityY - surfaceY, touch.normalY);
+
+      // A mid-path touch the ball is already LEAVING is not resolved there:
+      // pulling the ball back to a graze it was departing from would cost it
+      // most of a tick of travel for a contact that changes nothing. The final
+      // sample still resolves whatever it finds — that is the endpoint test
+      // this function has always run, and it is what keeps a ball that ends
+      // the tick embedded in the bat separated rather than left inside it.
+      if (approachSpeed >= 0 && sampled < total) continue;
+
+      // Resolve AT THE CROSSING POINT: the ball is placed at the sample that
+      // first met the bat, not at wherever the map integration finished. The
+      // discarded remainder of the tick is at most one pass's travel — the
+      // same granularity the original loses between its own collision passes.
+      ball.x = sampleX;
+      ball.y = sampleY;
 
       // THE GATE, +0x00AEAC and the eight octant masks at $B036+0x3C*n: the bat
       // imparts only when it is sweeping toward the face the ball is on. A rate

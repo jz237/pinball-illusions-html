@@ -34,18 +34,18 @@
  * ---------------------------------------------------------------------------
  * The shipped collision layer has no floor under the shooter lane — column 322
  * of Law 'n Justice is free all the way to the last row — because on the real
- * machine the ball rests on the plunger rod, and the rod is no more present in
+ * machine the ball rests on the launcher rod, and the rod is no more present in
  * the playfield bitmap than the flippers are. A served ball therefore has to be
  * held in place by the ball lifecycle rather than by the map: while
  * `laneBallId` is set the loop restores that ball to the serve point after the
- * step, and the moment the plunger fires the id is cleared and the ball becomes
+ * step, and the moment the launch fires the id is cleared and the ball becomes
  * an ordinary ball with an upward velocity.
  *
- * The same fact runs the other way too. A plunge too weak to carry the ball round
- * the top arch drops back down the lane, and since the lane floor IS the rod, the
- * ball ends up back on it: `ballBackOnTheRod` re-pins it and re-arms the plunger
- * so the player may shoot again. Without that an under-plunge would leave a live
- * ball resting in the lane with no way to move it and no way to lose it.
+ * The launch itself is the ORIGINAL'S: a fixed kick on the launch key's press
+ * edge (main.seg00 0x65EE / 0x663A — see `plunger.ts` for the whole story),
+ * so there is no under-plunge any more. The rod re-pin (`ballBackOnTheRod`)
+ * stays because the playfield can still feed a ball back into the lane from
+ * above, and a ball resting in the lane must always be shootable again.
  *
  * ---------------------------------------------------------------------------
  * THE BALL SEARCH
@@ -209,26 +209,25 @@ import {
 } from "../game/mode-vm.js";
 import type { TableAcceleration } from "../game/table-accel.js";
 import { tableAccelerationFor } from "../game/table-accel.js";
-import type { PlungerConfig, PlungerState } from "../game/plunger.js";
+import type { PlungerConfig } from "../game/plunger.js";
 import { SIMULATION_GRAVITY, SIMULATION_X_TILT } from "../game/timebase.js";
 import {
-  INITIAL_PLUNGER,
   autoLaunchOutcome,
-  chargeLevel,
   launchBall,
   plungerConfigFor,
-  resetPlunger,
   serveBall,
   servePosition,
   shooterLaneFor,
-  tickPlunger,
+  tickLauncher,
 } from "../game/plunger.js";
+import { isPoweredSurfaceId } from "../game/scoring.js";
 import type { NudgeConfig, NudgeDirection, TiltState } from "../game/tilt.js";
 import {
   INITIAL_TILT,
   flippersLive,
   nudge,
   nudgeConfigFor,
+  poweredSurfacesLive,
   resetTiltForNewBall,
   tickTilt,
 } from "../game/tilt.js";
@@ -606,7 +605,6 @@ export interface Game {
   searchPulses: number;
   /** Where each live ball was when that run of ticks began. See `runBallSearch`. */
   stillAnchors: readonly BallAnchor[];
-  plunger: PlungerState;
   tilt: TiltState;
   flippers: FlipperBank;
   camera: CameraState;
@@ -727,7 +725,6 @@ export function createGame(map: TableMap, options?: Partial<GameOptions>): Game 
     stillTicks: 0,
     searchPulses: BALL_SEARCH_PULSES,
     stillAnchors: [],
-    plunger: INITIAL_PLUNGER,
     tilt: INITIAL_TILT,
     flippers: createFlipperBank(map.tableId),
     camera: INITIAL_CAMERA,
@@ -770,7 +767,6 @@ export function startGame(game: Game): void {
   game.stillTicks = 0;
   game.searchPulses = BALL_SEARCH_PULSES;
   game.stillAnchors = [];
-  game.plunger = resetPlunger();
   game.tilt = resetTiltForNewBall();
   game.flippers = createFlipperBank(game.map.tableId);
   game.camera = INITIAL_CAMERA;
@@ -868,6 +864,12 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
   // nothing is owed does the player get charged a ball. Without locks the two
   // conditions collapse into the old `activeBallCount === 0` exactly, because
   // then every active ball is in play and the lane ball is one of them.
+  // While tilted the serve queue is WIPED, every tick: the original's state 8
+  // runs `clr.w $D86(a5)` each frame, which also cancels any ball-save
+  // requeue. Machine-owed balls die with the tilt; the player-owed count is a
+  // different counter and survives, exactly as $D7E does.
+  if (game.tilt.tilted) game.pendingServes = 0;
+
   let served = false;
   if (game.laneBallId === null) {
     const owed = game.pendingServes > 0;
@@ -879,7 +881,6 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
       } else {
         const ball = serveBall(game.balls, game.plungerConfig);
         game.laneBallId = ball.id;
-        game.plunger = resetPlunger();
         if (owed) {
           // A ball the machine owes: a lock's replacement or a multiball ball.
           // It costs the player nothing and it does NOT reset the tilt, because
@@ -902,6 +903,12 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
   }
 
   // ---- nudge and tilt ----------------------------------------------------
+  //
+  // The warning counter only warms while a ball is IN PLAY — measured: six
+  // shoves at 160 ms with the ball waiting on the plunger rod never tilted
+  // the original, and the same cadence with a ball rolling does. The shove
+  // itself still happens (the cabinet moves whatever is on it).
+  const ballRolling = freeBalls(game.balls).some((ball) => ball.id !== game.laneBallId);
   let nudgeX = 0;
   let nudgeY = 0;
   let justTilted = false;
@@ -909,7 +916,7 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     if (!wasPressed(snapshot, control)) continue;
     // Sequential rather than "first one wins": `nudge` refuses during its own
     // cooldown, so two directions in one tick correctly yield one shove.
-    const outcome = nudge(game.tilt, direction, game.nudgeConfig);
+    const outcome = nudge(game.tilt, direction, game.nudgeConfig, ballRolling);
     game.tilt = outcome.state;
     nudgeX += outcome.impulseX;
     nudgeY += outcome.impulseY;
@@ -917,9 +924,21 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
   }
   game.tilt = tickTilt(game.tilt, game.nudgeConfig);
 
-  // ---- plunger -----------------------------------------------------------
-  const plunge = tickPlunger(game.plunger, plungerInputFrom(snapshot), game.plungerConfig);
-  game.plunger = plunge.state;
+  // ---- launch ------------------------------------------------------------
+  //
+  // The original's launcher (main.seg00 0x65EE, run every in-play frame): the
+  // RETURN key byte is edge-consumed and fires a FIXED kick at the ball in the
+  // lane — no charge, no hold, tap and two-second press frame-identical on
+  // film. ENTER is bound to `start`, so during play a `start` press IS the
+  // launch edge — one key with both meanings, exactly as the original's
+  // RETURN starts from the shell and launches in play. The `plunger` control
+  // stays for the gamepad face button and the touch overlay.
+  const launchInput = plungerInputFrom(snapshot);
+  const launchPressed = launchInput.pressed || wasPressed(snapshot, "start");
+  const plunge = tickLauncher(
+    { pressed: launchPressed, released: launchInput.released, held: launchInput.held },
+    game.plungerConfig,
+  );
   let launched = false;
   if (plunge.fired && game.laneBallId !== null) {
     const ball = ballById(game.balls, game.laneBallId);
@@ -932,8 +951,10 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     }
   }
 
-  // The auto-launcher, for balls the machine served itself. It is disarmed the
-  // moment the lane empties, so a player who shoots first keeps the shot.
+  // The auto-launcher, for balls the machine served itself: the original sets
+  // $D89 on a machine-owed delivery and 0x6628 kicks it the moment it
+  // registers in the lane, no key. It is disarmed the moment the lane
+  // empties, so a player who shoots first keeps the shot.
   if (game.autoLaunchCountdown > 0) {
     if (game.laneBallId === null) {
       game.autoLaunchCountdown = 0;
@@ -943,7 +964,6 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
         const ball = ballById(game.balls, game.laneBallId);
         if (ball !== undefined && launchBall(ball, autoLaunchOutcome(game.plungerConfig))) {
           game.laneBallId = null;
-          game.plunger = resetPlunger();
           launched = true;
         }
       }
@@ -968,6 +988,14 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     nudgeX,
     nudgeY,
   };
+  // Where every ball BEGAN the tick, for the flippers' swept contact test: the
+  // bats must see the whole motion segment, or a ball fast enough to cross the
+  // bat line inside one tick is tested only where it ended — on the wrong
+  // side. That endpoint-only seam was the reconstruction's #1 defect (B1).
+  const flipperStarts = new Map<number, { readonly x: Q10; readonly y: Q10 }>();
+  for (const ball of game.balls.balls) {
+    if (ballIsInPlay(ball)) flipperStarts.set(ball.id, { x: ball.x, y: ball.y });
+  }
   // The drive is spread in LAST so a caller cannot switch it off through
   // `options.simulation` without noticing they have done it — and it is the
   // game's own, from the registry, not something the options carry.
@@ -975,6 +1003,10 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     ...game.options.simulation,
     rampDrive: game.rampDrive,
     surfaces: game.devices,
+    // Tilt kills the coils and only the coils: bumpers and slingshots stop
+    // kicking (and stop scoring, gated below) but keep their restitution,
+    // which is the original's gate at +0x00B216/+0x00B234.
+    poweredKicksLive: poweredSurfacesLive(game.tilt),
   });
   const flipperContacts = resolveFlipperContacts(
     game.balls.balls,
@@ -982,25 +1014,25 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     ballRadiusOf(game),
     null,
     restThresholdOf(game),
+    flipperStarts,
   );
   // The ball takes angular momentum out of the bat — measured, see
   // `applyFlipperReactions` — so the bank has to be told what it just paid for.
   game.flippers = applyFlipperReactions(game.flippers, flipperContacts);
 
-  // A plunge too weak to clear the arch drops back down the lane, and the lane
-  // floor IS the plunger rod, so the ball ends up back on it and may be shot
-  // again. That is how the real machine behaves and it is why the shipped
-  // collision layer has no floor under the lane to begin with; without it, an
-  // under-plunge would strand the ball and end the game.
+  // A ball that comes back down the lane lands on the rod — the lane floor IS
+  // the plunger rod, which is why the shipped collision layer has no floor
+  // under the lane — and may be shot again. The fixed kick makes an
+  // under-LAUNCH impossible, but the playfield can still feed a ball back
+  // into the lane from above, and without the re-pin it would strand there.
   if (game.laneBallId === null) {
     const returned = ballBackOnTheRod(game);
     if (returned !== null) {
       game.laneBallId = returned.id;
-      game.plunger = resetPlunger();
       // During multiball the player's hands are on the bats, so a ball that came
       // back down the lane goes out again on the auto-launcher rather than
-      // waiting for a plunge that is not coming. With one ball in play it is the
-      // player's shot, exactly as before.
+      // waiting for a launch press that is not coming. With one ball in play it
+      // is the player's shot, exactly as before.
       if (freeBallCount(game.balls) > 1) game.autoLaunchCountdown = AUTO_LAUNCH_DELAY_TICKS;
     }
   }
@@ -1025,7 +1057,7 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
   // cannot score the lane it is sitting in. Before the locks, because a lock
   // captures a ball that has already been scored for whatever it rolled over on
   // the way in.
-  const awards = runScoring(game, step.surfaces);
+  const awards = runScoring(game, step.surfaces, poweredSurfacesLive(game.tilt));
 
   // ---- ball locks and multiball ------------------------------------------
   const wasMultiball = game.multiball;
@@ -1044,7 +1076,16 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
   awards.push(...modeAwardsAsAwards(modeTick));
 
   // ---- ball search -------------------------------------------------------
-  const search = runBallSearch(game);
+  //
+  // A ball a bat is holding up is CONTROLLED, not lost: the player is cradling
+  // it, which is a legal and deliberate thing to do for as long as they like,
+  // and the original has no ball search at all to disagree (exhaustive read of
+  // every in-play state's service bundle — the only involuntary ball removal
+  // in the machine is the y>600 drain test). So a ball the flippers touched
+  // this tick is exempt from the search exactly as the rod ball is. B2.
+  const cradled = new Set<number>();
+  for (const contact of flipperContacts) cradled.add(contact.ballId);
+  const search = runBallSearch(game, cradled);
   const lost = search.lost;
   // A swallowed ball is inactive but NOT drained: it is back in the trough and
   // the machine owes a serve for it, so it must not reach the end-of-ball path.
@@ -1078,7 +1119,6 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
       }
       game.modeMessages = [];
       game.multiball = false;
-      game.plunger = resetPlunger();
       game.tilt = resetTiltForNewBall();
       game.serveCountdown = game.options.serveDelayTicks;
       if (game.ballsServed >= game.options.ballsPerGame) {
@@ -1131,8 +1171,18 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
  * A held ball is skipped entirely. It is out of the simulation (see
  * `ballIsInPlay`), so it has no contacts to score, and leaving it in the zone
  * pass would make a saucer re-award its own rectangle every tick it held a ball.
+ *
+ * `poweredLive` is false while TILTED, and it gates exactly what the original
+ * gates: the bumper and slingshot awards (their contact latches at +0x00B216
+ * and +0x00B234 are skipped on the tilt flag). Zone triggers, targets and
+ * every other device KEEP scoring on the way down — measured on film, twice —
+ * so filtering more than ids 16..31 here would be less authentic, not more.
  */
-function runScoring(game: Game, surfaces: ReadonlyMap<number, readonly number[]>): Award[] {
+function runScoring(
+  game: Game,
+  surfaces: ReadonlyMap<number, readonly number[]>,
+  poweredLive: boolean,
+): Award[] {
   const devices = game.devices;
   if (devices === null) return [];
   tickScoring(game.scoring);
@@ -1141,8 +1191,12 @@ function runScoring(game: Game, surfaces: ReadonlyMap<number, readonly number[]>
   for (const ball of game.balls.balls) {
     if (!ballIsInPlay(ball)) continue;
     if (ball.id === game.laneBallId) continue;
-    const touched = surfaces.get(ball.id);
+    let touched = surfaces.get(ball.id);
     if (touched === undefined || touched.length === 0) continue;
+    if (!poweredLive) {
+      touched = touched.filter((id) => !isPoweredSurfaceId(id));
+      if (touched.length === 0) continue;
+    }
     awards.push(...scoreSurfaces(game.scoring, devices, ball.level, touched));
   }
 
@@ -1526,9 +1580,18 @@ function ballsLeftTheBox(
  * expiry and the game completes with all three balls ending in real drains;
  * the full BabeWatch census slice is back to 0.0% at the same budget.
  */
-function runBallSearch(game: Game): { lost: number[]; swallowed: number[] } {
+function runBallSearch(
+  game: Game,
+  cradled: ReadonlySet<number>,
+): { lost: number[]; swallowed: number[] } {
   const none: { lost: number[]; swallowed: number[] } = { lost: [], swallowed: [] };
-  const live = freeBalls(game.balls);
+  // A ball a bat touched this tick is under the player's control — a cradle is
+  // motionless on purpose, exactly like the ball on the rod, and the original
+  // has no ball search at all, let alone one that confiscates a held ball. It
+  // is excluded from the watch list entirely: it neither runs the clock nor
+  // takes a coil pulse nor gets written off. Releasing the flipper puts it
+  // back on the list the next tick.
+  const live = freeBalls(game.balls).filter((ball) => !cradled.has(ball.id));
   if (
     live.length === 0 ||
     game.laneBallId !== null ||
@@ -1819,7 +1882,6 @@ export interface GameDebugState {
   } | null;
   /** The lines the mission last put on the display. */
   readonly modeMessages: readonly string[];
-  readonly plungerCharge: number;
   /** Consecutive motionless ticks counted toward the ball search. */
   readonly stillTicks: number;
   /** Coil pulses the ball search has left before it writes the ball off. */
@@ -1886,7 +1948,6 @@ export function debugSnapshot(game: Game): GameDebugState {
     }),
     mission: runningMission(game),
     modeMessages: [...game.modeMessages],
-    plungerCharge: chargeLevel(game.plunger),
     stillTicks: game.stillTicks,
     searchPulses: game.searchPulses,
     tilt: { ...game.tilt },
@@ -2007,8 +2068,9 @@ function statusLine(game: Game, scoreOnPanel: boolean): string {
   if (game.paused) return "PAUSED";
   if (game.tilt.tilted) return "TILT";
   const ball = Math.max(1, ballNumber(game));
-  const charge = Math.round(chargeLevel(game.plunger) * 100);
-  const plunger = game.laneBallId === null ? "" : `  PLUNGER ${charge}%`;
+  // The original's own attract line reads "RETURN LAUNCHES BALL"; the fixed
+  // kick has no charge to meter, so the prompt is the whole of the display.
+  const plunger = game.laneBallId === null ? "" : "  ENTER LAUNCHES";
   // Digits straight out of the BCD field: what is displayed is what is stored.
   const bonus = readBcdField(game.scoring.bonus);
   const bonusText = bonus === 0 ? "" : `  BONUS ${formatBcdField(game.scoring.bonus)}`;
