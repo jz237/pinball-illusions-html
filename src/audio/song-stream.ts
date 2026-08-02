@@ -31,37 +31,44 @@ const MAX_TICKS_PER_PASS = 1_000_000;
  * wraps back into the order list — as a timed command stream.
  *
  * `voices` maps the song's instrument numbers to the ids of whatever BANK the
- * output layer was built with — the synthesized one, or the twelve PCM voices
- * decoded out of the front-end module. A note on an unmapped instrument is a
- * throw, because a silently dropped voice is the bug that survives for
- * months. `restartMs` is the elapsed time at which the player first stood on
- * the song's restart position, so the output layer's repeat re-enters exactly
- * where the module engine's order-list restart field says.
+ * output layer was built with — the synthesized one, or the PCM voices decoded
+ * out of the front-end module. A note on an unmapped instrument is a throw,
+ * because a silently dropped voice is the bug that survives for months.
+ *
+ * `restartMs` IS WHERE THE LOOP RE-ENTERS, AND IT IS MEASURED, NOT DECLARED.
+ * A pass ends when the order position goes backwards, and the position it goes
+ * back TO is the loop entry — whichever mechanism took it there. That covers
+ * both of the machine's two wraps with one rule: running off the end of the
+ * order list, which $8138-$814A sends to position 0, and a `Bxx`, which
+ * $8182 sends to the param. The front-end module's own restart byte is 127
+ * against 54 orders — ProTracker's "unused" marker — and its loop is the `B13`
+ * on the last row of order 51, so the entry is order 19 and the lead-in ahead
+ * of it is never replayed. A song that simply falls off its order list still
+ * restarts at millisecond 0, exactly as before.
+ *
+ * `startOrder` is where the PROGRAM enters the module, which is not always 0
+ * and is not the module's business: the replayer takes a start position in d0
+ * ($79EA, and intro.seg00's own copy). The front-end module is entered at
+ * order 17 — see `shell-music.ts` and the exporter for the measurement.
  */
 export function renderSongStream(
   song: TrackerSong,
   voices: Readonly<Record<number, string>>,
+  startOrder = 0,
 ): TrackerCommandStream {
-  const player = createTrackerPlayer(song);
+  const player = createTrackerPlayer(song, startOrder);
   const commands: StreamCommand[] = [];
   let elapsedMs = 0;
-  let restartMs: number | null = null;
   let previousOrder = player.order;
+  /** Order position -> the elapsed time it was first entered at, row 0 tick 0. */
+  const enteredMs = new Map<number, number>();
 
   for (let guard = 0; ; guard += 1) {
     if (guard > MAX_TICKS_PER_PASS) {
       throw new Error(`tracker song "${song.title}" never wrapped its order list`);
     }
-    // The restart point is a POSITION, recorded the first time the player
-    // stands on it. With restart 0 that is the very first tick, and the
-    // whole pass repeats; the shell song's restart 1 skips its intro.
-    if (
-      restartMs === null &&
-      player.order === song.restart &&
-      player.row === 0 &&
-      player.tick === 0
-    ) {
-      restartMs = elapsedMs;
+    if (player.row === 0 && player.tick === 0 && !enteredMs.has(player.order)) {
+      enteredMs.set(player.order, elapsedMs);
     }
 
     for (const command of stepTracker(player)) {
@@ -104,12 +111,16 @@ export function renderSongStream(
     }
 
     // The tick that just played lasts the player's CURRENT tick length, so a
-    // speed or tempo effect re-times the song from the row that set it.
+    // speed effect re-times the song from the row that set it.
     elapsedMs += tickDurationSeconds(player) * 1000;
     if (player.order < previousOrder) break; // the order list wrapped: pass over
     previousOrder = player.order;
   }
 
+  // The wrap has landed the player on the loop entry. It was necessarily
+  // entered once already on the way here, so the lookup answers; a song that
+  // somehow jumped somewhere it had never been replays from the top.
+  const restartMs = enteredMs.get(player.order) ?? 0;
   return { commands, durationMs: elapsedMs, restartMs };
 }
 
@@ -122,15 +133,25 @@ export function renderSongStream(
  * variable, because there is no longer exactly ONE song — the front-end module
  * is loaded at runtime and a test may render a fixture beside it.
  */
-const STREAMS = new WeakMap<TrackerSong, TrackerCommandStream>();
+const STREAMS = new WeakMap<TrackerSong, Map<number, TrackerCommandStream>>();
 
 export function songStreamFor(
   song: TrackerSong,
   voices: Readonly<Record<number, string>>,
+  startOrder = 0,
 ): TrackerCommandStream {
-  const cached = STREAMS.get(song);
+  // Keyed on the START ORDER as well as the song: the same module entered at a
+  // different position is a different stream, with a different length and a
+  // different restart point, and a memo that ignored that would hand the
+  // second caller the first caller's song.
+  let byStart = STREAMS.get(song);
+  if (byStart === undefined) {
+    byStart = new Map<number, TrackerCommandStream>();
+    STREAMS.set(song, byStart);
+  }
+  const cached = byStart.get(startOrder);
   if (cached !== undefined) return cached;
-  const stream = renderSongStream(song, voices);
-  STREAMS.set(song, stream);
+  const stream = renderSongStream(song, voices, startOrder);
+  byStart.set(startOrder, stream);
   return stream;
 }

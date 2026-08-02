@@ -100,7 +100,8 @@
  * bat can push a ball at most its own penetration, a few pixels, and `stepBalls`
  * runs `recoverPenetration` on the next tick. Both halves turned out to be
  * wrong on Law 'n Justice's upper-left bat, whose capsule OVERLAPS the level-0
- * boundary wall (pivot (37,302), wall 14 px away, boss 5 + ball 8 = 13), and
+ * boundary wall (pivot (37,302), wall 14 px away against a boss-plus-ball touch
+ * distance of 13 at the time, and 16 since the silhouette was re-measured), and
  * whose recovery walk is 34 px wide on that table rather than 16 because the
  * budget was tied to the virtual top wall. `ball-physics.ts` now exports
  * `pushClampForMap`, so there is one clamp with one implementation and the bat
@@ -2198,13 +2199,14 @@ export function canvasSizeFor(scale: number): { readonly width: number; readonly
 /**
  * The bats, as the sprite layer needs to see them.
  *
- * The STROKE is the whole of the state a drawn bat depends on: the pose is
- * `restPose + ((direction * stroke) >> 6)` off the bat's own disk record, which
- * is the original's `asr.w #$6` at main.seg00 +0xBDB8. The pivot travels only so
- * a bat with no record can still put a fallback marker somewhere sensible — a
- * drawn bat is placed on its RECORD's pivot, not this one. See the note in
- * `flipper-bats.ts` about the two pixels and the 3.3 degrees the picture and the
- * simulation disagree by.
+ * The STROKE decides the POSE: `restPose + ((direction * stroke) >> 6)` off the
+ * bat's own disk record, which is the original's `asr.w #$6` at main.seg00
+ * +0xBDB8. The PIVOT decides where that pose is blitted, and it is this one —
+ * the simulation's. It used to travel only so a bat with no record could put a
+ * fallback marker somewhere sensible, while the drawn bat was placed on the pose
+ * bank record's pivot instead; the two were two pixels apart on every lower bat.
+ * Both now come from the same records, and the picture is hung on whatever the
+ * physics is actually colliding with.
  */
 function batFrameStates(game: Game): BatFrameState[] {
   const states: BatFrameState[] = [];

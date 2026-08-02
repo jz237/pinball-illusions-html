@@ -4,12 +4,18 @@
  * ---------------------------------------------------------------------------
  * WHY THESE EXIST
  * ---------------------------------------------------------------------------
- * The original shell plays one SNT! module through the player at main.seg00
- * $79EA. Its twelve PCM samples are preservation media and its note data is the
- * publisher's composition; neither ships. What ships instead is a NEWLY
- * COMPOSED piece played on the instruments below — short looped waveforms in
- * the idiom of the machine (an Amiga instrument IS a small sample with a loop
- * window, pitched by playback rate), but every byte of them computed here.
+ * These were written under a project rule the operator has since reversed: the
+ * original module's PCM was treated as preservation media that could not ship,
+ * so a new composition on synthesized voices stood in for it. The original
+ * front-end module now ships, gated, under `disk-derived-shell-music` (see
+ * `shell-music.ts`), and the stand-in composition is deleted.
+ *
+ * THE BANK STAYS, because a bank is now a parameter (`InstrumentBank` in
+ * `tracker-output.ts`): these voices are what a build with no authorized
+ * assets falls back to, and what the tracker's own tests play. They are short
+ * looped waveforms in the idiom of the machine — an Amiga instrument IS a small
+ * sample with a loop window, pitched by playback rate — but every byte of them
+ * is computed here and owes the disks nothing.
  *
  * ---------------------------------------------------------------------------
  * THE SHAPE OF AN INSTRUMENT

@@ -45,8 +45,8 @@ import { instrumentById, playbackRateFor } from "./instruments.js";
  * The instrument bank used to be a closed union — `InstrumentId` and the
  * module-level `instrumentById` — which was fine while there was exactly one
  * bank, the synthesized one. There are now two: the synthesized voices, and the
- * TWELVE PCM INSTRUMENTS decoded out of the front-end module and shipped as
- * WAVs under the `disk-derived-shell-music` gate. So a bank is a parameter: a
+ * 28 PCM INSTRUMENTS decoded out of the front-end module and shipped as WAVs
+ * under the `disk-derived-shell-music` gate. So a bank is a parameter: a
  * resolver from the id a command names to the buffer to play, defaulting to the
  * synthesized one so every existing caller is unchanged.
  *

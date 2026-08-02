@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-// Decodes THE FRONT-END MUSIC out of `music001.bin` into a shipped module
-// document and one WAV per live instrument, under public/generated/shell/. Run
-// locally, where the operator's own disks live; what it writes is what ships.
+// Decodes THE FRONT-END MUSIC — the tune under the attract/credits cycle — out
+// of `intro.bin` into a shipped module document and one WAV per live
+// instrument, under public/generated/shell/. Run locally, where the operator's
+// own disks live; what it writes is what ships.
 //
 // ---------------------------------------------------------------------------
 // THIS FILE EXISTS BECAUSE A PROJECT RULE WAS REVERSED
@@ -14,21 +15,56 @@
 // other disk-derived class. The stand-in composition has been deleted.
 //
 // ---------------------------------------------------------------------------
+// IT USED TO READ `music001.bin`, AND THAT WAS THE WRONG MODULE
+// ---------------------------------------------------------------------------
+// `music001.bin` holds a real, byte-faithful `SNT!` module off Disk 3, and the
+// shell (`main.seg00` +$CAE7) really does load `PROGDIR:music001.bin`. It is
+// the MENU tune. It is NOT the tune the attract/credits cycle plays, and the
+// attract/credits cycle is what this reconstruction's front end is.
+//
+// The capture settles it, and settles it by a margin. Against the continuous
+// 399.6 s take in research/view/reference/session3 (48 kHz, unresampled):
+//
+//   * the film's music loops in EXACTLY 8077 PAL frames — waveform
+//     self-correlation +0.997 at lag 8077 and below +0.04 at 8074..8080;
+//   * `music001`'s order list laps in 3584 frames (71.68 s) whatever reading
+//     of its cells the replayer allows, and rendered through this project's own
+//     player it scores +0.0146 waveform and +0.0322 onset-envelope against the
+//     take, with an envelope cross-correlation that peaks at +0.2661 against a
+//     99th percentile of +0.1973 on the same curve — noise;
+//   * the `SNT!` bank in `intro.bin.seg05` laps in EXACTLY 8077 frames under the
+//     same rules, and the same render scores +0.7240 waveform and +0.9820
+//     onset-envelope over the whole lap, at two places in the take exactly 8077
+//     frames apart. That is 50x the waveform figure and 30x the envelope one.
+//
+// `intro.bin` carries its own second copy of the replayer (intro.seg00 +$117C
+// probes for `SNT!`, +$12D2 sets the default speed 6, +$1670 wraps at 64 rows,
+// +$1C82 handles F, +$1AC0 E6, +$1CA4 B, +$1C8C D) and its own copper lists,
+// each with one `MOVE #$A000,INTREQ` a frame. The two banks share one sample
+// outright (descriptor 9 is byte-identical) and a sound library besides, which
+// is why per-instrument correlations against the film looked encouraging for
+// the wrong module for as long as they did.
+//
+// `music001` is left on the disks and out of the build. It is the menu tune and
+// deserves to ship one day; it is not this asset, and re-pointing this exporter
+// back at it would restore a front end that measurably does not match the film.
+//
+// ---------------------------------------------------------------------------
 // THE CONTAINER
 // ---------------------------------------------------------------------------
-// `music001.bin` is 85,568 bytes on Disk 3: a `TSL!` package with ONE data
-// descriptor (flags 0x00000002, no BSS) declaring 0x182E8 = 99,048 bytes, whose
-// `ATN!` stream decompresses to exactly that. The slot is hunk-wrapped pure
-// data — u32 body length 0x182E0, body, empty relocation table — so the
-// seg_clean split (`music001.bin.seg00.bin`) is `u32 length` + body + 4 zero
-// bytes, and this exporter reads that split.
+// `intro.bin` is 658,938 bytes on Disk 1: a `TSL!` package (the container
+// documented in docs/DISK_ANALYSIS.md, including two BSS descriptors of 512 and
+// 249,600 bytes that store no payload). Descriptor 5 is hunk-wrapped pure
+// data — u32 body length, body, empty relocation table — so the seg_clean split
+// (`intro.bin.seg05.bin`, 260,900 bytes) is `u32 length` + a 260,892-byte body
+// + 4 zero bytes, and this exporter reads that split.
 //
 // ---------------------------------------------------------------------------
 // THE BANK: `SNT!`, DICE'S REPACKED PROTRACKER
 // ---------------------------------------------------------------------------
 // The body is ONE bank holding ONE song. The layout is the one the parser at
-// main.seg00 $7BF8 reads, already proven for the in-table slot-7/8 banks by
-// scripts/export-table-audio.mjs:
+// main.seg00 $7BF8 reads — and intro.seg00's own copy reads the same — already
+// proven for the in-table slot-7/8 banks by scripts/export-table-audio.mjs:
 //
 //     +$000 'SNT!'
 //     +$004 u32  byte offset of the PCM, relative to the bank base
@@ -39,15 +75,48 @@
 //     +$302 packed pattern data
 //     +$004-> sample PCM, contiguous in table order, 2*length_words each
 //
-// This song: 31 sample descriptors of which 12 are live (1-7, 9-11, 14, 15),
-// song length 14, restart 127, order list [0,6,4,3,10,3,10,1,7,5,2,5,8,9],
-// 11 packed patterns, and 94,128 bytes of signed 8-bit PCM ending two pad bytes
-// short of the body.
+// This song: 31 sample descriptors of which 28 are live (1-28, all of them
+// named by the patterns and none named that is dead), song length 54, restart
+// 127, 37 packed patterns filling +$302..+$46E4, and 242,732 bytes of signed
+// 8-bit PCM ending 12 pad bytes short of the body.
+//
+// The program enters the order list at 17, plays 17 and 18 once (576 fields,
+// 11.5 s) and then loops orders 19..51 forever on the `B13` at pattern 29 row
+// 63; orders 0..16 are never heard and 52 and 53 are dead. That loop is the
+// 8077 frames: 23 orders at F03 (64 x 3 = 4416), 9 orders at F06 (64 x 6 =
+// 3456), and order 47 / pattern 35 at 205, whose row 46 carries an `F01` that
+// lasts a single field and is the reason 8077 is not divisible by 6.
+//
+// ---------------------------------------------------------------------------
+// WHY ORDER 17, AND HOW IT WAS FOUND
+// ---------------------------------------------------------------------------
+// The replayer takes a START POSITION in d0 ($79EA, and intro.seg00's own
+// copy), so where a program enters the order list is the program's business
+// and not the module's. The cold-boot take in session3
+// (`coldboot-loading-into-first-credits-page-50fps-native.mkv`, 269.8 s, 48 kHz,
+// unresampled) shows exactly where this one enters:
+//
+//   * it is DIGITALLY SILENT for 884 fields, boot fields 3380..4264, while the
+//     disk loads;
+//   * anchoring on the loop entry, which sits at boot field 4840.516, that
+//     silence ends at order 17's first field to within half a field;
+//   * order 17 then correlates +0.9389 waveform at an offset of -3 samples and
+//     order 18 +0.8758 at -1, over their whole 384 and 192 fields, and the 33
+//     orders of the loop follow at +0.56..+0.88;
+//   * every order BEFORE 17 correlates at -0.07..+0.09 — noise — and four of
+//     them sit against passages where the take is at digital zero and a render
+//     from order 0 is at full level.
+//
+// So a start at 0 would put 90 seconds of music in front of the tune that the
+// machine does not play. Two readings fit the recording equally — the loader
+// starts the module at 17, or it starts it at 0 with audio DMA off and enables
+// DMA at the display switch, which lands on order 17 — and they are audibly
+// identical from the first sound onwards, so this ships the audible one.
 //
 // ---------------------------------------------------------------------------
 // THE PACKED CELL ENCODING, FROM THE PLAYBACK DECODER
 // ---------------------------------------------------------------------------
-// main.seg00 $7F8A-$7FE6, verified bit-exact — all 11 patterns decode to
+// main.seg00 $7F8A-$7FE6, verified bit-exact — all 37 patterns decode to
 // exactly 256 cells (4 channels x 64 rows, row-major) and consume exactly their
 // offset-table ranges, the last of them ending precisely on the PCM offset:
 //
@@ -59,9 +128,9 @@
 //         effect     = byte1 & 0xF
 //         param      = byte2
 //
-// A 384-cell reading is arithmetically impossible, which is the cleanest check
-// on the 64-row shape: pattern 0 occupies 324 bytes and 384 cells need at least
-// 384. CHECK 3 below re-runs the tiling on every export.
+// CHECK 3 below re-runs the tiling on every export: 37 patterns have to
+// consume exactly the 17,378 bytes between +$302 and the PCM, with 36 interior
+// boundaries landing on the offset table's own words.
 //
 // ---------------------------------------------------------------------------
 // WHAT THIS SHIPS, AND WHY IT IS NOT A `.mod`
@@ -83,7 +152,7 @@
 // Usage:
 //   node scripts/export-shell-music.mjs <segment-dir> [out-dir] [--check]
 //
-// <segment-dir> holds music001.bin.seg00.bin. --check decodes and compares
+// <segment-dir> holds intro.bin.seg05.bin. --check decodes and compares
 // against what is already in <out-dir> without writing.
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
@@ -127,19 +196,37 @@ const WAV_NOTE_INDEX = 24;
 const PROVENANCE = {
   sourceClass: "disk-derived-shell-music",
   description:
-    "The front-end module decoded from the SNT! bank in music001.bin on the " +
-    "operator's own AGA floppy set: the order list, the 11 packed patterns and " +
-    "the 12 live PCM instruments, as a document plus one WAV each. Nothing is " +
+    "The front-end module decoded from the SNT! bank in intro.bin on the " +
+    "operator's own AGA floppy set: the order list, the 37 packed patterns and " +
+    "the 28 live PCM instruments, as a document plus one WAV each. Nothing is " +
     "resampled, normalised or faded.",
   authorizationRequired: true,
 };
+
+/** The seg_clean split this reads, and the bank inside it. */
+const SEGMENT_FILE = "intro.bin.seg05.bin";
+const MODULE = "intro.seg05";
+
+/**
+ * The order position the PROGRAM enters this module at — a playback parameter,
+ * measured off the cold-boot take, not a field of the bank. See the header.
+ * The exporter checks it against the decode rather than merely asserting it.
+ */
+const START_ORDER = 17;
+
+/**
+ * The PCM stops short of the body by a few pad bytes. `music001` carried 2;
+ * this bank carries 12 of the 260,892. The budget is 16 — enough for the
+ * alignment slack a packer leaves, far too little to hide a second bank.
+ */
+const MAX_TRAILING_PAD = 16;
 
 // ---------------------------------------------------------------------------
 // The bank
 // ---------------------------------------------------------------------------
 
 function loadBody(segDir) {
-  const path = join(segDir, "music001.bin.seg00.bin");
+  const path = join(segDir, SEGMENT_FILE);
   if (!existsSync(path)) throw new Error(`not found: ${path}`);
   const raw = readFileSync(path);
   const declared = raw.readUInt32BE(0);
@@ -159,7 +246,7 @@ function loadBody(segDir) {
  */
 function readBank(body) {
   if (body.length < 0x400 || body.toString("latin1", 0, 4) !== "SNT!") {
-    throw new Error("music001 slot 0 does not begin with SNT!");
+    throw new Error(`${MODULE} does not begin with SNT!`);
   }
   const pcmAt = body.readUInt32BE(BANK_PCM_OFFSET);
   const samples = [];
@@ -181,14 +268,14 @@ function readBank(body) {
   }
   if (cursor > body.length) {
     throw new Error(
-      `music001: the sample directory declares PCM ending at ${cursor}, past the ` +
+      `${MODULE}: the sample directory declares PCM ending at ${cursor}, past the ` +
         `${body.length}-byte body`,
     );
   }
-  if (body.length - cursor > 2) {
+  if (body.length - cursor > MAX_TRAILING_PAD) {
     throw new Error(
-      `music001: ${body.length - cursor} bytes of slack after the PCM; the decode expects at ` +
-        `most the two pad bytes the disk carries`,
+      `${MODULE}: ${body.length - cursor} bytes of slack after the PCM; the decode allows at ` +
+        `most ${MAX_TRAILING_PAD} pad bytes`,
     );
   }
 
@@ -227,7 +314,7 @@ function decodePattern(body, base) {
           cells.push(held === null ? { note: 0, instrument: 0, effect: 0, param: 0 } : held);
         } else {
           throw new Error(
-            `music001: unknown whole-cell byte 0x${byte0.toString(16)} at ${at - 1} ` +
+            `${MODULE}: unknown whole-cell byte 0x${byte0.toString(16)} at ${at - 1} ` +
               `(pattern base ${base}, row ${row}, channel ${channel})`,
           );
         }
@@ -267,7 +354,7 @@ function decodePatterns(body, bank) {
       index + 1 < count ? BANK_PATTERN_DATA + bank.patternOffsets[index + 1] : bank.pcmAt;
     if (end !== next) {
       throw new Error(
-        `music001: pattern ${index} decoded to ${end} but the next boundary is ${next} ` +
+        `${MODULE}: pattern ${index} decoded to ${end} but the next boundary is ${next} ` +
           `(off by ${next - end})`,
       );
     }
@@ -335,17 +422,42 @@ function decode(segDir) {
     for (const [cell, event] of cells.entries()) {
       if (event.instrument !== 0 && !liveIndices.has(event.instrument)) {
         throw new Error(
-          `music001: pattern ${at} cell ${cell} names instrument ${event.instrument}, ` +
+          `${MODULE}: pattern ${at} cell ${cell} names instrument ${event.instrument}, ` +
             `which has no PCM`,
         );
       }
       if (event.note > 36) {
-        throw new Error(`music001: pattern ${at} cell ${cell} has note ${event.note} > 36`);
+        throw new Error(`${MODULE}: pattern ${at} cell ${cell} has note ${event.note} > 36`);
       }
     }
   }
 
-  return { bank, patterns, live, files };
+  // CHECK 5 — the start position names a real order, and the loop the `B13`
+  // makes is reachable from it. A start order past the jump target would ship a
+  // tune that never enters its own loop.
+  if (START_ORDER < 0 || START_ORDER >= bank.songLength) {
+    throw new Error(
+      `${MODULE}: start order ${START_ORDER} is outside the ${bank.songLength}-order list`,
+    );
+  }
+  const jumps = [];
+  for (const [at, cells] of patterns.entries()) {
+    for (const [cell, event] of cells.entries()) {
+      if (event.effect === 0xb) jumps.push({ pattern: at, row: Math.floor(cell / CHANNELS), to: event.param });
+    }
+  }
+  if (jumps.length !== 1) {
+    throw new Error(`${MODULE}: expected exactly one Bxx, found ${jumps.length}`);
+  }
+  const loopEntry = jumps[0].to;
+  if (loopEntry < START_ORDER || loopEntry >= bank.songLength) {
+    throw new Error(
+      `${MODULE}: the B${loopEntry.toString(16)} loops to order ${loopEntry}, which a start ` +
+        `at ${START_ORDER} never reaches`,
+    );
+  }
+
+  return { bank, patterns, live, files, loopEntry, jump: jumps[0] };
 }
 
 function buildDocument(decoded) {
@@ -356,6 +468,9 @@ function buildDocument(decoded) {
     songLength: decoded.bank.songLength,
     restart: decoded.bank.restart,
     orders: decoded.bank.orders.slice(0, decoded.bank.songLength),
+    // The one thing here that is NOT a field of the bank: where the program
+    // enters the order list. Measured off the cold-boot take; see the header.
+    startOrder: START_ORDER,
     // 31 descriptors, live or not: the player indexes them by the instrument
     // number in a cell, and a sparse array would make that a search.
     instruments: decoded.bank.samples.map((sample) => ({
@@ -367,7 +482,7 @@ function buildDocument(decoded) {
       repeatLengthWords: sample.repeatLengthWords,
     })),
     // 4 numbers a cell, row-major, 1024 per pattern. Flat because a document
-    // of 11 x 64 x 4 objects is 40x the bytes for the same information.
+    // of 37 x 64 x 4 objects is 40x the bytes for the same information.
     patternCells: 4,
     patterns: decoded.patterns.map((cells) =>
       cells.flatMap((cell) => [cell.note, cell.instrument, cell.effect, cell.param]),
@@ -435,6 +550,16 @@ function main(argv) {
       `${total.toLocaleString()} bytes of WAV -> ${out}`,
   );
   console.log(`               orders [${decoded.bank.orders.slice(0, decoded.bank.songLength)}]`);
+  // The order the jump actually fires from: the first use of its pattern at or
+  // after the loop entry. Everything past it is unreachable.
+  const orders = decoded.bank.orders.slice(0, decoded.bank.songLength);
+  const fires = orders.indexOf(decoded.jump.pattern, decoded.loopEntry);
+  console.log(
+    `               enters at order ${START_ORDER}; pattern ${decoded.jump.pattern} row ` +
+      `${decoded.jump.row} carries B${decoded.loopEntry.toString(16).padStart(2, "0")}, so the ` +
+      `loop is orders ${decoded.loopEntry}..${fires} and ${decoded.bank.songLength - 1 - fires} ` +
+      `order(s) past it are dead`,
+  );
   for (const sample of decoded.live) {
     console.log(
       `               #${String(sample.index).padStart(2)} ${String(sample.byteLength).padStart(6)} B  ` +

@@ -39,6 +39,18 @@
  * into sound; node tests consume them directly.
  *
  * ---------------------------------------------------------------------------
+ * THE CLOCK: ONE TICK IS ONE PAL FIELD, AND THERE IS NO BPM
+ * ---------------------------------------------------------------------------
+ * This format is NOT ProTracker in its timing, and reading it as ProTracker is
+ * what made the reconstruction's front end play at the wrong tempo for months.
+ * The replayer is driven from the level-6 (EXTER) autovector at main.seg00
+ * $08FC, which the display copper list raises exactly once per frame
+ * (`MOVE #$A000,INTREQ`, one write per list) — so a tick IS a PAL field, 50 a
+ * second, and CIA-B Timer A is only the two-stage DMA restart delay at
+ * $8240/$828A, never a tempo source. `tickDurationSeconds` therefore answers a
+ * constant 20 ms and `tempo` is a field nothing in this format can write.
+ *
+ * ---------------------------------------------------------------------------
  * EFFECT COVERAGE
  * ---------------------------------------------------------------------------
  * IMPLEMENTED (the practical subset the shell module's idiom needs):
@@ -50,25 +62,60 @@
  *   A volume slide        (x up / y down per non-zero tick, clamps 0..64)
  *   B position jump       (order = param on row end; out of range goes to 0)
  *   C set volume          (tick 0, clamped to 64)
- *   D pattern break       (next order — or B's target — at row 10x + y)
- *   F set speed/tempo     (param < 0x20 is ticks/row, else BPM; F00 ignored)
+ *   D pattern break       (next order — or B's target — at row = the RAW param)
+ *   F set ticks per row   (the raw byte, 0..255; there is NO BPM branch)
  *
  *   4 vibrato             (sine table, depth/speed memory, per-tick)
  *   6 vibrato + volume slide
  *   9 sample offset       (start the note 256*param bytes in)
- *   E6 pattern loop       (E60 marks, E6x jumps back x times)
+ *   E6 pattern loop       (E60 marks, E6x jumps back x times, per channel)
  *   EA/EB fine volume slide up/down (tick 0 only, once)
  *
  * ACCEPTED BUT IGNORED (valid in song data, note still triggers, no effect):
  *   7 tremolo, 8 (unused in PT), and the E sub-commands other than 6, A and B.
- *   F00 — ProTracker halts; this player keeps the current speed, because the
- *   shell's music loops forever.
  *
- * The five that were added are the five the FRONT-END MODULE ACTUALLY USES:
- * a census of its 11 decoded patterns counts 4 x103, 6 x26, 9 x6, EA x94,
- * EB x48 and E6 x2, against 1 x24, 2 x1, 3 x13, A x35, B x1, C x183 and F x19
- * for the ones that were already here. Leaving them accepted-but-ignored would
- * have shipped an audible deviation on every bar that vibratos.
+ * THREE OF THOSE READINGS ARE THIS MACHINE'S AND NOT PROTRACKER'S. Each is
+ * taken from the replayer's own bytes, quoted here so the next reader does not
+ * have to re-derive them:
+ *
+ *   F  main.seg00 $883A `10 2c 00 05 / 66 06 / 50 ea 02 1c / 70 01 /
+ *      15 40 01 0d / 4e 75` — the param byte goes straight into $10d, the LOW
+ *      BYTE of the speed word $10c that $80BE reloads the countdown from.
+ *      No compare against $20, no CIA write, no tempo anywhere. F00 alone is
+ *      special-cased, and differently in the two builds: the shell build stores
+ *      1 and sets the stop flag $21c, while the intro build (intro.seg00
+ *      +$1C82 `10 2c 00 05 / 15 40 ff fb / 4e 75`) stores the 0 verbatim and
+ *      does not stop. A stored 0 and a stored 1 both give a ONE-FIELD row —
+ *      reload 0, `subq.w #1` to -1, `ble` taken — so this core stores the raw
+ *      byte and the arithmetic in `advance` produces the machine's row length
+ *      for either. The front-end module carries exactly one F00 (pattern 14
+ *      row 62, in the run-in, not in the loop) and never halts on it.
+ *
+ *   D  $884C `addi.w #$40,d0` on the RAW param, not ProTracker's 10x+y. The
+ *      one D in the front-end module is D00 (pattern 35 row 50) and music001
+ *      has none, so both readings agree on every shipped cell; the raw one is
+ *      the machine's. WHERE THIS MODEL STOPS: for a NON-ZERO param the machine
+ *      then walks $8112, which indexes `bank+$182 + 2*position` — a region that
+ *      is all zeros in both banks and is indexed by position rather than row,
+ *      an original bug — so the hardware lands on the pattern's first row with
+ *      the row counter reading `param`, and the pattern ends `param` rows
+ *      early. This core simply starts at row `param`. Nothing shipped tells
+ *      the two apart; a module with a non-zero D would.
+ *
+ *   E6 $8678 = intro.seg00 +$1AC0, byte-identical in both builds:
+ *      `70 0f / c0 2c 00 05 / 67 32 / 52 2c 00 2f / b0 2c 00 2f / 6d 22 ...`.
+ *      The counter $2f and the marked row $2c live in the 62-byte CHANNEL
+ *      block at a4, so the loop is PER CHANNEL. The counter is incremented
+ *      before the compare, so the FIRST pass is counted and E6x plays the
+ *      marked span x+1 times. And E60 is guarded by `tst.w $2e / bne` — a mark
+ *      laid while that channel's loop is still live is IGNORED.
+ *
+ * The five effects added for the module are the five it ACTUALLY USES: a
+ * census of the front-end module's 37 decoded patterns counts 4 x352, 6 x34,
+ * 9 x277, EA x12, EB x37 and E6 x4, against 1 x12, 2 x133, 3 x73, A x674,
+ * B x1, C x1278, D x1 and F x70 for the ones that were already here. Leaving
+ * them accepted-but-ignored would have shipped an audible deviation on every
+ * bar that vibratos.
  */
 
 // ---------------------------------------------------------------------------
@@ -232,9 +279,19 @@ export interface TrackerInstrument {
 
 export interface TrackerSong {
   readonly title: string;
-  /** Ticks per row at song start, 1..31. ProTracker's default is 6. */
+  /**
+   * Ticks per row at song start, 1..31. The machine's own default is 6 —
+   * `move.w #$6,$10c(a6)` at main.seg00 $7B08, and the same immediate at
+   * intro.seg00 +$12D2 — written on every song start before row 0 is fetched.
+   */
   readonly initialSpeed: number;
-  /** BPM at song start, 32..255. ProTracker's default is 125 (50 ticks/s). */
+  /**
+   * The tick rate as a ProTracker BPM, so `tickDurationSeconds` can state it
+   * in one place: 125 is 50 ticks a second, which IS the PAL field rate this
+   * replayer is clocked at. NOTHING IN THIS FORMAT CHANGES IT — see the header
+   * on `F` — so every song this core plays carries 125, and the field exists
+   * to name the constant rather than to be varied.
+   */
   readonly initialTempo: number;
   /** Order position the song loops back to at the end of the order list. */
   readonly restart: number;
@@ -382,6 +439,14 @@ interface ChannelState {
   /** Last emitted period/volume, so the stream only carries changes. */
   emittedPeriod: number;
   emittedVolume: number;
+  /**
+   * Effect E6's state, PER CHANNEL because the machine keeps it per channel:
+   * the row this channel's `E60` marked ($2c in the 62-byte channel block) and
+   * how many jumps back it still owes ($2f, the low byte of $2e). A non-zero
+   * count means the loop is live, which is what makes a second `E60` a no-op.
+   */
+  loopRow: number;
+  loopCount: number;
 }
 
 export interface TrackerPlayer {
@@ -397,22 +462,18 @@ export interface TrackerPlayer {
   pendingJump: number | null;
   pendingBreak: number | null;
   /**
-   * Effect E6's state: the row `E60` marked and how many jumps back are left.
-   *
-   * ProTracker keeps these per channel; this core keeps one pair, because the
-   * shipped module uses E6 on ONE channel of ONE pattern (pattern 0, `E60` at
-   * row 48 and `E62` at row 63, which plays rows 48..63 three times) and a
-   * per-channel model would be four times the state for no shipped behaviour.
-   * Stated rather than assumed: a song that ran two channels' loops at once
-   * would need the split.
+   * The row an E6x still owes a jump to, or null. One slot rather than four
+   * because the machine has one row register ($116) and the last channel to
+   * write it wins; the COUNTERS that decide whether to write are per channel.
    */
-  loopRow: number;
-  loopCount: number;
-  /** Set by an E6x that still owes a jump; consumed when the row ends. */
-  pendingLoop: boolean;
+  pendingLoopRow: number | null;
 }
 
-/** Wall-clock length of one tick: 2.5 / BPM seconds (125 BPM = 50 ticks/s). */
+/**
+ * Wall-clock length of one tick: 2.5 / BPM seconds. At the 125 this format
+ * pins (see `TrackerSong.initialTempo`) that is 20 ms — one PAL field, which
+ * is what the EXTER interrupt actually delivers.
+ */
 export function tickDurationSeconds(player: TrackerPlayer): number {
   return 2.5 / player.tempo;
 }
@@ -446,6 +507,8 @@ export function createTrackerPlayer(song: TrackerSong, startOrder = 0): TrackerP
       active: false,
       emittedPeriod: 0,
       emittedVolume: -1,
+      loopRow: 0,
+      loopCount: 0,
     });
   }
   return {
@@ -458,9 +521,7 @@ export function createTrackerPlayer(song: TrackerSong, startOrder = 0): TrackerP
     tempo: song.initialTempo,
     pendingJump: null,
     pendingBreak: null,
-    loopRow: 0,
-    loopCount: 0,
-    pendingLoop: false,
+    pendingLoopRow: null,
   };
 }
 
@@ -519,16 +580,19 @@ function applyRowStart(player: TrackerPlayer, state: ChannelState, at: TrackerCe
       const command = param >> 4;
       const operand = param & 0xf;
       if (command === 0x6) {
-        // E60 marks the loop row; E6x jumps back to it x times. The counter is
-        // set on the FIRST E6x seen and decremented after, so `E62` plays the
-        // marked span three times in all.
-        if (operand === 0) player.loopRow = player.row;
-        else if (player.loopCount === 0) {
-          player.loopCount = operand;
-          player.pendingLoop = true;
+        // E60 marks this channel's loop row, but only while no loop is live —
+        // $86B2 `tst.w $2e(a4) / bne` drops the mark otherwise. E6x jumps back
+        // to it x times: the counter is taken on the FIRST E6x seen and run
+        // down after, so `E62` plays the marked span three times in all, which
+        // is the machine's `addq.b #1,$2f / cmp / blt` counted the other way.
+        if (operand === 0) {
+          if (state.loopCount === 0) state.loopRow = player.row;
+        } else if (state.loopCount === 0) {
+          state.loopCount = operand;
+          player.pendingLoopRow = state.loopRow;
         } else {
-          player.loopCount -= 1;
-          if (player.loopCount > 0) player.pendingLoop = true;
+          state.loopCount -= 1;
+          if (state.loopCount > 0) player.pendingLoopRow = state.loopRow;
         }
       } else if (command === 0xa) {
         state.volume = Math.min(state.volume + operand, TRACKER_MAX_VOLUME);
@@ -543,16 +607,16 @@ function applyRowStart(player: TrackerPlayer, state: ChannelState, at: TrackerCe
     case 0xc:
       state.volume = Math.min(param, TRACKER_MAX_VOLUME);
       break;
-    case 0xd: {
-      const target = (param >> 4) * 10 + (param & 0xf);
-      player.pendingBreak = target < ROWS_PER_PATTERN ? target : 0;
+    case 0xd:
+      // $884C adds $40 to the RAW param; ProTracker's 10x+y is not this
+      // machine's arithmetic. See the header for where this model stops.
+      player.pendingBreak = param < ROWS_PER_PATTERN ? param : 0;
       break;
-    }
     case 0xf:
-      // F00 halts real ProTracker; shell music loops forever, so it is ignored.
-      if (param === 0) break;
-      if (param < 0x20) player.speed = param;
-      else player.tempo = param;
+      // The raw byte, verbatim, into ticks-per-row. No BPM branch exists in
+      // this replayer, and a stored 0 gives a one-field row exactly as a
+      // stored 1 does — see the header, and `advance`.
+      player.speed = param;
       break;
     default:
       break;
@@ -618,16 +682,19 @@ function applyTickEffect(state: ChannelState, at: TrackerCell): void {
 
 function advance(player: TrackerPlayer): void {
   player.tick += 1;
+  // `<` and not `<=`: a speed of 0 — which `F00` stores in the intro build —
+  // ends the row on its first tick, which is what the machine's `subq.w #1`
+  // to -1 followed by `ble` does with a 0 reload.
   if (player.tick < player.speed) return;
   player.tick = 0;
   // E6's jump is decided before B and D, exactly as ProTracker orders them:
   // the loop is inside the pattern and a position jump leaves it.
-  if (player.pendingLoop && player.pendingJump === null && player.pendingBreak === null) {
-    player.pendingLoop = false;
-    player.row = player.loopRow;
+  if (player.pendingLoopRow !== null && player.pendingJump === null && player.pendingBreak === null) {
+    player.row = player.pendingLoopRow;
+    player.pendingLoopRow = null;
     return;
   }
-  player.pendingLoop = false;
+  player.pendingLoopRow = null;
   if (player.pendingJump !== null || player.pendingBreak !== null) {
     player.order = player.pendingJump ?? player.order + 1;
     player.row = player.pendingBreak ?? 0;

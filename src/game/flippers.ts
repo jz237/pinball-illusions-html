@@ -21,30 +21,28 @@
  *     120 frames to the full turn, of which 109 are stored. The stored arc runs
  *     -72 deg .. +252 deg; the 11 frames from 255 to 285 (tip pointing up and to
  *     the left) are the ones no flipper on any table ever needs.
- *   * Silhouette geometry, from the solid frames: the pivot is the centre of the
- *     largest inscribed disc, radius 5 px; the tip is 45 px from it (exactly 45
- *     on the 0 deg and 90 deg frames, 43.4 median across the sweep once
- *     rasterisation noise is included); half-thickness at the boss is 5 px,
- *     tapering linearly to about 1 px at the tip, with the taper starting 6 px
- *     out. A 45 px bat next to a 16 px ball is 2.8 ball diameters, which is a
- *     real machine's proportion to two significant figures.
+ *   * Silhouette geometry, re-measured off the DECODED pose bank rather than off
+ *     the raw frames — see FLIPPER_BOSS_RADIUS_PIXELS for the profile row by
+ *     row. The drawn blade is 46 px from the pivot to its last pixel, 15 px
+ *     across at the boss (8 px from the pivot's axis, not 5), tapering to 4 px
+ *     at along 44, with a further 8 px of hub BEHIND the pivot that the
+ *     original draws over the inlane guide and that does not collide.
  *
- * WHERE THE BATS SIT IS NOW MEASURED TOO, and this file used to say it could not
- * be. The placement was looked for in the wrong place: it is not in `main.bin`
- * at all but in the TABLE packages, as four 0x1FA-byte flipper records reached
+ * WHERE THE BATS SIT IS MEASURED TOO, and the simulation now runs on it. The
+ * placement was once looked for in the wrong place: it is not in `main.bin` at
+ * all but in the TABLE packages, as four 0x1FA-byte flipper records reached
  * through $2346(a5) from the surface-id handlers for ids 1..4 at +0x00AE80,
  * +0x00AE86, +0x00AE90 and +0x00AE9A. Each record opens with a type byte, a
  * handler byte, the pivot as two words, the rest pose and the flipped pose, and
- * then the stroke rates. The pivots read (86,556) and (199,556) on Law 'n
- * Justice, (112,556) and (227,556) on BabeWatch and (113,556) and (227,556) on
- * Extreme Sports — within two pixels of what this project had inferred from the
- * map's free-centre spans, which is a good independent check on both.
+ * then the stroke rates. Every one of the nine bats — three per table — is built
+ * from its own record by `FLIPPER_RECORDS` below. There is no second placement
+ * left in this file to drift against it.
  *
- * Law 'n Justice also carries a THIRD record, at pivot (37,302), sweeping 11
- * poses instead of 18 — the upper-left flipper this file has always said it
- * could not locate. It is recorded in LAW_N_JUSTICE_UPPER_FLIPPER and NOT wired
- * in: giving a table a third bat is a change to how it plays and wants its own
- * pass with the census, not a line in a timebase audit.
+ * The lower pivots read (86,556) and (199,556) on Law 'n Justice, (112,556) and
+ * (227,556) on BabeWatch and (113,556) and (227,556) on Extreme Sports, and the
+ * rest poses are 10 and 50 — exactly 30 degrees below horizontal. Each table
+ * also carries a THIRD record: Law 'n Justice at (37,302) sweeping 11 poses,
+ * BabeWatch at (205,115) sweeping 13, Extreme Sports at (182,194) sweeping 18.
  *
  * ---------------------------------------------------------------------------
  * WHY THE STROKE IS A SCALAR AND NOT AN ANGLE
@@ -154,6 +152,7 @@
  * a copy that drifts a unit or two at some angles.
  */
 
+import { TABLE_IDS } from "./contracts.js";
 import type { BallState, MaterialBehaviour, PlayfieldLevel, TableId } from "./contracts.js";
 import type { PushClamp } from "./ball-physics.js";
 import { DEFAULT_SIMULATION_OPTIONS, reflectVelocity } from "./ball-physics.js";
@@ -291,17 +290,88 @@ export const FLIPPER_FRAME_ARC_END_DEGREES = 252;
  */
 export const FLIPPER_FIRST_BANK_FRAMES = 85;
 
-/** Pivot-to-tip length of the drawn bat, in pixels. Measured. */
-export const FLIPPER_LENGTH_PIXELS = 45;
+/**
+ * THE SILHOUETTE, RE-MEASURED OFF THE SHIPPED POSE BANK — and the four numbers
+ * below used to be half the bat.
+ *
+ * They were read once, before `flipdat1.bin` was decoded into
+ * `public/generated/flipper-bats.json`, and never revised: length 45, boss 5,
+ * tip 1. The boss was documented as "the largest inscribed disc. Measured." It
+ * is not. Rasterising pose 0 — the bat drawn horizontally, anchor (8,8), so
+ * `along` is x and `perp` is y — gives the profile outright:
+ *
+ *     perp  -8 ....###########........................................
+ *           ..
+ *           -4 #####################################################..
+ *            0 #######################################################
+ *           +2 #####################################################..
+ *           ..
+ *           +6 ....###########........................................
+ *              ^pivot                                        ^along 46
+ *
+ *   along  -8 .. -1   the HUB behind the pivot, 8 px of it
+ *   along   0 ..  6   perp -8 .. +6      half-thickness 8 from the axis
+ *   along   7 .. 16   perp -7 .. +5      7
+ *   along  17 .. 27   perp -6 .. +4      6
+ *   along  28 .. 37   perp -5 .. +3      5
+ *   along  38 .. 44   perp -4 .. +2      4
+ *   along  45         perp -3 .. +1      3
+ *   along  46         perp -2 ..  0      2
+ *
+ * So the drawn blade is EIGHT pixels from the axis at the boss, not five, and
+ * fifteen pixels across. The taper start of 6 was right; the length of 45 was a
+ * pixel short of the drawn 46; the tip was four pixels out.
+ *
+ * WHAT THE CAPSULE IS SET TO, and why it is not simply "the drawn numbers".
+ * `batRadiusAt` is constant to `taperStart` and then linear, and `touchAt`
+ * clamps `along` into 0..`length`, so the far end is a round cap of `tipRadius`.
+ * Fitting that shape to the profile above:
+ *
+ *   boss 8, tip 4, taper start 6, AXIS LENGTH 44
+ *
+ * reproduces the constant 8 to along 6, the 8 -> 4 run to along 44, and covers
+ * the last two drawn columns with the cap (at along 45 the cap allows 3.87 px
+ * against the drawn 3; at along 46, 3.46 against 2). Measured over the drawn
+ * pixels of ALL 64 shipped poses, forward of the pivot: 31,909 of 32,154 inside
+ * the capsule (99.24%), worst excursion 1.44 px, and the residue is the
+ * rasterisation wander of poses that were each drawn by hand — their
+ * perpendicular centre ranges over -1.57 .. +1.49 rather than sitting at a
+ * constant offset. At the old boss 5 / tip 1 / length 45 the same measurement is
+ * 22,174 of 32,154: NINE THOUSAND NINE HUNDRED AND EIGHTY drawn pixels, 31% of
+ * the bat the player can see, with no collision behind them.
+ *
+ * THE 8 PX HUB BEHIND THE PIVOT IS NOT PART OF THE BLADE. The original draws it
+ * over the end of the inlane guide rail, and `touchAt`'s clamp of `along` to 0
+ * is what keeps the blade out of that painted geometry: everything behind the
+ * pivot resolves against the pivot itself. That leaves a round cap of
+ * `bossRadius` there rather than nothing at all — 8 px, which is the drawn hub's
+ * own reach, though not its flat-sided shape — and the whole measured
+ * consequence is ONE PIXEL: the inlane guide's tip, exactly 8 px from the pivot,
+ * on three of the six lower bats. `tests/flippers.test.ts` names it by
+ * coordinate, along with the nine pixels of its own ramp scenery that Extreme
+ * Sports' upper bat is drawn over.
+ *
+ * `tests/flippers.test.ts` derives all four numbers from the shipped pose bank
+ * rather than restating them, so they cannot go stale again.
+ */
 
-/** Half-thickness at the boss, in pixels: the largest inscribed disc. Measured. */
-export const FLIPPER_BOSS_RADIUS_PIXELS = 5;
+/** Length of the capsule's AXIS, in pixels; the round tip cap reaches 48. */
+export const FLIPPER_LENGTH_PIXELS = 44;
 
-/** Half-thickness at the tip, in pixels. Measured. */
-export const FLIPPER_TIP_RADIUS_PIXELS = 1;
+/** Half-thickness at the boss, in pixels, measured from the pivot's axis. */
+export const FLIPPER_BOSS_RADIUS_PIXELS = 8;
+
+/** Half-thickness where the axis ends, in pixels. */
+export const FLIPPER_TIP_RADIUS_PIXELS = 4;
 
 /** Distance from the pivot at which the taper begins, in pixels. Measured. */
 export const FLIPPER_TAPER_START_PIXELS = 6;
+
+/** Furthest drawn pixel from the pivot, along the blade. Measured, pose 0. */
+export const FLIPPER_DRAWN_TIP_PIXELS = 46;
+
+/** Furthest drawn pixel BEHIND the pivot: the hub, which is not blade. */
+export const FLIPPER_DRAWN_HUB_PIXELS = 8;
 
 /**
  * The frame whose bearing is `angle`, or null when the sweep does not store one.
@@ -409,8 +479,9 @@ export const FLIPPER_DOWN_MAX_RATE = 50;
  * ball caught early and a ball caught late leave at genuinely different speeds,
  * which is the whole of what flipper timing is.
  *
- * At the tip, 45 px out, the peak is 17.7 px a tick — 885 px a second, against a
- * measured velocity clamp of 800 — so a full-strength flipper shot now crosses
+ * At the end of the capsule's axis, 44 px out, the peak is 17.3 px a tick — 864
+ * px a second, and 18.1 at the drawn tip 46 px out — against a measured velocity
+ * clamp of 800, so a full-strength flipper shot now crosses
  * the 600 px playfield in about half a second. At the old constant rate it was
  * 9.4 px a tick, which after the gravity correction would have made a flipper
  * shot WEAKER than a scoop kicker and a bumper twice as strong as a bat. That
@@ -432,7 +503,7 @@ export const FLIPPER_DOWN_TICKS = 6.25;
  * MEASURED. `+0x00AEC6` builds the index as `(|dx| << 6) + |dy|` and reads a
  * word, so both offsets are taken modulo nothing at all — a ball more than 63 px
  * from the pivot on either axis would read off the end of the row. It cannot
- * happen on a 45 px bat with an 8 px ball, and the port clamps rather than
+ * happen on a 46 px bat with an 8 px ball, and the port clamps rather than
  * reproducing the overrun.
  */
 export const ORIGINAL_IMPULSE_TABLE_SIDE = 64;
@@ -458,10 +529,16 @@ export const ORIGINAL_IMPULSE_SCALE_Q16 = 35810;
  * The floor applied to a small radius: 46, one pixel past the bat's own length.
  *
  * MEASURED at +0x00AEF0: `subi.w #$2e,d5 / bge / neg.w d5 / lsr.w #3,d5 /
- * add.w d5,d0`, i.e. `if v < 46: v += (46 - v) >> 3`. Every radius a 45 px bat
- * can produce is under 46, so on a flipper the floor ALWAYS fires; it lifts the
- * boss from 0 to 5 and the tip from 33 to 34, which is what stops a ball caught
- * at the boss from being handed nothing.
+ * add.w d5,d0`, i.e. `if v < 46: v += (46 - v) >> 3`. Every radius a 46 px bat
+ * can produce is under 46, so on a flipper the floor ALWAYS fires, and what it
+ * stops is a ball caught at the boss being handed nothing.
+ *
+ * WHAT THE WIDER COLLISION BAT DID TO IT. The nearest a ball's CENTRE can come
+ * to the pivot is the boss half-thickness plus the ball's radius, which the
+ * silhouette re-measurement moved from 5 + 8 = 13 px to 8 + 8 = 16 px. So the
+ * smallest table entry a flipper can now read is `isqrt(16*16*35810>>16)` = 11,
+ * floored to 15, against 9 floored to 13 before. A boss shot leaves marginally
+ * stronger, and no radius the bat can produce is outside the table.
  */
 export const ORIGINAL_IMPULSE_FLOOR = 46;
 
@@ -588,106 +665,54 @@ export interface FlipperConfig {
 }
 
 /**
- * Why every pivot below says `inferred`.
+ * WHERE THE BATS SIT — one table, straight off the disk records.
  *
- * The flippers are absent from the collision layer, and the placement tables
- * live in `main.bin`, a packed TSL container. A search of the unpacked table
- * segments for the flipdat frame row offsets, the frame heights and the
- * per-frame pivot offsets — as bytes, 16-bit and 32-bit, both endiannesses —
- * returned nothing, so there is no measured placement available.
+ * THIS FILE USED TO CARRY TWO PLACEMENTS AND RUN ON THE WRONG ONE, and that is
+ * the defect this block exists to close. The lower pivots were INFERRED from the
+ * shipped collision maps (the free ball-centre span on row 558, whose endpoints
+ * are 84/199 on Law 'n Justice and 112/227 on the other two) and the rest
+ * bearing was chosen (152 of 2048, 26.7 degrees). The disk's own records were
+ * decoded later, recorded beside them as a cross-check, and deliberately not
+ * wired in, because swapping them moves both bats two rows and three degrees and
+ * that is a change to how a table PLAYS. The safeguard was a test asserting the
+ * two agreed within two pixels, and it passed.
  *
- * What IS measured, off the shipped maps with the simulation's own rule that a
- * pixel blocks when its material index is odd:
+ * IT PASSED WHILE THE GAME WAS VISIBLY BROKEN. Two pixels of PIVOT agreement
+ * says nothing about FACE agreement, and once the renderer was moved onto the
+ * disk's own bat sprites the drawn bat sat on the record's pivot while the
+ * colliding bat stayed on the inferred one. Measured across the six lower bats
+ * against the filmed original's own pixels, the collision face sat a mean 4.83
+ * px (max 9) BELOW the face being drawn — 60% of a ball radius, at every point
+ * of every stroke. A ball resting on what the player could see was above
+ * anything that could stop it, and 33-43% of every approach to a bat was a
+ * contact the player saw and the machine did not.
  *
- *   * The bottom of the playfield is the SAME artwork on all three tables,
- *     shifted 28 px right on BabeWatch and Extreme Sports. Every wall run in
- *     rows 538..556 matches Law 'n Justice's exactly under that shift.
- *   * The two inlane guide rails end in rounded tips whose last blocking pixels
- *     are at x = 75..76 and x = 207..208 on row 556 (Law 'n Justice), so the
- *     bottom of the table is symmetric about x = 141.5.
- *   * Row 558 is the first row below those tips, and the free ball-CENTRE span
- *     across it — computed with the real 8 px radius — is exactly 84..199 on
- *     Law 'n Justice and exactly 112..227 on the other two. Those endpoints are
- *     symmetric about the same axis to the pixel.
+ * SO THE INFERENCE IS GONE. `FLIPPER_RECORDS` below is the only placement in
+ * this file, it is the disk's, and `tests/flippers.test.ts` pins every field of
+ * it against `public/generated/flipper-bats.json` by EQUALITY — the same
+ * document the renderer draws from. The map-anchor derivation that produced the
+ * inferred numbers is kept, but demoted to what it can actually prove: that the
+ * pivot lies inside the free ball-centre span and close enough to the guide tip
+ * that no ball can pass behind the bat. It is a sanity check on the record, not
+ * a rival source for it.
  *
- * Every column in that paragraph is 32 px right of where it used to read, and
- * the reason is not a re-derivation: the shipped collision maps were exported a
- * word out of phase and have been re-exported (see `plunger.ts` for the byte
- * evidence). The measurement is the same measurement, run again on the corrected
- * bitmap. The ROW numbers — 556, 558 — are untouched, because a horizontal
- * reframe cannot move a row.
- *
- * The pivots are placed on those endpoints. That puts the boss 3.7 px clear of
- * the guide tip, far less than the 16 px a ball needs, so no ball can pass
- * behind a flipper; and it puts the pivot on the exact centre track a ball
- * rolling out of the inlane follows, so the ball arrives at the bat's base
- * rather than beside it. The rest angle and the sweep are then classic
- * proportions rather than measurements: 26.7 degrees below horizontal leaves
- * 34.6 px between the two tips, 2.2 ball diameters, and the whole stroke clears
- * the painted geometry at both ends.
- *
- * THE INFERENCE WAS THEN CHECKED AGAINST THE DISK AND SURVIVED, WITHIN TWO
- * PIXELS. The flipper records in the table packages (see the file header) give
- * the pivots outright: MEASURED_FLIPPER_PIVOTS below. Every one of the six
- * columns is within two pixels of the inferred one and three are exact, and the
- * row is 556 against the inferred 558.
- *
- * The INFERRED placement is still what the simulation runs on, and that is a
- * deliberate choice rather than an oversight. The inferred numbers are
- * mechanically re-derived from a shipped asset by the placement tests, so they
- * cannot rot; the disk numbers cannot be, because the table packages are not in
- * this repository. Swapping them in also moves both bats two rows up and shifts
- * one of them sideways, which is a change to how a table PLAYS, and belongs in a
- * change that can run the census against it rather than in a timebase audit. The
- * test suite asserts the two agree to within two pixels, so the day they stop
- * agreeing is the day something is wrong with one of them.
+ * WHAT THE FILM SAYS, because it outranks both. Blitting each shipped rest pose
+ * at the record's pivot and counting pixels that disagree with the filmed AGA
+ * original leaves 0, 8, 10, 0, 0 and 0 disagreements on the six lower bats, and
+ * ZERO sprite-only pixels on all six; at the inferred pivot the same count is
+ * 176..270. A +-4 px sweep of the pivot bottoms out at exactly (0,0) on all six.
+ * Sweeping the rest bearing, 30 degrees leaves 0 sprite-only pixels and 27
+ * degrees leaves 51. The records are right and the film says so independently.
  */
 export const FLIPPER_PLACEMENT_NOTE =
-  "Bat geometry measured from pkg/flipdat1.bin; sweep and both stroke rates " +
-  "measured from the per-table flipper records at $2346(a5) (Table00N.seg04); " +
-  "LOWER pivots inferred from measured map anchors (guide tips row 556, free " +
-  "ball-centre span row 558) and cross-checked against those records to within " +
-  "two pixels; the UPPER bat every table ships is measured outright - pivot, " +
-  "both poses and all four stroke rates straight off its record, there being " +
-  "no map anchor to infer one from.";
-
-/** Rest bearing of a left flipper: 152 units below horizontal, 26.7 degrees. */
-export const FLIPPER_REST_ANGLE_UNITS = 152;
-
-/** Row the lower pivots sit on, in pixels. Two rows below the guide tips. */
-export const LOWER_FLIPPER_PIVOT_ROW = 558;
-
-/**
- * Pivot columns of the two lower flippers, in pixels, per table.
- *
- * These are the endpoints of the measured free ball-centre span on
- * LOWER_FLIPPER_PIVOT_ROW; see FLIPPER_PLACEMENT_NOTE. BabeWatch and Extreme
- * Sports share Law 'n Justice's bottom artwork shifted 28 px right, and their
- * spans confirm it independently.
- */
-export const LOWER_FLIPPER_PIVOT_COLUMNS: Readonly<
-  Record<TableId, { readonly left: number; readonly right: number }>
-> = Object.freeze({
-  "law-n-justice": Object.freeze({ left: 84, right: 199 }),
-  babewatch: Object.freeze({ left: 112, right: 227 }),
-  "extreme-sports": Object.freeze({ left: 112, right: 227 }),
-});
-
-/**
- * What the disk says, for the cross-check: word +2 and word +4 of each table's
- * two lower-flipper records, which are the pivot's x and y in whole pixels.
- *
- * Not used by the simulation. See FLIPPER_PLACEMENT_NOTE for why the inferred
- * placement above is still the one that runs, and `tests/flippers.test.ts` for
- * the assertion that the two never drift more than two pixels apart.
- */
-export const MEASURED_FLIPPER_PIVOTS: Readonly<
-  Record<TableId, { readonly left: number; readonly right: number; readonly row: number }>
-> = Object.freeze({
-  "law-n-justice": Object.freeze({ left: 86, right: 199, row: 556 }),
-  babewatch: Object.freeze({ left: 112, right: 227, row: 556 }),
-  "extreme-sports": Object.freeze({ left: 113, right: 227, row: 556 }),
-});
+  "Every bat is built from its own per-table flipper record at $2346(a5) " +
+  "(Table00N.seg04): pivot, rest and flipped pose, sweep and all four stroke " +
+  "rates. Bat silhouette measured from the decoded pkg/flipdat1.bin pose bank. " +
+  "The map-anchor derivation (guide tips row 556, free ball-centre span) is " +
+  "kept as a sanity check on the records and is no longer a source of " +
+  "placement; the inferred pivots and the chosen 26.7 degree rest bearing are " +
+  "deleted, because carrying two placements is what let the drawn bat and the " +
+  "colliding bat come apart.";
 
 /**
  * ALL THREE TABLES SHIP A THIRD BAT, and this file used to say two of them did
@@ -740,76 +765,216 @@ export const MEASURED_FLIPPER_PIVOTS: Readonly<
  * gates analytically on the approach side in `touchAt`, which subsumes it, so
  * the family byte is recorded and not used.
  */
-export const UPPER_FLIPPER_RECORDS: Readonly<
-  Record<
-    TableId,
-    {
-      readonly pivotXPixels: number;
-      readonly pivotYPixels: number;
-      readonly restPose: number;
-      readonly flippedPose: number;
-      readonly sweepPoses: number;
-      readonly role: FlipperRole;
-      readonly handlerFamily: number;
-      readonly upAcceleration: number;
-      readonly upMaxRate: number;
-      readonly downAcceleration: number;
-      readonly downMaxRate: number;
-      readonly level: PlayfieldLevel;
-    }
-  >
-> = Object.freeze({
-  // Slot 0, id 1, hunk4 +0x18D8. Key word 1 = LEFT. Poses run DOWN, 23 -> 12,
-  // so eleven of them: 33 degrees, two thirds of a lower bat. Bank hunk2+0 =
-  // the main playfield.
-  "law-n-justice": Object.freeze({
-    pivotXPixels: 37,
-    pivotYPixels: 302,
-    restPose: 23,
-    flippedPose: 12,
-    sweepPoses: 11,
-    role: "left" as FlipperRole,
-    handlerFamily: 7,
-    upAcceleration: 20,
-    upMaxRate: 120,
-    downAcceleration: 30,
-    downMaxRate: 50,
-    level: 0 as PlayfieldLevel,
-  }),
-  // Slot 1, id 2, hunk4 +0x18D0. Key word 0 = RIGHT. Poses run UP, 35 -> 48,
-  // thirteen of them, 39 degrees. SOFTER than a lower bat in both directions —
-  // coil acceleration 10 against 20, spring 15 against 30 — with the same caps.
-  babewatch: Object.freeze({
-    pivotXPixels: 205,
-    pivotYPixels: 115,
-    restPose: 35,
-    flippedPose: 48,
-    sweepPoses: 13,
-    role: "right" as FlipperRole,
-    handlerFamily: 5,
-    upAcceleration: 10,
-    upMaxRate: 120,
-    downAcceleration: 15,
-    downMaxRate: 50,
-    level: 1 as PlayfieldLevel,
-  }),
-  // Slot 1, id 2, hunk4 +0x18D4. Key word 0 = RIGHT. A FULL eighteen-pose
-  // sweep on the same pose numbers as a lower-right bat, softened coil.
-  "extreme-sports": Object.freeze({
-    pivotXPixels: 182,
-    pivotYPixels: 194,
-    restPose: 50,
-    flippedPose: 68,
-    sweepPoses: 18,
-    role: "right" as FlipperRole,
-    handlerFamily: 4,
-    upAcceleration: 15,
-    upMaxRate: 120,
-    downAcceleration: 20,
-    downMaxRate: 50,
-    level: 1 as PlayfieldLevel,
-  }),
+export interface FlipperRecord {
+  /** Matches `FlipperConfig.id` and the drawn record's id in the pose bank. */
+  readonly id: string;
+  /** Whole playfield pixels, word +2 and word +4 of the record. */
+  readonly pivotXPixels: number;
+  readonly pivotYPixels: number;
+  /** Word +6 and word +8, on the 120-pose / 3-degree flipdat scale. */
+  readonly restPose: number;
+  readonly flippedPose: number;
+  /** Poses from rest to fully flipped: |flipped - rest| taken the short way. */
+  readonly sweepPoses: number;
+  readonly role: FlipperRole;
+  /** Byte +1: which of the eight octant-mask families the record selects. */
+  readonly handlerFamily: number;
+  /** Words +16/+18 (coil) and +C/+E (return spring). */
+  readonly upAcceleration: number;
+  readonly upMaxRate: number;
+  readonly downAcceleration: number;
+  readonly downMaxRate: number;
+  readonly level: PlayfieldLevel;
+}
+
+/**
+ * THE NINE BATS, one record each. The only placement in this file.
+ *
+ * Ordered as the original's own four-slot array is, so a reader can walk the
+ * records beside the disassembly. Every field is word +N of the record; see the
+ * field map above. `sweepPoses` is derived from the two poses in the record and
+ * restated so a mis-typed pair fails loudly rather than sweeping the long way
+ * round the circle: 112 wraps to -8 against a base of 10, which is 18 poses and
+ * not 102.
+ *
+ * The two LOWER records are identical on all three tables except for the pivot
+ * columns, which is what a shared bottom-of-the-table design looks like: Law 'n
+ * Justice's artwork sits 28 px left of the other two, and 227 - 28 = 199 is its
+ * right pivot exactly. Its LEFT pivot is 86 rather than the 84 that shift would
+ * predict, and Extreme Sports' is 113 rather than 112 — per-table jitter of a
+ * pixel or two that only the records carry and no derivation can produce. That
+ * is the whole reason the derivation could not be the source.
+ */
+export const FLIPPER_RECORDS: Readonly<Record<TableId, readonly FlipperRecord[]>> = Object.freeze({
+  "law-n-justice": Object.freeze([
+    // Slot 0, id 1, hunk4 +0x18D8. Key word 1 = LEFT. Poses run DOWN, 23 -> 12,
+    // so eleven of them: 33 degrees, two thirds of a lower bat. Bank hunk2+0 =
+    // the main playfield.
+    Object.freeze({
+      id: "upper",
+      pivotXPixels: 37,
+      pivotYPixels: 302,
+      restPose: 23,
+      flippedPose: 12,
+      sweepPoses: 11,
+      role: "left" as FlipperRole,
+      handlerFamily: 7,
+      upAcceleration: 20,
+      upMaxRate: 120,
+      downAcceleration: 30,
+      downMaxRate: 50,
+      level: 0 as PlayfieldLevel,
+    }),
+    Object.freeze({
+      id: "lower-left",
+      pivotXPixels: 86,
+      pivotYPixels: 556,
+      restPose: 10,
+      flippedPose: 112,
+      sweepPoses: FLIPPER_SWEEP_POSES,
+      role: "left" as FlipperRole,
+      handlerFamily: 0,
+      upAcceleration: FLIPPER_UP_ACCELERATION,
+      upMaxRate: FLIPPER_UP_MAX_RATE,
+      downAcceleration: FLIPPER_DOWN_ACCELERATION,
+      downMaxRate: FLIPPER_DOWN_MAX_RATE,
+      level: 0 as PlayfieldLevel,
+    }),
+    Object.freeze({
+      id: "lower-right",
+      pivotXPixels: 199,
+      pivotYPixels: 556,
+      restPose: 50,
+      flippedPose: 68,
+      sweepPoses: FLIPPER_SWEEP_POSES,
+      role: "right" as FlipperRole,
+      handlerFamily: 4,
+      upAcceleration: FLIPPER_UP_ACCELERATION,
+      upMaxRate: FLIPPER_UP_MAX_RATE,
+      downAcceleration: FLIPPER_DOWN_ACCELERATION,
+      downMaxRate: FLIPPER_DOWN_MAX_RATE,
+      level: 0 as PlayfieldLevel,
+    }),
+  ]),
+  babewatch: Object.freeze([
+    // Slot 1, id 2, hunk4 +0x18D0. Key word 0 = RIGHT. Poses run UP, 35 -> 48,
+    // thirteen of them, 39 degrees. SOFTER than a lower bat in both directions —
+    // coil acceleration 10 against 20, spring 15 against 30 — with the same caps.
+    Object.freeze({
+      id: "upper",
+      pivotXPixels: 205,
+      pivotYPixels: 115,
+      restPose: 35,
+      flippedPose: 48,
+      sweepPoses: 13,
+      role: "right" as FlipperRole,
+      handlerFamily: 5,
+      upAcceleration: 10,
+      upMaxRate: 120,
+      downAcceleration: 15,
+      downMaxRate: 50,
+      level: 1 as PlayfieldLevel,
+    }),
+    Object.freeze({
+      id: "lower-left",
+      pivotXPixels: 112,
+      pivotYPixels: 556,
+      restPose: 10,
+      flippedPose: 112,
+      sweepPoses: FLIPPER_SWEEP_POSES,
+      role: "left" as FlipperRole,
+      handlerFamily: 0,
+      upAcceleration: FLIPPER_UP_ACCELERATION,
+      upMaxRate: FLIPPER_UP_MAX_RATE,
+      downAcceleration: FLIPPER_DOWN_ACCELERATION,
+      downMaxRate: FLIPPER_DOWN_MAX_RATE,
+      level: 0 as PlayfieldLevel,
+    }),
+    Object.freeze({
+      id: "lower-right",
+      pivotXPixels: 227,
+      pivotYPixels: 556,
+      restPose: 50,
+      flippedPose: 68,
+      sweepPoses: FLIPPER_SWEEP_POSES,
+      role: "right" as FlipperRole,
+      handlerFamily: 4,
+      upAcceleration: FLIPPER_UP_ACCELERATION,
+      upMaxRate: FLIPPER_UP_MAX_RATE,
+      downAcceleration: FLIPPER_DOWN_ACCELERATION,
+      downMaxRate: FLIPPER_DOWN_MAX_RATE,
+      level: 0 as PlayfieldLevel,
+    }),
+  ]),
+  "extreme-sports": Object.freeze([
+    // Slot 1, id 2, hunk4 +0x18D4. Key word 0 = RIGHT. A FULL eighteen-pose
+    // sweep on the same pose numbers as a lower-right bat, softened coil.
+    Object.freeze({
+      id: "upper",
+      pivotXPixels: 182,
+      pivotYPixels: 194,
+      restPose: 50,
+      flippedPose: 68,
+      sweepPoses: 18,
+      role: "right" as FlipperRole,
+      handlerFamily: 4,
+      upAcceleration: 15,
+      upMaxRate: 120,
+      downAcceleration: 20,
+      downMaxRate: 50,
+      level: 1 as PlayfieldLevel,
+    }),
+    Object.freeze({
+      id: "lower-left",
+      pivotXPixels: 113,
+      pivotYPixels: 556,
+      restPose: 10,
+      flippedPose: 112,
+      sweepPoses: FLIPPER_SWEEP_POSES,
+      role: "left" as FlipperRole,
+      handlerFamily: 0,
+      upAcceleration: FLIPPER_UP_ACCELERATION,
+      upMaxRate: FLIPPER_UP_MAX_RATE,
+      downAcceleration: FLIPPER_DOWN_ACCELERATION,
+      downMaxRate: FLIPPER_DOWN_MAX_RATE,
+      level: 0 as PlayfieldLevel,
+    }),
+    Object.freeze({
+      id: "lower-right",
+      pivotXPixels: 227,
+      pivotYPixels: 556,
+      restPose: 50,
+      flippedPose: 68,
+      sweepPoses: FLIPPER_SWEEP_POSES,
+      role: "right" as FlipperRole,
+      handlerFamily: 4,
+      upAcceleration: FLIPPER_UP_ACCELERATION,
+      upMaxRate: FLIPPER_UP_MAX_RATE,
+      downAcceleration: FLIPPER_DOWN_ACCELERATION,
+      downMaxRate: FLIPPER_DOWN_MAX_RATE,
+      level: 0 as PlayfieldLevel,
+    }),
+  ]),
 });
+
+/** One table's records, keyed by the simulation's flipper id. */
+export function flipperRecordFor(tableId: TableId, id: string): FlipperRecord {
+  const record = FLIPPER_RECORDS[tableId].find((entry) => entry.id === id);
+  if (record === undefined) {
+    throw new RangeError(`${tableId} ships no flipper record called "${id}"`);
+  }
+  return record;
+}
+
+/**
+ * The three upper bats, kept under this name because the dossier and the tests
+ * cite it. A VIEW of `FLIPPER_RECORDS`, not a second copy.
+ */
+export const UPPER_FLIPPER_RECORDS: Readonly<Record<TableId, FlipperRecord>> = Object.freeze(
+  Object.fromEntries(
+    TABLE_IDS.map((id) => [id, flipperRecordFor(id, "upper")]),
+  ) as Record<TableId, FlipperRecord>,
+);
 
 /**
  * Kept under its old name because other modules and the dossier cite it.
@@ -823,31 +988,39 @@ export function poseToAngleUnits(pose: number): number {
 }
 
 /**
- * The third bat, built from its table's record.
+ * ONE BUILDER FOR ALL NINE BATS, and there used to be two.
  *
- * PROVENANCE IS MIXED and the config says `measured` because the parts that
- * decide where the bat is and how it moves all come off the disk: pivot, both
- * poses, and all four stroke constants. The lower pairs deliberately run on
- * INFERRED pivots (row 558 against the disk's 556) because there is a shipped
- * asset the placement tests can re-derive them from; there is no such anchor for
- * an upper bat, so the disk pivot is used directly. What is still this port's is
- * the bat's own geometry — length 45, boss 5, tip 1, taper 6, from
- * pkg/flipdat1.bin — and its elasticity, and those are shared with the lower
- * bats: there is no mini-flipper art in the package, flipdat1 holds 109 poses of
- * ONE 45 px bat, and the record carries no length field.
+ * `lowerFlipper` took a column and a row and a chosen rest bearing; `upperFlipper`
+ * read a record. That is exactly how the drawn bat and the colliding bat came
+ * apart, so there is now a single function and it takes a record. Everything
+ * that decides where a bat is and how it moves comes off the disk: pivot, rest
+ * pose, sweep and all four stroke constants.
+ *
+ * WHAT IS STILL THIS PORT'S is the bat's own silhouette — measured off the
+ * decoded pose bank rather than off a record, because `flipdat1.bin` holds 109
+ * poses of ONE bat shared by every flipper on every table and no record carries
+ * a length field — and its elasticity. The configuration is `measured` because
+ * its placement and its stroke both are.
+ *
+ * THE REST BEARING IS THE RECORD'S POSE, converted once. A left bat rests at
+ * pose 10 and a right bat at pose 50: `poseToAngleUnits` gives 171 and 853, and
+ * 853 is exactly `HALF_TURN_UNITS - 171`, so the mirror symmetry the old
+ * hand-written constant was there to guarantee falls out of the records
+ * themselves. There is no second rest angle left to drift.
  */
-function upperFlipper(tableId: TableId): FlipperConfig {
-  const record = UPPER_FLIPPER_RECORDS[tableId];
+function flipperFromRecord(record: FlipperRecord): FlipperConfig {
+  // Whether the poses count UP or DOWN is the handedness, and it agrees with
+  // every record's own key-binding word.
   const mirrored = record.role === "right";
   return {
-    id: "upper",
+    id: record.id,
     role: record.role,
     pivotX: pixelsToQ10(record.pivotXPixels),
     pivotY: pixelsToQ10(record.pivotYPixels),
     restAngle: poseToAngleUnits(record.restPose),
     sweep: record.sweepPoses * BAT_ANGLE_UNITS_PER_POSE,
-    // Whether the poses count up or down IS the handedness, and it agrees with
-    // the key binding on all three records.
+    // Flipping raises the tip, which on the left means a smaller bearing and on
+    // the right a larger one.
     direction: mirrored ? 1 : -1,
     length: pixelsToQ10(FLIPPER_LENGTH_PIXELS),
     bossRadius: pixelsToQ10(FLIPPER_BOSS_RADIUS_PIXELS),
@@ -863,53 +1036,18 @@ function upperFlipper(tableId: TableId): FlipperConfig {
   };
 }
 
-function lowerFlipper(
-  id: string,
-  role: "left" | "right",
-  column: number,
-  row: number,
-): FlipperConfig {
-  const mirrored = role === "right";
-  return {
-    id,
-    role,
-    pivotX: pixelsToQ10(column),
-    pivotY: pixelsToQ10(row),
-    // The right flipper's rest angle is the left's reflected in the vertical
-    // axis, written as the reflection rather than as a second constant so the
-    // two cannot drift apart.
-    restAngle: mirrored ? HALF_TURN_UNITS - FLIPPER_REST_ANGLE_UNITS : FLIPPER_REST_ANGLE_UNITS,
-    sweep: FLIPPER_SWEEP_UNITS,
-    // Flipping raises the tip, which on the left means a smaller bearing and on
-    // the right a larger one.
-    direction: mirrored ? 1 : -1,
-    length: pixelsToQ10(FLIPPER_LENGTH_PIXELS),
-    bossRadius: pixelsToQ10(FLIPPER_BOSS_RADIUS_PIXELS),
-    tipRadius: pixelsToQ10(FLIPPER_TIP_RADIUS_PIXELS),
-    taperStart: pixelsToQ10(FLIPPER_TAPER_START_PIXELS),
-    upAcceleration: FLIPPER_UP_ACCELERATION,
-    upMaxRate: FLIPPER_UP_MAX_RATE,
-    downAcceleration: FLIPPER_DOWN_ACCELERATION,
-    downMaxRate: FLIPPER_DOWN_MAX_RATE,
-    surface: FLIPPER_SURFACE,
-    // Both lower bats are on the main playfield on all three tables: their
-    // records' +0x1C bank pointers are hunk2+0, the same bank, and they sit on
-    // the drain row where there is no raised level at all.
-    level: 0,
-    // The pivot, the sweep and both stroke rates are read off the table
-    // package now. What is still this port's own is the REST BEARING and the
-    // bat's elasticity, so the configuration as a whole is not yet "measured".
-    confidence: "inferred",
-  };
-}
-
-/** The flippers this table is played with: two lower bats and one upper. */
+/**
+ * The flippers this table is played with: two lower bats and one upper.
+ *
+ * Ordered lower-left, lower-right, upper — the order every replay digest and
+ * every debug snapshot in this project already carries — rather than the
+ * records' own slot order.
+ */
 export function flipperConfigsFor(tableId: TableId): readonly FlipperConfig[] {
-  const columns = LOWER_FLIPPER_PIVOT_COLUMNS[tableId];
   return Object.freeze([
-    lowerFlipper("lower-left", "left", columns.left, LOWER_FLIPPER_PIVOT_ROW),
-    lowerFlipper("lower-right", "right", columns.right, LOWER_FLIPPER_PIVOT_ROW),
-    upperFlipper(tableId),
+    flipperFromRecord(flipperRecordFor(tableId, "lower-left")),
+    flipperFromRecord(flipperRecordFor(tableId, "lower-right")),
+    flipperFromRecord(flipperRecordFor(tableId, "upper")),
   ]);
 }
 
@@ -1132,11 +1270,13 @@ export function flipperEndpoints(
 /**
  * Half-thickness of the bat `along` units from the pivot, Q10.
  *
- * The silhouette is a constant 5 px to about 6 px out and then tapers linearly
- * to the tip, which is exactly what this reproduces. Treating the bat as a
- * capsule of varying radius rather than a true cone overstates the surface by at
- * most the taper's slope, about a tenth of a pixel per pixel — well inside the
- * one-pixel quantisation the silhouette was measured at.
+ * The drawn silhouette is a constant 8 px from the axis out to along 6 and then
+ * steps down to 4 px at along 44, which is what this reproduces — see
+ * FLIPPER_BOSS_RADIUS_PIXELS for the profile and for the 99.24% of drawn pixels
+ * this covers. Treating the bat as a capsule of varying radius rather than a
+ * true cone overstates the surface by at most the taper's slope, about a tenth
+ * of a pixel per pixel, which is inside the one-pixel quantisation the
+ * silhouette is drawn at.
  */
 export function batRadiusAt(config: FlipperConfig, along: Q10): Q10 {
   if (along <= config.taperStart) return config.bossRadius;
@@ -1219,12 +1359,15 @@ function touchAt(
   //   - Extreme Sports' upper bat at full stroke moved a ball at (184,181)L1 to
   //     (184.124, 180.721) and then reported ZERO contacts there, so the ball
   //     search saw a cradle as a strand and pulsed its coils at it.
-  //   - Law 'n Justice's upper bat sits 13 px — boss 5 plus ball 8, exactly the
-  //     touch distance — from a notch at (25,307) between the rubber post at
-  //     (23-24,305-307) and the top of the level-0 boundary wall at (25,308). A
-  //     ball pressed into it was at distance exactly 13.0 and so could neither
-  //     be seen as cradled NOR be struck by the bat sweeping past it. Three of
-  //     270 census balls ended up there.
+  //   - Law 'n Justice's upper bat sits 13 px from a notch at (25,307) between
+  //     the rubber post at (23-24,305-307) and the top of the level-0 boundary
+  //     wall at (25,308) — which was EXACTLY the touch distance while the boss
+  //     was 5 (5 + ball 8). A ball pressed into it was at distance exactly 13.0
+  //     and so could neither be seen as cradled NOR be struck by the bat
+  //     sweeping past it. Three of 270 census balls ended up there. The
+  //     re-measured boss of 8 puts the touch distance at 16 and the notch well
+  //     inside it, so the coincidence is gone; the `>` is kept because it is
+  //     `separate()`'s own arithmetic that creates the case, not that one notch.
   if (distanceSquared > touchDistance * touchDistance) return null;
 
   // The bat's perpendicular, unit length because the axis is: the reference
@@ -1339,7 +1482,7 @@ export interface FlipperContact {
 
 // The original's own clamp, +-4095 of its velocity units. See `timebase.ts`.
 // It matters here in a way it never did before: the measured stroke puts the tip
-// at 17.7 px a tick and the clamp is 16, so a tip strike is the one impulse in
+// at 17.3 px a tick and the clamp is 16, so a tip strike is the one impulse in
 // the game that the machine's own limiter actually catches.
 const VELOCITY_LIMIT = VELOCITY_CLAMP_Q10;
 

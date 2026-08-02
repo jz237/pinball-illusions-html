@@ -4,12 +4,14 @@
  * ---------------------------------------------------------------------------
  * WHAT THIS IS, AND WHAT REPLACED WHAT
  * ---------------------------------------------------------------------------
- * `scripts/export-shell-music.mjs` decodes the `SNT!` bank in `music001.bin`
+ * `scripts/export-shell-music.mjs` decodes the `SNT!` bank in `intro.bin` — the
+ * tune the attract/credits cycle plays, NOT the menu tune in `music001.bin`;
+ * that exporter's header carries the measurement that settles which is which —
  * into `public/generated/shell/shell-music.json` plus one 8-bit WAV per live
  * instrument, all under the `disk-derived-shell-music` gate class. This module
  * fetches them and hands back three things the audio layer already understands:
  *
- *   song    a `TrackerSong` — the order list, the 11 patterns, the 31
+ *   song    a `TrackerSong` — the order list, the 37 patterns, the 31
  *           instrument descriptors' finetune and volume
  *   voices  instrument number -> the bank's own id for that voice
  *   bank    an `InstrumentBank`: id -> a `ChipInstrument` over the WAV's PCM
@@ -32,8 +34,7 @@
  * The loop window is the descriptor's own `repeatWords`/`repeatLengthWords`,
  * in bytes and therefore in samples: a descriptor whose repeat length is 1 word
  * is ProTracker's "no loop" and becomes a one-shot (`loopStart = -1`), which is
- * why instruments 1 and 5 fire once and 2, 3, 4, 6, 7, 9, 10, 11, 14 and 15
- * sustain.
+ * why instruments 2, 4, 7, 13, 18 and 28 fire once and the other 22 sustain.
  *
  * SILENCE IS A CORRECT OUTCOME. Every failure path here answers null: a build
  * without the authorized assets, a 404, a truncated WAV. The shell then runs
@@ -60,6 +61,17 @@ export interface ShellMusicAsset {
   readonly bank: InstrumentBank;
   /** The instrument numbers that carry PCM, ascending. */
   readonly liveInstruments: readonly number[];
+  /**
+   * The order position the PROGRAM enters the module at — 17, not 0. The
+   * replayer takes a start position in d0 ($79EA and intro.seg00's own copy),
+   * so this is the program's choice rather than anything in the bank, and it
+   * is measured off the cold-boot take: that recording is digitally silent for
+   * 884 fields while the disk loads, and the silence ends on order 17's first
+   * field. Orders 17 and 18 then correlate +0.9389 and +0.8758 waveform
+   * against this render, and every order before 17 correlates at noise. See
+   * the exporter's header for the whole measurement.
+   */
+  readonly startOrder: number;
 }
 
 /** The minimum a fetch has to look like; `table-art.ts` uses the same shape. */
@@ -84,6 +96,7 @@ interface RawDocument {
   readonly schema: string;
   readonly songLength: number;
   readonly restart: number;
+  readonly startOrder: number;
   readonly orders: readonly number[];
   readonly instruments: readonly RawDescriptor[];
   readonly patternCells: number;
@@ -107,12 +120,20 @@ export function parseShellMusicDocument(doc: unknown): {
   readonly voices: Readonly<Record<number, string>>;
   readonly descriptors: readonly RawDescriptor[];
   readonly files: Readonly<Record<number, string>>;
+  readonly startOrder: number;
 } {
   const raw = doc as RawDocument | null;
   if (raw === null || typeof raw !== "object") fail("document is not an object");
   if (raw.schema !== SHELL_MUSIC_SCHEMA) fail(`unknown schema ${String(raw.schema)}`);
   if (!Array.isArray(raw.orders) || raw.orders.length !== raw.songLength) {
     fail(`order list is ${raw.orders?.length} long against a song length of ${raw.songLength}`);
+  }
+  if (
+    !Number.isInteger(raw.startOrder) ||
+    raw.startOrder < 0 ||
+    raw.startOrder >= raw.orders.length
+  ) {
+    fail(`start order ${String(raw.startOrder)} is outside the ${raw.orders.length}-order list`);
   }
   if (!Array.isArray(raw.patterns) || raw.patterns.length === 0) fail("no patterns");
   if (raw.patternCells !== 4) fail(`cells are ${raw.patternCells} numbers, not 4`);
@@ -167,23 +188,24 @@ export function parseShellMusicDocument(doc: unknown): {
 
   const song = validateTrackerSong({
     title: "Pinball Illusions front end",
-    // The engine is VBlank-clocked at one tick a PAL field; the module's own
-    // `F` rows set the speed from row 0 of pattern 0 onward, so the initial
-    // values here are ProTracker's defaults and are overwritten on the first
-    // row the song plays. See `SHELL_MUSIC_TICK_NOTE`.
+    // The replayer is VBlank-clocked at one tick a PAL field, and 6 is the
+    // speed it writes on every song start ($7B08, intro.seg00 +$12D2) before
+    // row 0 is fetched. The module's own `F` rows take over from there.
     initialSpeed: 6,
     initialTempo: 125,
-    // The bank's restart byte is 127 against a song length of 14 — ProTracker's
-    // "unused" marker — and the order list is wrapped by the `B01` on the last
-    // row of the last pattern instead. 0 is the conventional reading of an
-    // out-of-range restart and is what the validator will accept.
+    // `restart` is only what happens if the position runs off the END of the
+    // order list, which $8138-$814A answers with position 0. The bank's own
+    // restart byte is 127 against a song length of 54 — ProTracker's "unused"
+    // marker, and out of range for the validator besides. The tune never gets
+    // there: the `B13` on the last row of order 51 loops it back to order 19,
+    // and `renderSongStream` measures that entry rather than reading it here.
     restart: 0,
     orders: raw.orders,
     patterns,
     instruments,
   });
 
-  return { song, voices, descriptors: raw.instruments, files };
+  return { song, voices, descriptors: raw.instruments, files, startOrder: raw.startOrder };
 }
 
 /**
@@ -283,5 +305,6 @@ export async function loadShellMusic(
     voices: parsed.voices,
     bank: (id) => instruments.get(id) ?? null,
     liveInstruments: live,
+    startOrder: parsed.startOrder,
   };
 }

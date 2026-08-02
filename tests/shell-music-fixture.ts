@@ -76,5 +76,7 @@ export function syntheticShellMusicAsset(): ShellMusicAsset {
     voices: { 1: "pulse50" },
     bank: SYNTHESIZED_BANK,
     liveInstruments: [1],
+    // The shipped module is entered at 17; a two-order fixture starts at 0.
+    startOrder: 0,
   };
 }

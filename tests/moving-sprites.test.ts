@@ -63,7 +63,20 @@ import {
 import type { PixelTarget } from "../src/browser/playfield-renderer.js";
 import { buildLampSprites, compositeLampOverlays, lampModes } from "../src/game/lamp-overlays.js";
 import { BALL_RADIUS_PIXELS } from "../src/game/collision-probe.js";
-import { pixelsToQ10 } from "../src/core/fixed-point.js";
+import { pixelsToQ10, q10ToPixel } from "../src/core/fixed-point.js";
+import { flipperConfigsFor } from "../src/game/flippers.js";
+import type { FlipperConfig } from "../src/game/flippers.js";
+import { SERVE_FRAMING_SCROLL, VIEWPORT_HEIGHT } from "../src/browser/camera.js";
+import { PLAYFIELD_HEIGHT, PLAYFIELD_WIDTH } from "../src/game/contracts.js";
+import { CONTROLS } from "../src/browser/input.js";
+import type { Control, ControlSnapshot } from "../src/browser/input.js";
+
+/** One table's flipper configuration, by id. */
+function configFor(tableId: TableId, id: string): FlipperConfig {
+  const config = flipperConfigsFor(tableId).find((entry) => entry.id === id);
+  if (config === undefined) throw new Error(`${tableId} configures no flipper "${id}"`);
+  return config;
+}
 import { TABLE_IDS } from "../src/game/contracts.js";
 import type { TableBallDocument, TableId, TableMap } from "../src/game/contracts.js";
 import { ballFor, flipperBatsFixture, lampsFor, mapFor } from "./table-fixtures.js";
@@ -239,32 +252,62 @@ describe("placement", () => {
     expect([placements[0]?.width, placements[0]?.height]).toEqual([17, 17]);
   });
 
-  it("places every bat on its RECORD's pivot at its record's rest pose", async () => {
+  it("places every bat on the SIMULATION's pivot, which IS its record's", async () => {
+    // INVERTED, AND THE INVERSION IS THE FIX. This test used to hand the
+    // placement "a deliberately wrong pivot" and assert that "a drawn bat must
+    // ignore it" — the drawn bat was hung on the pose bank record and the
+    // simulation's pivot travelled only to place a fallback marker. That is
+    // exactly how the picture and the physics came apart: the simulation ran on
+    // an inferred row 558 while the record drew on row 556, the drawn bat sat
+    // two pixels ABOVE the colliding one, and a ball resting on the flipper the
+    // player could see had nothing under it.
+    //
+    // So a wrong pivot must now MOVE THE PICTURE, loudly, rather than be
+    // ignored quietly — and the pivot the simulation supplies is asserted to be
+    // the record's, which is the property that makes the picture right.
     for (const tableId of TABLE_IDS as readonly TableId[]) {
       const sprites = buildMovingSprites(await artFor(tableId), bats, ballFor(tableId));
       for (const bat of sprites.bats.values()) {
-        const placements = movingSpritePlacements(
-          sprites,
-          [
-            {
-              id: bat.id,
-              stroke: 0,
-              sweep: bat.sweepPoses * 64,
-              // A deliberately wrong pivot: a drawn bat must ignore it.
-              pivotX: pixelsToQ10(1),
-              pivotY: pixelsToQ10(1),
-            },
-          ],
-          [],
-        );
         const pose = sprites.poses.get(bat.restPose);
         if (pose === undefined) throw new Error(`no pose ${bat.restPose}`);
-        expect([tableId, bat.id, placements[0]?.kind]).toEqual([tableId, bat.id, "bat"]);
-        expect([tableId, bat.id, placements[0]?.x, placements[0]?.y]).toEqual([
+
+        // 1. The simulation's own configuration is on the record's pivot.
+        const config = flipperConfigsFor(tableId).find((c) => c.id === bat.id);
+        if (config === undefined) throw new Error(`${tableId} configures no ${bat.id}`);
+        expect([tableId, bat.id, q10ToPixel(config.pivotX), q10ToPixel(config.pivotY)])
+          .toEqual([tableId, bat.id, bat.pivotX, bat.pivotY]);
+
+        // 2. Handed that pivot, the bat is drawn where the original draws it.
+        const drawn = movingSpritePlacements(
+          sprites,
+          [{ id: bat.id, stroke: 0, sweep: bat.sweepPoses * 64, pivotX: config.pivotX, pivotY: config.pivotY }],
+          [],
+        );
+        expect([tableId, bat.id, drawn[0]?.kind]).toEqual([tableId, bat.id, "bat"]);
+        expect([tableId, bat.id, drawn[0]?.x, drawn[0]?.y]).toEqual([
           tableId,
           bat.id,
           bat.pivotX - pose.anchorX,
           bat.pivotY - pose.anchorY,
+        ]);
+
+        // 3. And a pivot two rows out — the exact divergence that shipped —
+        //    moves the picture by two rows instead of being swallowed.
+        const wrong = movingSpritePlacements(
+          sprites,
+          [{
+            id: bat.id,
+            stroke: 0,
+            sweep: bat.sweepPoses * 64,
+            pivotX: config.pivotX,
+            pivotY: config.pivotY + pixelsToQ10(2),
+          }],
+          [],
+        );
+        expect([tableId, bat.id, wrong[0]?.y]).toEqual([
+          tableId,
+          bat.id,
+          bat.pivotY + 2 - pose.anchorY,
         ]);
       }
     }
@@ -556,8 +599,10 @@ describe("drawing does not move the simulation", () => {
           id: flipper.id,
           stroke: flipper.stroke,
           sweep: sprites.bats.get(flipper.id)!.sweepPoses * 64,
-          pivotX: pixelsToQ10(0),
-          pivotY: pixelsToQ10(0),
+          // The simulation's own pivot: a placement is hung on this now, so
+          // handing it zero would draw all three bats in the top-left corner.
+          pivotX: configFor(tableId, flipper.id).pivotX,
+          pivotY: configFor(tableId, flipper.id).pivotY,
         })),
         snapshot.balls
           .filter((ball) => ball.active)
@@ -565,5 +610,190 @@ describe("drawing does not move the simulation", () => {
       );
     }
     expect(debugSnapshot(drawing)).toEqual(debugSnapshot(quiet));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Every bat draws, in every state a player passes through
+// ---------------------------------------------------------------------------
+
+describe("the bats a player actually sees", () => {
+  /**
+   * WHY THIS EXISTS. The fourth play-test report opened "still missing flippers
+   * on the first board". Three independent read-only investigations — two
+   * headless through `renderGame` and one driving the shipped page in a real
+   * Chrome with real key events, real requestAnimationFrame and the player's own
+   * route through the menus — failed to reproduce a bat that does not draw, on
+   * Law 'n Justice or on either of the others. That is a reason to PIN the
+   * property, not a reason to assume it: this walks a real game through every
+   * state a player passes through and asserts that all three bats produce a real
+   * sprite placement, at the pixel the original draws it, every time.
+   *
+   * `movingSpritePlacements` emits a MAGENTA MARKER rather than nothing when a
+   * pose or a record is unavailable, so "bat-missing" is what this catches,
+   * along with a blit box that has fallen off the overlay.
+   */
+  const held = (...down: readonly Control[]): ControlSnapshot => ({
+    sequence: 1,
+    controls: Object.fromEntries(
+      CONTROLS.map((control) => [
+        control,
+        {
+          down: down.includes(control),
+          pressed: down.includes(control),
+          released: false,
+          pressCount: down.includes(control) ? 1 : 0,
+          releaseCount: 0,
+        },
+      ]),
+    ) as ControlSnapshot["controls"],
+  });
+
+  function assertEveryBatDraws(
+    tableId: TableId,
+    sprites: ReturnType<typeof buildMovingSprites>,
+    game: ReturnType<typeof createGame>,
+    where: string,
+  ): void {
+    const snapshot = debugSnapshot(game);
+    const states = snapshot.flippers.map((flipper) => {
+      const config = configFor(tableId, flipper.id);
+      return {
+        id: flipper.id,
+        stroke: flipper.stroke,
+        sweep: config.sweep,
+        pivotX: config.pivotX,
+        pivotY: config.pivotY,
+      };
+    });
+    expect({ where, bats: states.length }).toEqual({ where, bats: 3 });
+    const placements = movingSpritePlacements(sprites, states, []);
+    expect({ where, kinds: placements.map((p) => p.kind) })
+      .toEqual({ where, kinds: ["bat", "bat", "bat"] });
+    for (const [index, placement] of placements.entries()) {
+      const id = states[index]?.id ?? "?";
+      // The pose resolved to one the bank actually ships.
+      expect({ where, id, shipped: sprites.batPoses.has(placement.key) })
+        .toEqual({ where, id, shipped: true });
+      // The whole block is inside the 336 x 600 playfield overlay, so nothing
+      // is clipped away before the camera has had a chance to frame it.
+      const inside =
+        placement.x >= 0 &&
+        placement.y >= 0 &&
+        placement.x + placement.width <= PLAYFIELD_WIDTH &&
+        placement.y + placement.height <= PLAYFIELD_HEIGHT;
+      expect({ where, id, inside }).toEqual({ where, id, inside: true });
+      // And it is where the ORIGINAL draws it: the record's pivot, less the
+      // pose's own anchor. The simulation supplied that pivot, which is the
+      // property the whole round is about.
+      const record = sprites.bats.get(id);
+      const pose = sprites.poses.get(placement.key);
+      if (record === undefined || pose === undefined) throw new Error(`no ${id}`);
+      expect({ where, id, at: [placement.x, placement.y] }).toEqual({
+        where,
+        id,
+        at: [record.pivotX - pose.anchorX, record.pivotY - pose.anchorY],
+      });
+    }
+  }
+
+  it("draws all three bats in every state, on all three tables", async () => {
+    for (const tableId of TABLE_IDS as readonly TableId[]) {
+      const sprites = buildMovingSprites(await artFor(tableId), bats, ballFor(tableId));
+      const game = createGame(mapFor(tableId));
+
+      // 1. Attract: the table is loaded and nothing has been started.
+      assertEveryBatDraws(tableId, sprites, game, `${tableId}/attract`);
+
+      // 2. The instant a game starts, before a single tick — the frame the
+      //    camera spends at the TOP of the table during the filmed serve snap,
+      //    and the one state in which a player really does see no flippers.
+      startGame(game);
+      assertEveryBatDraws(tableId, sprites, game, `${tableId}/started`);
+
+      // 3. Every tick of the serve countdown and the run-down after it, which
+      //    is the 0.8 s a player watches before the ball appears.
+      const idle: InputSource = { sample: () => IDLE_SNAPSHOT };
+      for (let tick = 0; tick < 160; tick += 1) {
+        runTicks(game, idle, 1);
+        assertEveryBatDraws(tableId, sprites, game, `${tableId}/serve+${tick}`);
+      }
+
+      // 4. Ball in play, plunged and flipped at, sampled through 2,000 ticks —
+      //    across a drain and the next ball's serve.
+      let beat = 0;
+      for (let tick = 0; tick < 2000; tick += 1) {
+        beat += 1;
+        const down: Control[] = [];
+        if (beat % 23 < 3) down.push("leftFlipper", "upperFlipper");
+        if (beat % 31 < 3) down.push("rightFlipper");
+        if (beat % 17 === 0) down.push("plunger");
+        const snapshot = held(...down);
+        runTicks(game, { sample: () => snapshot }, 1);
+        if (tick % 7 === 0) assertEveryBatDraws(tableId, sprites, game, `${tableId}/play+${tick}`);
+      }
+
+      // 5. Both bats held all the way up and all the way back down, tick by
+      //    tick: every pose of every stroke has to resolve to a shipped frame.
+      const bothDown = held("leftFlipper", "rightFlipper", "upperFlipper");
+      for (let tick = 0; tick < 12; tick += 1) {
+        runTicks(game, { sample: () => bothDown }, 1);
+        assertEveryBatDraws(tableId, sprites, game, `${tableId}/held+${tick}`);
+      }
+      for (let tick = 0; tick < 20; tick += 1) {
+        runTicks(game, idle, 1);
+        assertEveryBatDraws(tableId, sprites, game, `${tableId}/released+${tick}`);
+      }
+
+      // 6. Tilt: three nudges inside half a second trips it, and a tilted table
+      //    still has flippers drawn on it — they simply stop responding.
+      const nudge = held("nudgeLeft");
+      for (let tick = 0; tick < 40; tick += 1) {
+        runTicks(game, { sample: () => (tick % 10 === 0 ? nudge : IDLE_SNAPSHOT) }, 1);
+        assertEveryBatDraws(tableId, sprites, game, `${tableId}/tilt+${tick}`);
+      }
+
+      // 7. Game over: the card the player reads before the high-score entry.
+      const over = createGame(mapFor(tableId), { ballsPerGame: 1 });
+      startGame(over);
+      for (let tick = 0; tick < 20000 && over.phase !== "game-over"; tick += 1) {
+        const down: Control[] = [];
+        if (tick % 29 < 3) down.push("leftFlipper", "rightFlipper", "upperFlipper");
+        if (tick % 19 === 0) down.push("plunger");
+        const snapshot = held(...down);
+        runTicks(over, { sample: () => snapshot }, 1);
+      }
+      expect({ tableId, phase: over.phase }).toEqual({ tableId, phase: "game-over" });
+      assertEveryBatDraws(tableId, sprites, over, `${tableId}/game-over`);
+    }
+  });
+
+  it("keeps the lower pair inside the window wherever the camera settles", async () => {
+    // The camera holds at the bottom stop for most of a ball, and that is the
+    // frame the operator was looking at when he reported the bats missing. Both
+    // lower bats' blit blocks have to be wholly inside the 256-row window there,
+    // on every table.
+    for (const tableId of TABLE_IDS as readonly TableId[]) {
+      const sprites = buildMovingSprites(await artFor(tableId), bats, ballFor(tableId));
+      for (const id of ["lower-left", "lower-right"] as const) {
+        const record = sprites.bats.get(id);
+        if (record === undefined) throw new Error(`${tableId} has no ${id}`);
+        for (let step = 0; step <= record.sweepPoses; step += 1) {
+          const pose = sprites.poses.get(
+            ((record.restPose + record.direction * step) % 120 + 120) % 120,
+          );
+          if (pose === undefined) throw new Error(`${tableId} ${id} is missing a pose`);
+          const top = record.pivotY - pose.anchorY;
+          expect({ tableId, id, step, top: top >= SERVE_FRAMING_SCROLL })
+            .toEqual({ tableId, id, step, top: true });
+          expect({
+            tableId,
+            id,
+            step,
+            bottom: top + pose.height <= SERVE_FRAMING_SCROLL + VIEWPORT_HEIGHT,
+          }).toEqual({ tableId, id, step, bottom: true });
+        }
+      }
+    }
   });
 });

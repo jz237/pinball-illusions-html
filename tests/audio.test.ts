@@ -34,6 +34,8 @@ import type { InputSource } from "../src/browser/game-loop.js";
 import { IDLE_SNAPSHOT, controlForKeyEvent } from "../src/browser/input.js";
 import { mapFor } from "./table-fixtures.js";
 import { renderSongStream, songStreamFor } from "../src/audio/song-stream.js";
+import { createTrackerPlayer, stepTracker } from "../src/audio/tracker.js";
+import type { TrackerSong } from "../src/audio/tracker.js";
 import { shippedShellMusic, syntheticShellMusicAsset } from "./shell-music-fixture.js";
 import {
   createTrackerOutput,
@@ -406,23 +408,28 @@ describe("the shell music stream", () => {
   it("renders one pass of the decoded module, deterministic to the byte", async () => {
     const asset = await shippedShellMusic();
     if (asset === null) return;
-    const one = renderSongStream(asset.song, asset.voices);
-    const two = renderSongStream(asset.song, asset.voices);
+    const one = renderSongStream(asset.song, asset.voices, asset.startOrder);
+    const two = renderSongStream(asset.song, asset.voices, asset.startOrder);
     expect(one.commands.length).toBeGreaterThan(0);
     expect(JSON.stringify(one)).toBe(JSON.stringify(two));
     // The memo hands back the same object rather than re-rendering.
-    expect(songStreamFor(asset.song, asset.voices)).toBe(
-      songStreamFor(asset.song, asset.voices),
+    expect(songStreamFor(asset.song, asset.voices, asset.startOrder)).toBe(
+      songStreamFor(asset.song, asset.voices, asset.startOrder),
+    );
+    // ...and a different entry point is a different stream, not the memo's.
+    expect(songStreamFor(asset.song, asset.voices, 0)).not.toBe(
+      songStreamFor(asset.song, asset.voices, asset.startOrder),
     );
   });
 
   it("times the pass to the module's own speed changes", async () => {
     const asset = await shippedShellMusic();
     if (asset === null) return;
-    const stream = songStreamFor(asset.song, asset.voices);
+    const stream = songStreamFor(asset.song, asset.voices, asset.startOrder);
     // Not `orders.length * 64 * rowMs`: the module sets its own speed with `F`
-    // on row 0 of nearly every pattern (F08 on patterns 0 and 9, F04 on the
-    // rest), so the pass is a sum over rows rather than a product.
+    // on row 0 of nearly every pattern (F03 on 23 of the loop's orders, F06 on
+    // 9, and F01/F04/F05/F08/F0A/F0E scattered besides), so the pass is a sum
+    // over rows rather than a product.
     const tickMs = 2500 / asset.song.initialTempo;
     expect(tickMs).toBe(20);
     let previous = -1;
@@ -436,7 +443,7 @@ describe("the shell music stream", () => {
   it("names only voices the loaded bank builds, and speaks all three kinds", async () => {
     const asset = await shippedShellMusic();
     if (asset === null) return;
-    const stream = songStreamFor(asset.song, asset.voices);
+    const stream = songStreamFor(asset.song, asset.voices, asset.startOrder);
     const kinds = new Set<string>();
     for (const command of stream.commands) {
       kinds.add(command.kind);
@@ -453,6 +460,182 @@ describe("the shell music stream", () => {
     const asset = await shippedShellMusic();
     if (asset === null) return;
     expect(() => renderSongStream(asset.song, {})).toThrow(/no synthesized voice/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// THE LAP. These are the assertions the film is the oracle for, and the whole
+// reason the shipped module is the one in `intro.bin` rather than the one in
+// `music001.bin`. Measured against the continuous 399.6 s take in
+// research/view/reference/session3 (48 kHz, unresampled), rendering this exact
+// command stream at 960 samples a field:
+//
+//   * the take's own waveform self-correlation is +0.9969 at lag 8077 fields
+//     and -0.100..-0.017 at 8074..8076 and 8078..8080 — a sharp measurement,
+//     not a fit;
+//   * one 8077-field lap of this render sits in the take at +0.7240 waveform
+//     and +0.9820 onset-envelope, twice, exactly 8077 fields apart;
+//   * all 33 orders of the lap correlate individually, waveform +0.5615 worst,
+//     +0.7083 median, +0.9081 best;
+//   * the `A01` volume slides at pattern 35 rows 39-43 take the render to
+//     DIGITAL ZERO for loop-offset fields 6499..6516, and the take is at the
+//     noise floor at loop offsets 6499.5..6515.5 on all three of its laps;
+//   * the separate cold-boot take replicates the whole lap at +0.7223 waveform
+//     and +0.9821 envelope, and the lead-in orders 17 and 18 at +0.9389 and
+//     +0.8758 — while every order before 17 correlates at noise there, four of
+//     them against 884 fields in which that take is at digital zero.
+//
+// The reading these replaced — music001 at speed 4/8, lapping in 3584 — scored
+// +0.0146 waveform and +0.0322 envelope through the identical pipeline.
+// ---------------------------------------------------------------------------
+
+/** Where the machine enters the module. See `ShellMusicAsset.startOrder`. */
+const SHIPPED_START_ORDER = 17;
+/** Orders 17 and 18, played once before the loop: 384 + 192 fields. */
+const SHIPPED_LEAD_IN_FIELDS = 576;
+const SHIPPED_LAP_FIELDS = 8077;
+
+/** Steps the shipped song and reports where the order list actually goes. */
+function walkShippedSong(song: TrackerSong, fields: number): {
+  readonly entries: { order: number; field: number }[];
+  readonly rowLengths: Map<number, number>;
+} {
+  const player = createTrackerPlayer(song, SHIPPED_START_ORDER);
+  const entries: { order: number; field: number }[] = [];
+  const rowLengths = new Map<number, number>();
+  let previousOrder = -1;
+  let rowStart = 0;
+  for (let field = 0; field < fields; field += 1) {
+    if (player.row === 0 && player.tick === 0 && player.order !== previousOrder) {
+      entries.push({ order: player.order, field });
+      previousOrder = player.order;
+    }
+    const row = player.row;
+    const order = player.order;
+    stepTracker(player);
+    if (player.row !== row || player.order !== order) {
+      const length = field + 1 - rowStart;
+      rowLengths.set(length, (rowLengths.get(length) ?? 0) + 1);
+      rowStart = field + 1;
+    }
+  }
+  return { entries, rowLengths };
+}
+
+describe("the front-end module's lap, against the capture", () => {
+  it("loops in exactly 8077 PAL fields", async () => {
+    const asset = await shippedShellMusic();
+    if (asset === null) return;
+    const stream = songStreamFor(asset.song, asset.voices, asset.startOrder);
+    // One field is one tick is 20 ms — the EXTER interrupt the copper raises
+    // once a frame. See the tracker core's header.
+    expect(2500 / asset.song.initialTempo).toBe(20);
+    expect(stream.restartMs).not.toBeNull();
+    const restartFields = (stream.restartMs as number) / 20;
+    const totalFields = stream.durationMs / 20;
+    expect(totalFields - restartFields).toBe(SHIPPED_LAP_FIELDS);
+    // And the lead-in ahead of it, orders 17 and 18, played once.
+    expect(restartFields).toBe(SHIPPED_LEAD_IN_FIELDS);
+    expect(totalFields).toBe(SHIPPED_LEAD_IN_FIELDS + SHIPPED_LAP_FIELDS);
+  });
+
+  it("is entered at order 17, where the cold-boot take's 884-field silence ends", async () => {
+    const asset = await shippedShellMusic();
+    if (asset === null) return;
+    expect(asset.startOrder).toBe(SHIPPED_START_ORDER);
+    // Orders 17 and 18 are 384 and 192 fields — patterns 16 and 28 at F06 and
+    // F03 — and they are what plays before the loop, once.
+    const { entries } = walkShippedSong(asset.song, SHIPPED_LEAD_IN_FIELDS + 1);
+    expect(entries).toEqual([
+      { order: 17, field: 0 },
+      { order: 18, field: 384 },
+      { order: 19, field: SHIPPED_LEAD_IN_FIELDS },
+    ]);
+  });
+
+  it("loops orders 19..51 on the B13, and plays 17..18 exactly once", async () => {
+    const asset = await shippedShellMusic();
+    if (asset === null) return;
+    expect(asset.song.orders.length).toBe(54);
+    // The jump itself: `B13` on the last row of the last order of the loop.
+    const last = asset.song.orders[51] as number;
+    expect(last).toBe(29);
+    const jump = (asset.song.patterns[last] as readonly (readonly unknown[])[])[63]?.[0] as {
+      effect: number;
+      param: number;
+    };
+    expect([jump.effect, jump.param]).toEqual([0xb, 0x13]);
+
+    const span = SHIPPED_LEAD_IN_FIELDS + 2 * SHIPPED_LAP_FIELDS + 1;
+    const { entries } = walkShippedSong(asset.song, span);
+    const firstPass = entries.slice(0, 35).map((one) => one.order);
+    expect(firstPass).toEqual(Array.from({ length: 35 }, (_, at) => at + 17));
+    // Orders 52 and 53 are dead: the B13 fires at 51 and never reaches them.
+    expect(entries.map((one) => one.order)).not.toContain(52);
+    expect(entries.map((one) => one.order)).not.toContain(53);
+    // And 0..16 are never entered at all: the machine does not start there.
+    expect(Math.min(...entries.map((one) => one.order))).toBe(17);
+    // Every later pass re-enters at 19, one lap apart to the field.
+    const reentries = entries.filter((one) => one.order === 19).map((one) => one.field);
+    expect(reentries).toEqual([
+      SHIPPED_LEAD_IN_FIELDS,
+      SHIPPED_LEAD_IN_FIELDS + SHIPPED_LAP_FIELDS,
+      SHIPPED_LEAD_IN_FIELDS + 2 * SHIPPED_LAP_FIELDS,
+    ]);
+  });
+
+  it("plays the lap on a six-field row, with the one one-field row that makes 8077 odd", async () => {
+    const asset = await shippedShellMusic();
+    if (asset === null) return;
+    // Rows counted over the lead-in AND the lap; the lap's own share is
+    // 1504 x 3 + 594 x 6 + 1 x 1 = 8077 over 2099 rows.
+    const span = SHIPPED_LEAD_IN_FIELDS + SHIPPED_LAP_FIELDS;
+    const { rowLengths } = walkShippedSong(asset.song, span);
+    const total = [...rowLengths.entries()].reduce((sum, [len, n]) => sum + len * n, 0);
+    expect(total).toBe(span);
+    // Every row is 3 or 6 fields except the single one-field row the `F01` at
+    // pattern 35 row 46 buys — the reason 8077 is not divisible by 6.
+    expect([...rowLengths.keys()].sort((a, b) => a - b)).toEqual([1, 3, 6]);
+    expect(rowLengths.get(1)).toBe(1);
+    expect(rowLengths.get(3)).toBe(1504 + 64); // the lap's 1504, plus order 18's 64
+    expect(rowLengths.get(6)).toBe(594 + 64); //  the lap's  594, plus order 17's 64
+    // The audible grid is six fields: a speed-3 pattern puts its notes on even
+    // rows, which is why the capture's onset autocorrelation peaks at 6, 12,
+    // 18, 24, 30, 36 and 48 and goes NEGATIVE at 3 and 8. Measured on the
+    // capture: mean ACF +0.0849 at multiples of six against -0.0091 elsewhere,
+    // with the WORST multiple of six (+0.0609) above the BEST non-multiple
+    // (+0.0509). This render gives +0.1552 against -0.0218 on the same test.
+    expect(1504 * 3 + 594 * 6 + 1).toBe(SHIPPED_LAP_FIELDS);
+  });
+
+  it("takes all four channels to silence where the capture goes silent", async () => {
+    const asset = await shippedShellMusic();
+    if (asset === null) return;
+    // Pattern 35 (order 47) rows 39..43 carry `A01` on all four channels, and
+    // the volumes reach 0 together. The capture is at its noise floor for the
+    // same 17 fields of every lap.
+    const pattern = asset.song.patterns[35] as readonly (readonly {
+      effect: number;
+      param: number;
+    }[])[];
+    for (let channel = 0; channel < 4; channel += 1) {
+      const slides = [39, 40, 41, 42, 43].filter((row) => {
+        const at = pattern[row]?.[channel];
+        return at !== undefined && at.effect === 0xa && at.param === 0x01;
+      });
+      expect(slides.length, `channel ${channel} volume slides`).toBeGreaterThan(0);
+    }
+    // And the stream really does emit volume 0 on every channel there.
+    const player = createTrackerPlayer(asset.song, SHIPPED_START_ORDER);
+    const silenced = new Set<number>();
+    const from = SHIPPED_LEAD_IN_FIELDS + 6400;
+    for (let field = 0; field < SHIPPED_LEAD_IN_FIELDS + 6516; field += 1) {
+      for (const command of stepTracker(player)) {
+        if (field < from) continue;
+        if (command.action === "volume" && command.volume === 0) silenced.add(command.channel);
+      }
+    }
+    expect([...silenced].sort()).toEqual([0, 1, 2, 3]);
   });
 });
 

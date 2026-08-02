@@ -332,11 +332,11 @@ ids 1…4) give every number, identical on all three tables and mirrored between
 **sweep 18 poses = 54°, coil 20 units/step capped at 120, spring 30 capped at 50.** That is
 a full stroke in **3.5 ticks** and a return in 6.25, and a tip speed of 17.7 px/tick where
 this port's chosen constant-rate stroke gave 9.4. The same records also carry the **pivots**
-— (86,556)/(199,556), (112,556)/(227,556), (113,556)/(227,556) — within two pixels of the
-ones this project had inferred from the map's free-centre spans, and a **third record on
-Law 'n Justice at (37,302) sweeping 11 poses, which is the upper-left flipper this document
-has been carrying as [open]**. Neither the disk pivots nor the third bat are wired in: both
-change how a table plays and want their own change with their own census. **[disk]**
+— (86,556)/(199,556), (112,556)/(227,556), (113,556)/(227,556) — and a **third record per
+table**, at (37,302) on Law 'n Justice sweeping 11 poses, (205,115) on BabeWatch sweeping 13
+and (182,194) on Extreme Sports sweeping 18. **All nine are now what the simulation runs
+on**; see *The drawn bat and the colliding bat were two different objects* below for the
+round that wired the lower six in and for what it cost the census. **[disk]**
 
 **The flipper IMPULSE, which is the other half and was this port's own invention.** The
 stroke above is what the bat does; what it gives the ball is +0x00AEA2, reached from the
@@ -357,8 +357,11 @@ change:
    `$10(a0)`: the ball takes angular momentum out of the bat, the impulse is computed from
    the reduced rate, and a second ball on the same stroke gets less.
 4. Small radii are floored — `if d0 < $2E: d0 += ($2E − d0) >> 3` — so a ball struck at the
-   boss still leaves with something. On a 45 px bat every radius is under 46, so the floor
-   always fires: it lifts the boss from 0 to 5 and the tip from 33 to 34.
+   boss still leaves with something. On a 46 px bat every radius is under 46, so the floor
+   always fires: with the re-measured silhouette the nearest a ball's centre can come to the
+   pivot is boss 8 + ball 8 = 16 px, which the table reads as 11 and the floor lifts to 15,
+   and a ball on the tip is 46 px out, read as 33 and lifted to 34. (At the old 5 px boss the
+   nearest centre was 13 px, read as 9 and lifted to 13.)
 5. One of eight sub-handlers at `$B036 + 0x3C·n`, chosen by the record's byte `$1(a0)`,
    writes `$1c(a4) = magnitude × 2 × rate` and `$1a(a4) = 8 × 2 × rate`. Those are consumed
    at +0x00B528: `$1C` is added to the **normal** component of the ball's velocity and
@@ -387,10 +390,14 @@ speed of one met at 120. `src/game/flippers.ts` implements it and
 
 ## Physical layout
 
-- Three flippers per table. **[src]** — and Law 'n Justice's third is now located on the
-  disk: record 0 of its flipper array, pivot (37,302), an 11-pose (33°) sweep with the same
-  coil and spring rates as the lower pair. BabeWatch and Extreme Sports carry two records
-  only. Recorded in `flippers.ts` as `LAW_N_JUSTICE_UPPER_FLIPPER` and not wired in. **[disk]**
+- Three flippers per table, and all nine are **[disk]**: pivot, rest and flipped pose, sweep
+  and all four stroke rates straight off each table's own flipper record. The claim that
+  BabeWatch and Extreme Sports carried two records only was an alignment artefact — the
+  four-slot array starts at a different hunk-4 offset on each table — and all three ship an
+  upper bat: Law 'n Justice (37,302) 11 poses, BabeWatch (205,115) 13, Extreme Sports
+  (182,194) 18. `FLIPPER_RECORDS` in `flippers.ts` is the only placement in the port, and
+  `tests/flipper-bats.test.ts` pins every field of it against the shipped pose bank by
+  equality. **[disk]**
 - Bumpers, ball traps, ramps, multi-level playfields. **[src]**
 - Vertically scrolling playfield in normal play; full-screen hi-res during multiball. **[src]**
   — and the scroll itself is now **[disk]**: a proportional follower closing 1/5 of the
@@ -775,6 +782,97 @@ Parity means deciding about these deliberately rather than by accident:
 
 Both are candidates for a "faithful / fixed" toggle rather than silent correction.
 
+## The drawn bat and the colliding bat were two different objects (2026-08)
+
+The fourth play-test report read, verbatim: *"still missing flippers on the first board,
+flippers look good on the 2nd 2 boards but dont work correctly, ball goes through them when
+flipping."* The second half is closed here. The first half could not be reproduced and is
+recorded as open at the bottom of this section.
+
+**What was wrong.** The sprite round made the DRAWING truthful — the bats are the disk's own
+pose bank, blitted at the record's pivot — while proving the SIMULATION byte-identical. That
+was reported as a success and was in fact the defect: the drawn bat moved onto the disk's
+real geometry and the colliding bat stayed on the reconstruction's inferred approximation.
+They became two objects. Three errors, in rising order of size:
+
+1. **Pivot row.** The records put every lower pivot on row 556; the simulation collided on
+   an inferred 558, from the free ball-centre span on the map. Two rows, and one table's
+   column was out too: Law 'n Justice's left pivot is 86 against the inferred 84.
+2. **Rest bearing.** The records rest at pose 10 / pose 50 — exactly 30° below horizontal.
+   The simulation rested at a chosen 152 of 2048, 26.72°. 3.28° of error.
+3. **The bat's own thickness, which nobody had flagged.** `FLIPPER_BOSS_RADIUS_PIXELS = 5`
+   was documented as "the largest inscribed disc. Measured." It is not. Rasterising the
+   shipped pose bank gives the profile outright: the blade is **15 px across at the boss,
+   8 px from the pivot's axis**, holding to along 6 and then stepping down to 4 px at along
+   44, with 46 px of drawn blade and a further 8 px of hub behind the pivot. The constant
+   came in at the initial commit, long before `flipdat1.bin` was decoded, and was never
+   revised.
+
+**What it did.** Measured over the drawn pixels of all 64 shipped poses, forward of the
+pivot: **9,980 of 32,154 — 31.0% of the bat the player can see — had no collision behind
+them.** Against the filmed original's own pixels the collision face sat a mean **4.83 px**
+(max 9) BELOW the face being drawn, at every point of every stroke, on all six lower bats.
+A ball resting on the flipper the player could see was above anything that could stop it.
+The direct measurement: put a ball touching the outer face of the drawn bat at eleven points
+along each of the nine bats, sweep the bat from rest, and ask whether the physics registers
+anything — **67 of 99 sample points registered NO CONTACT AT ALL**, including all eleven on
+BabeWatch's and Extreme Sports' upper bats. That is the operator's "ball goes through them",
+and it is now **0 of 99**. `tests/flippers.test.ts` asserts it.
+
+**The safeguard that did not fire.** A test asserted that the inferred pivots and the disk's
+agreed *to within two pixels*. They did. Two pixels of PIVOT agreement says nothing about
+FACE agreement, and two pixels is enough for a ball to fall through a flipper. It has been
+replaced by an assertion that there is only one source: `FLIPPER_RECORDS` against the
+shipped `flipper-bats.json`, field for field, by equality, with no tolerance anywhere; plus
+"every drawn pixel of every pose is inside the collision capsule"; plus the drawn-face
+contact test above. `movingSpritePlacements` now blits each pose against the SIMULATION's
+pivot rather than the record's, so the picture is hung on whatever the physics collides
+with, by construction.
+
+**What the film says, because it outranks both.** Blitting each shipped rest pose at the
+record's pivot and counting pixels that disagree with the filmed AGA original leaves 0, 8,
+10, 0, 0 and 0 disagreements on the six lower bats and ZERO sprite-only pixels; at the
+inferred pivot the same count is 176–270. A ±4 px sweep of the pivot bottoms out at exactly
+(0,0) on all six. Sweeping the rest bearing, 30° leaves 0 sprite-only pixels and 27° leaves
+51. **[disk]/[film]**
+
+**The collision body, and what it is not.** boss 8, tip 4, taper start 6, axis length 44,
+with the round cap carrying the last two drawn columns — 31,909 of 32,154 drawn pixels
+(99.24%) inside the capsule, worst excursion 1.44 px. The residue is the hand-drawn poses'
+own wander: each of the 64 was drawn separately and their perpendicular centres range over
+−1.57..+1.49 rather than sitting at a constant offset, so no single capsule fits all of them
+exactly. The 8 px hub BEHIND the pivot is deliberately not part of the blade — the original
+draws it over the end of the inlane guide rail — and `touchAt`'s clamp of `along` to 0 is
+what keeps it out. The one place the body still overlaps painted geometry is Extreme Sports'
+upper bat, 9 pixels at (181–184, 201–203), because the original draws that bat over its own
+ramp scenery; the six lower bats overlap at most ONE pixel each, the guide tip exactly
+`bossRadius` from the pivot. All of it is pinned to the pixel by test.
+
+**What legitimately moved.** Every impulse: `flipperImpulseRadius` indexes the original's
+64×64 table with whole pixels from the pivot, so moving the pivot two rows changes `dy` for
+every contact, and the wider boss moves the nearest possible contact from 13 px to 16. The
+census below is re-run against it.
+
+**NOT REPRODUCED: "missing flippers on the first board".** "The first board" is Law 'n
+Justice (`TABLE_IDS[0]`, `SHELL_TABLES[0]`, guarded at module load). Three independent
+read-only investigations failed to make any bat fail to draw: two headless through
+`renderGame()` with a software `OffscreenCanvas` — attract, table-loaded, every tick of the
+serve, ball in play, flippers held, the bottom stop, the film's own window row, multiball
+reframe, tilt, game-over and table revisits — and one driving the shipped page in a real
+Chrome with real key events, real `requestAnimationFrame` and the player's own route through
+the menus, for 40 s on each table plus a revisit to the first: **1,524 canvas samples, zero
+fallback markers, zero blank bat boxes**, and Law 'n Justice's lower bats measured 4,708
+device pixels of sprite-layer contribution against BabeWatch's 4,696. Its bats are on screen
+89.1% of ticks, MORE than either other table's. The property is now pinned anyway
+(`tests/moving-sprites.test.ts`, "the bats a player actually sees"): all three bats draw, at
+the pixel the original draws them, in every state a real game passes through on all three
+tables. The two candidate readings that remain are (a) the operator means the behaviour —
+Law 'n Justice's left bat was the only bat in the game 2 px out in BOTH axes, so its
+flippers really did do the least — or (b) a stopped clock, which is the one condition that
+leaves a player looking at a flipper-less table indefinitely: the camera resets to the TOP
+of the playfield at `startGame` (the filmed serve snap) and HOLDS there while nothing ticks,
+and a backgrounded tab runs no `requestAnimationFrame`. **[open]**
+
 ## Census baseline — at the measured flipper, camera and tilt (2026-08)
 
 The first full census after the invented flipper/camera/tilt were replaced by the
@@ -839,6 +937,54 @@ same budget.
   second does (measured 100/160/220 at 10-tick spacing, identical on all three
   tables). At census cadences — one nudge per 700 or 400 ticks — the table
   tilted 0 times in 540 games, so census play is tilt-neutral.
+
+## Census after the geometry was unified (2026-08)
+
+**Budget, stated with the figures because a rate is only comparable against another rate at
+the same budget:** `scripts/aggressive-census.mts`, **40,000 ticks a game, 90 games a table,
+3 balls a game, 270 ball ends a table**, plunge holds 8..97, both bats tapped for 3 ticks on
+a cycling 17..30 tick cadence, nudge left every 700 ticks. Both columns are the same
+instrument, run back to back on the same machine: `921151b` in a pristine worktree against
+the same commit with only the flipper geometry changed.
+
+| | HEAD `921151b` | one geometry | why |
+|---|---|---|---|
+| **Law 'n Justice** completed | 90/90 | 90/90 | — |
+| write-offs | 0 of 270 (0.0%) | 0 of 270 (0.0%) | all 270 ends are real drains both sides |
+| score median | 365,000 | **487,500** | +33.6% |
+| score max | 3,050,000 | 3,245,000 | +6.4% |
+| ball-1 median | 47,500 | **100,000** | +110% |
+| zero-score games | 4/90 | 4/90 | — |
+| **BabeWatch** completed | 90/90 | 90/90 | — |
+| write-offs | 0.0% | 0.0% | — |
+| score median | 155,000 | **190,000** | +22.6% |
+| score max | 1,722,340 | **2,585,000** | +50.1% |
+| distinct scores | 42 | 58 | more of the table is being reached |
+| **Extreme Sports** completed | 90/90 | 90/90 | — |
+| write-offs | 0.0% | 0.0% | — |
+| score median | 162,500 | **242,500** | +49.2% |
+| score max | 7,455,000 | 4,220,000 | −43.4%, one lucky game lost |
+| distinct scores | 48 | 63 | — |
+
+**The medians rise on all three tables and that is the expected direction, not a
+regression.** The census player taps the bats on a fixed cadence; before the change, one
+approach in three arrived at a bat whose collision face was 4.83 px below the face being
+drawn and took no impulse at all. The same player now connects, so the ball stays in play
+longer and reaches more of the table — Law 'n Justice's ball-1 median doubles, and the
+distinct-score count rises on the two tables where it had been narrow. Extreme Sports' max
+falls because its old 7.46M was a single outlier game; its median rises by half.
+
+**Nothing moved that should not have.** 90/90 completions and 0.0% write-offs on all three
+tables, both sides, all 810 ball-ends real drains. The drain mouth barely moved: the
+tip-to-tip separation at rest goes 34.6 px to 35.1.
+
+**The picture did not move at all.** The film comparison re-run on the same three windows
+(playfield rows 370–597, columns 0–326, at 2x, 894,672 pixels) gives **99.15% agreement,
+byte-identical to `921151b`**: Law 'n Justice 98.45%, BabeWatch 99.86%, Extreme Sports
+99.13%, with 0 of 298,224 pixels differing between the two renders on every table. That is
+the expected result and it is the point — the drawn bat was already on the record's pivot;
+this change moved the SIMULATION onto it. Differing pixels inside the bat boxes: 4, 0, 8, 0,
+24 and 8 of 6,144 each, so the bats remain absent from the difference list.
 
 ## How the open items get closed
 

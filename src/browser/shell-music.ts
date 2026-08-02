@@ -141,7 +141,9 @@ export function createShellMusic(
       const wants = musicWantedFor(phase) && asset !== null;
       if (wants && !wanted && asset !== null) {
         wanted = true;
-        startTracker(output, songStreamFor(asset.song, asset.voices));
+        // `startOrder` is where the machine enters the module (17, not 0); see
+        // `src/audio/shell-music.ts`.
+        startTracker(output, songStreamFor(asset.song, asset.voices, asset.startOrder));
       } else if (!wants && wanted) {
         wanted = false;
         stopTracker(output);

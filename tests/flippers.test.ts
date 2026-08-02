@@ -46,24 +46,23 @@ import {
   FLIPPER_FRAME_ARC_START_DEGREES,
   FLIPPER_FRAME_COUNT,
   FLIPPER_FRAME_STEP_DEGREES,
+  FLIPPER_DRAWN_HUB_PIXELS,
+  FLIPPER_DRAWN_TIP_PIXELS,
   FLIPPER_LENGTH_PIXELS,
   FLIPPER_PLACEMENT_NOTE,
-  FLIPPER_REST_ANGLE_UNITS,
+  FLIPPER_RECORDS,
   FLIPPER_SURFACE,
   FLIPPER_STEPS_PER_TICK,
   FLIPPER_SWEEP_UNITS,
   FLIPPER_TAPER_START_PIXELS,
   FLIPPER_TIP_RADIUS_PIXELS,
   FLIPPER_UP_TICKS,
-  LOWER_FLIPPER_PIVOT_COLUMNS,
-  LOWER_FLIPPER_PIVOT_ROW,
   UPPER_FLIPPER_RECORDS,
   BAT_ANGLE_UNITS_PER_POSE,
   poseToAngleUnits,
   QUARTER_TURN_UNITS,
   BAT_ANGLE_UNITS_PER_TURN,
   FLIPPER_UP_MAX_RATE,
-  MEASURED_FLIPPER_PIVOTS,
   batAngleToBearing,
   batRadiusAt,
   cosineUnits,
@@ -73,6 +72,7 @@ import {
   flipperEndpoints,
   flipperFrameIndex,
   flipperInputFrom,
+  flipperRecordFor,
   hasUpperFlipper,
   isFullyFlipped,
   resolveFlipperContacts,
@@ -90,8 +90,73 @@ import {
   tickFlipperBank,
   validateFlipperConfig,
 } from "../src/game/flippers.js";
+import { DEGREES_PER_POSE, batPoseForStroke } from "../src/game/flipper-bats.js";
+import { flipperBatsFixture } from "./table-fixtures.js";
 
 const BALL_RADIUS: Q10 = pixelsToQ10(BALL_RADIUS_PIXELS);
+
+// ---------------------------------------------------------------------------
+// THE DRAWN BAT, read back out of the shipped pose bank
+// ---------------------------------------------------------------------------
+//
+// Every geometric assertion below that used to restate a number now DERIVES it
+// from `public/generated/flipper-bats.json` — the same document the renderer
+// blits — so it cannot go stale the way "45 px long, 5 px at the boss" did.
+
+const BATS = flipperBatsFixture();
+
+/** Offsets from the pivot of every opaque pixel of one drawn pose. */
+function drawnPixels(pose: number): readonly (readonly [number, number])[] {
+  const entry = BATS.poses.get(pose);
+  if (entry === undefined) throw new Error(`pose ${pose} is not in the shipped bank`);
+  const rowBytes = Math.ceil(entry.width / 8);
+  const plane2Rows = entry.height - 2 * BATS.plane2RowOffset;
+  const bit = (plane: Uint8Array, row: number, x: number): boolean =>
+    ((plane[row * rowBytes + (x >> 3)] ?? 0) & (0x80 >> (x & 7))) !== 0;
+  const out: [number, number][] = [];
+  for (let y = 0; y < entry.height; y += 1) {
+    for (let x = 0; x < entry.width; x += 1) {
+      let index = (bit(entry.plane0, y, x) ? 1 : 0) | (bit(entry.plane1, y, x) ? 2 : 0);
+      const body = y - BATS.plane2RowOffset;
+      if (body >= 0 && body < plane2Rows && bit(entry.plane2, body, x)) index |= 4;
+      if (index !== 0) out.push([x - entry.anchorX, y - entry.anchorY]);
+    }
+  }
+  return out;
+}
+
+/** A drawn pixel's position in the bat's own frame, at a bearing in degrees. */
+function batFrame(bearingDegrees: number, dx: number, dy: number): { along: number; perp: number } {
+  const radians = (bearingDegrees * Math.PI) / 180;
+  const cos = Math.cos(radians);
+  const sin = Math.sin(radians);
+  return { along: dx * cos + dy * sin, perp: -dx * sin + dy * cos };
+}
+
+/** How far OUTSIDE the collision capsule a point in the bat's frame is; <=0 is in. */
+function outsideCapsule(config: FlipperConfig, along: number, perp: number): number {
+  const lengthPixels = config.length / Q10_ONE;
+  const clamped = Math.min(lengthPixels, Math.max(0, along));
+  // The capsule's own radius, in Q10, NOT rounded to a whole pixel: rounding it
+  // here would measure a thinner bat than the one the physics collides on.
+  const radius = batRadiusAt(config, Math.round(clamped * Q10_ONE)) / Q10_ONE;
+  return Math.hypot(along - clamped, perp) - radius;
+}
+
+/** True when (dx,dy) from the pivot is inside the capsule at this bat angle. */
+function insideCapsuleAt(config: FlipperConfig, angle: number, dx: number, dy: number): boolean {
+  const axisX = cosineUnits(angle);
+  const axisY = sineUnits(angle);
+  const px = pixelsToQ10(dx);
+  const py = pixelsToQ10(dy);
+  let along = q10Multiply(px, axisX) + q10Multiply(py, axisY);
+  if (along < 0) along = 0;
+  if (along > config.length) along = config.length;
+  const offsetX = px - q10Multiply(along, axisX);
+  const offsetY = py - q10Multiply(along, axisY);
+  const radius = batRadiusAt(config, along);
+  return offsetX * offsetX + offsetY * offsetY <= radius * radius;
+}
 
 /** The gravity the rest of the simulation is calibrated against. */
 const GRAVITY = SIMULATION_GRAVITY;
@@ -210,13 +275,76 @@ describe("the flipdat1.bin sweep", () => {
     expect(stored).toBe(FLIPPER_FRAME_COUNT);
   });
 
-  it("carries the measured silhouette: 45 px long, 5 px at the boss, 1 px at the tip", () => {
-    expect(FLIPPER_LENGTH_PIXELS).toBe(45);
-    expect(FLIPPER_BOSS_RADIUS_PIXELS).toBe(5);
-    expect(FLIPPER_TIP_RADIUS_PIXELS).toBe(1);
-    expect(FLIPPER_TAPER_START_PIXELS).toBe(6);
-    // A 45 px bat against a 16 px ball is a real machine's proportion.
-    expect(FLIPPER_LENGTH_PIXELS / (BALL_RADIUS_PIXELS * 2)).toBeCloseTo(2.8, 1);
+  it("derives its silhouette from the shipped pose bank rather than restating it", () => {
+    // REPLACED, NOT WEAKENED. This test used to assert 45 / 5 / 1 / 6 as
+    // literals, and three of the four were WRONG — read once before
+    // flipdat1.bin was decoded and never revised. A literal cannot notice that.
+    // So the four constants are now re-derived here from the shipped raster,
+    // pose 0, where the bat is drawn horizontally and `along` is x.
+    const profile = new Map<number, { lo: number; hi: number }>();
+    for (const [dx, dy] of drawnPixels(0)) {
+      const seen = profile.get(dx) ?? { lo: Infinity, hi: -Infinity };
+      profile.set(dx, { lo: Math.min(seen.lo, dy), hi: Math.max(seen.hi, dy) });
+    }
+    const alongs = [...profile.keys()].sort((a, b) => a - b);
+    const halfAt = (along: number): number => {
+      const span = profile.get(along);
+      if (span === undefined) throw new Error(`nothing drawn at along ${along}`);
+      return Math.max(Math.abs(span.lo), Math.abs(span.hi));
+    };
+
+    // The drawn extent, forward and behind.
+    expect(Math.max(...alongs)).toBe(FLIPPER_DRAWN_TIP_PIXELS);
+    expect(-Math.min(...alongs)).toBe(FLIPPER_DRAWN_HUB_PIXELS);
+
+    // The boss: constant out to the taper start, and that is where it stops
+    // being constant. Measured from the PIVOT'S AXIS, which is what the capsule
+    // is centred on — the blade is 15 px across and hangs 1 px below the axis.
+    for (let along = 0; along <= FLIPPER_TAPER_START_PIXELS; along += 1) {
+      expect({ along, half: halfAt(along) }).toEqual({ along, half: FLIPPER_BOSS_RADIUS_PIXELS });
+    }
+    expect(halfAt(FLIPPER_TAPER_START_PIXELS + 1)).toBeLessThan(FLIPPER_BOSS_RADIUS_PIXELS);
+
+    // The taper: the capsule's axis ends where the drawn blade is exactly the
+    // tip radius, and the round cap carries it over the last two columns.
+    expect(halfAt(FLIPPER_LENGTH_PIXELS)).toBe(FLIPPER_TIP_RADIUS_PIXELS);
+    expect(halfAt(FLIPPER_LENGTH_PIXELS - 1)).toBe(FLIPPER_TIP_RADIUS_PIXELS);
+    expect(halfAt(FLIPPER_LENGTH_PIXELS + 1)).toBeLessThan(FLIPPER_TIP_RADIUS_PIXELS);
+
+    // A 46 px bat against a 16 px ball is a real machine's proportion.
+    expect(FLIPPER_DRAWN_TIP_PIXELS / (BALL_RADIUS_PIXELS * 2)).toBeCloseTo(2.9, 1);
+  });
+
+  it("puts a collision face behind 99% of every pixel of every drawn pose", () => {
+    // THE TEST THAT WOULD HAVE CAUGHT IT. The old safeguard compared PIVOTS to
+    // within two pixels and passed while 31% of the bat the player could see
+    // had nothing behind it, because pivot agreement says nothing about FACE
+    // agreement. This measures the face: every opaque pixel of every shipped
+    // pose, forward of the pivot, against the capsule the physics collides on.
+    const left = flipperConfigsFor("law-n-justice")[0] as FlipperConfig;
+    let total = 0;
+    let unbacked = 0;
+    let worst = 0;
+    for (const [pose, entry] of BATS.poses) {
+      for (const [dx, dy] of drawnPixels(pose)) {
+        const { along, perp } = batFrame(entry.bearingDeg, dx, dy);
+        if (along < -0.5) continue;
+        total += 1;
+        const gap = outsideCapsule(left, along, perp);
+        if (gap > 0.5) {
+          unbacked += 1;
+          worst = Math.max(worst, gap);
+        }
+      }
+    }
+    // Measured: 245 of 32,154 (0.76%), worst excursion 1.44 px, and the residue
+    // is the hand-drawn poses' own wander — their perpendicular centre ranges
+    // over -1.57..+1.49 rather than sitting at a constant offset. At the old
+    // boss 5 / tip 1 / length 45 the same count is 9,980 (31.0%).
+    expect(total).toBe(32154);
+    expect(unbacked).toBeLessThanOrEqual(245);
+    expect(worst).toBeLessThanOrEqual(1.5);
+    expect(unbacked / total).toBeLessThan(0.01);
   });
 
   it("maps a bearing to the frame the file actually stores", () => {
@@ -683,13 +811,44 @@ describe("flipping", () => {
   });
 
   it("hits harder the further out the ball sits, because the arm is longer", () => {
-    const atBoss = ballRestingOn(LEFT, FLIPPER_AT_REST, 12);
-    const atTip = ballRestingOn(LEFT, FLIPPER_AT_REST, 40);
-    const bossBall = createBall(0, atBoss.x, atBoss.y);
-    const tipBall = createBall(1, atTip.x, atTip.y);
-    runTicks([bossBall], [LEFT], [true], UP_STROKE_TICKS + 2);
-    runTicks([tipBall], [LEFT], [true], UP_STROKE_TICKS + 2);
-    expect(speedOf(tipBall)).toBeGreaterThan(speedOf(bossBall));
+    // STRENGTHENED, and the reason is a real consequence of the re-measured
+    // silhouette. This used to run the WHOLE up-stroke and compare two final
+    // speeds. On the 5 px bat that worked; on the drawn 8 px bat a ball resting
+    // on the boss sits 19.7 px from the pivot rather than 17.2, its impulse
+    // magnitude goes 16 -> 18, and BOTH shots now saturate the original's own
+    // +-4095 per-axis velocity clamp by the third tick (14.72 / 16.19 / 16.03 /
+    // 15.89 / 17.69 / 15.64 px a tick at along 6 / 12 / 20 / 28 / 36 / 40). The
+    // old assertion would have been comparing two clamped numbers.
+    //
+    // So the claim is now made where it is actually observable — the tick the
+    // impulse lands, before the clamp binds — and the MECHANISM the test names
+    // is asserted directly: the magnitude the original's own table hands back
+    // rises monotonically with the contact radius, all the way out.
+    const speedAfter = (alongPixels: number, ticks: number): number => {
+      const at = ballRestingOn(LEFT, FLIPPER_AT_REST, alongPixels);
+      const ball = createBall(0, at.x, at.y);
+      runTicks([ball], [LEFT], [true], ticks);
+      return speedOf(ball);
+    };
+    let previousSpeed = 0;
+    let previousMagnitude = 0;
+    for (const alongPixels of [6, 12, 20, 28, 36, 40]) {
+      const speed = speedAfter(alongPixels, 2);
+      expect({ alongPixels, rising: speed > previousSpeed }).toEqual({ alongPixels, rising: true });
+      previousSpeed = speed;
+
+      const at = ballRestingOn(LEFT, FLIPPER_AT_REST, alongPixels);
+      const magnitude = flipperImpulseMagnitude(
+        q10ToPixel(at.x) - q10ToPixel(LEFT.pivotX),
+        q10ToPixel(at.y) - q10ToPixel(LEFT.pivotY),
+      );
+      expect({ alongPixels, rising: magnitude > previousMagnitude })
+        .toEqual({ alongPixels, rising: true });
+      previousMagnitude = magnitude;
+    }
+    // And over the whole stroke the tip still beats the boss, which is the
+    // original claim, stated where the clamp cannot swallow it.
+    expect(speedAfter(40, UP_STROKE_TICKS + 2)).toBeGreaterThan(speedAfter(6, UP_STROKE_TICKS + 2));
   });
 
   it("does not fire a ball that the bat is moving away from", () => {
@@ -830,13 +989,55 @@ describe("placement", () => {
     return best;
   }
 
-  it("puts each pivot on the measured edge of the flipper box", () => {
-    // This is the derivation itself, run as a test: the pivots ARE the ends of
-    // the widest free ball-centre span on the first row below the inlane guides.
+  it("keeps the map derivation as a SANITY CHECK on the records, not a source", () => {
+    // DEMOTED, DELIBERATELY, AND THE DEMOTION IS THE POINT. This used to read
+    // "puts each pivot on the measured edge of the flipper box" and assert that
+    // the widest free ball-centre span on row 558 IS the pivot pair. It was the
+    // derivation run as a test — and the derivation was the wrong source. The
+    // records put the pivots on row 556 at 86/199, 112/227 and 113/227, and at
+    // the disk's own row the span does not reproduce them on any table:
+    //
+    //   row 556   LnJ 85..198   BW 113..226   ES 113..226
+    //   row 558   LnJ 84..199   BW 112..227   ES 112..227
+    //   records   LnJ 86/199    BW 112/227    ES 113/227
+    //
+    // Only BabeWatch's pair ever appears, and at the wrong row; that
+    // coincidence is what made the inference look sound for five rounds. What
+    // the map CAN still prove is asserted here, and it is worth keeping because
+    // it is the property the pivot has to have for the table to be playable.
     for (const id of TABLE_IDS) {
-      const span = widestFreeSpan(mapFor(id), LOWER_FLIPPER_PIVOT_ROW);
-      const columns = LOWER_FLIPPER_PIVOT_COLUMNS[id];
-      expect({ id, ...span }).toEqual({ id, from: columns.left, to: columns.right });
+      const map = mapFor(id);
+      const left = flipperRecordFor(id, "lower-left");
+      const right = flipperRecordFor(id, "lower-right");
+      expect(left.pivotYPixels).toBe(556);
+      expect(right.pivotYPixels).toBe(556);
+
+      // 1. Each pivot is inside the free ball-centre corridor the two guides
+      //    leave, on the row below the one the record names.
+      const span = widestFreeSpan(map, left.pivotYPixels + 2);
+      expect({ id, in: left.pivotXPixels >= span.from && left.pivotXPixels <= span.to })
+        .toEqual({ id, in: true });
+      expect({ id, in: right.pivotXPixels >= span.from && right.pivotXPixels <= span.to })
+        .toEqual({ id, in: true });
+
+      // 2. The boss seals the gap to the guide tip: no ball can pass behind a
+      //    bat. This is the load-bearing half and it is asserted exactly.
+      let leftTip = -1;
+      let rightTip = -1;
+      for (let x = 0; x < map.width; x += 1) {
+        if (!blocks(map, x, 556)) continue;
+        if (x < left.pivotXPixels && x > leftTip) leftTip = x;
+        if (x > right.pivotXPixels && rightTip < 0) rightTip = x;
+      }
+      const gaps: Readonly<Record<TableId, readonly [number, number]>> = {
+        "law-n-justice": [10, 8],
+        babewatch: [8, 8],
+        "extreme-sports": [9, 8],
+      };
+      expect({ id, gap: [left.pivotXPixels - leftTip, rightTip - right.pivotXPixels] })
+        .toEqual({ id, gap: [...gaps[id]] });
+      expect(left.pivotXPixels - leftTip).toBeLessThan(2 * BALL_RADIUS_PIXELS);
+      expect(rightTip - right.pivotXPixels).toBeLessThan(2 * BALL_RADIUS_PIXELS);
     }
   });
 
@@ -896,35 +1097,81 @@ describe("placement", () => {
       }
       expect({ id, best }).toEqual({ id, best: 28 });
     }
-    expect(LOWER_FLIPPER_PIVOT_COLUMNS.babewatch.left
-      - LOWER_FLIPPER_PIVOT_COLUMNS["law-n-justice"].left).toBe(28);
+    // The 28 px shows up in the RECORDS too, on the right-hand pivots, which
+    // are 199 / 227 / 227. It does NOT show up on the left-hand ones — 86 / 112
+    // / 113 — and that per-table jitter of a pixel or two is exactly what no
+    // derivation off a shared bottom-of-table template could ever produce. It
+    // is the reason the records have to be the source and the map the check.
+    expect(flipperRecordFor("babewatch", "lower-right").pivotXPixels
+      - flipperRecordFor("law-n-justice", "lower-right").pivotXPixels).toBe(28);
+    expect(flipperRecordFor("babewatch", "lower-left").pivotXPixels
+      - flipperRecordFor("law-n-justice", "lower-left").pivotXPixels).toBe(26);
+    expect(flipperRecordFor("extreme-sports", "lower-left").pivotXPixels
+      - flipperRecordFor("babewatch", "lower-left").pivotXPixels).toBe(1);
   });
 
-  it("keeps the pair symmetric about the axis the guide tips define", () => {
+  it("keeps the pair near the axis the guide tips define, to the record's own jitter", () => {
+    // RESTATED AGAINST THE RECORDS, and the restatement is a finding. The old
+    // assertion was `left + right === leftTip + rightTip` — the pivots and the
+    // guide tips share a midpoint EXACTLY — and it held because the pivots were
+    // being read off the map in the first place. The disk's own records are not
+    // that tidy: BabeWatch is exact, Law 'n Justice is 2 px off centre and
+    // Extreme Sports 1 px. Those are the numbers, and asserting them exactly is
+    // strictly more informative than asserting a symmetry the original does not
+    // actually have.
+    const offCentre: Readonly<Record<TableId, number>> = {
+      "law-n-justice": 2,
+      babewatch: 0,
+      "extreme-sports": 1,
+    };
     for (const id of TABLE_IDS) {
-      const columns = LOWER_FLIPPER_PIVOT_COLUMNS[id];
       const map = mapFor(id);
-      // The guide tips are the last blocking pixels on row 556 either side.
+      const left = flipperRecordFor(id, "lower-left").pivotXPixels;
+      const right = flipperRecordFor(id, "lower-right").pivotXPixels;
       const row = 556;
       let leftTip = -1;
       let rightTip = -1;
       for (let x = 0; x < map.width; x += 1) {
         if (!blocks(map, x, row)) continue;
-        if (x < columns.left && x > leftTip) leftTip = x;
-        if (x > columns.right && rightTip < 0) rightTip = x;
+        if (x < left && x > leftTip) leftTip = x;
+        if (x > right && rightTip < 0) rightTip = x;
       }
       expect(leftTip).toBeGreaterThan(0);
       expect(rightTip).toBeGreaterThan(0);
-      // Same axis to the pixel: the guide tips' inner edges and the two pivots
-      // share a midpoint, which is what says the pivots are on the table's own
-      // line of symmetry rather than near it.
-      expect(columns.left + columns.right).toBe(leftTip + rightTip);
-      // And the boss seals the gap: no ball can pass behind the flipper.
-      expect(columns.left - leftTip).toBeLessThan(2 * BALL_RADIUS_PIXELS);
+      expect({ id, off: left + right - (leftTip + rightTip) }).toEqual({ id, off: offCentre[id] });
+      // Whatever the jitter, the two pivots are the same distance apart on
+      // every table bar the one-pixel jog, so the drain mouth is the same size.
+      expect(right - left).toBeGreaterThanOrEqual(113);
+      expect(right - left).toBeLessThanOrEqual(115);
     }
   });
 
-  it("sweeps every bat through open playfield at every point of the stroke", () => {
+  it("never puts a collision face into painted geometry the ORIGINAL does not draw over", () => {
+    // REPLACED, AND STRENGTHENED. This used to read "sweeps every bat through
+    // open playfield at every point of the stroke" and assert that no pixel of
+    // the collision body ever overlaps a blocking map pixel. That was true of a
+    // body 5 px thick. The bat is drawn 8 px from its axis, and the original
+    // DRAWS its hub over the end of the inlane guide rail — so a collision body
+    // that matches the picture must overlap those pixels too, and an assertion
+    // of zero would now be an assertion that the body is too thin.
+    //
+    // So the rule becomes the stronger one it should always have been: the
+    // collision body may overlap painted geometry only where the ORIGINAL'S OWN
+    // SPRITE does, and every exception is named to the pixel.
+    const expected: Readonly<Record<string, readonly string[]>> = {
+      // The guide tip, exactly `bossRadius` px from the pivot — the boundary of
+      // the boss cap, one pixel outside the drawn hub. A ball can never be in a
+      // solid pixel, so this can trap nothing; it is recorded so that a body
+      // that grew would fail here.
+      "law-n-justice/lower-right": ["207,556"],
+      "babewatch/lower-right": ["235,556"],
+      "extreme-sports/lower-right": ["235,556"],
+      // Extreme Sports draws its upper bat overlapping its own ramp scenery.
+      "extreme-sports/upper": [
+        "181,202", "181,203", "182,201", "182,202", "182,203",
+        "183,201", "183,202", "184,201", "184,202",
+      ],
+    };
     for (const id of TABLE_IDS) {
       // EACH BAT AGAINST ITS OWN COLLISION LEVEL. The three lower pairs and Law
       // 'n Justice's upper bat live on the main playfield; BabeWatch's and
@@ -938,38 +1185,45 @@ describe("placement", () => {
       };
       for (const config of flipperConfigsFor(id)) {
         const map = views[config.level] ?? mapFor(id);
-        for (let stroke = 0; stroke <= config.sweep; stroke += 17) {
-          const state: FlipperState = batAt(stroke);
-          const angle = flipperAngle(config, state);
-          const axisX = cosineUnits(angle);
-          const axisY = sineUnits(angle);
-          for (let alongPixels = 0; alongPixels <= FLIPPER_LENGTH_PIXELS; alongPixels += 1) {
-            const along = pixelsToQ10(alongPixels);
-            const cx = q10ToPixel(config.pivotX + q10Multiply(along, axisX));
-            const cy = q10ToPixel(config.pivotY + q10Multiply(along, axisY));
-            const radius = q10ToPixel(batRadiusAt(config, along));
-            for (let dy = -radius; dy <= radius; dy += 1) {
-              for (let dx = -radius; dx <= radius; dx += 1) {
-                if (dx * dx + dy * dy > radius * radius) continue;
-                expect({ id, stroke, alongPixels, blocked: blocks(map, cx + dx, cy + dy) })
-                  .toEqual({ id, stroke, alongPixels, blocked: false });
-              }
+        const drawnRecord = BATS.tables.get(id)?.get(config.id);
+        if (drawnRecord === undefined) throw new Error(`${id} draws no ${config.id}`);
+        const pivotX = q10ToPixel(config.pivotX);
+        const pivotY = q10ToPixel(config.pivotY);
+        const drawnOver = new Set<string>();
+        const notDrawnOver = new Set<string>();
+        for (let stroke = 0; stroke <= config.sweep; stroke += 1) {
+          const angle = flipperAngle(config, batAt(stroke));
+          const pose = batPoseForStroke(drawnRecord, stroke, config.sweep);
+          const drawn = new Set(drawnPixels(pose).map(([dx, dy]) => `${dx},${dy}`));
+          for (let dx = -14; dx <= 52; dx += 1) {
+            for (let dy = -52; dy <= 52; dy += 1) {
+              if (!insideCapsuleAt(config, angle, dx, dy)) continue;
+              if (!blocks(map, pivotX + dx, pivotY + dy)) continue;
+              const at = `${pivotX + dx},${pivotY + dy}`;
+              if (drawn.has(`${dx},${dy}`)) drawnOver.add(at);
+              else notDrawnOver.add(at);
             }
           }
         }
+        const key = `${id}/${config.id}`;
+        expect({ key, px: [...notDrawnOver].sort() })
+          .toEqual({ key, px: [...(expected[key] ?? [])].sort() });
+        // Whatever the bat is drawn over is allowed, and there is very little
+        // of it: at most one pixel on any lower bat.
+        if (config.id !== "upper") expect(drawnOver.size).toBeLessThanOrEqual(1);
       }
     }
   });
 
   it("records where each number came from, so nothing reads as measured that is not", () => {
-    // The bat's shape is measured; where it sits is not. Both halves of that
-    // have to stay visible in the data or the next person will trust the wrong
-    // one of them.
+    // The bat's shape and where it sits are BOTH measured now, and the note has
+    // to say so — and has to keep saying why the inferred placement is gone,
+    // because "the map can re-derive it and the disk cannot" is a genuinely
+    // attractive argument and it is the one that produced this defect.
     expect(FLIPPER_PLACEMENT_NOTE).toContain("flipdat1.bin");
-    expect(FLIPPER_PLACEMENT_NOTE).toContain("inferred");
-    // REPLACED with what the note now has to say: the upper bat is not
-    // "located and not wired in" any more, it is measured and running.
-    expect(FLIPPER_PLACEMENT_NOTE).toContain("UPPER bat every table ships is measured");
+    expect(FLIPPER_PLACEMENT_NOTE).toContain("Every bat is built from its own per-table flipper record");
+    expect(FLIPPER_PLACEMENT_NOTE).toContain("sanity check");
+    expect(FLIPPER_PLACEMENT_NOTE).toContain("deleted");
     // The file's own split: 85 poses, a 48-row gap, then the remaining 24.
     expect(FLIPPER_FIRST_BANK_FRAMES).toBe(85);
     expect(FLIPPER_FRAME_COUNT - FLIPPER_FIRST_BANK_FRAMES).toBe(24);
@@ -978,31 +1232,153 @@ describe("placement", () => {
     expect(FLIPPER_SURFACE.passable).toBe(false);
   });
 
-  it("agrees with the pivots the table packages state, to within two pixels", () => {
-    // The inferred placement is what runs — see FLIPPER_PLACEMENT_NOTE — because
-    // it is re-derived from a shipped asset by the tests above and the table
-    // packages are not in this repository. This is the other half of that
-    // bargain: the two must never drift apart, and if they ever do, one of the
-    // two readings is wrong and it will fail here rather than in play.
+  it("is the SAME geometry the renderer draws, field for field, by equality", () => {
+    // THE SAFEGUARD THAT REPLACES "to within two pixels".
+    //
+    // The old test compared the inferred pivots with the disk's and passed when
+    // they agreed within two pixels. They did agree within two pixels. Two
+    // pixels is enough for a ball to fall through a flipper, the drawn bat sat
+    // on one placement and the colliding bat on the other, and the test that
+    // was there to catch exactly that could not, because it was checking a
+    // TOLERANCE between two sources instead of refusing to have two sources.
+    //
+    // There is now one source. This asserts it: every field of FLIPPER_RECORDS
+    // against the shipped `flipper-bats.json` — the document the renderer blits
+    // from — by EQUALITY, and then the configuration the simulation actually
+    // runs on against that record. Nothing here has a tolerance.
     for (const id of TABLE_IDS) {
-      const inferred = LOWER_FLIPPER_PIVOT_COLUMNS[id];
-      const measured = MEASURED_FLIPPER_PIVOTS[id];
-      const gap = {
-        id,
-        left: Math.abs(inferred.left - measured.left),
-        right: Math.abs(inferred.right - measured.right),
-        row: Math.abs(LOWER_FLIPPER_PIVOT_ROW - measured.row),
-      };
-      expect(gap.left).toBeLessThanOrEqual(2);
-      expect(gap.right).toBeLessThanOrEqual(2);
-      expect(gap.row).toBeLessThanOrEqual(2);
-      // And the right-hand pivots are exact on all three tables, which is the
-      // part of the agreement that is not luck.
-      expect({ id, right: gap.right }).toEqual({ id, right: 0 });
+      const drawn = BATS.tables.get(id);
+      if (drawn === undefined) throw new Error(`the pose bank has no ${id}`);
+      expect({ id, n: FLIPPER_RECORDS[id].length }).toEqual({ id, n: drawn.size });
+      for (const record of FLIPPER_RECORDS[id]) {
+        const bat = drawn.get(record.id);
+        if (bat === undefined) throw new Error(`${id} draws no ${record.id}`);
+        expect({ id, bat: record.id, fields: [
+          bat.pivotX, bat.pivotY, bat.restPose, bat.flippedPose, bat.sweepPoses,
+          bat.role, bat.coilAcceleration, Math.abs(bat.coilCap),
+          bat.springAcceleration, Math.abs(bat.springCap), bat.handlerFamily,
+        ] }).toEqual({ id, bat: record.id, fields: [
+          record.pivotXPixels, record.pivotYPixels, record.restPose, record.flippedPose,
+          record.sweepPoses, record.role, record.upAcceleration, record.upMaxRate,
+          record.downAcceleration, record.downMaxRate, record.handlerFamily,
+        ] });
+
+        // And the running configuration is that record, not a copy of it.
+        const config = flipperConfigsFor(id).find((c) => c.id === record.id);
+        if (config === undefined) throw new Error(`${id} configures no ${record.id}`);
+        expect({ id, bat: record.id, at: [q10ToPixel(config.pivotX), q10ToPixel(config.pivotY)] })
+          .toEqual({ id, bat: record.id, at: [bat.pivotX, bat.pivotY] });
+        expect(config.restAngle).toBe(poseToAngleUnits(bat.restPose));
+        expect(config.sweep).toBe(bat.sweepPoses * BAT_ANGLE_UNITS_PER_POSE);
+        expect(config.direction).toBe(bat.direction);
+      }
     }
   });
 
-  it("ships THREE bats a table, the lower pair inferred and the upper measured", () => {
+  it("catches a ball resting on the DRAWN face — every bat, every table", () => {
+    // THE OPERATOR'S DEFECT, PINNED DIRECTLY. His words were "flippers look
+    // good on the 2nd 2 boards but dont work correctly, ball goes through them
+    // when flipping", and this is the measurement of it: put a ball where the
+    // player can see it — touching the outer face of the bat the ORIGINAL
+    // DRAWS, at eleven points along every one of the nine bats — sweep the bat
+    // from rest, and ask the physics whether anything happened.
+    //
+    // BEFORE this change, 67 of these 99 points registered NO CONTACT AT ALL:
+    // 5 of 11 on every lower-left bat, 9 of 11 on every lower-right, 3 on Law
+    // 'n Justice's upper and 11 of 11 — the whole bat — on BabeWatch's and
+    // Extreme Sports'. The ball was resting on a picture. It must be 0.
+    let missed = 0;
+    let sampled = 0;
+    for (const id of TABLE_IDS) {
+      for (const config of flipperConfigsFor(id)) {
+        const bat = BATS.tables.get(id)?.get(config.id);
+        if (bat === undefined) throw new Error(`${id} draws no ${config.id}`);
+        const angle = flipperAngle(config, FLIPPER_AT_REST);
+        const axisX = cosineUnits(angle);
+        const axisY = sineUnits(angle);
+        // The face the bat sweeps toward. A point `t` out along it has a
+        // perpendicular offset of `direction * t`, which is how the drawn
+        // silhouette below is read on the same side.
+        const faceX = (-config.direction * axisY) | 0;
+        const faceY = (config.direction * axisX) | 0;
+        const outermost = new Map<number, number>();
+        for (const [dx, dy] of drawnPixels(bat.restPose)) {
+          const { along, perp } = batFrame(bat.restPose * DEGREES_PER_POSE, dx, dy);
+          if (along < 0) continue;
+          const at = Math.round(along);
+          const face = perp * config.direction;
+          outermost.set(at, Math.max(outermost.get(at) ?? -Infinity, face));
+        }
+        for (const alongPixels of [4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44]) {
+          const face = outermost.get(alongPixels);
+          if (face === undefined) continue;
+          sampled += 1;
+          const standoff = pixelsToQ10(face) + BALL_RADIUS;
+          const along = pixelsToQ10(alongPixels);
+          const ball: BallState = {
+            id: 0,
+            x: (config.pivotX + q10Multiply(along, axisX) + q10Multiply(standoff, faceX)) | 0,
+            y: (config.pivotY + q10Multiply(along, axisY) + q10Multiply(standoff, faceY)) | 0,
+            velocityX: 0,
+            velocityY: 0,
+            active: true,
+            heldBy: null,
+            level: config.level,
+          };
+          const sweep = tickFlipper(config, FLIPPER_AT_REST, true);
+          const contacts = resolveFlipperContacts([ball], [sweep], BALL_RADIUS);
+          if (contacts.length === 0) {
+            missed += 1;
+            expect({ id, bat: config.id, alongPixels, face, sawIt: false })
+              .toEqual({ id, bat: config.id, alongPixels, face, sawIt: true });
+          }
+        }
+      }
+    }
+    expect(sampled).toBe(99);
+    expect(missed).toBe(0);
+  });
+
+  it("holds the SAME bearing the drawn pose does, at every point of every stroke", () => {
+    // The other half of "one geometry": the pivot being shared is no use if the
+    // angle is not. `batPoseForStroke` is the original's own `asr.w #$6` on the
+    // record's rest pose; `flipperAngle` is the simulation's bearing. They have
+    // to be the same rotation of the same bat, so the drawn blade and the
+    // colliding capsule point the same way at every step of the stroke.
+    for (const id of TABLE_IDS) {
+      for (const config of flipperConfigsFor(id)) {
+        const bat = BATS.tables.get(id)?.get(config.id);
+        if (bat === undefined) throw new Error(`${id} draws no ${config.id}`);
+        for (let stroke = 0; stroke <= config.sweep; stroke += 1) {
+          const pose = batPoseForStroke(bat, stroke, config.sweep);
+          const drawnBearing = poseToAngleUnits(pose);
+          const simulated = flipperAngle(config, batAt(stroke));
+          // Both on the 2048 scale; the drawn pose is quantised to 3 degrees
+          // (17.07 units) and the simulation is not, so the two agree to within
+          // the rounding of one pose and never more.
+          const delta = Math.abs(angleDelta(simulated, drawnBearing));
+          expect({ id, bat: config.id, stroke, within: delta <= BAT_ANGLE_UNITS_PER_POSE })
+            .toEqual({ id, bat: config.id, stroke, within: true });
+          // At a whole pose boundary the two agree to ONE unit of 2048 — 0.18
+          // degrees, 0.14 px at the drawn tip — and the residue is the two
+          // integer scales the original itself uses: the pose bank counts 120
+          // poses to a turn and the bearing scale counts 2048, which 120 does
+          // not divide, and `poseToAngleUnits` rounds where `batAngleToBearing`
+          // truncates. Zero at rest on every bat, which is what says the two
+          // are the same rotation and not merely a close one.
+          if (stroke % BAT_ANGLE_UNITS_PER_POSE === 0) {
+            expect({ id, bat: config.id, stroke, near: delta <= 1 })
+              .toEqual({ id, bat: config.id, stroke, near: true });
+          }
+          if (stroke === 0) {
+            expect({ id, bat: config.id, delta }).toEqual({ id, bat: config.id, delta: 0 });
+          }
+        }
+      }
+    }
+  });
+
+  it("ships THREE bats a table, every one of them measured", () => {
     // REPLACED, not weakened, and the measurement is in the table packages:
     // the four-slot flipper array (stride 0x1FA) starts at hunk4 +0x18D8 on Law
     // 'n Justice, +0x18D0 on BabeWatch and +0x18D4 on Extreme Sports, and read
@@ -1020,14 +1396,13 @@ describe("placement", () => {
         expect(config.surface.elasticity).toBe(460);
       }
       for (const config of configs.slice(0, 2)) {
-        // The lower CONFIGURATION stays inferred — the rest bearing and the
-        // pivot row are still this port's own.
-        expect(config.confidence).toBe("inferred");
+        // REPLACED: the lower configuration used to read `inferred`, because
+        // its rest bearing and its pivot row were this port's own. They are the
+        // record's now, so all three bats on all three tables are measured.
+        expect(config.confidence).toBe("measured");
         expect(config.level).toBe(0);
       }
       const upper = configs[2] as FlipperConfig;
-      // The upper bat has no map anchor to infer a pivot from, so it runs on
-      // the disk numbers outright and says so.
       expect(upper.id).toBe("upper");
       expect(upper.confidence).toBe("measured");
       const record = UPPER_FLIPPER_RECORDS[id];
@@ -1081,9 +1456,23 @@ describe("placement", () => {
     expect(resolveFlipperContacts([at(0)], [sweep], BALL_RADIUS)).toHaveLength(0);
   });
 
-  it("uses the mirrored rest angle on the right flipper", () => {
-    expect(LEFT.restAngle).toBe(FLIPPER_REST_ANGLE_UNITS);
-    expect(RIGHT.restAngle).toBe(ANGLE_UNITS_PER_TURN / 2 - FLIPPER_REST_ANGLE_UNITS);
+  it("uses the mirrored rest angle on the right flipper, off the records' own poses", () => {
+    // REPLACED: this used to assert both bats against `FLIPPER_REST_ANGLE_UNITS
+    // = 152`, a chosen 26.7 degrees. The records rest at pose 10 and pose 50 —
+    // exactly 30 degrees below horizontal — and the mirror symmetry the old
+    // hand-written constant existed to guarantee falls out of the two poses:
+    // 171 and 853 are 1024 apart on the 2048 scale, to the unit.
+    expect(flipperRecordFor("law-n-justice", "lower-left").restPose).toBe(10);
+    expect(flipperRecordFor("law-n-justice", "lower-right").restPose).toBe(50);
+    expect(LEFT.restAngle).toBe(poseToAngleUnits(10));
+    expect(RIGHT.restAngle).toBe(poseToAngleUnits(50));
+    expect(LEFT.restAngle + RIGHT.restAngle).toBe(ANGLE_UNITS_PER_TURN / 2);
+    // 171 of 2048 is 30.06 degrees: 30 exactly, to the nearest unit of a scale
+    // on which 30 degrees is 170.67. The pose is the integer; the bearing is the
+    // rounding of it, and there is nowhere else for the third of a unit to go.
+    expect(LEFT.restAngle).toBe(171);
+    expect(RIGHT.restAngle).toBe(853);
+    expect(Math.round((30 * ANGLE_UNITS_PER_TURN) / 360)).toBe(LEFT.restAngle);
     expect(LEFT.direction).toBe(-1);
     expect(RIGHT.direction).toBe(1);
   });

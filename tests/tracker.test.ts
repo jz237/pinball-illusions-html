@@ -404,9 +404,11 @@ describe("effect arithmetic", () => {
     expect(volumes).toEqual([37, 28]);
   });
 
-  it("E6: the pattern loop replays the marked span", () => {
-    // main.seg00's own module does exactly this once: `E60` on row 48 of
-    // pattern 0 and `E62` on row 63, which plays rows 48..63 three times.
+  it("E6: the pattern loop replays the marked span, counting its first pass", () => {
+    // $8678 increments the counter $2f BEFORE comparing it against x, so `E62`
+    // plays the marked span x+1 = three times in all. The front-end module does
+    // this twice: `E60`/`E67` on channel 2 of pattern 0, and `E60`/`E64` on
+    // channel 3 of pattern 9 — both in the run-in.
     const pattern = blankPattern();
     put(pattern, 60, 0, cell(0, 0, 0xe, 0x60));
     put(pattern, 63, 0, cell(0, 0, 0xe, 0x62));
@@ -415,15 +417,50 @@ describe("effect arithmetic", () => {
     run(player, 72);
     expect([player.order, player.row]).toEqual([1, 0]);
   });
+
+  it("E6: the mark is PER CHANNEL — four marks stand at once", () => {
+    // The marked row $2c and the counter $2f live in the 62-byte channel block
+    // at a4, not in the song state, so four channels hold four marks. All four
+    // lay one here and channel 0 then jumps: with one shared pair it would land
+    // on whichever channel marked LAST (row 40), not on its own row 10.
+    const pattern = blankPattern();
+    put(pattern, 10, 0, cell(0, 0, 0xe, 0x60));
+    put(pattern, 20, 1, cell(0, 0, 0xe, 0x60));
+    put(pattern, 30, 2, cell(0, 0, 0xe, 0x60));
+    put(pattern, 40, 3, cell(0, 0, 0xe, 0x60));
+    put(pattern, 50, 0, cell(0, 0, 0xe, 0x61));
+    const player = createTrackerPlayer(songOf([pattern, blankPattern()], { initialSpeed: 1 }));
+    run(player, 51); // rows 0..50; the E61 fires as row 50 ends
+    expect(player.row).toBe(10);
+    expect(player.channels.map((one) => one.loopRow)).toEqual([10, 20, 30, 40]);
+    expect(player.channels.map((one) => one.loopCount)).toEqual([1, 0, 0, 0]);
+    // The replay runs 10..50 once more and the counter dies there, so the
+    // pattern ends normally rather than looping for ever.
+    run(player, 41 + 13);
+    expect([player.order, player.row]).toEqual([1, 0]);
+  });
 });
 
 describe("sequencing effects", () => {
-  it("D: breaks to the decimal row of the next pattern", () => {
+  it("D: breaks to the RAW row of the next pattern, not ProTracker's 10x + y", () => {
+    // $884C is `move.b $5(a4),d0 / addi.w #$40,d0 / move.w d0,$116(a2)` and the
+    // intro build's copy at +$1C8C is the same three instructions. The byte is
+    // the row; there is no decimal split. The only D in the shipped module is
+    // D00 (pattern 35 row 50), where both readings agree, so this is the
+    // machine's arithmetic pinned rather than an audible change.
     const first = blankPattern();
-    put(first, 5, 0, cell(0, 0, 0xd, 0x12)); // rows are 10x + y: row 12
+    put(first, 5, 0, cell(0, 0, 0xd, 0x12)); // 0x12 is 18, not 12
     const player = createTrackerPlayer(songOf([first, blankPattern()], { initialSpeed: 1 }));
     run(player, 6); // rows 0..5
-    expect([player.order, player.row]).toEqual([1, 12]);
+    expect([player.order, player.row]).toEqual([1, 18]);
+  });
+
+  it("D: a param past the last row lands on row 0 rather than off the pattern", () => {
+    const first = blankPattern();
+    put(first, 0, 0, cell(0, 0, 0xd, 0x40)); // 64: one past the last row
+    const player = createTrackerPlayer(songOf([first, blankPattern()], { initialSpeed: 1 }));
+    run(player, 1);
+    expect([player.order, player.row]).toEqual([1, 0]);
   });
 
   it("D: at the last order, breaks into the restart pattern", () => {
@@ -448,7 +485,7 @@ describe("sequencing effects", () => {
     expect([looper.order, looper.row]).toEqual([0, 0]);
   });
 
-  it("F: below 0x20 sets ticks per row, immediately", () => {
+  it("F: sets ticks per row, immediately", () => {
     const pattern = blankPattern();
     put(pattern, 0, 0, cell(0, 0, 0xf, 0x03));
     const player = createTrackerPlayer(songOf([pattern]));
@@ -456,23 +493,43 @@ describe("sequencing effects", () => {
     expect([player.row, player.speed]).toEqual([1, 3]);
   });
 
-  it("F: 0x20 and above sets tempo, which scales the tick length", () => {
+  it("F: 0x20 and above is STILL ticks per row — this format has no BPM", () => {
+    // ProTracker splits Fxx at 0x20 and reprograms CIA-B timer A above it.
+    // This replayer does not: $883A is `move.b $5(a4),d0 ... move.b d0,$10d(a2)`,
+    // storing the raw byte in the low half of the speed word $10c that $80BE
+    // reloads the countdown from. There is no compare against $20 and no CIA
+    // write anywhere in the effect table. The tick is a PAL field, delivered by
+    // the level-6 EXTER interrupt the copper raises once a frame, so the tick
+    // LENGTH is a constant 20 ms whatever Fxx says.
     const pattern = blankPattern();
     put(pattern, 0, 0, cell(0, 0, 0xf, 0x80));
     const player = createTrackerPlayer(songOf([pattern]));
-    expect(tickDurationSeconds(player)).toBe(2.5 / 125); // 50 ticks a second
+    expect(tickDurationSeconds(player)).toBe(0.02); // one PAL field
     run(player, 1);
-    expect(player.tempo).toBe(0x80);
-    expect(tickDurationSeconds(player)).toBe(2.5 / 128);
-    expect(player.speed).toBe(6); // speed untouched
+    expect(player.speed).toBe(0x80); // 128 fields for this row
+    expect(player.tempo).toBe(125); // and nothing touched the clock
+    expect(tickDurationSeconds(player)).toBe(0.02);
+    run(player, 127);
+    expect([player.row, player.tick]).toEqual([1, 0]);
   });
 
-  it("F00 is accepted and ignored: shell music never halts", () => {
+  it("F00 gives a ONE-FIELD row and never halts", () => {
+    // The two builds spell it differently and mean the same thing: the shell's
+    // $883A stores 1 (and raises the stop flag $21c, which is the shell's own
+    // business), while the intro build at +$1C82 has no `bne` at all and stores
+    // the 0 verbatim. A stored 0 reloads the countdown with 0, `subq.w #1`
+    // takes it to -1, and `ble` ends the row — one field, exactly as a stored 1
+    // does. The shipped module carries one F00, at pattern 14 row 62.
     const pattern = blankPattern();
     put(pattern, 0, 0, cell(0, 0, 0xf, 0x00));
+    put(pattern, 3, 0, cell(0, 0, 0xf, 0x06));
     const player = createTrackerPlayer(songOf([pattern]));
-    run(player, 6);
-    expect([player.row, player.speed]).toEqual([1, 6]);
+    run(player, 1);
+    expect([player.row, player.tick]).toEqual([1, 0]); // row 0 lasted one field
+    run(player, 2); // rows 1 and 2 are one field each: the speed stays 0
+    expect([player.row, player.tick]).toEqual([3, 0]);
+    run(player, 6); // and F06 on row 3 puts it back
+    expect([player.row, player.speed]).toEqual([4, 6]);
   });
 
   it("a speed change mid-song re-times every later row", () => {
@@ -577,7 +634,11 @@ describe("determinism", () => {
 
     const second = blankPattern();
     put(second, 8, 0, cell(6, 2, 0, 0));
-    put(second, 9, 1, cell(0, 0, 0xf, 0xf0)); // tempo 240
+    // Was `F F0`, when this core read F above 0x20 as a BPM. It is ticks per
+    // row over the whole byte range (see the F tests above), so a 240 here
+    // would spend the 2000-tick budget on one row and cost this workout its
+    // coverage of rows 10, 20 and 63. The big-F case has its own test.
+    put(second, 9, 1, cell(0, 0, 0xf, 0x02));
     put(second, 10, 2, cell(13, 0, 0x5, 0x02)); // porta + volume slide
     put(second, 20, 1, cell(0, 1, 0, 0)); // instrument only
     put(second, 63, 3, cell(30, 7, 0, 0));
@@ -596,7 +657,13 @@ describe("determinism", () => {
   it("the full command stream hashes to the recorded value", () => {
     // Pure arithmetic on plain data: this hash must never drift between runs,
     // machines, or refactors that claim to preserve behaviour.
+    // Re-recorded once, when `F` stopped being read as a BPM above 0x20 and
+    // `D` stopped being read as 10x + y — both corrections to this machine's
+    // own arithmetic, both quoted from the replayer's bytes in the core's
+    // header, and both covered by their own tests above. The workout still
+    // exercises every implemented effect and still reaches the `B00` on row 63
+    // of the second pattern at tick 146 of 2000.
     const digest = createHash("sha256").update(streamOf(2000).join("\n")).digest("hex");
-    expect(digest).toBe("41d3314d0b698bb5a44a25e8b6589ba470059262ee92ab66786afa170a9c7e66");
+    expect(digest).toBe("d0d88db3db1553d0ff7457e24f8f134465651b14cd1741baa3b86ba66620a663");
   });
 });

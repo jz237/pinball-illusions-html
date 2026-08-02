@@ -42,10 +42,12 @@ import type { FlipperBatsDocument, TableId } from "../src/game/contracts.js";
 import { TABLE_IDS } from "../src/game/contracts.js";
 import {
   BAT_ANGLE_UNITS_PER_POSE,
+  FLIPPER_RECORDS,
   FLIPPER_SWEEP_POSES,
-  MEASURED_FLIPPER_PIVOTS,
   UPPER_FLIPPER_RECORDS,
   flipperConfigsFor,
+  flipperRecordFor,
+  poseToAngleUnits,
 } from "../src/game/flippers.js";
 import { flipperBatsFixture } from "./table-fixtures.js";
 
@@ -298,30 +300,39 @@ describe("the records", () => {
     }
   });
 
-  it("agrees with the pivots and poses flippers.ts already read off the disk", () => {
+  it("IS the geometry flippers.ts simulates — all nine bats, every field, by equality", () => {
+    // WIDENED FROM THE UPPER BATS TO ALL NINE. This used to check the three
+    // upper records field for field and the six lower ones only by pivot,
+    // against a `MEASURED_FLIPPER_PIVOTS` table that the simulation did not
+    // read — the simulation ran on inferred pivots two rows away, and the
+    // safeguard for THAT lived in flippers.test.ts and allowed two pixels of
+    // slack. The inferred placement is gone; this is now the whole cross-check
+    // between the picture and the physics, and it has no slack at all.
     for (const tableId of TABLE_IDS as readonly TableId[]) {
       const records = bats.tables.get(tableId);
       if (records === undefined) throw new Error(`no records for ${tableId}`);
-      const pivots = MEASURED_FLIPPER_PIVOTS[tableId];
-      expect(records.get("lower-left")?.pivotX).toBe(pivots.left);
-      expect(records.get("lower-right")?.pivotX).toBe(pivots.right);
-      expect(records.get("lower-left")?.pivotY).toBe(pivots.row);
-      expect(records.get("lower-right")?.pivotY).toBe(pivots.row);
-
-      const upper = UPPER_FLIPPER_RECORDS[tableId];
-      const drawn = records.get("upper");
-      if (drawn === undefined) throw new Error(`${tableId} has no upper bat`);
-      expect([drawn.pivotX, drawn.pivotY]).toEqual([upper.pivotXPixels, upper.pivotYPixels]);
-      expect([drawn.restPose, drawn.flippedPose, drawn.sweepPoses]).toEqual([
-        upper.restPose,
-        upper.flippedPose,
-        upper.sweepPoses,
-      ]);
-      expect(drawn.role).toBe(upper.role);
-      expect(drawn.coilAcceleration).toBe(upper.upAcceleration);
-      expect(Math.abs(drawn.coilCap)).toBe(upper.upMaxRate);
-      expect(drawn.springAcceleration).toBe(upper.downAcceleration);
-      expect(Math.abs(drawn.springCap)).toBe(upper.downMaxRate);
+      expect(records.size).toBe(FLIPPER_RECORDS[tableId].length);
+      for (const simulated of FLIPPER_RECORDS[tableId]) {
+        const drawn = records.get(simulated.id);
+        if (drawn === undefined) throw new Error(`${tableId} has no ${simulated.id}`);
+        expect({ tableId, id: simulated.id, drawn: [
+          drawn.pivotX, drawn.pivotY, drawn.restPose, drawn.flippedPose, drawn.sweepPoses,
+          drawn.role, drawn.handlerFamily, drawn.coilAcceleration, Math.abs(drawn.coilCap),
+          drawn.springAcceleration, Math.abs(drawn.springCap),
+        ] }).toEqual({ tableId, id: simulated.id, drawn: [
+          simulated.pivotXPixels, simulated.pivotYPixels, simulated.restPose,
+          simulated.flippedPose, simulated.sweepPoses, simulated.role,
+          simulated.handlerFamily, simulated.upAcceleration, simulated.upMaxRate,
+          simulated.downAcceleration, simulated.downMaxRate,
+        ] });
+      }
+      // The upper view still resolves, since the dossier cites it by name.
+      expect(UPPER_FLIPPER_RECORDS[tableId]).toBe(flipperRecordFor(tableId, "upper"));
+      // Every lower bat rests at exactly 30 degrees below horizontal — pose 10
+      // mirrored to pose 50 — which is what the film adjudicated.
+      expect(records.get("lower-left")?.restPose).toBe(10);
+      expect(records.get("lower-right")?.restPose).toBe(50);
+      expect(poseToAngleUnits(10) + poseToAngleUnits(50)).toBe(1024);
     }
   });
 

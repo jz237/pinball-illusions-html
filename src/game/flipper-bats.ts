@@ -25,26 +25,29 @@
  * one raster serves three tables.
  *
  * ---------------------------------------------------------------------------
- * THE TWO NUMBERS THE SIMULATION AND THE PICTURE DISAGREE ON
+ * THE SIMULATION AND THE PICTURE NOW AGREE ON EVERY NUMBER
  * ---------------------------------------------------------------------------
- * Stated here rather than buried, because both are real and neither is hidden:
+ * This block used to say the opposite, and it is worth keeping the shape of the
+ * old note so the mistake is not available again.
  *
- *   PIVOT ROW. The records put every lower pivot on row 556. The simulation
- *   collides on `LOWER_FLIPPER_PIVOT_ROW = 558`, inferred from the map's free
- *   ball-centre span, and deliberately keeps running on the inferred placement
- *   (see `flippers.ts`). The DRAWN bat uses the record's 556, because that is
- *   where the original draws it and this document is the picture. So the bat
- *   the player sees is two pixels above the bat the ball hits.
+ * There were two: the records put every lower pivot on ROW 556 and the
+ * simulation collided on an inferred row 558, and the records rest at pose 10 /
+ * pose 50 — exactly 30 degrees — while the simulation rested at a chosen 26.7.
+ * Both were labelled "rendering-only", on the reasoning that the simulation must
+ * not be moved to make a picture right. That reasoning was backwards. The
+ * picture was the disk's and the simulation's was not, so the drawn bat was
+ * correct and the colliding bat was two pixels and three degrees away from it —
+ * and because the drawn bat sat ABOVE the colliding one, a ball resting on the
+ * flipper the player could see had nothing under it. 33-43% of every approach to
+ * a bat was a contact the player saw and the machine did not.
  *
- *   REST ANGLE. The records rest at pose 10 / pose 50, i.e. exactly 30 degrees.
- *   The simulation rests at `FLIPPER_REST_ANGLE_UNITS = 152` of 2048, 26.7
- *   degrees. The DRAWN bat again uses the record, so at rest the picture is 3.3
- *   degrees steeper than the collision bat.
- *
- * Both are rendering-only and neither touches a tick: the simulation was not
- * moved to make the picture right, and the picture was not bent to match an
- * inferred number. Closing the gap means re-deriving the placement with a
- * census behind it, which is a gameplay change and belongs in its own round.
+ * `flippers.ts` now builds all nine bats from these same records, and
+ * `movingSpritePlacements` blits each pose against the SIMULATION's pivot rather
+ * than the record's, so the picture cannot come apart from the physics again
+ * without a test failing: `tests/flippers.test.ts` pins every field of
+ * `FLIPPER_RECORDS` against this document by equality, and asserts that every
+ * pixel of every drawn rest pose forward of the pivot lies inside the collision
+ * capsule.
  */
 
 import { TABLE_IDS } from "./contracts.js";
@@ -410,12 +413,20 @@ export function batPoseForStroke(bat: FlipperBatRecord, stroke: number, sweepUni
   return (((bat.restPose + offset) % POSES_PER_TURN) + POSES_PER_TURN) % POSES_PER_TURN;
 }
 
-/** Top-left playfield pixel of a pose blitted against a pivot. */
+/**
+ * Top-left playfield pixel of a pose blitted against a pivot.
+ *
+ * Takes a PIVOT rather than a record, and that is the whole point: the renderer
+ * hands it the SIMULATION's pivot, so the bat that is drawn and the bat that
+ * collides are the same object by construction rather than by agreement. A
+ * record satisfies the shape, so a caller that has one may still pass it, and
+ * the two are pinned equal by `tests/flippers.test.ts`.
+ */
 export function batBlockOrigin(
-  bat: FlipperBatRecord,
+  pivot: { readonly pivotX: number; readonly pivotY: number },
   pose: FlipperBatPose,
 ): { readonly x: number; readonly y: number } {
-  return { x: bat.pivotX - pose.anchorX, y: bat.pivotY - pose.anchorY };
+  return { x: pivot.pivotX - pose.anchorX, y: pivot.pivotY - pose.anchorY };
 }
 
 // ---------------------------------------------------------------------------

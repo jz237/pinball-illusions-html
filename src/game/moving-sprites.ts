@@ -209,7 +209,19 @@ export interface BatFrameState {
   readonly stroke: number;
   /** The configured sweep in bat angle units, for the range check. */
   readonly sweep: number;
-  /** The SIMULATION's pivot, used only to place a fallback marker. */
+  /**
+   * The SIMULATION's pivot, and what the sprite is BLITTED AGAINST.
+   *
+   * This used to be carried only so a bat with no record could put a fallback
+   * marker somewhere sensible, while the drawn bat was placed on the pose bank
+   * record's own pivot. The two were two pixels apart on every lower bat, and
+   * the drawn one sat ABOVE the colliding one — a ball resting on what the
+   * player could see was above anything that could stop it. They are now one
+   * number: the simulation is built from the same records the pose bank ships
+   * (`FLIPPER_RECORDS` in `flippers.ts`, pinned field for field against the
+   * document by test), and the picture is placed on whatever the simulation is
+   * actually colliding with.
+   */
   readonly pivotX: Q10;
   readonly pivotY: Q10;
 }
@@ -257,7 +269,11 @@ export function movingSpritePlacements(
       });
       continue;
     }
-    const origin = batBlockOrigin(record, geometry);
+    // THE SIMULATION'S pivot, not the record's. See `BatFrameState.pivotX`.
+    const origin = batBlockOrigin(
+      { pivotX: q10ToPixel(bat.pivotX), pivotY: q10ToPixel(bat.pivotY) },
+      geometry,
+    );
     placements.push({
       kind: "bat",
       key: pose,

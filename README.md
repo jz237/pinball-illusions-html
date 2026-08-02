@@ -379,8 +379,18 @@ this project draws is between **functional geometry** and **creative content**:
   picture, so they go through exactly the same authorization gate: `npm run
   guard:public` refuses a build containing a sound file no manifest accounts for,
   or one whose bytes do not match its recorded digest, unless the operator sets
-  the variable. **No music is shipped** — the modules' packed pattern format is
-  not decoded, so there is nothing here that could play a tune.
+  the variable.
+- **THE FRONT-END MUSIC IS DISK-DERIVED TOO, and this bullet used to deny it.**
+  It said "no music is shipped — the modules' packed pattern format is not
+  decoded, so there is nothing here that could play a tune". Both halves are now
+  false. The packed cell format IS decoded (`scripts/export-shell-music.mjs`,
+  from the playback decoder at `main.seg00 $7F8A-$7FE6`), and the original
+  front-end module ships: the `SNT!` bank in `intro.bin`, as a JSON document
+  plus one 8-bit WAV per live instrument, under a `disk-derived-shell-music`
+  manifest carrying each file's sha256, through the identical gate. A raw
+  `.mod` still cannot ship — that extension is on the guard's forbidden list and
+  stays there. What is published is a decoded document and digest-claimed
+  samples, never a module file.
 - No disk image, ROM, Amiga executable or PowerPacker payload enters this
   repository or any build, and that is checked mechanically rather than promised.
 
