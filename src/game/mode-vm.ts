@@ -463,6 +463,20 @@ export interface ModeTickReport {
   readonly awards: readonly ModeAward[];
   /** Display lines the mission asked for, in the order it asked. */
   readonly messages: readonly string[];
+  /**
+   * Element indices a `START`/`START_TIMED` armed this tick, in execution
+   * order. The panel layer needs the INDEX and not just the arming: the
+   * element's +$14 display record names the slot-5 animations a START queues
+   * on the score panel, and the wiring from index to objects lives in the
+   * panel document (`table-panel.ts`), not here.
+   */
+  readonly elementStarts: readonly number[];
+  /**
+   * Message-record indices shown this tick, in execution order — the same
+   * records whose text lands in `messages`, kept as indices because the panel
+   * document wires each message record to the slot-5 objects it displays.
+   */
+  readonly messagesShown: readonly number[];
   /** `TableModes.missions` index started this tick, or -1. */
   readonly missionStarted: number;
   /** True on the tick the running mission reached its END. */
@@ -493,6 +507,8 @@ export interface ModeTickReport {
 export const EMPTY_MODE_TICK: ModeTickReport = Object.freeze({
   awards: Object.freeze([]),
   messages: Object.freeze([]),
+  elementStarts: Object.freeze([]),
+  messagesShown: Object.freeze([]),
   missionStarted: -1,
   missionEnded: false,
   ballsUpTo: 0,
@@ -505,6 +521,8 @@ export const EMPTY_MODE_TICK: ModeTickReport = Object.freeze({
 interface Accumulator {
   awards: ModeAward[];
   messages: string[];
+  elementStarts: number[];
+  messagesShown: number[];
   missionStarted: number;
   missionEnded: boolean;
   ballsUpTo: number;
@@ -525,6 +543,7 @@ function elementAt(modes: TableModes, index: number): ModeElement | null {
 function pushMessage(modes: TableModes, out: Accumulator, message: number): void {
   const record = message < 0 ? undefined : modes.messages[message];
   if (record === undefined) return;
+  out.messagesShown.push(record.index);
   for (const line of record.lines) out.messages.push(line);
 }
 
@@ -540,6 +559,7 @@ function startElement(
   if (element === null) return;
   state.armed[index] = 1;
   state.timers[index] = seconds > 0 ? seconds * TICKS_PER_SECOND : 0;
+  out.elementStarts.push(index);
   pushMessage(modes, out, element.displayStart);
 
   // RECONSTRUCTION. Lighting a mode-arm shot while nothing is running starts the
@@ -953,6 +973,8 @@ export function tickModes(modes: TableModes, state: ModeState): ModeTickReport {
   const out: Accumulator = {
     awards: [],
     messages: [],
+    elementStarts: [],
+    messagesShown: [],
     missionStarted: -1,
     missionEnded: false,
     ballsUpTo: 0,
@@ -975,6 +997,8 @@ export function tickModes(modes: TableModes, state: ModeState): ModeTickReport {
   if (
     out.awards.length === 0 &&
     out.messages.length === 0 &&
+    out.elementStarts.length === 0 &&
+    out.messagesShown.length === 0 &&
     out.missionStarted < 0 &&
     !out.missionEnded &&
     out.ballsUpTo === 0 &&
@@ -988,6 +1012,8 @@ export function tickModes(modes: TableModes, state: ModeState): ModeTickReport {
   return {
     awards: out.awards,
     messages: out.messages,
+    elementStarts: out.elementStarts,
+    messagesShown: out.messagesShown,
     missionStarted: out.missionStarted,
     missionEnded: out.missionEnded,
     ballsUpTo: out.ballsUpTo,

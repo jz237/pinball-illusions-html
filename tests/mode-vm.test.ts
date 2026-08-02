@@ -231,6 +231,33 @@ describe("the background queue", () => {
   });
 });
 
+describe("the display-queue feed", () => {
+  it("reports STARTed element indices and shown message records by index", () => {
+    // The panel layer queues animations off these indices — the element's +$14
+    // record on START and the message record's own list — so the report has to
+    // carry the INDEX, not just the arming and the flattened text.
+    const raw = fixtureDocument() as unknown as Record<string, unknown>;
+    raw["messages"] = [{ lines: ["READY"] }];
+    (raw["elements"] as { displayStart: number }[])[2]!.displayStart = 0;
+    const modes = parseTableModesDocument(raw as unknown as TableModesDocument);
+    const state = createModeState(modes);
+
+    queueScript(state, 3); // START element 2, whose displayStart is message 0.
+    const report = tickModes(modes, state);
+    expect(report.elementStarts).toEqual([2]);
+    expect(report.messagesShown).toEqual([0]);
+    expect(report.messages).toEqual(["READY"]);
+  });
+
+  it("reports nothing on a tick that starts and shows nothing", () => {
+    const modes = fixture();
+    const state = createModeState(modes);
+    const report = tickModes(modes, state);
+    expect(report.elementStarts).toEqual([]);
+    expect(report.messagesShown).toEqual([]);
+  });
+});
+
 describe("arming and awarding", () => {
   it("pays an element's packed-BCD score and bonus once, and puts the shot out", () => {
     const modes = fixture();

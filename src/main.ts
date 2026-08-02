@@ -50,6 +50,8 @@ import { loadTableAcceleration } from "./game/table-accel.js";
 import { loadTableDevices } from "./game/table-devices.js";
 import { loadTableModes } from "./game/table-modes.js";
 import { loadTableLamps } from "./game/table-lamps.js";
+import { loadTablePanel, tablePanelFor } from "./game/table-panel.js";
+import { PanelDisplay } from "./browser/panel-display.js";
 import { loadTableAudio } from "./game/table-audio.js";
 import { createAudioBank, loadAudioBank, playTick, resumeAudio } from "./browser/audio.js";
 import type { AudioBank } from "./browser/audio.js";
@@ -72,6 +74,7 @@ import type { ShellArtworkSource } from "./browser/shell-screens.js";
 import { createShellSkin } from "./browser/shell-skin.js";
 import type { ShellSkin } from "./browser/shell-skin.js";
 import { loadShellArt } from "./game/shell-art.js";
+import type { ShellFont } from "./game/shell-art.js";
 import {
   MUSIC_TOGGLE_CODE,
   MUSIC_TOGGLE_KEY,
@@ -83,6 +86,13 @@ interface LoadedTable {
   readonly tableId: TableId;
   readonly game: Game;
   readonly loop: GameLoop;
+  /**
+   * The score panel: the decoded slot-5 animation heap behind a display-queue
+   * reconstruction, fed per tick and drawn above the playfield. Null when the
+   * table's panel document did not load — the game plays identically and the
+   * score stays on the text HUD.
+   */
+  readonly panel: PanelDisplay | null;
   /**
    * The per-tick hook the loop runs, exposed so the debug handle's `tick` runs
    * it too.
@@ -333,8 +343,16 @@ async function boot(): Promise<void> {
    * that matters, exactly like the sound banks.
    */
   let skin: ShellSkin | null = null;
+  /**
+   * The small shell font (`font2`), for the score panel's score view — the
+   * font whose comma and digit advances are the 3 and 7 the original's own
+   * `300 - (3*commas + 7*digits)` column arithmetic sums. Read per frame by
+   * each table's `PanelDisplay`, which draws nothing until it arrives.
+   */
+  let panelFont: ShellFont | null = null;
   void loadShellArt()
     .then((art) => {
+      panelFont = art.font2;
       skin = createShellSkin(art, (width, height) => {
         const surface = document.createElement("canvas");
         surface.width = width;
@@ -350,7 +368,7 @@ async function boot(): Promise<void> {
 
   const draw = (): void => {
     if (table !== null && shellDrawsOverPlayfield(shell)) {
-      renderGame(context, table.game, scale);
+      renderGame(context, table.game, scale, table.panel);
     }
     renderShell(context, shell, scale, thumbnails, skin);
   };
@@ -398,9 +416,18 @@ async function boot(): Promise<void> {
       loadTableDevices(tableId),
       loadTableModes(tableId),
       loadTableLamps(tableId),
+      // The panel heap registers itself too, but tolerantly: it is
+      // presentation only, so a table whose panel document will not fetch
+      // still plays an identical ball and shows the score as text.
+      loadTablePanel(tableId).catch((error: unknown) => {
+        console.warn(`pinball-illusions: ${tableId} panel animations unavailable`, error);
+        return null;
+      }),
     ]);
     setPlayfieldArtwork(map, artwork);
     const game = createGame(map);
+    const heap = tablePanelFor(tableId);
+    const panel = heap === null ? null : new PanelDisplay(heap, () => panelFont);
     // The loop's animation frames are never used: the single driver below calls
     // `frame()` by hand. What the loop is here for is its SCHEDULER — the fixed
     // step and the catch-up clamp — and keeping one per table means a table
@@ -409,6 +436,10 @@ async function boot(): Promise<void> {
     const onTick = (report: GameTickReport): void => {
       const bank = sound.bank;
       if (bank !== null) playTick(bank, report);
+      // The panel consumes the same per-tick reports the audio does — the
+      // debug handle's `tick` goes through this hook too, so a scripted game
+      // queues exactly the animations a played one does.
+      panel?.observe(report);
       // The score is read here rather than after the frame because the game's
       // own phase has already moved to `game-over` and nothing further will
       // change it — but reading it at the tick keeps the two in step even if
@@ -419,10 +450,10 @@ async function boot(): Promise<void> {
       game,
       input: router,
       frames: { request: () => 0, cancel: () => undefined },
-      render: (current) => renderGame(context, current, scale),
+      render: (current) => renderGame(context, current, scale, panel),
       onTick,
     });
-    return { tableId, game, loop, onTick };
+    return { tableId, game, loop, panel, onTick };
   };
 
   /**
@@ -485,6 +516,9 @@ async function boot(): Promise<void> {
             flushInput();
             table.loop.scheduler.resume();
             startGame(table.game);
+            // The display ring's contents belong to the game that queued
+            // them; a fresh game opens on the score view.
+            table.panel?.reset();
             sound.resume();
           }
           break;

@@ -232,6 +232,7 @@ import {
   resetTiltForNewBall,
   tickTilt,
 } from "../game/tilt.js";
+import { PANEL_HEIGHT as PANEL_STRIP_HEIGHT } from "./panel-renderer.js";
 
 // ---------------------------------------------------------------------------
 // Options
@@ -659,6 +660,22 @@ export interface GameTickReport {
   readonly missionEnded: boolean;
   /** Everything that scored this tick, in the order it scored. */
   readonly awards: readonly Award[];
+  /**
+   * Element indices the mode VM STARTed this tick, in execution order.
+   *
+   * These three lists are the score panel's feed: the element's +$14 display
+   * record (on START), its +$18 record (on AWARD) and each message record
+   * name the slot-5 animations the original's $6C2C append queues on the
+   * 64-slot display ring, and the index-to-objects wiring ships in the panel
+   * document. The simulation neither knows nor cares what a panel is — these
+   * are indices into data it already owns — which is what keeps the panel
+   * strictly downstream of the tick.
+   */
+  readonly elementStarts: readonly number[];
+  /** Element indices the mode VM AWARDed this tick, in execution order. */
+  readonly elementAwards: readonly number[];
+  /** Message-record indices the mode VM put on the display this tick. */
+  readonly messagesShown: readonly number[];
   readonly justTilted: boolean;
   readonly gameOver: boolean;
 }
@@ -835,6 +852,9 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     missionStarted: -1,
     missionEnded: false,
     awards: [],
+    elementStarts: [],
+    elementAwards: [],
+    messagesShown: [],
     justTilted: false,
     gameOver: false,
   };
@@ -1091,6 +1111,9 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     missionStarted: modeTick.missionStarted,
     missionEnded: modeTick.missionEnded,
     awards,
+    elementStarts: modeTick.elementStarts,
+    elementAwards: modeTick.awards.map((award) => award.element),
+    messagesShown: modeTick.messagesShown,
     justTilted,
     gameOver,
   };
@@ -1967,7 +1990,14 @@ function drawFlippers(context: CanvasRenderingContext2D, game: Game, scale: numb
   }
 }
 
-function statusLine(game: Game): string {
+/**
+ * The status readout under the HUD. `scoreOnPanel` is true when the score
+ * panel strip is being drawn: the panel IS the score display then, exactly as
+ * it is in the original, so the text line keeps only what the panel does not
+ * show — ball count, bonus, plunger charge — instead of printing the same
+ * digits twice.
+ */
+function statusLine(game: Game, scoreOnPanel: boolean): string {
   if (game.phase === "attract") return "PRESS ENTER TO START";
   // The score outlives the ball, so it is on the game-over line too — that is
   // the one moment a player actually wants to read it.
@@ -1982,7 +2012,8 @@ function statusLine(game: Game): string {
   // Digits straight out of the BCD field: what is displayed is what is stored.
   const bonus = readBcdField(game.scoring.bonus);
   const bonusText = bonus === 0 ? "" : `  BONUS ${formatBcdField(game.scoring.bonus)}`;
-  return `BALL ${ball} OF ${game.options.ballsPerGame}  ${formatBcdField(game.scoring.score)}${bonusText}${plunger}`;
+  const scoreText = scoreOnPanel ? "" : `  ${formatBcdField(game.scoring.score)}`;
+  return `BALL ${ball} OF ${game.options.ballsPerGame}${scoreText}${bonusText}${plunger}`;
 }
 
 /**
@@ -2001,13 +2032,43 @@ function missionLine(game: Game): string {
 }
 
 /**
+ * The score panel, as the drawing code sees it.
+ *
+ * An interface rather than the concrete `PanelDisplay` so this module never
+ * imports the panel integrator (which imports this module's report type — the
+ * dependency points one way in values even though the types meet). `draw`
+ * composes the whole 16-row panel band across the top of a `viewWidth`-wide
+ * view and returns whether it did; false — no decoded heap, or the shell font
+ * not yet fetched — leaves the caller on the text score exactly as before.
+ */
+export interface PanelPresenter {
+  draw(
+    context: CanvasRenderingContext2D,
+    score: number,
+    scale: number,
+    viewWidth: number,
+  ): boolean;
+}
+
+/**
  * Draws one frame.
  *
  * Everything is redrawn every frame — there is no dirty-rectangle tracking —
  * because the whole window is 336 x 256 source pixels and a full blit of that
  * costs less than working out what changed.
+ *
+ * `panel` is the score panel strip, drawn over the top 16 rows of the view the
+ * way the original's own display sits the panel above the playfield window (a
+ * 320x256 PAL screen: 16 panel lines, then the scrolling playfield). Optional
+ * and nullable: every existing caller and test renders identically without
+ * one, and a missing shell font merely keeps the text score.
  */
-export function renderGame(context: CanvasRenderingContext2D, game: Game, scale: number): void {
+export function renderGame(
+  context: CanvasRenderingContext2D,
+  game: Game,
+  scale: number,
+  panel?: PanelPresenter | null,
+): void {
   const size = canvasSizeFor(scale);
   context.setTransform(1, 0, 0, 1, 0, 0);
   context.imageSmoothingEnabled = false;
@@ -2029,16 +2090,26 @@ export function renderGame(context: CanvasRenderingContext2D, game: Game, scale:
     drawBall(context, game, scale, ball);
   }
 
+  // The score panel strip, above the playfield view. Drawn after the balls so
+  // it sits over them the way the original's panel plane does — a ball rolling
+  // under the top of the window passes behind the panel, not through it.
+  const panelDrawn =
+    panel !== undefined && panel !== null &&
+    panel.draw(context, currentScore(game), scale, PLAYFIELD_WIDTH);
+
   // The overlay is drawn at device resolution rather than magnified: scaled-up
   // text at 3x is unreadable mush, and this is instrumentation, not artwork.
+  // It drops below the panel band when one is up, so the readouts stay
+  // readable rather than printing over the strip.
+  const hudTop = panelDrawn ? PANEL_STRIP_HEIGHT * scale + 6 : 6;
   context.imageSmoothingEnabled = true;
   context.font = "12px ui-monospace, 'DejaVu Sans Mono', monospace";
   context.textBaseline = "top";
   context.fillStyle = game.tilt.tilted ? HUD_ALERT : HUD_TEXT;
-  context.fillText(statusLine(game), 6, 6);
+  context.fillText(statusLine(game, panelDrawn), 6, hudTop);
   const mission = missionLine(game);
   if (mission.length > 0) {
     context.fillStyle = HUD_ALERT;
-    context.fillText(mission, 6, 22);
+    context.fillText(mission, 6, hudTop + 16);
   }
 }

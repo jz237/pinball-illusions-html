@@ -89,6 +89,28 @@ export const HUD_TEXT = "#9fb4cc";
 export const HUD_ALERT = "#ff6b5a";
 
 // ---------------------------------------------------------------------------
+// The score panel
+// ---------------------------------------------------------------------------
+
+/**
+ * The 320 x 16 score panel's three tones.
+ *
+ * The panel bitmap itself ships straight off the disk — three bitplanes at a
+ * 40-byte row stride — but the COLOUR REGISTERS the copper loads over that
+ * strip are not in the decoded data, the same gap as the shell fonts' text
+ * colours. What the copper produces on screen is the amber-on-dark dot-matrix
+ * look of a mid-90s pinball display with white picked out on top, so that is
+ * what these three constants reconstruct: a dark warm glass for cleared
+ * pixels, amber for the plane-0 fill (and the plane-2 score digits, which sit
+ * on the same glass), and a warm white for the plane-1 outline highlights.
+ * `Rgb` triples because `panel-renderer.ts` writes them into a byte buffer,
+ * exactly like `CABINET_BLACK`.
+ */
+export const PANEL_UNLIT: Rgb = [26, 12, 4];
+export const PANEL_AMBER: Rgb = [255, 148, 16];
+export const PANEL_WHITE: Rgb = [255, 241, 214];
+
+// ---------------------------------------------------------------------------
 // The shell
 // ---------------------------------------------------------------------------
 
