@@ -5,9 +5,17 @@
  * surround is near-black so nothing on the page competes with the playfield for
  * contrast — a bright page next to a dark table makes the table look muddy —
  * and every rule that touches the canvas exists to stop a browser from
- * resampling it. Integer magnification is done in JavaScript by resizing the
- * backing store; CSS must therefore NOT scale the element, or the two scalings
- * would compose into a fractional one and the rails would wobble.
+ * resampling it. In NATIVE mode, integer magnification is done in JavaScript
+ * by resizing the backing store; CSS must therefore NOT scale the element, or
+ * the two scalings would compose into a fractional one and the rails would
+ * wobble.
+ *
+ * In HD mode (`fitCanvas` in main.ts, active once a table's 4x master loads)
+ * that rule is deliberately repealed FROM JAVASCRIPT: the backing store is a
+ * fixed 1344 x 1024 supersample and inline styles size the element to the
+ * viewport with `image-rendering: auto`, because a 4x picture is protected BY
+ * bilinear downscale rather than from it — the sibling Pinball Fantasies HD
+ * convention. The rules below still describe every build without HD assets.
  */
 
 :root {

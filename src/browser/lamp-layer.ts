@@ -15,6 +15,18 @@
  * overlay cannot drift off the artwork by even a pixel, and clipping in
  * scrolled view comes free.
  *
+ * THE HD PATH keeps the polarity and the geometry and swaps the pixels: the
+ * HD master (`playfieldArtworkHd`) is exported all-lit — masked-kind lamps
+ * included, forced to their lit faces — and every lamp that is not visibly
+ * lit draws its precomputed DIM PATCH from the table's `lamps-hd` atlas onto
+ * a 4x overlay. The patches are crops of an identical-settings upscale of the
+ * all-dim board, dilated 12 HD px past each lamp's rect — the measured radius
+ * beyond which the two upscales are pixel-identical — so compositing them
+ * over the master reproduces the true all-dim upscale exactly, seam-free by
+ * construction (research/hd/INDEX.txt section 4, pinned by test). WHICH lamp
+ * draws on WHICH tick is the same `lampModes`/`lampVisible` decision as the
+ * native path: HD changes pixels, never behaviour.
+ *
  * Cached per (map, artwork, lamps) identity, exactly as the playfield raster
  * is cached per map: the sprites never change during play, only which of them
  * draw.
@@ -25,16 +37,23 @@ import { buildLampSprites, lampModes, lampVisible } from "../game/lamp-overlays.
 import type { LampSprite } from "../game/lamp-overlays.js";
 import type { ModeState } from "../game/mode-vm.js";
 import type { TableArt } from "../game/table-art.js";
+import type { LampPatchHd, TableLampsHd } from "../game/table-art-hd.js";
 import type { TableLamps } from "../game/table-lamps.js";
 import type { CameraState } from "./camera.js";
+import { HD_SCALE } from "./hd-scale.js";
 import {
   RASTER_HEIGHT,
   RASTER_WIDTH,
+  hdBlitSmoothing,
   playfieldArtwork,
+  playfieldArtworkHd,
   playfieldBlitGeometry,
   rasterToCanvas,
 } from "./playfield-renderer.js";
 import type { BlitContext } from "./playfield-renderer.js";
+
+/** RGBA, matching `ImageData`. */
+const BYTES_PER_PIXEL = 4;
 
 /** The 2d-context slice the overlay canvas needs. */
 interface OverlayContext {
@@ -53,11 +72,40 @@ interface LampLayer {
   readonly context: OverlayContext;
 }
 
+interface HdLampLayer {
+  readonly lamps: TableLamps;
+  readonly doc: TableLampsHd;
+  /** One canvas per patch, cut from the atlas once. Parallel to doc.patches. */
+  readonly patches: readonly CanvasImageSource[];
+  readonly canvas: CanvasImageSource;
+  readonly context: OverlayContext;
+}
+
 let layers = new WeakMap<TableMap, LampLayer>();
+let hdDocs = new WeakMap<TableMap, TableLampsHd>();
+let hdLayers = new WeakMap<TableMap, HdLampLayer>();
 
 /** Drops every cached layer. For tests and for live-swapping a decode. */
 export function invalidateLampLayers(): void {
   layers = new WeakMap<TableMap, LampLayer>();
+  hdDocs = new WeakMap<TableMap, TableLampsHd>();
+  hdLayers = new WeakMap<TableMap, HdLampLayer>();
+}
+
+/**
+ * Registers (or, with null, withdraws) a table's HD dim-patch atlas.
+ *
+ * Optional exactly as the HD master is optional: with no atlas registered —
+ * or no HD master to sit the patches on — the native overlay path below runs
+ * unchanged.
+ */
+export function setLampOverlaysHd(map: TableMap, doc: TableLampsHd | null): void {
+  hdLayers.delete(map);
+  if (doc === null) {
+    hdDocs.delete(map);
+    return;
+  }
+  hdDocs.set(map, doc);
 }
 
 function faceCanvas(sprite: LampSprite, face: Uint8ClampedArray | null): CanvasImageSource | null {
@@ -65,17 +113,17 @@ function faceCanvas(sprite: LampSprite, face: Uint8ClampedArray | null): CanvasI
   return rasterToCanvas({ width: sprite.width, height: sprite.height, data: face });
 }
 
-function overlayCanvas(): { canvas: CanvasImageSource; context: OverlayContext } {
+function overlayCanvas(width: number, height: number): { canvas: CanvasImageSource; context: OverlayContext } {
   if (typeof OffscreenCanvas !== "undefined") {
-    const canvas = new OffscreenCanvas(RASTER_WIDTH, RASTER_HEIGHT);
+    const canvas = new OffscreenCanvas(width, height);
     const context = canvas.getContext("2d");
     if (context === null) throw new Error("could not acquire a 2d context for the lamp layer");
     return { canvas, context };
   }
   if (typeof document !== "undefined") {
     const canvas = document.createElement("canvas");
-    canvas.width = RASTER_WIDTH;
-    canvas.height = RASTER_HEIGHT;
+    canvas.width = width;
+    canvas.height = height;
     const context = canvas.getContext("2d");
     if (context === null) throw new Error("could not acquire a 2d context for the lamp layer");
     return { canvas, context };
@@ -94,7 +142,7 @@ function layerFor(map: TableMap, lamps: TableLamps): LampLayer | null {
   const cached = layers.get(map);
   if (cached !== undefined && cached.lamps === lamps && cached.artwork === artwork) return cached;
   const sprites = buildLampSprites(artwork as TableArt, lamps);
-  const { canvas, context } = overlayCanvas();
+  const { canvas, context } = overlayCanvas(RASTER_WIDTH, RASTER_HEIGHT);
   const layer: LampLayer = {
     lamps,
     artwork,
@@ -105,6 +153,37 @@ function layerFor(map: TableMap, lamps: TableLamps): LampLayer | null {
     context,
   };
   layers.set(map, layer);
+  return layer;
+}
+
+/** One patch's pixels sliced out of the atlas image. */
+function patchCanvas(doc: TableLampsHd, patch: LampPatchHd): CanvasImageSource {
+  const data = new Uint8ClampedArray(patch.width * patch.height * BYTES_PER_PIXEL);
+  const stride = doc.atlas.width * BYTES_PER_PIXEL;
+  for (let y = 0; y < patch.height; y += 1) {
+    const from = (patch.atlasY + y) * stride + patch.atlasX * BYTES_PER_PIXEL;
+    data.set(doc.atlas.data.subarray(from, from + patch.width * BYTES_PER_PIXEL), y * patch.width * BYTES_PER_PIXEL);
+  }
+  return rasterToCanvas({ width: patch.width, height: patch.height, data });
+}
+
+function hdLayerFor(map: TableMap, lamps: TableLamps): HdLampLayer | null {
+  // Patches are crops that agree with the HD master along their edges; over
+  // any other picture they would be visible rectangles. No master, no patches.
+  if (playfieldArtworkHd(map) === null) return null;
+  const doc = hdDocs.get(map);
+  if (doc === undefined) return null;
+  const cached = hdLayers.get(map);
+  if (cached !== undefined && cached.lamps === lamps && cached.doc === doc) return cached;
+  const { canvas, context } = overlayCanvas(RASTER_WIDTH * HD_SCALE, RASTER_HEIGHT * HD_SCALE);
+  const layer: HdLampLayer = {
+    lamps,
+    doc,
+    patches: doc.patches.map((patch) => patchCanvas(doc, patch)),
+    canvas,
+    context,
+  };
+  hdLayers.set(map, layer);
   return layer;
 }
 
@@ -125,10 +204,39 @@ export function drawLampOverlays(
   modeState: ModeState | null,
   tick: number,
 ): void {
+  const modes = lampModes(lamps, modeState);
+
+  const hd = hdLayerFor(map, lamps);
+  if (hd !== null) {
+    hd.context.clearRect(0, 0, RASTER_WIDTH * HD_SCALE, RASTER_HEIGHT * HD_SCALE);
+    for (let i = 0; i < hd.doc.patches.length; i += 1) {
+      const patch = hd.doc.patches[i];
+      const face = hd.patches[i];
+      if (patch === undefined || face === undefined) continue;
+      // The master is all-lit, masked kinds included, so EVERY kind of lamp
+      // draws only when not visibly lit — the uniform HD polarity.
+      if (lampVisible(modes[patch.index] ?? 0, tick, lamps.blinkHalfPeriodFrames)) continue;
+      hd.context.drawImage(face, patch.destX, patch.destY);
+    }
+    const geometry = playfieldBlitGeometry(map, camera, scale);
+    context.imageSmoothingEnabled = hdBlitSmoothing(camera);
+    context.drawImage(
+      hd.canvas,
+      geometry.sourceX * HD_SCALE,
+      geometry.sourceY * HD_SCALE,
+      geometry.sourceWidth * HD_SCALE,
+      geometry.sourceHeight * HD_SCALE,
+      0,
+      0,
+      geometry.destWidth,
+      geometry.destHeight,
+    );
+    return;
+  }
+
   const layer = layerFor(map, lamps);
   if (layer === null) return;
 
-  const modes = lampModes(lamps, modeState);
   layer.context.clearRect(0, 0, RASTER_WIDTH, RASTER_HEIGHT);
   for (const sprite of layer.sprites) {
     const visible = lampVisible(modes[sprite.index] ?? 0, tick, lamps.blinkHalfPeriodFrames);

@@ -131,6 +131,18 @@ const DERIVED_MARKERS = [
   // instrument, each digest-claimed through the samples[] branch below — never
   // as a `.mod`, which FORBIDDEN_EXT still refuses and should go on refusing.
   { class: "disk-derived-shell-music", noun: "front-end music" },
+  // The HD (4x) presentation set. Every one of these is derived from assets
+  // already in the classes above by a deterministic local upscale
+  // (scripts/hd-pipeline.mjs), which changes NOTHING about custody: art
+  // derived from the disk artwork is still disk-derived, so each ships behind
+  // the same authorization gate, as a PNG claimed by its own manifest through
+  // the single-image branch below. The flipper and ball sprites' native
+  // classes ship pixels inside JSON; these HD variants are precisely the
+  // "PNG atlas instead" case the comment above anticipates.
+  { class: "disk-derived-playfield-artwork-hd", noun: "HD playfield artwork" },
+  { class: "disk-derived-lamp-overlays-hd", noun: "HD lamp patch atlas" },
+  { class: "disk-derived-ball-sprite-hd", noun: "HD ball sprite" },
+  { class: "disk-derived-flipper-sprites-hd", noun: "HD flipper bat atlas" },
 ];
 
 /** Manifest classes that must account for the binary files they ship beside. */
@@ -139,6 +151,19 @@ const MEDIA_MARKERS = new Map([
   ["disk-derived-audio", { noun: "sound effect", extensions: AUDIO_EXT }],
   ["disk-derived-shell-artwork", { noun: "shell artwork", extensions: IMAGE_EXT }],
   ["disk-derived-shell-music", { noun: "front-end music", extensions: AUDIO_EXT }],
+  ["disk-derived-playfield-artwork-hd", { noun: "HD playfield artwork", extensions: IMAGE_EXT }],
+  ["disk-derived-lamp-overlays-hd", { noun: "HD lamp patch atlas", extensions: IMAGE_EXT }],
+  ["disk-derived-ball-sprite-hd", { noun: "HD ball sprite", extensions: IMAGE_EXT }],
+  ["disk-derived-flipper-sprites-hd", { noun: "HD flipper bat atlas", extensions: IMAGE_EXT }],
+]);
+
+/** Classes whose manifest claims exactly one raster through an `image` field. */
+const SINGLE_IMAGE_CLASSES = new Set([
+  "disk-derived-playfield-artwork",
+  "disk-derived-playfield-artwork-hd",
+  "disk-derived-lamp-overlays-hd",
+  "disk-derived-ball-sprite-hd",
+  "disk-derived-flipper-sprites-hd",
 ]);
 
 /** Tolerates both `"sourceClass":"x"` and the spaced form a formatter might emit. */
@@ -191,8 +216,8 @@ for await (const file of walk(root)) {
     violations.push(`${rel}: declares disk-derived ${media_marker.noun} but is not valid JSON`);
     continue;
   }
-  if (marker.class === "disk-derived-playfield-artwork") {
-    claim(rel, doc?.image?.file, doc?.image?.sha256, media_marker.noun, "artwork manifest");
+  if (SINGLE_IMAGE_CLASSES.has(marker.class)) {
+    claim(rel, doc?.image?.file, doc?.image?.sha256, media_marker.noun, `${media_marker.noun} manifest`);
     continue;
   }
   if (marker.class === "disk-derived-shell-artwork") {

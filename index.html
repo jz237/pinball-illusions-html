@@ -13,10 +13,13 @@
   <body>
     <main class="cabinet">
       <!--
-        The playfield window is 336 x 256 source pixels, magnified by a whole
-        number only. The backing store is resized to that magnification in
-        main.ts and the element is left at its natural size, so one source pixel
-        is always an exact square block of device pixels.
+        The playfield window is 336 x 256 source pixels. Without HD assets it
+        is magnified by a whole number only: the backing store is resized to
+        that magnification in main.ts and the element is left at its natural
+        size, so one source pixel is always an exact square block of device
+        pixels. Once a table's HD master loads, the backing store becomes a
+        fixed 4x supersample (1344 x 1024) and main.ts CSS-fits the element to
+        the viewport instead — see fitCanvas.
 
         The same canvas carries the shell. The original's menu screens are
         320 x 256, so they are drawn into a 320-wide box centred in this one —

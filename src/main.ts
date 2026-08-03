@@ -43,9 +43,22 @@ import {
   tickGame,
 } from "./browser/game-loop.js";
 import type { Game, GameDebugState, GameTickReport } from "./browser/game-loop.js";
-import { integerScaleFor, setPlayfieldArtwork } from "./browser/playfield-renderer.js";
+import {
+  integerScaleFor,
+  setPlayfieldArtwork,
+  setPlayfieldArtworkHd,
+} from "./browser/playfield-renderer.js";
+import { setLampOverlaysHd } from "./browser/lamp-layer.js";
+import { setMovingSpritesHd } from "./browser/sprite-layer.js";
+import { HD_SCALE } from "./browser/hd-scale.js";
 import { loadTableMap } from "./game/table-map.js";
 import { loadTableArt, tableArtUrl } from "./game/table-art.js";
+import {
+  loadFlipperBatsHd,
+  loadTableArtHd,
+  loadTableBallHd,
+  loadTableLampsHd,
+} from "./game/table-art-hd.js";
 import { loadTableAcceleration } from "./game/table-accel.js";
 import { loadTableDevices } from "./game/table-devices.js";
 import { loadTableModes } from "./game/table-modes.js";
@@ -154,19 +167,54 @@ function requireContext(canvas: HTMLCanvasElement): CanvasRenderingContext2D {
 }
 
 /**
+ * Whether the HD presentation set is live: flipped the first time a table's
+ * HD master loads and registers, never before, never speculatively. Until
+ * then — and forever, in a build without the HD assets — the canvas rules
+ * below are byte-for-byte the pre-HD ones.
+ */
+let hdActive = false;
+
+/**
  * Picks the magnification and resizes the backing store to match.
  *
- * Whole numbers only, from `integerScaleFor`. The CSS keeps the element at its
- * natural pixel size, so one source pixel is always an exact square block of
- * device pixels and the rails never wobble.
+ * NATIVE MODE: whole numbers only, from `integerScaleFor`. The CSS keeps the
+ * element at its natural pixel size, so one source pixel is always an exact
+ * square block of device pixels and the rails never wobble.
+ *
+ * HD MODE: the backing store is fixed at `HD_SCALE` (1344x1024 — a 4x
+ * supersampled window) and CSS fits the element to the viewport instead,
+ * aspect preserved. That deliberately repeals the "CSS must not scale the
+ * element" rule, which existed to protect a NATIVE-resolution picture from
+ * fractional resampling; a 4x supersampled picture is protected BY the
+ * browser's bilinear downscale — exactly how Pinball Fantasies HD ships its
+ * 4x masters into a ≤3x canvas. `image-rendering: pixelated` is lifted for
+ * the same reason, and only in this mode.
  */
 function fitCanvas(canvas: HTMLCanvasElement): number {
+  if (hdActive) {
+    const size = canvasSizeFor(HD_SCALE);
+    if (canvas.width !== size.width || canvas.height !== size.height) {
+      canvas.width = size.width;
+      canvas.height = size.height;
+    }
+    const fit = Math.min(
+      window.innerWidth / size.width,
+      Math.max(0.1, window.innerHeight - 120) / size.height,
+    );
+    canvas.style.width = `${Math.max(1, Math.round(size.width * fit))}px`;
+    canvas.style.height = `${Math.max(1, Math.round(size.height * fit))}px`;
+    canvas.style.imageRendering = "auto";
+    return HD_SCALE;
+  }
   const scale = integerScaleFor(window.innerWidth, window.innerHeight - 120);
   const size = canvasSizeFor(scale);
   if (canvas.width !== size.width || canvas.height !== size.height) {
     canvas.width = size.width;
     canvas.height = size.height;
   }
+  canvas.style.removeProperty("width");
+  canvas.style.removeProperty("height");
+  canvas.style.removeProperty("image-rendering");
   return scale;
 }
 
@@ -431,7 +479,7 @@ async function boot(): Promise<void> {
    * is deliberately unmistakable rather than quietly plausible.
    */
   const assemble = async (tableId: TableId): Promise<LoadedTable> => {
-    const [map, artwork] = await Promise.all([
+    const [map, artwork, , , , , , , , artHd, lampsHd, ballHd, batsHd] = await Promise.all([
       loadTableMap(tableId),
       loadTableArt(tableId),
       // These six register themselves; `createGame` and the renderer read them
@@ -451,8 +499,41 @@ async function boot(): Promise<void> {
         console.warn(`pinball-illusions: ${tableId} panel animations unavailable`, error);
         return null;
       }),
+      // The HD presentation set — 4x master, lamp dim-patch atlas, ball, bat
+      // atlas. All four are OPTIONAL-WITH-LOUD-FALLBACK, the panel's pattern:
+      // a table whose HD set is missing (or half missing) renders through the
+      // native-resolution path unchanged and says so in the console, because
+      // the native artwork above is the real disk picture and the renderer
+      // must never invent a substitute for it.
+      loadTableArtHd(tableId).catch((error: unknown) => {
+        console.warn(`pinball-illusions: ${tableId} HD artwork unavailable, using native resolution`, error);
+        return null;
+      }),
+      loadTableLampsHd(tableId).catch((error: unknown) => {
+        console.warn(`pinball-illusions: ${tableId} HD lamp patches unavailable, using native overlays`, error);
+        return null;
+      }),
+      loadTableBallHd(tableId).catch((error: unknown) => {
+        console.warn(`pinball-illusions: ${tableId} HD ball unavailable, using native sprites`, error);
+        return null;
+      }),
+      loadFlipperBatsHd(tableId).catch((error: unknown) => {
+        console.warn(`pinball-illusions: ${tableId} HD bats unavailable, using native sprites`, error);
+        return null;
+      }),
     ]);
     setPlayfieldArtwork(map, artwork);
+    if (artHd !== null) {
+      setPlayfieldArtworkHd(map, artHd);
+      setLampOverlaysHd(map, lampsHd);
+      // Both movers or neither: mixing one HD sprite with one native sprite
+      // on the same overlay would be a resolution seam nobody chose.
+      setMovingSpritesHd(map, ballHd !== null && batsHd !== null ? { ball: ballHd, bats: batsHd } : null);
+      if (!hdActive) {
+        hdActive = true;
+        scale = fitCanvas(canvas);
+      }
+    }
     const game = createGame(map);
     const heap = tablePanelFor(tableId);
     const panel = heap === null ? null : new PanelDisplay(heap, () => panelFont);

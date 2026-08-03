@@ -59,6 +59,7 @@ import { PLAYFIELD_HEIGHT, PLAYFIELD_WIDTH } from "../game/contracts.js";
 import type { TableMap } from "../game/contracts.js";
 import { VIEWPORT_HEIGHT, clampScroll, toViewportSize } from "./camera.js";
 import type { CameraState } from "./camera.js";
+import { HD_SCALE } from "./hd-scale.js";
 import { CABINET_BLACK } from "./palette.js";
 
 /** RGBA, matching `ImageData`. */
@@ -196,12 +197,18 @@ export function renderPlayfield(artwork: PixelTarget): PixelTarget {
 // The artwork a map is drawn with
 // ---------------------------------------------------------------------------
 
-// All three keyed by map identity rather than by table id: a reloaded or
+// All keyed by map identity rather than by table id: a reloaded or
 // re-exported map is a different object and must not silently inherit the
 // previous one's pixels.
 let artworkByMap = new WeakMap<TableMap, PixelTarget>();
 let rasterCache = new WeakMap<TableMap, PixelTarget>();
 let sourceCache = new WeakMap<TableMap, CanvasImageSource>();
+// The OPTIONAL HD master (1344x2400, xBRZ 4x of the artwork above — see
+// scripts/export-table-art-hd.mjs). Registered beside the native artwork,
+// never instead of it: the native raster stays required, stays tested, and
+// stays the fallback the instant the HD master is absent.
+let hdArtworkByMap = new WeakMap<TableMap, PixelTarget>();
+let hdSourceCache = new WeakMap<TableMap, CanvasImageSource>();
 
 /**
  * Tells the renderer which decoded artwork belongs to a map.
@@ -227,6 +234,35 @@ export function setPlayfieldArtwork(map: TableMap, artwork: PixelTarget): void {
 /** The artwork registered for a map, or null. */
 export function playfieldArtwork(map: TableMap): PixelTarget | null {
   return artworkByMap.get(map) ?? null;
+}
+
+/**
+ * Tells the renderer which HD master belongs to a map, or takes one away.
+ *
+ * The registration invariant is the size check: logical (x, y) is HD image
+ * (HD_SCALE·x, HD_SCALE·y) with no crop and no letterbox, which is what lets
+ * every blit multiply the source rectangle by HD_SCALE and nothing else. A
+ * master of any other size would silently shear the picture off the physics.
+ */
+export function setPlayfieldArtworkHd(map: TableMap, artwork: PixelTarget | null): void {
+  if (artwork === null) {
+    hdArtworkByMap.delete(map);
+    hdSourceCache.delete(map);
+    return;
+  }
+  if (artwork.width !== RASTER_WIDTH * HD_SCALE || artwork.height !== RASTER_HEIGHT * HD_SCALE) {
+    throw new RangeError(
+      `HD artwork for ${map.tableId} is ${artwork.width}x${artwork.height}, ` +
+        `expected ${RASTER_WIDTH * HD_SCALE}x${RASTER_HEIGHT * HD_SCALE}`,
+    );
+  }
+  if (hdArtworkByMap.get(map) !== artwork) hdSourceCache.delete(map);
+  hdArtworkByMap.set(map, artwork);
+}
+
+/** The HD master registered for a map, or null. */
+export function playfieldArtworkHd(map: TableMap): PixelTarget | null {
+  return hdArtworkByMap.get(map) ?? null;
 }
 
 /**
@@ -268,10 +304,13 @@ export function invalidatePlayfieldRaster(map?: TableMap): void {
     artworkByMap = new WeakMap<TableMap, PixelTarget>();
     rasterCache = new WeakMap<TableMap, PixelTarget>();
     sourceCache = new WeakMap<TableMap, CanvasImageSource>();
+    hdArtworkByMap = new WeakMap<TableMap, PixelTarget>();
+    hdSourceCache = new WeakMap<TableMap, CanvasImageSource>();
     return;
   }
   rasterCache.delete(map);
   sourceCache.delete(map);
+  hdSourceCache.delete(map);
 }
 
 // ---------------------------------------------------------------------------
@@ -415,6 +454,24 @@ export function playfieldImageSource(map: TableMap): CanvasImageSource {
   return source;
 }
 
+/**
+ * The registered HD master as something `drawImage` accepts, or null when no
+ * HD master is registered — which is the renderer's fallback signal: null
+ * sends every layer down the native-resolution path unchanged.
+ *
+ * Uploaded through the same `putImageData` path as the native raster, for the
+ * same reason: the pixels the exporter computed go up exactly as computed.
+ */
+export function playfieldImageSourceHd(map: TableMap): CanvasImageSource | null {
+  const cached = hdSourceCache.get(map);
+  if (cached !== undefined) return cached;
+  const artwork = hdArtworkByMap.get(map);
+  if (artwork === undefined) return null;
+  const source = rasterToCanvas(artwork);
+  hdSourceCache.set(map, source);
+  return source;
+}
+
 /** The bit of a 2d context this module uses, so a fake can stand in for it. */
 export interface BlitContext {
   imageSmoothingEnabled: boolean;
@@ -432,16 +489,38 @@ export interface BlitContext {
 }
 
 /**
+ * Whether a blit of the HD sources should smooth.
+ *
+ * The scrolling blit at the HD window scale is 1:1 — HD source pixels land on
+ * canvas pixels untouched, so nearest keeps them exact (and the flag is moot
+ * anyway). Whole-table mode downsamples 2400 HD rows into the window, and
+ * there bilinear is strictly better than the dropped-row shimmer nearest
+ * produces — the same filtering stance both sibling remakes ship. Shared by
+ * the lamp and sprite overlays so all three layers resample identically.
+ */
+export function hdBlitSmoothing(camera: CameraState): boolean {
+  return camera.mode === "full-table";
+}
+
+/**
  * Blits the cached playfield for the current camera.
  *
- * `scale` is the integer magnification from `integerScaleFor`; the camera's own
- * scale (1 while scrolling, 256/600 in whole-table mode) is applied on top of it
- * via `toViewport`, so this function never second-guesses the camera about how
- * much of the table is on screen.
+ * `scale` is the window magnification (`integerScaleFor`'s pick, or HD_SCALE
+ * when the HD master is live); the camera's own scale (1 while scrolling,
+ * 256/600 in whole-table mode) is applied on top of it via `toViewport`, so
+ * this function never second-guesses the camera about how much of the table
+ * is on screen.
  *
- * Smoothing is disabled on every call rather than once at setup, because a
- * context is shared with whatever else draws this frame and any of them may
- * have turned it back on.
+ * With an HD master registered the same geometry is read at HD resolution:
+ * the source rectangle is multiplied by HD_SCALE and nothing else changes —
+ * the registration invariant (logical (x,y) is HD (4x,4y)) makes that the
+ * whole of the mapping. At `scale = HD_SCALE` the scrolling blit is therefore
+ * 1:1. Without one, the native path below is byte-for-byte what it always
+ * was.
+ *
+ * Smoothing is set on every call rather than once at setup, because a context
+ * is shared with whatever else draws this frame and any of them may have
+ * changed it.
  */
 export function drawPlayfield(
   context: BlitContext,
@@ -450,6 +529,22 @@ export function drawPlayfield(
   scale: number,
 ): void {
   const geometry = playfieldBlitGeometry(map, camera, scale);
+  const hd = playfieldImageSourceHd(map);
+  if (hd !== null) {
+    context.imageSmoothingEnabled = hdBlitSmoothing(camera);
+    context.drawImage(
+      hd,
+      geometry.sourceX * HD_SCALE,
+      geometry.sourceY * HD_SCALE,
+      geometry.sourceWidth * HD_SCALE,
+      geometry.sourceHeight * HD_SCALE,
+      0,
+      0,
+      geometry.destWidth,
+      geometry.destHeight,
+    );
+    return;
+  }
   context.imageSmoothingEnabled = false;
   context.drawImage(
     playfieldImageSource(map),
