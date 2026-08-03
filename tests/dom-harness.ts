@@ -422,7 +422,8 @@ export class FakeCanvasElement extends FakeElement {
 }
 
 /**
- * The three selector forms `touch.ts` uses, and nothing else.
+ * The four selector forms `touch.ts` and `front-door.ts` use, and nothing
+ * else.
  *
  * Anything unrecognised THROWS rather than returning null. A harness that
  * quietly matched nothing would report "the deck has no buttons" as a clean
@@ -432,6 +433,9 @@ export class FakeCanvasElement extends FakeElement {
 function matches(element: FakeElement, selector: string): boolean {
   const attribute = /^\[([-\w]+)="([^"]*)"\]$/.exec(selector);
   if (attribute !== null) return element.getAttribute(attribute[1] ?? "") === attribute[2];
+  // The bare-presence form, `[data-bar-title]`: matches whatever value.
+  const presence = /^\[([-\w]+)\]$/.exec(selector);
+  if (presence !== null) return element.hasAttribute(presence[1] ?? "");
   const className = /^\.([-\w]+)$/.exec(selector);
   if (className !== null) return element.classList.contains(className[1] ?? "");
   const id = /^#([-\w]+)$/.exec(selector);
@@ -633,6 +637,45 @@ export function readDeckMarkup(html = shippedHtml()): DeckMarkup {
   };
 }
 
+/** The front door as `index.html` ships it, read the same way the deck is. */
+export interface DoorMarkup {
+  /** Table ids in card order, from `data-door-table`. */
+  readonly cards: readonly string[];
+  /** Ids that have a name / blurb / champion / thumbnail slot. */
+  readonly names: readonly string[];
+  readonly blurbs: readonly string[];
+  readonly champs: readonly string[];
+  readonly thumbs: readonly string[];
+  /** The card hrefs, which are the `?table=` boot links. */
+  readonly hrefs: readonly (readonly [string, string])[];
+  readonly hasVersion: boolean;
+  readonly hasBarTitle: boolean;
+  /** The footer key legend's text, whitespace-collapsed. */
+  readonly keyLegend: string;
+}
+
+export function readDoorMarkup(html = shippedHtml()): DoorMarkup {
+  const attr = (name: string): string[] =>
+    [...html.matchAll(new RegExp(`${name}="([^"]+)"`, "g"))].map((match) => match[1] ?? "");
+  const hrefs: [string, string][] = [];
+  const card = /<a\b[^>]*href="([^"]*)"[^>]*data-door-table="([^"]+)"/g;
+  for (const match of html.matchAll(card)) {
+    hrefs.push([match[2] ?? "", match[1] ?? ""]);
+  }
+  const legend = /<p class="door__keys">([\s\S]*?)<\/p>/.exec(html);
+  return {
+    cards: attr("data-door-table"),
+    names: attr("data-door-name"),
+    blurbs: attr("data-door-blurb"),
+    champs: attr("data-door-champ"),
+    thumbs: attr("data-door-thumb"),
+    hrefs,
+    hasVersion: /data-door-version/.test(html),
+    hasBarTitle: /data-bar-title/.test(html),
+    keyLegend: (legend?.[1] ?? "").replace(/\s+/g, " ").trim(),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // The globals `touch.ts` narrows against
 // ---------------------------------------------------------------------------
@@ -681,6 +724,8 @@ export interface HostLog {
   readonly keys: ShellKey[];
   gestures: number;
   muteToggles: number;
+  /** Presentation-framing flips requested through the host hook. */
+  framingToggles: number;
 }
 
 export interface TouchHarness {
@@ -689,6 +734,8 @@ export interface TouchHarness {
   readonly root: FakeElement;
   readonly canvas: FakeCanvasElement;
   readonly initials: FakeInputElement;
+  /** The front-door section, built from the shipped markup. */
+  readonly door: FakeElement;
   readonly router: InputRouter;
   readonly wakeLock: FakeWakeLock;
   readonly log: HostLog;
@@ -696,6 +743,8 @@ export interface TouchHarness {
   readonly shell: { phase: ShellPhase; menuCursor: number; cursor: number; column: 0 | 1 };
   ballInLane: boolean;
   muted: boolean;
+  /** The render-layer framing the host reports; flipped by `toggleFraming`. */
+  framing: "full-table" | "amiga";
 
   deck(slot: DeckSlot): FakeButtonElement;
   bar(action: "back" | "view" | "mute"): FakeButtonElement;
@@ -740,8 +789,39 @@ export function createTouchHarness(options: HarnessOptions = {}): TouchHarness {
   if (options.noWakeLock !== true) window.navigator.wakeLock = wakeLock;
 
   const markup = readDeckMarkup();
+  const doorMarkup = readDoorMarkup();
 
   // -- the fixture, built from the shipped markup ---------------------------
+
+  const door = document.body.append(document.createElement("section"));
+  door.setAttribute("id", "door");
+  door.setAttribute("class", "door");
+  const doorCards = door.append(document.createElement("div"));
+  doorCards.setAttribute("class", "door__cards");
+  for (const [tableId, href] of doorMarkup.hrefs) {
+    const card = doorCards.append(document.createElement("a"));
+    card.setAttribute("class", "door__card");
+    card.setAttribute("href", href);
+    card.setAttribute("data-door-table", tableId);
+    if (doorMarkup.thumbs.includes(tableId)) {
+      const img = card.append(document.createElement("img"));
+      img.setAttribute("class", "door__thumb-art");
+      img.setAttribute("data-door-thumb", tableId);
+    }
+    for (const [attribute, present] of [
+      ["data-door-name", doorMarkup.names],
+      ["data-door-blurb", doorMarkup.blurbs],
+      ["data-door-champ", doorMarkup.champs],
+    ] as const) {
+      if (!present.includes(tableId)) continue;
+      const span = card.append(document.createElement("span"));
+      span.setAttribute(attribute, tableId);
+    }
+  }
+  if (doorMarkup.hasVersion) {
+    const version = door.append(document.createElement("p"));
+    version.setAttribute("data-door-version", "");
+  }
 
   const cabinet = document.body.append(document.createElement("main"));
   cabinet.setAttribute("class", "cabinet");
@@ -755,6 +835,11 @@ export function createTouchHarness(options: HarnessOptions = {}): TouchHarness {
     button.setAttribute("class", "topbar__button");
     button.textContent = text;
     bars.set(action, button);
+  }
+  if (doorMarkup.hasBarTitle) {
+    const title = topbar.append(document.createElement("span"));
+    title.setAttribute("class", "topbar__title");
+    title.setAttribute("data-bar-title", "");
   }
 
   const stage = cabinet.append(document.createElement("div"));
@@ -794,7 +879,7 @@ export function createTouchHarness(options: HarnessOptions = {}): TouchHarness {
   // -- the host -------------------------------------------------------------
 
   const router = new InputRouter();
-  const log: HostLog = { keys: [], gestures: 0, muteToggles: 0 };
+  const log: HostLog = { keys: [], gestures: 0, muteToggles: 0, framingToggles: 0 };
   const shell = {
     phase: options.phase ?? "attract",
     menuCursor: 0,
@@ -805,6 +890,7 @@ export function createTouchHarness(options: HarnessOptions = {}): TouchHarness {
   const state = {
     ballInLane: options.ballInLane ?? false,
     muted: options.muted ?? false,
+    framing: "full-table" as "full-table" | "amiga",
   };
 
   const requireSlot = (slot: DeckSlot): FakeButtonElement => {
@@ -867,6 +953,7 @@ export function createTouchHarness(options: HarnessOptions = {}): TouchHarness {
     root: document.documentElement,
     canvas,
     initials,
+    door,
     router,
     wakeLock,
     log,
@@ -882,6 +969,12 @@ export function createTouchHarness(options: HarnessOptions = {}): TouchHarness {
     },
     set muted(value: boolean) {
       state.muted = value;
+    },
+    get framing(): "full-table" | "amiga" {
+      return state.framing;
+    },
+    set framing(value: "full-table" | "amiga") {
+      state.framing = value;
     },
 
     deck: requireSlot,
@@ -940,6 +1033,12 @@ export function createTouchHarness(options: HarnessOptions = {}): TouchHarness {
           return state.muted;
         },
         muted: () => state.muted,
+        toggleFraming: () => {
+          state.framing = state.framing === "full-table" ? "amiga" : "full-table";
+          log.framingToggles += 1;
+          return state.framing;
+        },
+        framing: () => state.framing,
       }),
 
     dispatch,

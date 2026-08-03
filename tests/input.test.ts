@@ -89,30 +89,48 @@ describe("the control vocabulary", () => {
 });
 
 describe("keyboard bindings", () => {
-  it("binds the original's observed keys", () => {
-    // Filmed under emulation with an input-mark log: SHIFTs are the flippers,
-    // SPACE is the nudge (it shakes the view and feeds the tilt counter), and
-    // RETURN launches — the attract DMD says "RETURN LAUNCHES BALL" outright.
-    // Space used to be this port's invented plunger; that binding is gone.
+  it("binds the Fantasies scheme as primary", () => {
+    // The operator's choice: the sibling Pinball Fantasies HD's map — Z/← and
+    // //→ flippers, ↑/X nudge, Space/↓ launch, P pause. Space maps onto the
+    // `plunger` control, which in Illusions is the decoded FIXED kick's press
+    // edge — no hold-to-charge exists in this machine, so no spring is
+    // invented for the key.
+    expect(controlForKeyEvent(key("ArrowLeft"))).toBe("leftFlipper");
     expect(controlForKeyEvent(key("KeyZ"))).toBe("leftFlipper");
-    expect(controlForKeyEvent(key("Comma"))).toBe("leftFlipper");
-    expect(controlForKeyEvent(key("ShiftLeft"))).toBe("leftFlipper");
+    expect(controlForKeyEvent(key("ArrowRight"))).toBe("rightFlipper");
     expect(controlForKeyEvent(key("Slash"))).toBe("rightFlipper");
-    expect(controlForKeyEvent(key("Period"))).toBe("rightFlipper");
-    expect(controlForKeyEvent(key("ShiftRight"))).toBe("rightFlipper");
-    expect(controlForKeyEvent(key("Space"))).toBe("nudgeForward");
-    expect(controlForKeyEvent(key("ArrowLeft"))).toBe("nudgeLeft");
-    expect(controlForKeyEvent(key("ArrowRight"))).toBe("nudgeRight");
     expect(controlForKeyEvent(key("ArrowUp"))).toBe("nudgeForward");
+    expect(controlForKeyEvent(key("KeyX"))).toBe("nudgeForward");
+    expect(controlForKeyEvent(key("Space"))).toBe("plunger");
+    expect(controlForKeyEvent(key("ArrowDown"))).toBe("plunger");
+    expect(controlForKeyEvent(key("KeyP"))).toBe("pause");
+    expect(controlForKeyEvent(key("Escape"))).toBe("pause");
+  });
+
+  it("keeps every film-verified original binding alive as an alias", () => {
+    // Filmed under emulation with an input-mark log: the SHIFTs are the
+    // flippers and RETURN both starts and launches (the attract DMD says
+    // "RETURN LAUNCHES BALL" outright). The Fantasies-primary round must not
+    // cost the machine's own keys.
+    expect(controlForKeyEvent(key("ShiftLeft"))).toBe("leftFlipper");
+    expect(controlForKeyEvent(key("ShiftRight"))).toBe("rightFlipper");
     expect(controlForKeyEvent(key("Enter"))).toBe("start");
     expect(controlForKeyEvent(key("NumpadEnter"))).toBe("start");
-    expect(controlForKeyEvent(key("Escape"))).toBe("pause");
-    expect(controlForKeyEvent(key("F9"))).toBe("toggleWholeTableView");
-    expect(controlForKeyEvent(key("F10"))).toBe("toggleWholeTableView");
+    // The one filmed binding that CANNOT survive: SPACE was the original's
+    // nudge and is Fantasies' launch; it launches now, and the nudge lives on
+    // ArrowUp/X. Asserted so the conflict resolution is pinned, not implied.
+    expect(controlForKeyEvent(key("Space"))).not.toBe("nudgeForward");
+  });
+
+  it("keeps the Amiga-port comma and full-stop flipper aliases", () => {
+    expect(controlForKeyEvent(key("Comma"))).toBe("leftFlipper");
+    expect(controlForKeyEvent(key("Period"))).toBe("rightFlipper");
   });
 
   it("gives the upper flipper a key under each hand", () => {
-    expect(controlForKeyEvent(key("KeyX"))).toBe("upperFlipper");
+    // A under the left hand (X moved to the Fantasies nudge), semicolon under
+    // the right — Fantasies has no upper-bat key to inherit.
+    expect(controlForKeyEvent(key("KeyA"))).toBe("upperFlipper");
     expect(controlForKeyEvent(key("Semicolon"))).toBe("upperFlipper");
   });
 
@@ -121,12 +139,39 @@ describe("keyboard bindings", () => {
     expect(KEY_CODE_BINDINGS["ShiftRight"]).toBe("rightFlipper");
   });
 
+  it("leaves the side nudges off the keyboard, as Fantasies has them", () => {
+    // The arrows became flippers; nudgeLeft/nudgeRight remain reachable on
+    // the gamepad stick only. Nothing film-verified is lost: the arrows are
+    // inert on the Illusions original.
+    for (const code of Object.keys(KEY_CODE_BINDINGS)) {
+      expect(KEY_CODE_BINDINGS[code]).not.toBe("nudgeLeft");
+      expect(KEY_CODE_BINDINGS[code]).not.toBe("nudgeRight");
+    }
+  });
+
+  it("binds no key to the sim-side view toggle any more", () => {
+    // F9/F10 flip the RENDER-LAYER framing and are intercepted in main.ts
+    // before the router; the hashed `toggleWholeTableView` control keeps
+    // existing but nothing on the keyboard reaches it.
+    expect(controlForKeyEvent(key("F9"))).toBeNull();
+    expect(controlForKeyEvent(key("F10"))).toBeNull();
+    for (const control of Object.values(KEY_CODE_BINDINGS)) {
+      expect(control).not.toBe("toggleWholeTableView");
+    }
+    for (const control of Object.values(KEY_NAME_BINDINGS)) {
+      expect(control).not.toBe("toggleWholeTableView");
+    }
+  });
+
   it("falls back to the key name when no code is supplied", () => {
     expect(controlForKeyEvent({ key: "z" })).toBe("leftFlipper");
     expect(controlForKeyEvent({ key: "Z" })).toBe("leftFlipper");
     expect(controlForKeyEvent({ key: "/" })).toBe("rightFlipper");
-    expect(controlForKeyEvent({ key: " " })).toBe("nudgeForward");
-    expect(controlForKeyEvent({ key: "ArrowLeft" })).toBe("nudgeLeft");
+    expect(controlForKeyEvent({ key: " " })).toBe("plunger");
+    expect(controlForKeyEvent({ key: "ArrowLeft" })).toBe("leftFlipper");
+    expect(controlForKeyEvent({ key: "ArrowDown" })).toBe("plunger");
+    expect(controlForKeyEvent({ key: "a" })).toBe("upperFlipper");
+    expect(controlForKeyEvent({ key: "x" })).toBe("nudgeForward");
     expect(controlForKeyEvent({ key: "Escape" })).toBe("pause");
   });
 
@@ -315,7 +360,7 @@ describe("the flippers are independent", () => {
     const router = new InputRouter();
     router.handleKeyDown(key("KeyZ"));
     router.handleKeyDown(key("Slash"));
-    router.handleKeyDown(key("KeyX"));
+    router.handleKeyDown(key("KeyA"));
 
     const snapshot = router.sample();
     expect(wasPressed(snapshot, "leftFlipper")).toBe(true);
@@ -517,6 +562,39 @@ describe("gamepads", () => {
     expect(isDown(snapshot, "plunger")).toBe(true);
   });
 
+  it("carries the Fantasies merge: d-pad flips, X nudges, 3 is unbound", () => {
+    // Fantasies' StandardPinballGamepadReader: buttons 14/15 (d-pad
+    // left/right) are flipper duplicates and button 2 (X/Square) is the
+    // nudge. Button 3 is deliberately unbound here — it flips the
+    // render-layer framing and main.ts reads its edges itself, so the
+    // router must never see it.
+    expect(GAMEPAD_BUTTON_BINDINGS[14]).toBe("leftFlipper");
+    expect(GAMEPAD_BUTTON_BINDINGS[15]).toBe("rightFlipper");
+    expect(GAMEPAD_BUTTON_BINDINGS[2]).toBe("nudgeForward");
+    expect(GAMEPAD_BUTTON_BINDINGS[3]).toBeUndefined();
+    for (const control of Object.values(GAMEPAD_BUTTON_BINDINGS)) {
+      expect(control).not.toBe("toggleWholeTableView");
+    }
+
+    const router = new InputRouter();
+    router.pollGamepad(padWith(14, 2, 3));
+    const snapshot = router.sample();
+    expect(isDown(snapshot, "leftFlipper")).toBe(true);
+    expect(isDown(snapshot, "nudgeForward")).toBe(true);
+    expect(isDown(snapshot, "toggleWholeTableView")).toBe(false);
+  });
+
+  it("keeps the Illusions extras Fantasies is silent about", () => {
+    // Triggers stay the UPPER flipper — a deliberate deviation recorded in
+    // the brief: Fantasies duplicates its lower bats there only because its
+    // tables have no upper bats to give the triggers to.
+    expect(GAMEPAD_BUTTON_BINDINGS[6]).toBe("upperFlipper");
+    expect(GAMEPAD_BUTTON_BINDINGS[7]).toBe("upperFlipper");
+    expect(GAMEPAD_BUTTON_BINDINGS[8]).toBe("pause");
+    expect(GAMEPAD_BUTTON_BINDINGS[9]).toBe("start");
+    expect(GAMEPAD_BUTTON_BINDINGS[12]).toBe("nudgeForward");
+  });
+
   it("emits one press however many times it is polled", () => {
     const router = new InputRouter();
     for (let poll = 0; poll < 5; poll += 1) router.pollGamepad(padWith(4));
@@ -623,7 +701,7 @@ describe("losing and regaining focus", () => {
     expect(isDown(snapshot, "leftFlipper")).toBe(false);
     // Every held control must SEE the release, or it stays asserted while the
     // player is looking at another window.
-    expect(wasReleased(snapshot, "nudgeForward")).toBe(true);
+    expect(wasReleased(snapshot, "plunger")).toBe(true);
     expect(wasReleased(snapshot, "rightFlipper")).toBe(true);
   });
 
@@ -716,16 +794,16 @@ describe("attaching to a DOM-like target", () => {
     target.fire("keydown", bound);
     target.fire("keydown", unbound);
     expect(prevented).toBe(1);
-    expect(isDown(router.sample(), "nudgeForward")).toBe(true);
+    expect(isDown(router.sample(), "plunger")).toBe(true);
 
     target.fire("keyup", bound);
     expect(prevented).toBe(2);
-    expect(wasReleased(router.sample(), "nudgeForward")).toBe(true);
+    expect(wasReleased(router.sample(), "plunger")).toBe(true);
 
     detach();
     expect(target.counts.get("keydown")).toBe(0);
     target.fire("keydown", bound);
-    expect(pressCount(router.sample(), "nudgeForward")).toBe(0);
+    expect(pressCount(router.sample(), "plunger")).toBe(0);
   });
 
   it("drops held controls when the target reports blur", () => {
@@ -749,10 +827,10 @@ describe("attaching to a DOM-like target", () => {
 });
 
 describe("feeding the launcher", () => {
-  // The launch key on the keyboard is Enter, which the router files under
-  // `start`; the game loop treats a start press in play as the launch edge.
-  // The `plunger` control itself remains for the gamepad face button and the
-  // touch overlay, so the adapter is exercised through a manual press here.
+  // Space and ArrowDown feed `plunger` directly since the Fantasies-parity
+  // round; Enter still files under `start`, which the game loop also treats
+  // as the launch edge in play. Both meet the same fixed-kick launcher, so
+  // the adapter is exercised through a manual press here.
 
   it("translates a snapshot into the launcher's input", () => {
     const router = new InputRouter();

@@ -138,7 +138,7 @@ import type {
   SimulationForces,
   TableMap,
 } from "../game/contracts.js";
-import { PLAYFIELD_WIDTH } from "../game/contracts.js";
+import { PLAYFIELD_HEIGHT, PLAYFIELD_WIDTH } from "../game/contracts.js";
 import type { Q10 } from "../core/fixed-point.js";
 import { pixelsToQ10, q10ToPixel } from "../core/fixed-point.js";
 import { FixedStepScheduler, millisecondsToNanos } from "../core/fixed-step-scheduler.js";
@@ -1022,6 +1022,13 @@ function cameraOptionsFor(game: Game): CameraOptions {
 export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport {
   game.tick += 1;
 
+  // The SIM-SIDE whole-table toggle. Since the Fantasies-parity round no
+  // input path reaches this control any more: F9/F10 and pad button 3 are
+  // intercepted in `main.ts` and flip the RENDER-LAYER framing instead (see
+  // `RenderFraming` below and research/FANTASIES_PARITY_BRIEF.md §2.4). The
+  // branch and the `forceFullTable` field both STAY — the field is part of
+  // every hashed `debugSnapshot` and removing it would move the pins in
+  // `tests/sim-hash-pin.test.ts`, which this round is forbidden to do.
   if (wasPressed(snapshot, "toggleWholeTableView")) {
     game.forceFullTable = !game.forceFullTable;
   }
@@ -2646,6 +2653,32 @@ export function canvasSizeFor(scale: number): { readonly width: number; readonly
 }
 
 /**
+ * The PRESENTATION FRAMING — a render-layer choice, never simulation state.
+ *
+ * "amiga" is the film-verified 336 x 256 scrolling window this port has always
+ * drawn: panel strip over the top 16 rows, the measured proportional follower,
+ * and the documented multiball whole-table reframe inside the window. It is
+ * the machine's own presentation and it stays byte-identical.
+ *
+ * "full-table" is the Fantasies-parity default: a 336 x 616 canvas — the
+ * 16-row panel in its own cabinet band, then all 600 playfield rows at scale
+ * 1 with NO camera transform. `game.camera` keeps stepping (it is hashed
+ * state, covered by `tests/sim-hash-pin.test.ts`) and is simply not read.
+ * `main.ts` owns which framing is live, persists it, and re-fits the canvas
+ * on a toggle; the switch is a live cut, no reload — nothing in this
+ * renderer is startup-baked.
+ */
+export type RenderFraming = "full-table" | "amiga";
+
+/** Logical rows of the full-table framing: the cabinet band plus the board. */
+export const FULL_TABLE_FRAMING_ROWS = PANEL_STRIP_HEIGHT + PLAYFIELD_HEIGHT;
+
+/** Logical canvas rows for a framing; width is always `PLAYFIELD_WIDTH`. */
+export function framingRows(framing: RenderFraming): number {
+  return framing === "full-table" ? FULL_TABLE_FRAMING_ROWS : VIEWPORT_HEIGHT;
+}
+
+/**
  * Whether there is a ball sitting on the plunger rod.
  *
  * A selector rather than a reach into `Game` from the presentation layer: the
@@ -2715,9 +2748,10 @@ function statusLine(game: Game, scoreOnPanel: boolean): string {
   if (game.paused) return "PAUSED";
   if (game.tilt.tilted) return "TILT";
   const ball = Math.max(1, ballNumber(game));
-  // The original's own attract line reads "RETURN LAUNCHES BALL"; the fixed
-  // kick has no charge to meter, so the prompt is the whole of the display.
-  const plunger = game.laneBallId === null ? "" : "  ENTER LAUNCHES";
+  // The fixed kick has no charge to meter, so the prompt is the whole of the
+  // display. SPACE is the primary launch key since the Fantasies-parity
+  // round; the film-verified RETURN still works as an alias.
+  const plunger = game.laneBallId === null ? "" : "  SPACE LAUNCHES";
   // While the bonus counts out, the whole line is the bonus: the machine's own
   // display shows nothing else during it, and this one has no ball to describe.
   const view = bonusViewOf(game);
@@ -2780,25 +2814,52 @@ export interface PanelPresenter {
  * 320x256 PAL screen: 16 panel lines, then the scrolling playfield). Optional
  * and nullable: every existing caller and test renders identically without
  * one, and a missing shell font merely keeps the text score.
+ *
+ * `framing` is the presentation framing (`RenderFraming` above). It defaults
+ * to "amiga" so every existing caller and test renders byte-for-byte what it
+ * always did; `main.ts` passes the live choice. In "full-table" the canvas is
+ * 336 x 616: the panel keeps its own 16-row cabinet band at the top (drawn in
+ * the same top-of-canvas position it always had — the band is simply no
+ * longer over playfield rows), and the board is drawn below it through a
+ * canvas translate with the camera unread.
  */
 export function renderGame(
   context: CanvasRenderingContext2D,
   game: Game,
   scale: number,
   panel?: PanelPresenter | null,
+  framing: RenderFraming = "amiga",
 ): void {
-  const size = canvasSizeFor(scale);
+  const fullTable = framing === "full-table";
+  const size = fullTable
+    ? { width: PLAYFIELD_WIDTH * scale, height: FULL_TABLE_FRAMING_ROWS * scale }
+    : canvasSizeFor(scale);
   context.setTransform(1, 0, 0, 1, 0, 0);
   context.imageSmoothingEnabled = false;
   context.fillStyle = SURROUND;
   context.fillRect(0, 0, size.width, size.height);
 
-  drawPlayfield(context, game.map, game.camera, scale);
+  // The full-table pass hangs the board under the cabinet band with one
+  // translate; the three layers then draw full-source geometry at scale 1
+  // (their `fullTable` flag) instead of reading the camera. The transform is
+  // reset before the panel so the band's own coordinates never move.
+  if (fullTable) context.setTransform(1, 0, 0, 1, 0, PANEL_STRIP_HEIGHT * scale);
+
+  drawPlayfield(context, game.map, game.camera, scale, fullTable);
   // The lamps, straight over the artwork and before anything that sits above
   // the playfield glass: the cached raster stores every insert lit, so this
   // draws the DIM face of each lamp the mission VM is not lighting this frame.
   if (game.lamps !== null) {
-    drawLampOverlays(context, game.map, game.camera, scale, game.lamps, game.modeState, game.tick);
+    drawLampOverlays(
+      context,
+      game.map,
+      game.camera,
+      scale,
+      game.lamps,
+      game.modeState,
+      game.tick,
+      fullTable,
+    );
   }
   // The bats and the balls, as decoded SPRITES on the playfield's own pixel
   // grid — one overlay, bats first and balls over them, which is the original's
@@ -2814,7 +2875,10 @@ export function renderGame(
     tableBallFor(game.map.tableId),
     batFrameStates(game),
     ballFrameStates(game),
+    fullTable,
   );
+
+  if (fullTable) context.setTransform(1, 0, 0, 1, 0, 0);
 
   // The score panel strip, above the playfield view. Drawn after the balls so
   // it sits over them the way the original's panel plane does — a ball rolling

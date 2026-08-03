@@ -42,11 +42,15 @@ import {
   createGame,
   currentScore,
   debugSnapshot,
+  framingRows,
   renderGame,
   startGame,
   tickGame,
 } from "./browser/game-loop.js";
-import type { Game, GameDebugState, GameTickReport } from "./browser/game-loop.js";
+import type { Game, GameDebugState, GameTickReport, RenderFraming } from "./browser/game-loop.js";
+import { VIEWPORT_HEIGHT } from "./browser/camera.js";
+import { attachFrontDoor } from "./browser/front-door.js";
+import type { FrontDoor } from "./browser/front-door.js";
 import { setPlayfieldArtwork, setPlayfieldArtworkHd } from "./browser/playfield-renderer.js";
 import { canvasFitFor } from "./browser/canvas-fit.js";
 import { COARSE_POINTER_QUERY, attachTouch } from "./browser/touch.js";
@@ -197,6 +201,46 @@ function requireContext(canvas: HTMLCanvasElement): CanvasRenderingContext2D {
  */
 let hdActive = false;
 
+/** The version the front door's footer and the game bar print. */
+const BUILD_VERSION = "v0.1.0";
+
+/**
+ * THE FRAMING — the render-layer full-table/Amiga choice of
+ * `RenderFraming` (`game-loop.ts`), owned here beside `hdActive` because it
+ * is the same kind of fact: presentation, never simulation. Default
+ * FULL-TABLE, which is Fantasies' default and the reason the operator asked
+ * for the toggle; persisted so a returning player keeps their choice, and
+ * overridable per link with `?camera=original` / `?camera=amiga` (Fantasies'
+ * own URL contract) or `?camera=full`.
+ */
+const FRAMING_STORAGE_KEY = "pinball-illusions/framing";
+
+function framingFromQuery(search: string): RenderFraming | null {
+  try {
+    const camera = new URLSearchParams(search).get("camera");
+    if (camera === "original" || camera === "amiga") return "amiga";
+    if (camera === "full" || camera === "full-table") return "full-table";
+  } catch {
+    // An unparsable query string chooses nothing.
+  }
+  return null;
+}
+
+function initialFraming(
+  storage: Pick<Storage, "getItem" | "setItem"> | null,
+  search: string,
+): RenderFraming {
+  const fromQuery = framingFromQuery(search);
+  if (fromQuery !== null) return fromQuery;
+  try {
+    const stored = storage?.getItem(FRAMING_STORAGE_KEY);
+    if (stored === "amiga" || stored === "full-table") return stored;
+  } catch {
+    // Blocked storage forgets the choice; it must not stop the boot.
+  }
+  return "full-table";
+}
+
 /** `navigator.connection.saveData`, which counts as a coarse pointer would. */
 function dataSaverRequested(): boolean {
   const connection = (navigator as Navigator & { connection?: { saveData?: boolean } }).connection;
@@ -231,7 +275,12 @@ function coarsePointer(): boolean {
  * 336 x 256 in the corner of the screen and is unplayable — easy to miss,
  * because a development machine always has the HD assets.
  */
-function fitCanvas(canvas: HTMLCanvasElement, stage: HTMLElement, touch: boolean): number {
+function fitCanvas(
+  canvas: HTMLCanvasElement,
+  stage: HTMLElement,
+  touch: boolean,
+  logicalHeight: number,
+): number {
   const fit = canvasFitFor(
     { width: stage.clientWidth, height: stage.clientHeight },
     {
@@ -239,6 +288,7 @@ function fitCanvas(canvas: HTMLCanvasElement, stage: HTMLElement, touch: boolean
       coarsePointer: touch || coarsePointer(),
       dataSaver: dataSaverRequested(),
       devicePixelRatio: window.devicePixelRatio,
+      logicalHeight,
     },
   );
   if (canvas.width !== fit.canvasWidth || canvas.height !== fit.canvasHeight) {
@@ -258,23 +308,42 @@ function fitCanvas(canvas: HTMLCanvasElement, stage: HTMLElement, touch: boolean
 }
 
 /**
+ * The pad button that flips the framing. Read HERE, not through the router:
+ * the view toggle is presentation, so the button was dropped from
+ * `GAMEPAD_BUTTON_BINDINGS` and its edges are detected at this boundary the
+ * way F9/F10 are intercepted ahead of the key router. Button 3 (Y/Triangle),
+ * the binding the sim-side toggle used to hold.
+ */
+const GAMEPAD_VIEW_BUTTON = 3;
+
+/** Last polled state of the view button per pad slot, for the rising edge. */
+const padViewHeld = new Map<number, boolean>();
+
+/**
  * Folds the connected gamepads into the router once per frame.
  *
  * Pads are polled, not evented, so this has to happen before the frame's ticks
  * sample the router or a press would land one frame late. Disconnected slots
  * are dropped explicitly: a pad that vanishes without a `gamepaddisconnected`
  * event would otherwise hold its controls down forever.
+ *
+ * `onViewToggle` fires once per rising edge of the view button on any pad —
+ * the presentation seam, never a control.
  */
-function pollGamepads(router: InputRouter): void {
+function pollGamepads(router: InputRouter, onViewToggle?: () => void): void {
   if (typeof navigator.getGamepads !== "function") return;
   const pads = navigator.getGamepads();
   for (let index = 0; index < pads.length; index += 1) {
     const pad = pads[index];
     if (pad === null || pad === undefined) {
       router.dropGamepad(index);
+      padViewHeld.delete(index);
       continue;
     }
     router.pollGamepad(pad, index);
+    const viewDown = pad.buttons[GAMEPAD_VIEW_BUTTON]?.pressed === true;
+    if (viewDown && padViewHeld.get(index) !== true) onViewToggle?.();
+    padViewHeld.set(index, viewDown);
   }
 }
 
@@ -453,12 +522,38 @@ async function boot(): Promise<void> {
    * shell, the shell's first frame needs a fitted canvas.
    */
   let touch: TouchHandle | null = null;
-  const refit = (): number => fitCanvas(canvas, stage, touch?.active() ?? false);
+
+  /**
+   * The front door, attached below once the effects exist. Declared here so
+   * the key router above it in source order can consult `door.idling()`
+   * without a temporal dead zone.
+   */
+  let door: FrontDoor | null = null;
+
+  /**
+   * THE FRAMING (§2 of the parity brief): full table by default, the Amiga
+   * window as the live toggle. Presentation only — the simulation's own
+   * `forceFullTable` field stays untouched and hashed, and no input path
+   * reaches it any more.
+   */
+  let framing: RenderFraming = initialFraming(storage, window.location.search);
+
+  /**
+   * Logical canvas rows right now: the framing's rows while the playfield
+   * presentation is on screen, the 256-row shell page everywhere else — the
+   * decoded menus and the credits attract are 336 x 256 screens and stay so.
+   */
+  const canvasRows = (): number =>
+    shellDrawsOverPlayfield(shell) ? framingRows(framing) : VIEWPORT_HEIGHT;
+
+  const refit = (): number => fitCanvas(canvas, stage, touch?.active() ?? false, canvasRows());
 
   let scale = refit();
   /** The stage size the canvas was last fitted to. See the frame loop. */
   let stageWidth = stage.clientWidth;
   let stageHeight = stage.clientHeight;
+  /** The logical rows the canvas was last fitted for. See the frame loop. */
+  let fittedRows = canvasRows();
   let table: LoadedTable | null = null;
   /** Set by the tick hook the moment a game reports its last ball gone. */
   let endedWithScore: number | null = null;
@@ -525,11 +620,54 @@ async function boot(): Promise<void> {
 
   thumbnails.warm();
 
+  /**
+   * Flips the framing and persists the choice. A LIVE CUT: refit the canvas,
+   * redraw the frame — no reload, because nothing in this renderer is
+   * startup-baked (which is Fantasies' one limitation this port does not
+   * share; its flag changes composites baked at boot, so it reloads).
+   */
+  const setFraming = (next: RenderFraming): void => {
+    if (next === framing) return;
+    framing = next;
+    try {
+      storage?.setItem(FRAMING_STORAGE_KEY, next);
+    } catch {
+      // A blocked storage forgets the choice; the toggle still works.
+    }
+    scale = refit();
+    fittedRows = canvasRows();
+    draw();
+  };
+
+  const toggleFraming = (): RenderFraming => {
+    setFraming(framing === "full-table" ? "amiga" : "full-table");
+    return framing;
+  };
+
+  /**
+   * The shell, drawn wherever the current canvas puts its 336 x 256 page.
+   *
+   * Over a full-table-framed playfield the canvas is 616 rows and the shell's
+   * cards (quit-confirm, game over, initials, ladder) would otherwise pin to
+   * the top of the picture; a translate centres their 256-row page over the
+   * board. Everywhere else — every framing's play frame aside — the canvas IS
+   * 256 rows and the offset is zero, byte-for-byte the old draw.
+   */
+  const drawShellOverlay = (): void => {
+    const offsetRows =
+      framing === "full-table" && shellDrawsOverPlayfield(shell)
+        ? (framingRows(framing) - VIEWPORT_HEIGHT) >> 1
+        : 0;
+    if (offsetRows > 0) context.setTransform(1, 0, 0, 1, 0, offsetRows * scale);
+    renderShell(context, shell, scale, thumbnails, skin);
+    if (offsetRows > 0) context.setTransform(1, 0, 0, 1, 0, 0);
+  };
+
   const draw = (): void => {
     if (table !== null && shellDrawsOverPlayfield(shell)) {
-      renderGame(context, table.game, scale, table.panel);
+      renderGame(context, table.game, scale, table.panel, framing);
     }
-    renderShell(context, shell, scale, thumbnails, skin);
+    drawShellOverlay();
   };
 
   /**
@@ -653,7 +791,7 @@ async function boot(): Promise<void> {
       game,
       input: router,
       frames: { request: () => 0, cancel: () => undefined },
-      render: (current) => renderGame(context, current, scale, panel),
+      render: (current) => renderGame(context, current, scale, panel, framing),
       onTick,
     });
     return { tableId, game, loop, panel, onTick };
@@ -770,6 +908,7 @@ async function boot(): Promise<void> {
     const keyEvent = event as KeyEventLike;
     // A keypress is a gesture; so is a touch, which is wired below.
     unlockAudio();
+    door?.noteActivity(performance.now());
     // The soft keyboard on the initials screen has its own element and its own
     // `input` handler. Letting the window listener see the same keystroke would
     // type every character twice.
@@ -786,7 +925,35 @@ async function boot(): Promise<void> {
       return;
     }
 
+    // THE FRAMING TOGGLE, intercepted before the input router exactly as the
+    // mute is: F9/F10 flip the render-layer framing (§2 of the parity brief)
+    // and are no longer bound to any control, so the simulation never hears
+    // the key at all. Any phase — the choice is about the canvas, not the
+    // game, and flipping it in a menu simply takes effect on the next table.
+    const code = keyEvent.code ?? "";
+    const keyName = (keyEvent.key ?? "").toLowerCase();
+    if (code === "F9" || code === "F10" || keyName === "f9" || keyName === "f10") {
+      if (keyEvent.repeat !== true) toggleFraming();
+      keyEvent.preventDefault?.();
+      return;
+    }
+
     const key = shellKeyFor(keyEvent);
+
+    // The idle attract behind the front door. The decoded paths keep
+    // working — SPACE forward into the menu, F1-F3 straight to a table,
+    // exactly the filmed 0x1128 behaviour — and every key those screens
+    // would IGNORE wakes the front door instead, which is the §3 rule
+    // ("any key/tap returns to the front door") minus the keys the
+    // authentic navigation itself claims.
+    if (door !== null && door.idling() && shell.phase === "attract") {
+      if (key === null || (key.kind !== "select" && key.kind !== "table")) {
+        door.noteActivity(performance.now());
+        door.refresh(shell.phase, shell.tableId, performance.now());
+        keyEvent.preventDefault?.();
+        return;
+      }
+    }
 
     if (shell.phase === "play") {
       // ESC belongs to the shell on the playfield — the original asks "REALLY
@@ -850,14 +1017,47 @@ async function boot(): Promise<void> {
       return muted;
     },
     muted: () => music.muted(),
+    toggleFraming,
+    framing: () => framing,
   });
+
+  // The front door (§3 of the parity brief): the HTML card page over the
+  // decoded shell. Optional at runtime — a hand-edited page without the
+  // section boots straight into the canvas attract, exactly the old entry.
+  const doorElement = document.getElementById("door");
+  if (doorElement instanceof HTMLElement) {
+    door = attachFrontDoor(doorElement, {
+      // The decoded F-key path, so a card click and F1 are the same state.
+      playTable: (tableId) => apply(shellPlayTable(shell, store, tableId)),
+      ladder: (tableId) => store.load(tableId),
+      gesture: unlockAudio,
+      version: () => BUILD_VERSION,
+    });
+  }
 
   window.addEventListener("keydown", onKeyDown);
   window.addEventListener("keyup", onKeyUp);
   window.addEventListener("blur", () => router.releaseAll());
   // A touch is a gesture too, and on a phone it is the only one there will be.
-  // Capture phase so it is seen before any handler that stops the event.
-  window.addEventListener("pointerdown", unlockAudio, { capture: true });
+  // Capture phase so it is seen before any handler that stops the event; the
+  // same gesture is the idle clock's activity, and — while the idle attract
+  // has the screen — the tap that brings the front door back, swallowed
+  // before the canvas hit test can read it as the attract's SPACE.
+  window.addEventListener(
+    "pointerdown",
+    (event) => {
+      unlockAudio();
+      const now = performance.now();
+      if (door !== null && door.idling() && shell.phase === "attract") {
+        door.noteActivity(now);
+        door.refresh(shell.phase, shell.tableId, now);
+        event.stopPropagation();
+        return;
+      }
+      door?.noteActivity(now);
+    },
+    { capture: true },
+  );
 
   const onViewportChange = (): void => {
     scale = refit();
@@ -944,15 +1144,27 @@ async function boot(): Promise<void> {
    * charging for the time the other owned.
    */
   const frame = (timeMs: number): void => {
-    pollGamepads(router);
+    pollGamepads(router, toggleFraming);
+    // The front door follows the shell's phase and the idle clock; it owns
+    // the `data-door-mode` attribute the stylesheet reads.
+    door?.refresh(shell.phase, shell.tableId, timeMs);
+    const covered = door?.showing() === true;
     // Read the layout BEFORE the deck writes to it, so a relabel never forces a
     // synchronous reflow. Two integers compared per frame is nothing, and it
     // makes the fit self-healing: the `ResizeObserver` above reacts sooner, but
     // this catches the deck appearing for the first time, a browser without an
     // observer, and anything else that changes the box without a resize event.
-    if (stage.clientWidth !== stageWidth || stage.clientHeight !== stageHeight) {
+    // Skipped while the door covers the cabinet: the stage measures zero
+    // under `display: none`, and a fit against nothing is a fit to undo.
+    if (
+      !covered &&
+      (stage.clientWidth !== stageWidth ||
+        stage.clientHeight !== stageHeight ||
+        canvasRows() !== fittedRows)
+    ) {
       stageWidth = stage.clientWidth;
       stageHeight = stage.clientHeight;
+      fittedRows = canvasRows();
       scale = refit();
     }
     // The deck's five buttons are a function of the phase — the cabinet's
@@ -985,14 +1197,18 @@ async function boot(): Promise<void> {
       }
       // The shell draws nothing over a live table, but a card raised on this
       // very frame has to appear on the frame that raised it.
-      if (shell.phase !== "play") renderShell(context, shell, scale, thumbnails, skin);
+      if (shell.phase !== "play") drawShellOverlay();
       window.requestAnimationFrame(frame);
       return;
     }
 
     if (table !== null && !table.loop.scheduler.paused) table.loop.scheduler.pause();
     apply(shellClock.frame(timeMs, shell, store));
-    draw();
+    // No canvas work while the HTML door covers the cabinet — the shell's
+    // clocks keep running above (the attract lap and the palette cycle are
+    // free-running, exactly as the machine's are), so the roll the idle
+    // handoff reveals is mid-flight, not restarted.
+    if (!covered) draw();
     window.requestAnimationFrame(frame);
   };
 
@@ -1046,6 +1262,18 @@ async function boot(): Promise<void> {
       await openTable(tableId);
     },
   };
+
+  // `?table=<id>` boots straight into a game — the front door's card hrefs
+  // and Fantasies' own URL contract. Through the same decoded F-key path a
+  // click takes, so a shared link and a keypress are the same state.
+  try {
+    const bootTable = new URLSearchParams(window.location.search).get("table");
+    if (bootTable !== null && isTableId(bootTable)) {
+      apply(shellPlayTable(shell, store, bootTable));
+    }
+  } catch {
+    // An unparsable query string boots the front door, which is the default.
+  }
 
   window.requestAnimationFrame(frame);
 }

@@ -90,27 +90,42 @@ export function chooseRenderScale(cssWidth: number, options: RenderScaleOptions 
 }
 
 /**
- * The largest 336 x 256 picture that fits a box, aspect preserved.
+ * The largest 336 x `logicalHeight` picture that fits a box, aspect preserved.
  *
  * Rounded rather than floored so a picture that is a hair under a whole pixel
  * does not lose a whole row; the two axes are rounded independently, which can
  * leave the aspect a fraction of a pixel out and is exactly what the pre-mobile
  * code did.
+ *
+ * `logicalHeight` defaults to the 256-row Amiga window; the full-table framing
+ * passes its 616 rows (`FULL_TABLE_FRAMING_ROWS`) and gets the tall picture —
+ * which on a portrait phone is finally the natural fit, the reason Fantasies
+ * made that framing its default.
  */
-export function fitWindowInto(available: FitSize): FitSize {
+export function fitWindowInto(
+  available: FitSize,
+  logicalHeight: number = VIEWPORT_HEIGHT,
+): FitSize {
   const width = Number.isFinite(available.width) ? available.width : 0;
   const height = Number.isFinite(available.height) ? available.height : 0;
-  if (width <= 0 || height <= 0) return { width: PLAYFIELD_WIDTH, height: VIEWPORT_HEIGHT };
-  const fit = Math.min(width / PLAYFIELD_WIDTH, height / VIEWPORT_HEIGHT);
+  if (width <= 0 || height <= 0) return { width: PLAYFIELD_WIDTH, height: logicalHeight };
+  const fit = Math.min(width / PLAYFIELD_WIDTH, height / logicalHeight);
   return {
     width: Math.max(1, Math.round(PLAYFIELD_WIDTH * fit)),
-    height: Math.max(1, Math.round(VIEWPORT_HEIGHT * fit)),
+    height: Math.max(1, Math.round(logicalHeight * fit)),
   };
 }
 
 export interface CanvasFitOptions extends RenderScaleOptions {
   /** True once a table's 4x master has registered. */
   readonly hd: boolean;
+  /**
+   * Logical canvas rows — 256 (the Amiga window, the default) or 616 (the
+   * full-table framing). The framing's own row count, handed in by the host
+   * exactly as the stage size is: `canvas-fit` stays a pure geometry decision
+   * with no knowledge of which framing is live or why.
+   */
+  readonly logicalHeight?: number | undefined;
 }
 
 export interface CanvasFit {
@@ -154,24 +169,25 @@ export interface CanvasFit {
  *    because a development machine always has the HD assets.
  */
 export function canvasFitFor(available: FitSize, options: CanvasFitOptions): CanvasFit {
+  const logicalHeight = options.logicalHeight ?? VIEWPORT_HEIGHT;
   const cssFit = options.hd || options.coarsePointer === true;
   if (!cssFit) {
-    const scale = integerScaleFor(available.width, available.height);
+    const scale = integerScaleFor(available.width, available.height, logicalHeight);
     return {
       scale,
       canvasWidth: PLAYFIELD_WIDTH * scale,
-      canvasHeight: VIEWPORT_HEIGHT * scale,
+      canvasHeight: logicalHeight * scale,
       cssWidth: null,
       cssHeight: null,
       smooth: false,
     };
   }
-  const painted = fitWindowInto(available);
+  const painted = fitWindowInto(available, logicalHeight);
   const scale = chooseRenderScale(painted.width, options);
   return {
     scale,
     canvasWidth: PLAYFIELD_WIDTH * scale,
-    canvasHeight: VIEWPORT_HEIGHT * scale,
+    canvasHeight: logicalHeight * scale,
     cssWidth: painted.width,
     cssHeight: painted.height,
     smooth: true,

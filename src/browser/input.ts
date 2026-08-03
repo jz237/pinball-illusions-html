@@ -154,44 +154,57 @@ export function plungerInputFrom(snapshot: ControlSnapshot): PlungerInput {
  * Keyboard defaults, by `KeyboardEvent.code` so they follow the physical key
  * rather than the layout.
  *
- * THE ORIGINAL'S CONTROLS ARE NOW OBSERVED, not remembered: filmed under
- * emulation with an input-mark log, RETURN launches the ball (the DMD attract
- * text says so in as many words), the two SHIFT keys are the flippers, and
- * SPACE is the NUDGE — it shakes the view a pixel or two and feeds the tilt
- * counter. Space used to be this port's plunger, which had the one key the
- * original uses for shoving the table winding an invented spring instead.
+ * THE PRIMARY SCHEME IS PINBALL FANTASIES', BY THE OPERATOR'S CHOICE: Z/← and
+ * //→ are the flippers, ↑/X is the nudge, Space/↓ is the launch, P pauses —
+ * the exact map the sibling Pinball Fantasies HD build ships
+ * (`src/browser/pinball-browser-input.ts` there). The film-verified Illusions
+ * originals all SURVIVE AS ALIASES wherever they do not collide: the two
+ * SHIFT keys still flip (filmed under emulation with an input-mark log), and
+ * RETURN still both starts and launches (the DMD attract says "RETURN
+ * LAUNCHES BALL" in as many words).
  *
- * Enter is bound to `start`, and the game loop treats a `start` press during
- * play as the launch edge — one key, both meanings, exactly as the original's
- * RETURN both starts from the shell and launches in play. The `plunger`
- * control remains for the gamepad face button and the on-screen touch button.
+ * The two schemes genuinely conflict in two places, resolved here and
+ * recorded in research/FANTASIES_PARITY_BRIEF.md §1.3:
  *
- * Z and / stay as flipper aliases for keyboards that put the shifts somewhere
- * unhelpful, and the comma and full stop for the many Amiga ports that used
- * them; the arrows stay as nudge aliases (they are inert on the original, so
- * the alias shadows nothing). The upper flipper gets one key per hand — X
- * under the left flipper key, the semicolon beside the right — because which
- * hand is free depends on the table.
+ *  - SPACE. Film-verified NUDGE on the Illusions original; the plunger in
+ *    Fantasies. Space follows Fantasies and LAUNCHES; the film-verified nudge
+ *    survives on ArrowUp and gains Fantasies' X. No spring is invented to go
+ *    with it: Illusions' decoded launcher is a fixed kick on the press edge
+ *    (`src/game/plunger.ts`), so Space maps onto the existing `plunger`
+ *    control — the same launch edge `start` fires — with zero sim change.
+ *  - THE ARROWS. Inert on the Illusions original, so re-binding them loses
+ *    nothing verified: Left/Right become flippers (they were this port's
+ *    side-nudge aliases; the side nudges stay reachable on the gamepad
+ *    stick, matching Fantasies' single nudge), Up stays the nudge, Down
+ *    becomes the launch.
+ *
+ * The upper flipper — a control Fantasies has no key for, because its tables
+ * have no upper bats — keeps one key per hand: A under the left hand (X, the
+ * old left-hand key, is now the Fantasies nudge) and the semicolon beside
+ * the right. Comma and full stop stay as flipper aliases for the many Amiga
+ * ports that used them. F9/F10 are deliberately ABSENT here: the view toggle
+ * is a presentation choice, not a simulation input, and `main.ts` intercepts
+ * those keys ahead of this router (see the framing seam there).
  */
 export const KEY_CODE_BINDINGS: Readonly<Record<string, Control>> = Object.freeze({
   KeyZ: "leftFlipper",
   Comma: "leftFlipper",
   ShiftLeft: "leftFlipper",
+  ArrowLeft: "leftFlipper",
   Slash: "rightFlipper",
   Period: "rightFlipper",
   ShiftRight: "rightFlipper",
-  KeyX: "upperFlipper",
+  ArrowRight: "rightFlipper",
+  KeyA: "upperFlipper",
   Semicolon: "upperFlipper",
-  Space: "nudgeForward",
-  ArrowLeft: "nudgeLeft",
-  ArrowRight: "nudgeRight",
+  KeyX: "nudgeForward",
   ArrowUp: "nudgeForward",
+  Space: "plunger",
+  ArrowDown: "plunger",
   Enter: "start",
   NumpadEnter: "start",
   Escape: "pause",
   KeyP: "pause",
-  F9: "toggleWholeTableView",
-  F10: "toggleWholeTableView",
 });
 
 /**
@@ -205,30 +218,40 @@ export const KEY_CODE_BINDINGS: Readonly<Record<string, Control>> = Object.freez
 export const KEY_NAME_BINDINGS: Readonly<Record<string, Control>> = Object.freeze({
   z: "leftFlipper",
   ",": "leftFlipper",
+  arrowleft: "leftFlipper",
   "/": "rightFlipper",
   ".": "rightFlipper",
-  x: "upperFlipper",
+  arrowright: "rightFlipper",
+  a: "upperFlipper",
   ";": "upperFlipper",
-  " ": "nudgeForward",
-  spacebar: "nudgeForward",
-  arrowleft: "nudgeLeft",
-  arrowright: "nudgeRight",
+  x: "nudgeForward",
   arrowup: "nudgeForward",
+  " ": "plunger",
+  spacebar: "plunger",
+  arrowdown: "plunger",
   enter: "start",
   escape: "pause",
   esc: "pause",
   p: "pause",
-  f9: "toggleWholeTableView",
-  f10: "toggleWholeTableView",
 });
 
 /**
- * Standard-gamepad button numbers. Shoulders flip, because that is where a
- * pinball player's fingers already are, and the face button plunges.
+ * Standard-gamepad button numbers: Fantasies' mapping first, Illusions' extras
+ * kept where Fantasies is silent.
+ *
+ * From Fantasies (`StandardPinballGamepadReader` there): shoulders 4/5 AND the
+ * d-pad's 14/15 flip — a d-pad is under the same thumb a flipper button wants —
+ * and 2 (X/Square) is the nudge. Kept from this port because Fantasies binds
+ * nothing there: 8 pause, 9 start, 12 (d-pad up) as a second nudge, and — a
+ * deliberate deviation — 6/7 stay the UPPER flipper rather than duplicating
+ * the lower bats, because Fantasies' triggers duplicate only for want of the
+ * upper bats Illusions actually has. Button 3 is deliberately ABSENT: it is
+ * the view toggle, which is presentation, and `main.ts` reads its edges
+ * itself before this table is consulted.
  */
 export const GAMEPAD_BUTTON_BINDINGS: Readonly<Record<number, Control>> = Object.freeze({
   0: "plunger",
-  3: "toggleWholeTableView",
+  2: "nudgeForward",
   4: "leftFlipper",
   5: "rightFlipper",
   6: "upperFlipper",
@@ -236,8 +259,8 @@ export const GAMEPAD_BUTTON_BINDINGS: Readonly<Record<number, Control>> = Object
   8: "pause",
   9: "start",
   12: "nudgeForward",
-  14: "nudgeLeft",
-  15: "nudgeRight",
+  14: "leftFlipper",
+  15: "rightFlipper",
 });
 
 export interface GamepadAxisBinding {

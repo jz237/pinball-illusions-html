@@ -324,10 +324,18 @@ export function invalidatePlayfieldRaster(map?: TableMap): void {
  * Whole numbers only. A fractional scale means some source pixels cover more
  * output pixels than their neighbours, which at this resolution is instantly
  * visible as wobbling rails — worse than a slightly smaller picture.
+ *
+ * `logicalHeight` is the framing's row count — 256 for the Amiga window, 616
+ * for the full-table framing — defaulted so every existing caller keeps the
+ * window it always had.
  */
-export function integerScaleFor(availableWidth: number, availableHeight: number): number {
+export function integerScaleFor(
+  availableWidth: number,
+  availableHeight: number,
+  logicalHeight: number = VIEWPORT_HEIGHT,
+): number {
   const horizontal = Math.floor(availableWidth / PLAYFIELD_WIDTH);
-  const vertical = Math.floor(availableHeight / VIEWPORT_HEIGHT);
+  const vertical = Math.floor(availableHeight / logicalHeight);
   const fit = Math.min(horizontal, vertical);
   return Number.isFinite(fit) && fit >= 1 ? fit : 1;
 }
@@ -374,6 +382,39 @@ export function playfieldBlitGeometry(map: TableMap, camera: CameraState, scale:
     destWidth: size.x * scale,
     destHeight: size.y * scale,
   };
+}
+
+/**
+ * The blit for the FULL-TABLE FRAMING: every playfield row at scale 1, no
+ * camera transform at all.
+ *
+ * This is the presentation-layer framing the Fantasies-parity round added —
+ * the whole 336 x 600 board on a tall canvas, the way Pinball Fantasies HD's
+ * default view scales logical space directly (`applyPlayfieldTransform`
+ * there) — and it deliberately does NOT read the camera: `game.camera` keeps
+ * stepping inside the hashed simulation state and is simply not consulted.
+ * The caller places the board under the cabinet panel band with a canvas
+ * translate; this geometry is always the full source at `scale`.
+ */
+export function playfieldFullTableGeometry(map: TableMap, scale: number): BlitGeometry {
+  return {
+    sourceX: 0,
+    sourceY: 0,
+    sourceWidth: map.width,
+    sourceHeight: map.height,
+    destWidth: map.width * scale,
+    destHeight: map.height * scale,
+  };
+}
+
+/**
+ * Smoothing for a full-table-framing blit of the HD sources: 1:1 at the
+ * master's own scale (nearest keeps it exact), a supersampled downscale below
+ * it (bilinear resolves it) — the same rule `hdBlitSmoothing` applies to the
+ * scrolling window, restated without the camera because this framing has none.
+ */
+export function hdFullTableSmoothing(scale: number): boolean {
+  return scale !== HD_SCALE;
 }
 
 /** The two context methods the upload needs, shared by both canvas flavours. */
@@ -527,17 +568,27 @@ export function hdBlitSmoothing(camera: CameraState, scale: number = HD_SCALE): 
  * Smoothing is set on every call rather than once at setup, because a context
  * is shared with whatever else draws this frame and any of them may have
  * changed it.
+ *
+ * `fullTable` selects the presentation-layer full-table framing: the whole
+ * board at scale 1 with the camera left unread (`playfieldFullTableGeometry`).
+ * Defaulted off so every existing caller keeps the windowed behaviour
+ * byte-for-byte.
  */
 export function drawPlayfield(
   context: BlitContext,
   map: TableMap,
   camera: CameraState,
   scale: number,
+  fullTable = false,
 ): void {
-  const geometry = playfieldBlitGeometry(map, camera, scale);
+  const geometry = fullTable
+    ? playfieldFullTableGeometry(map, scale)
+    : playfieldBlitGeometry(map, camera, scale);
   const hd = playfieldImageSourceHd(map);
   if (hd !== null) {
-    context.imageSmoothingEnabled = hdBlitSmoothing(camera, scale);
+    context.imageSmoothingEnabled = fullTable
+      ? hdFullTableSmoothing(scale)
+      : hdBlitSmoothing(camera, scale);
     context.drawImage(
       hd,
       geometry.sourceX * HD_SCALE,

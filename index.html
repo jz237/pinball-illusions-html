@@ -19,16 +19,89 @@
     <link rel="stylesheet" href="./src/browser/styles.css" />
   </head>
   <body>
+    <!--
+      THE FRONT DOOR — the same kind of title screen as Pinball Fantasies HD:
+      an HTML page, a CSS-gradient wordmark (no logo art exists there either),
+      one card per table with a champion line from the local ladder, and a
+      key-legend footer. A card boots straight into a game, which is already
+      Illusions' own decoded behaviour (`shellTableLoaded` returns start-game).
+
+      The decoded canvas shell SURVIVES BEHIND THIS DOOR, layered: after
+      thirty idle seconds `front-door.ts` hands the screen to the film-verified
+      credits attract (the disk's own twelve pages over the tumbling-object
+      backdrops), and any key or tap hands it back. SPACE from that attract
+      still opens the decoded menu / table select / info screens, exactly as
+      the machine's own front end works. Nothing decoded was deleted for this
+      page — it is a front door, not a replacement. See
+      research/FANTASIES_PARITY_BRIEF.md §3.
+
+      `front-door.ts` fills the data (names, blurbs, champion lines) from the
+      same modules the canvas shell reads — SHELL_TABLES and the high-score
+      ladder — so this markup carries structure and static copy only.
+    -->
+    <section id="door" class="door" hidden>
+      <header class="door__mast">
+        <p class="door__eyebrow">Three tables · three balls · one credit</p>
+        <h1 class="door__wordmark">Pinball <span class="door__wordmark-accent">Illusions</span></h1>
+        <p class="door__tagline">
+          The 1995 Digital Illusions AGA classic, reconstructed for the browser —
+          decoded rules, physics and art.
+        </p>
+      </header>
+
+      <div class="door__cards">
+        <a class="door__card" href="?table=law-n-justice" data-door-table="law-n-justice">
+          <span class="door__thumb"><img class="door__thumb-art" alt="" data-door-thumb="law-n-justice" /></span>
+          <span class="door__card-name" data-door-name="law-n-justice"></span>
+          <span class="door__card-blurb" data-door-blurb="law-n-justice"></span>
+          <span class="door__card-champ" data-door-champ="law-n-justice"></span>
+          <span class="door__card-play">Play</span>
+        </a>
+        <a class="door__card" href="?table=babewatch" data-door-table="babewatch">
+          <span class="door__thumb"><img class="door__thumb-art" alt="" data-door-thumb="babewatch" /></span>
+          <span class="door__card-name" data-door-name="babewatch"></span>
+          <span class="door__card-blurb" data-door-blurb="babewatch"></span>
+          <span class="door__card-champ" data-door-champ="babewatch"></span>
+          <span class="door__card-play">Play</span>
+        </a>
+        <a class="door__card" href="?table=extreme-sports" data-door-table="extreme-sports">
+          <span class="door__thumb"><img class="door__thumb-art" alt="" data-door-thumb="extreme-sports" /></span>
+          <span class="door__card-name" data-door-name="extreme-sports"></span>
+          <span class="door__card-blurb" data-door-blurb="extreme-sports"></span>
+          <span class="door__card-champ" data-door-champ="extreme-sports"></span>
+          <span class="door__card-play">Play</span>
+        </a>
+      </div>
+
+      <footer class="door__foot">
+        <p class="door__keys">
+          Z/← left flipper · //→ right flipper · Space launch · X/↑ nudge ·
+          A/; upper flipper · P pause · F1–F3 tables · F9 view
+        </p>
+        <p class="door__tribute">
+          A personal reconstruction. Original game © 1995 Digital Illusions /
+          21st Century Entertainment.
+        </p>
+        <p class="door__version" data-door-version></p>
+      </footer>
+    </section>
+
     <main class="cabinet">
       <!--
-        The touch chrome. Present in every build and hidden by the stylesheet
-        unless the pointer is coarse or a finger has actually been seen, so a
-        desktop cabinet is still the screen and nothing else. Drawn entirely in
-        CSS: any new raster would need a manifest claim and a digest, and the
-        build guard reads HTML and CSS as text without restricting them.
+        The GAME BAR — the Fantasies-style strip over the table (back to the
+        card page, the table's name, the framing button labelled with the
+        CURRENT framing, the sound toggle) — which is also the touch top bar
+        it always was. On a desktop the stylesheet shows it only while a table
+        is up (`html[data-door-mode="game"]`); on touch it is always present.
+        Drawn entirely in CSS: any new raster would need a manifest claim and
+        a digest, and the build guard reads HTML and CSS as text without
+        restricting them. BACK goes through the decoded quit-confirm — the
+        shell's own "REALLY QUIT TABLE?" — never straight out of a game.
       -->
       <div class="topbar" aria-label="Machine controls">
-        <button type="button" class="topbar__button" data-bar-action="back">BACK</button>
+        <button type="button" class="topbar__button" data-bar-action="back">‹ TABLES</button>
+        <span class="topbar__title" data-bar-title></span>
+        <span class="topbar__keys">Z/← · //→ · Space launch · X/↑ nudge</span>
         <button type="button" class="topbar__button" data-bar-action="view">TABLE</button>
         <button type="button" class="topbar__button" data-bar-action="mute">SOUND ON</button>
       </div>
