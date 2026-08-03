@@ -1187,14 +1187,121 @@ function sweepToContact(
    * of null means the centre sweep refused the point and there is no surface to
    * bounce off — the anti-tunnelling backstop, which only fires for geometry the
    * ring is blind to, since the ring sees a wall a full radius earlier.
+   *
+   * ---------------------------------------------------------------------------
+   * THE CONTACT IS JUDGED, AND THE BOUNCE TAKEN, ONE PIXEL INTO THE SURFACE
+   * ---------------------------------------------------------------------------
+   * The original never evaluates a contact at tangency. Its frame (main.seg00
+   * +0x00A618) is four groups of [test-and-respond at the CURRENT position,
+   * then two free `pos += v>>1` substeps at +0x00B6E8]; the responder at
+   * +0x00B4BA never writes position, and the test only fires when the blit
+   * finds ring pixels overlapping the outline — so every contact the machine
+   * resolves is read from a ball that has already penetrated the touch band,
+   * by anything up to a quarter frame of path. From inside the band the ring
+   * STRADDLES the surface and the mean of the touched bearings is the face
+   * normal; the machine's +0x00B54E gate then drops the many overlapped
+   * positions that read "not approaching", which is how a ball slides along a
+   * wall it is pressed against.
+   *
+   * This sweep finds contact at exact first touch, where the hit set is only
+   * the one or two LEADING edge pixels and their mean tilts toward the
+   * direction of travel by up to half a ring step — 80/2048 of a turn against
+   * a one-pixel wall stair. The tilt manufactures approach speed out of what
+   * is really tangential motion, and the responder then kills or bounces
+   * speed the machine never loses; and because first touch is one exact
+   * alignment, the port deterministically picked the single worst sample on
+   * every face. Measured on BabeWatch's untouched launch (the round-8 RAM
+   * telemetry in research/PARITY_DELTAS.md): the launch-guide's mouth face at
+   * (291..295, 209..218) read at tangency as the two-pixel edge {1104,1193},
+   * whose 22-degree-tilted mean turned a 0.35 px/f wall-slide into a full
+   * bounce — the ball crossed the table top 1.3 px/f slow, sagged to y47
+   * instead of apexing at y32, and missed the top-lane saucer and its
+   * +500,000. One pixel inside the band the same face reads {1024,1065,1156,
+   * 1193}, and the same responder answers the graze the original's live RAM
+   * shows: vx +2.75 -> kept vy, 0.35 px/f lost.
+   *
+   * So the verdict and the bounce are taken from the ring INSIDE the band, at
+   * the machine's own evaluation depth — one collision-pass spacing, |v|/4 of
+   * path, walked in whole pixels along the contact bearing and clamped to the
+   * deepest position whose centre is still free:
+   *
+   *   - along the BEARING, not the path: penetration deepens the overlap
+   *     toward the surface whatever direction the ball crosses it, where a
+   *     path-directed step walks ALONG a face met obliquely and reads the
+   *     same tilted edge one pixel over;
+   *   - |v|/4 because that is the machine's spacing between evaluations
+   *     (four responder calls a frame, two `pos += v>>1` substeps apart): a
+   *     contact that matters persists across its passes, and the passes
+   *     after discovery read it from about that depth. Floored at one pixel
+   *     so a slow ball still evaluates from inside the band, and capped by
+   *     the free-centre clamp;
+   *   - at depth the read is honest in a way tangency can never be: a
+   *     one-pixel line crosses the ring as a symmetric chord and reads its
+   *     TRUE normal, a thick wall reads its interior straddle, and the
+   *     leading-edge tilt exists only at the tangent alignment. Measured on
+   *     the launch corridor: the guide step at (330,396) reads mean 0 — not
+   *     approaching, ball runs on — and the left-wall read turns the
+   *     tangency set's spurious 22-degree tilt into the face's own normal,
+   *     which is the difference between this port killing 4.9 px/f at the
+   *     wall-join and the RAM-measured original losing 0.35;
+   *   - the BALL still stops at the last free sample, exactly as before: the
+   *     machine resolves penetration by motion because its responder cannot
+   *     move a ball, and this port resolves it by never entering — what must
+   *     agree is the CONTACT SET THE RESPONSE IS COMPUTED FROM, not where
+   *     the ball sits for one frame;
+   *   - an overlapped probe that touches NOTHING is a lone pixel fallen
+   *     inside the hollow ring — invisible to the machine's stencil at
+   *     overlap too — and an overlapped probe the ball is LEAVING is the
+   *     machine's +0x00B54E gate; both let the sweep run on, with the
+   *     touched pixels still logged, since the machine's id dispatch
+   *     (+0x00AD42) runs off the overlap before its responder decides
+   *     anything;
+   *   - when even the first inward pixel's CENTRE is inside solid the wall
+   *     is thinner than any overlap this can take and the tangent set
+   *     stands — the machine would tunnel here, and the port's
+   *     anti-tunnelling guarantee is not for sale.
    */
   const stopperAt = (t: number, record: boolean): { readonly probe: RingProbe | null } | null => {
     const point = pointAt(t);
     if (!centreIsFree(map, passable, point.x, point.y)) return { probe: null };
 
     const probe = probeRing(map, materials, passable, ring, point.x, point.y);
-    if (probe.contactIndex < 0) return null;
+    if (probe.contactIndex < 0 || probe.normalAngle === null) return null;
     if (record) logContacts(log, probe, materials);
+
+    // The machine's evaluation depth: one collision-pass spacing of path,
+    // |v|/4, in whole pixels. NOT floored — a ball slower than a pixel per
+    // quarter tick penetrates nothing between the machine's passes, so its
+    // evaluation position IS the tangent one; that is what parks a ball
+    // resting in a slot narrower than itself (the mean of both rails is a
+    // phantom floor), and a floor of one pixel here let exactly that ball
+    // ratchet out through a gap it cannot fit. The bearing unit vector is
+    // the outward normal negated, which cosineUnits/sineUnits deliver as
+    // exact Q10 components of a unit pixel step.
+    const speed = integerSqrt(
+      ball.velocityX * ball.velocityX + ball.velocityY * ball.velocityY,
+    );
+    const depth = speed >> 12;
+    let overlapX = point.x;
+    let overlapY = point.y;
+    let inside = false;
+    for (let step = 1; step <= depth; step += 1) {
+      const x = (point.x - step * probe.normalX) | 0;
+      const y = (point.y - step * probe.normalY) | 0;
+      if (!centreIsFree(map, passable, x, y)) break;
+      overlapX = x;
+      overlapY = y;
+      inside = true;
+    }
+    if (inside) {
+      const overlapped = probeRing(map, materials, passable, ring, overlapX, overlapY);
+      if (overlapped.contactIndex < 0) return null;
+      if (record) logContacts(log, overlapped, materials);
+      const intoOverlap =
+        q10Multiply(ball.velocityX, overlapped.normalX) +
+        q10Multiply(ball.velocityY, overlapped.normalY);
+      return intoOverlap < 0 ? { probe: overlapped } : null;
+    }
 
     // The un-snapped normal, which is also what the bounce is taken about; see
     // `outwardNormalOf`. Using the ring entry here and the exact vector there

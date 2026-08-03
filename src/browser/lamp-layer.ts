@@ -219,7 +219,7 @@ export function drawLampOverlays(
       hd.context.drawImage(face, patch.destX, patch.destY);
     }
     const geometry = playfieldBlitGeometry(map, camera, scale);
-    context.imageSmoothingEnabled = hdBlitSmoothing(camera);
+    context.imageSmoothingEnabled = hdBlitSmoothing(camera, scale);
     context.drawImage(
       hd.canvas,
       geometry.sourceX * HD_SCALE,

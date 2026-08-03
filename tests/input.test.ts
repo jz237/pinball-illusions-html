@@ -409,6 +409,98 @@ describe("touch and pointers", () => {
     expect(wasReleased(snapshot, "start")).toBe(true);
     expect(isDown(snapshot, "start")).toBe(false);
   });
+
+  /**
+   * The cradle, at the level the simulation actually sees it.
+   *
+   * A held bat is not a repeated press: `flipperStroke` reads `isDown` every
+   * tick and the stroke holds the bat up for as long as that is true, so what a
+   * finger on the glass has to produce is one press edge and then `down` on
+   * every tick until it lifts. Three seconds at 50 Hz is 150 ticks; ten is
+   * enough to prove the shape and cheap enough to keep.
+   */
+  it("holds a flipper for as long as the finger is down, with one press edge", () => {
+    const router = new InputRouter();
+    router.pointerDown(7, "leftFlipper");
+
+    let presses = 0;
+    for (let tick = 0; tick < 150; tick += 1) {
+      const snapshot = router.sample();
+      expect(isDown(snapshot, "leftFlipper")).toBe(true);
+      expect(wasReleased(snapshot, "leftFlipper")).toBe(false);
+      if (wasPressed(snapshot, "leftFlipper")) presses += 1;
+    }
+    expect(presses).toBe(1);
+
+    expect(router.pointerUp(7)).toBe("leftFlipper");
+    const lifted = router.sample();
+    expect(isDown(lifted, "leftFlipper")).toBe(false);
+    expect(wasReleased(lifted, "leftFlipper")).toBe(true);
+  });
+
+  it("keeps three fingers on three controls independent", () => {
+    const router = new InputRouter();
+    router.pointerDown(1, "leftFlipper");
+    router.pointerDown(2, "rightFlipper");
+    router.pointerDown(3, "nudgeForward");
+
+    const all = router.sample();
+    expect(isDown(all, "leftFlipper")).toBe(true);
+    expect(isDown(all, "rightFlipper")).toBe(true);
+    expect(isDown(all, "nudgeForward")).toBe(true);
+    expect(router.holdersOf("leftFlipper")).toEqual(["pointer:1"]);
+    expect(router.holdersOf("rightFlipper")).toEqual(["pointer:2"]);
+    expect(router.holdersOf("nudgeForward")).toEqual(["pointer:3"]);
+
+    router.pointerUp(3);
+    const bats = router.sample();
+    expect(isDown(bats, "leftFlipper")).toBe(true);
+    expect(isDown(bats, "rightFlipper")).toBe(true);
+    expect(isDown(bats, "nudgeForward")).toBe(false);
+  });
+
+  /**
+   * The stuck-flipper backstop, which is the whole reason `touch.ts` listens on
+   * `window` in the capture phase and on `pagehide`. Whatever route the release
+   * arrives by, it must leave the router with nothing held and no pointer
+   * remembered — and a later pointer-up for the same id must then be inert
+   * rather than a second, phantom release.
+   */
+  it("releases everything mid-hold and forgets the pointers", () => {
+    const router = new InputRouter();
+    router.pointerDown(1, "leftFlipper");
+    router.pointerDown(2, "rightFlipper");
+    router.sample();
+
+    router.releaseAll();
+    const cleared = router.sample();
+    for (const control of ["leftFlipper", "rightFlipper"] as const) {
+      expect(isDown(cleared, control)).toBe(false);
+      expect(releaseCount(cleared, control)).toBe(1);
+    }
+
+    expect(router.pointerUp(1)).toBeNull();
+    expect(router.pointerUp(2)).toBeNull();
+    const after = router.sample();
+    for (const control of CONTROLS) {
+      expect(edgesFor(after, control).releaseCount).toBe(0);
+    }
+  });
+
+  it("launches exactly once however long the launch button is held", () => {
+    const router = new InputRouter();
+    router.pointerDown(4, "plunger");
+
+    let fired = 0;
+    for (let tick = 0; tick < 40; tick += 1) {
+      const snapshot = router.sample();
+      if (tickLauncher(plungerInputFrom(snapshot), DEFAULT_PLUNGER_CONFIG).fired) fired += 1;
+    }
+    router.pointerUp(4);
+    if (tickLauncher(plungerInputFrom(router.sample()), DEFAULT_PLUNGER_CONFIG).fired) fired += 1;
+
+    expect(fired).toBe(1);
+  });
 });
 
 describe("gamepads", () => {

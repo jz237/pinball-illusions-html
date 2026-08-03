@@ -56,11 +56,29 @@ const TICKS = 4000;
  * 4,000-tick scripted games hash identically before and after the fix — no
  * ball position, velocity, score or serve in this script's coverage moved;
  * only the stillness bookkeeping did.
+ *
+ * RE-PIN, overlapped contact evaluation (the BabeWatch wall-join round): the
+ * sweep's bounce used to be computed from the ring at exact first touch,
+ * where the hit set is only the leading edge pixels of the surface and their
+ * mean tilts into the direction of travel — against the round-8 RAM
+ * telemetry that tilt turned the launch guide's wall-slide into a bounce and
+ * killed 4.9 px/f at the top-right wall-join where the original loses 0.35.
+ * The response probe is now read one collision-pass spacing (|v|/4, whole
+ * pixels, zero for a slow ball) INTO the contact along the mean bearing,
+ * which is where the original's own penetrating sampler evaluates every
+ * contact it resolves (main.seg00 +0x00A618 frame structure; +0x00B54E
+ * leaving-gate). Every wall contact on every table can move by up to the
+ * tilt of an edge set, so all three hashes moved. The gates that held:
+ * census 90 games x 3 tables, 0 write-offs, 0 stalls; anomaly sweep
+ * strictly cleaner than HEAD (teleport 2 -> 0, over-clamp 4 -> 1,
+ * game-stalled 1 -> 0, search-pulse 1 -> 0, lock-runaway 0 -> 0); tip-flip
+ * sweep pass-under 0/1122; film side-by-side byte-identical at
+ * 98.4508/99.8645/99.1322.
  */
 const PINNED: Record<TableId, string> = {
-  "law-n-justice": "258d036a101029117c244a00c5b5ec4b393e3f921097d09744f15569ec3280a5",
-  "babewatch": "42ba53da1772e4b05c956a04c5cb5a23055e93cd82b6f3f215b2c694146e75d4",
-  "extreme-sports": "28fea99c93643581901e95c379c6494b760f237667c3b00204a3260b1932d9f9",
+  "law-n-justice": "284c980c86dd3d2dc8ec82842d47bd6ae5adf020f92f5e89822079d19f9f2576",
+  "babewatch": "e8e4afb0543081f6b57c6bb0e67c0fbb1f012ae57c04a650b99e256249645710",
+  "extreme-sports": "a74be0c098fa34bd36f2bb96fb5e41635b1d837f70f1926e420f836b63c224f5",
 };
 
 /** Same shape as the determinism harness's input: behaviour = f(tick index). */

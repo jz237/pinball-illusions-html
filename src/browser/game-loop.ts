@@ -2375,6 +2375,17 @@ export function canvasSizeFor(scale: number): { readonly width: number; readonly
 }
 
 /**
+ * Whether there is a ball sitting on the plunger rod.
+ *
+ * A selector rather than a reach into `Game` from the presentation layer: the
+ * on-screen LAUNCH button is shown only while there is something to launch, and
+ * that is the one fact it needs.
+ */
+export function ballInLane(game: Game): boolean {
+  return game.laneBallId !== null;
+}
+
+/**
  * The bats, as the sprite layer needs to see them.
  *
  * The STROKE decides the POSE: `restPose + ((direction * stroke) >> 6)` off the

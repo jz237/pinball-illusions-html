@@ -2,7 +2,15 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!--
+      `viewport-fit=cover` lets the page paint under a notch and a home
+      indicator, and the stylesheet then pays the insets back with
+      `env(safe-area-inset-*)`. Neither sibling remake sets `user-scalable=no`
+      or a `maximum-scale`, and neither does this: pinch-zoom is disabled where
+      it matters by `touch-action`, and taking it away everywhere else is an
+      accessibility regression for no gain.
+    -->
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <title>Pinball Illusions</title>
     <meta
       name="description"
@@ -13,30 +21,95 @@
   <body>
     <main class="cabinet">
       <!--
-        The playfield window is 336 x 256 source pixels. Without HD assets it
-        is magnified by a whole number only: the backing store is resized to
-        that magnification in main.ts and the element is left at its natural
-        size, so one source pixel is always an exact square block of device
-        pixels. Once a table's HD master loads, the backing store becomes a
-        fixed 4x supersample (1344 x 1024) and main.ts CSS-fits the element to
-        the viewport instead — see fitCanvas.
+        The touch chrome. Present in every build and hidden by the stylesheet
+        unless the pointer is coarse or a finger has actually been seen, so a
+        desktop cabinet is still the screen and nothing else. Drawn entirely in
+        CSS: any new raster would need a manifest claim and a digest, and the
+        build guard reads HTML and CSS as text without restricting them.
+      -->
+      <div class="topbar" aria-label="Machine controls">
+        <button type="button" class="topbar__button" data-bar-action="back">BACK</button>
+        <button type="button" class="topbar__button" data-bar-action="view">TABLE</button>
+        <button type="button" class="topbar__button" data-bar-action="mute">SOUND ON</button>
+      </div>
+
+      <!--
+        The playfield window is 336 x 256 source pixels. Without HD assets on a
+        fine pointer it is magnified by a whole number only: the backing store
+        is resized to that magnification in main.ts and the element is left at
+        its natural size, so one source pixel is always an exact square block of
+        device pixels. Once a table's HD master loads — or whenever the pointer
+        is coarse, where a 336 x 256 postage stamp would be unplayable — the
+        element is fitted to this stage instead and the backing store follows
+        the render-scale cap. See `src/browser/canvas-fit.ts`.
+
+        The stage is what JavaScript measures. Its size comes from the
+        stylesheet (the small-viewport unit, minus the deck, minus the safe-area
+        insets), which is the sibling Pinball Fantasies HD split: CSS owns how
+        big the box is, a ResizeObserver tells JavaScript what it became, and
+        JavaScript owns nothing but the pixels behind it.
 
         The same canvas carries the shell. The original's menu screens are
         320 x 256, so they are drawn into a 320-wide box centred in this one —
         eight pixels of surround each side, and not one of the decoded
         coordinates moved. See src/browser/shell-screens.ts.
       -->
-      <canvas id="playfield" width="336" height="256" aria-label="Pinball playfield"></canvas>
+      <div class="stage" id="stage">
+        <canvas id="playfield" width="336" height="256" aria-label="Pinball playfield"></canvas>
+      </div>
 
       <p id="boot" class="boot">Loading…</p>
 
       <!--
-        No key list here. A cabinet is the screen and nothing else, which is how
-        the sibling Pinball Fantasies HD build presents itself, and the machine
-        already names its own keys where the original does: the hint row on the
-        attract and menu pages. Anything the shell does not say belongs in the
-        README, not under the glass.
+        The deck. Five dedicated buttons under the picture rather than left and
+        right halves of the screen — the convention both sibling remakes arrived
+        at independently. Their labels and their meanings are a function of the
+        shell's phase (`deckPlanFor`), which is what makes every menu reachable
+        by touch without hit-testing anything: in play they are the cabinet's
+        controls, everywhere else they are a d-pad and a select.
+
+        No key list here. A cabinet is the screen and nothing else, and the
+        machine already names its own keys where the original does: the hint row
+        on the attract and menu pages.
       -->
+      <div class="deck" aria-label="Pinball controls">
+        <button type="button" class="deck__button deck__button--up" data-deck-slot="up">
+          <span class="deck__label">UP</span>
+        </button>
+        <button type="button" class="deck__button deck__button--down" data-deck-slot="down">
+          <span class="deck__label">NUDGE</span>
+        </button>
+        <button type="button" class="deck__button deck__button--action" data-deck-slot="action">
+          <span class="deck__label">LAUNCH</span>
+        </button>
+        <button type="button" class="deck__button deck__button--left" data-deck-slot="left">
+          <span class="deck__label">LEFT</span>
+        </button>
+        <button type="button" class="deck__button deck__button--right" data-deck-slot="right">
+          <span class="deck__label">RIGHT</span>
+        </button>
+      </div>
+
+      <!--
+        Name entry, and the only element on the page a keyboard is wanted for.
+        Focused only while the shell is on its initials screen and only when the
+        touch presentation is showing, so a desktop player never loses a
+        keystroke to it. An on-canvas A-Z picker is the alternative and is more
+        work for a worse result: the phone already has a keyboard.
+      -->
+      <label class="offscreen" for="initials-entry">Your initials</label>
+      <input
+        id="initials-entry"
+        class="offscreen"
+        type="text"
+        maxlength="3"
+        inputmode="text"
+        enterkeyhint="done"
+        autocapitalize="characters"
+        autocomplete="off"
+        autocorrect="off"
+        spellcheck="false"
+      />
     </main>
 
     <script type="module" src="./src/main.ts"></script>

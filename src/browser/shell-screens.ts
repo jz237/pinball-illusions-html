@@ -883,7 +883,7 @@ function drawAttract(ctx: ShellContext, scale: number, state: ShellState, skin: 
  * The hint line is the reconstruction's. The fallback additionally titles the
  * page, because a placeholder needs more signposting than the real artwork does.
  */
-const MENU_RECTS = Object.freeze([
+export const MENU_RECTS = Object.freeze([
   Object.freeze({ x1: 120, y1: 83, x2: 200, y2: 115, textY: 90 }),
   Object.freeze({ x1: 120, y1: 126, x2: 200, y2: 158, textY: 133 }),
 ]);
@@ -953,6 +953,19 @@ function drawMenu(ctx: ShellContext, scale: number, state: ShellState, skin: She
  * unselected box follows the menu's measured rule and is drawn in the field's
  * own black rather than a dimmed white.
  */
+/**
+ * Table select's two boxes and the strip the names scroll through, named rather
+ * than inlined so the touch hit test can be built on the renderer's own numbers
+ * instead of a second copy of them. `SELECT_ROW_Y` is the row the selected entry
+ * is pinned to and `SELECT_ROW_PITCH` the spacing either side of it, which
+ * together turn a tap anywhere in the strip into a cursor offset.
+ */
+export const SELECT_NAME_BOX = Object.freeze({ x1: 20, y1: 111, x2: 218, y2: 143 });
+export const SELECT_INFO_BOX = Object.freeze({ x1: 228, y1: 111, x2: 300, y2: 143 });
+export const SELECT_LIST_CLIP = Object.freeze({ x1: 18, y1: 22, x2: 220, y2: 214 });
+export const SELECT_ROW_Y = 118;
+export const SELECT_ROW_PITCH = 32;
+
 function drawSelect(
   ctx: ShellContext,
   scale: number,
@@ -974,23 +987,28 @@ function drawSelect(
   box(
     ctx,
     scale,
-    20,
-    111,
-    218,
-    143,
+    SELECT_NAME_BOX.x1,
+    SELECT_NAME_BOX.y1,
+    SELECT_NAME_BOX.x2,
+    SELECT_NAME_BOX.y2,
     state.column === 0 ? focusColour : idleColour,
     !skinned && state.column === 0 ? SHELL_HIGHLIGHT_FILL : null,
   );
 
   ctx.save();
   ctx.beginPath();
-  ctx.rect(px(18, scale), py(22, scale), 202 * scale, (214 - 22) * scale);
+  ctx.rect(
+    px(SELECT_LIST_CLIP.x1, scale),
+    py(SELECT_LIST_CLIP.y1, scale),
+    (SELECT_LIST_CLIP.x2 - SELECT_LIST_CLIP.x1) * scale,
+    (SELECT_LIST_CLIP.y2 - SELECT_LIST_CLIP.y1) * scale,
+  );
   ctx.clip();
   for (let i = 0; i < SHELL_TABLES.length; i += 1) {
     const table = SHELL_TABLES[i];
     if (table === undefined) continue;
-    const y = 118 - 32 * state.cursor + 32 * i;
-    if (y < 22 || y > 214) continue;
+    const y = SELECT_ROW_Y + SELECT_ROW_PITCH * (i - state.cursor);
+    if (y < SELECT_LIST_CLIP.y1 || y > SELECT_LIST_CLIP.y2) continue;
     if (skin === null) {
       text(ctx, scale, 28, y, table.name, i === state.cursor ? SHELL_HIGHLIGHT : SHELL_DIM, FONT_BIG);
     } else {
@@ -1002,17 +1020,17 @@ function drawSelect(
   box(
     ctx,
     scale,
-    228,
-    111,
-    300,
-    143,
+    SELECT_INFO_BOX.x1,
+    SELECT_INFO_BOX.y1,
+    SELECT_INFO_BOX.x2,
+    SELECT_INFO_BOX.y2,
     state.column === 1 ? focusColour : idleColour,
     !skinned && state.column === 1 ? SHELL_HIGHLIGHT_FILL : null,
   );
   if (skin === null) {
-    text(ctx, scale, 264, 118, "Info", state.column === 1 ? SHELL_HIGHLIGHT : SHELL_TEXT, FONT_BIG, "center");
+    text(ctx, scale, 264, SELECT_ROW_Y, "Info", state.column === 1 ? SHELL_HIGHLIGHT : SHELL_TEXT, FONT_BIG, "center");
   } else {
-    glyphs(ctx, skin, "font1", scale, 264, 118, "Info", SKIN_WHITE, "center");
+    glyphs(ctx, skin, "font1", scale, 264, SELECT_ROW_Y, "Info", SKIN_WHITE, "center");
   }
 
   thumbnail(ctx, scale, skin, artwork, highlightedTable(state).id, 238, 20, 52, 84, null);

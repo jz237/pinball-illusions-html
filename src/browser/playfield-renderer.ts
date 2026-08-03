@@ -497,9 +497,15 @@ export interface BlitContext {
  * there bilinear is strictly better than the dropped-row shimmer nearest
  * produces — the same filtering stance both sibling remakes ship. Shared by
  * the lamp and sprite overlays so all three layers resample identically.
+ *
+ * `scale` below `HD_SCALE` is the mobile render-scale cap: the source is still
+ * read at 4x and the destination is smaller, so the blit is a 2:1 supersampled
+ * downscale and needs the same bilinear resolve whole-table mode does. Nearest
+ * there would throw three of every four pixels away and shimmer as the table
+ * scrolls. Defaulted so every existing caller keeps the 1:1 answer it had.
  */
-export function hdBlitSmoothing(camera: CameraState): boolean {
-  return camera.mode === "full-table";
+export function hdBlitSmoothing(camera: CameraState, scale: number = HD_SCALE): boolean {
+  return camera.mode === "full-table" || scale !== HD_SCALE;
 }
 
 /**
@@ -531,7 +537,7 @@ export function drawPlayfield(
   const geometry = playfieldBlitGeometry(map, camera, scale);
   const hd = playfieldImageSourceHd(map);
   if (hd !== null) {
-    context.imageSmoothingEnabled = hdBlitSmoothing(camera);
+    context.imageSmoothingEnabled = hdBlitSmoothing(camera, scale);
     context.drawImage(
       hd,
       geometry.sourceX * HD_SCALE,

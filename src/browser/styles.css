@@ -5,17 +5,28 @@
  * surround is near-black so nothing on the page competes with the playfield for
  * contrast — a bright page next to a dark table makes the table look muddy —
  * and every rule that touches the canvas exists to stop a browser from
- * resampling it. In NATIVE mode, integer magnification is done in JavaScript
- * by resizing the backing store; CSS must therefore NOT scale the element, or
- * the two scalings would compose into a fractional one and the rails would
- * wobble.
+ * resampling it. In NATIVE mode on a fine pointer, integer magnification is
+ * done in JavaScript by resizing the backing store; CSS must therefore NOT
+ * scale the element, or the two scalings would compose into a fractional one
+ * and the rails would wobble.
  *
- * In HD mode (`fitCanvas` in main.ts, active once a table's 4x master loads)
- * that rule is deliberately repealed FROM JAVASCRIPT: the backing store is a
- * fixed 1344 x 1024 supersample and inline styles size the element to the
- * viewport with `image-rendering: auto`, because a 4x picture is protected BY
- * bilinear downscale rather than from it — the sibling Pinball Fantasies HD
- * convention. The rules below still describe every build without HD assets.
+ * In HD mode — and on a coarse pointer in either mode, where a 336 x 256
+ * postage stamp would be unplayable — that rule is deliberately repealed FROM
+ * JAVASCRIPT: inline styles size the element to the stage with
+ * `image-rendering: auto`, because a supersampled picture is protected BY
+ * bilinear downscale rather than from it. `src/browser/canvas-fit.ts` decides
+ * which of the two it is; the rules below describe the page around it.
+ *
+ * ---------------------------------------------------------------------------
+ * THE TOUCH PRESENTATION
+ * ---------------------------------------------------------------------------
+ * Everything mobile hangs off ONE attribute, `data-touch` on <html>, which
+ * `src/browser/touch.ts` sets from `(hover: none) and (pointer: coarse)` and
+ * from having actually seen a finger. Not a media query directly, for two
+ * reasons: a laptop with a touchscreen reports a fine primary pointer and
+ * should still get a deck once its owner touches the screen, and one attribute
+ * keeps the whole mobile layout in a single block instead of duplicated either
+ * side of an `@media`. There is no user-agent string anywhere in this project.
  */
 
 :root {
@@ -35,6 +46,9 @@
 html,
 body {
   height: 100%;
+  /* Pull-to-refresh and the iOS rubber band, both of which are ways to lose a
+     ball. Harmless on a desktop, where there is nothing to overscroll. */
+  overscroll-behavior: none;
 }
 
 body {
@@ -56,6 +70,27 @@ body {
   align-items: center;
   gap: 14px;
   padding: 16px;
+  /* Definite, so the stage below can be measured rather than guessed at. The
+     `- 120` this replaced was desktop chrome expressed as a magic number, and
+     in landscape on a phone it cost the picture a third of its height. */
+  width: 100%;
+  height: 100%;
+}
+
+/*
+ * The box the picture is fitted into.
+ *
+ * `flex: 1 1 0` with `min-height: 0` so it takes what is left after the bar,
+ * the boot line and the deck and never grows to its own content — which would
+ * be circular, since the content is sized from this box.
+ */
+.stage {
+  flex: 1 1 0;
+  min-height: 0;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 #playfield {
@@ -89,3 +124,227 @@ body {
   display: none;
 }
 
+/* Present for a screen reader and for the soft keyboard; never seen. */
+.offscreen {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  opacity: 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* The touch chrome                                                          */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * Hidden until `touch.ts` says otherwise. A build opened on a desktop is
+ * byte-for-byte the cabinet it always was.
+ */
+.topbar,
+.deck {
+  display: none;
+}
+
+html[data-touch="on"] body {
+  /* The small viewport unit, not the dynamic one: `dvh` grows and shrinks as
+     the URL bar animates, which would resize the canvas — and therefore the
+     backing store — in the middle of a ball. */
+  height: 100svh;
+}
+
+html[data-touch="on"] .cabinet {
+  height: 100svh;
+  gap: 6px;
+  padding: calc(4px + env(safe-area-inset-top)) calc(4px + env(safe-area-inset-right))
+    calc(4px + env(safe-area-inset-bottom)) calc(4px + env(safe-area-inset-left));
+}
+
+html[data-touch="on"] #playfield {
+  border-width: 1px;
+  box-shadow: none;
+}
+
+html[data-touch="on"] .topbar,
+html[data-touch="on"] .deck {
+  display: grid;
+  width: 100%;
+  gap: 6px;
+}
+
+html[data-touch="on"] .topbar {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  flex: 0 0 auto;
+}
+
+/*
+ * Two rows: the secondary controls above, the two bats along the bottom edge
+ * where the thumbs already are. In play that reads UP / NUDGE / LAUNCH over
+ * LEFT / RIGHT; in a menu the same five buttons are a d-pad and a select.
+ */
+html[data-touch="on"] .deck {
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-areas:
+    "up up down down action action"
+    "left left left right right right";
+  flex: 0 0 auto;
+}
+
+.deck__button--up {
+  grid-area: up;
+}
+.deck__button--down {
+  grid-area: down;
+}
+.deck__button--action {
+  grid-area: action;
+}
+.deck__button--left {
+  grid-area: left;
+}
+.deck__button--right {
+  grid-area: right;
+}
+
+.topbar__button,
+.deck__button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0;
+  border: 1px solid var(--edge);
+  border-radius: 6px;
+  background: linear-gradient(180deg, #1b2331 0%, #10151f 100%);
+  color: var(--ink);
+  font: inherit;
+  letter-spacing: 0.06em;
+  /* Nothing in the deck is ever selected, dragged, long-pressed for a
+     copy/paste bubble, or flashed with a tap highlight. A two-second cradle
+     otherwise raises the callout menu on iOS. */
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.topbar__button[hidden],
+.deck__button[hidden] {
+  display: none;
+}
+
+/*
+ * `none` on the held controls, `manipulation` on the merely tapped ones.
+ *
+ * The split is the sibling Pinball Dreams build's. `none` hands the whole
+ * gesture to the page, which is what a cradle needs and what stops a pan or a
+ * pinch stealing a flipper; `manipulation` only kills the double-tap-zoom
+ * delay, which is all a button that is tapped rather than held wants.
+ */
+/*
+ * Generously sized, on purpose.
+ *
+ * The window's aspect is 1.3125 — wide and short — so on a portrait phone the
+ * picture is width-bound and leaves several hundred pixels underneath. That
+ * surplus cannot be spent on the picture (`VIEWPORT_HEIGHT` is inside the
+ * hashed simulation state and is not negotiable), so it is spent here. 44 px is
+ * the minimum comfortable target; this affords two to three times that.
+ */
+.deck__button {
+  touch-action: none;
+  min-height: max(48px, 11svh);
+  font-size: clamp(11px, 3.4vw, 16px);
+}
+
+.topbar__button {
+  touch-action: manipulation;
+  min-height: 34px;
+  font-size: clamp(10px, 2.8vw, 13px);
+  color: var(--ink-dim);
+}
+
+.deck__button--left,
+.deck__button--right {
+  min-height: max(56px, 15svh);
+  background: linear-gradient(180deg, #223046 0%, #131a26 100%);
+  color: #cfe0f5;
+}
+
+.deck__button--action {
+  border-color: #3a4c68;
+  color: #cfe0f5;
+}
+
+.deck__button:active,
+.topbar__button:active {
+  background: #2b3a52;
+  color: #eaf2ff;
+}
+
+.deck__label {
+  pointer-events: none;
+}
+
+/*
+ * Landscape — the one place this window's shape is an advantage.
+ *
+ * The picture is wide and short (1.3125) where both siblings are tall, so on a
+ * landscape phone HEIGHT is the scarce axis and width is abundant: at 844 x 390
+ * a deck under the picture leaves the canvas 373 x 284 with four hundred pixels
+ * of empty page either side. Moving the deck INTO that empty width gives the
+ * canvas the whole height and about 45 % more picture, and puts the two bats
+ * under the thumbs that are already holding the phone.
+ *
+ * `display: contents` on the deck is what makes it possible without a second
+ * copy of the markup: the five buttons become items of the cabinet's own grid
+ * and can be placed on both edges at once. Each button keeps its own accessible
+ * name, so only the group's label is lost.
+ */
+@media (orientation: landscape) {
+  html[data-touch="on"] .cabinet {
+    display: grid;
+    grid-template-columns: minmax(76px, 13%) minmax(0, 1fr) minmax(76px, 13%);
+    grid-template-rows: auto minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.5fr);
+    grid-template-areas:
+      "bar    bar   bar"
+      "up     stage down"
+      "action stage down"
+      "left   stage right";
+    /* The portrait column centres its items; a grid cell must fill instead, or
+       the stage collapses to the size of the canvas it is supposed to size. */
+    align-items: stretch;
+    justify-items: stretch;
+  }
+
+  html[data-touch="on"] .topbar {
+    grid-area: bar;
+  }
+
+  html[data-touch="on"] .stage {
+    grid-area: stage;
+  }
+
+  html[data-touch="on"] .deck {
+    display: contents;
+  }
+
+  html[data-touch="on"] .deck__button,
+  html[data-touch="on"] .deck__button--left,
+  html[data-touch="on"] .deck__button--right {
+    min-height: 44px;
+  }
+
+  html[data-touch="on"] .topbar__button {
+    min-height: 30px;
+  }
+
+  /* The boot notice is the one thing with no place in this grid. */
+  html[data-touch="on"] .boot {
+    grid-area: stage;
+    align-self: end;
+  }
+}

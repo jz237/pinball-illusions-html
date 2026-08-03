@@ -25,7 +25,15 @@ import {
   shellTick,
 } from "../src/browser/shell.js";
 import type { ScoreStore, ShellEffect, ShellKey, ShellState } from "../src/browser/shell.js";
-import { formatScore } from "../src/browser/shell-screens.js";
+import {
+  MENU_RECTS,
+  SELECT_INFO_BOX,
+  SELECT_NAME_BOX,
+  SELECT_ROW_PITCH,
+  SELECT_ROW_Y,
+  formatScore,
+} from "../src/browser/shell-screens.js";
+import { deckPlanFor, shellHitTest } from "../src/browser/touch-zones.js";
 import { FACTORY_HIGH_SCORES, HIGH_SCORE_SLOTS } from "../src/game/high-scores.js";
 import type { HighScoreEntry } from "../src/game/high-scores.js";
 import { TABLE_IDS } from "../src/game/contracts.js";
@@ -634,5 +642,160 @@ describe("the ladder block's formatting", () => {
     expect(formatScore(1_000)).toBe("1,000");
     expect(formatScore(1_000_000_000)).toBe("1,000,000,000");
     expect(formatScore(20_900_000)).toBe("20,900,000");
+  });
+});
+
+/**
+ * The same flow, driven by fingers.
+ *
+ * The point of these cases is not that touch works — that is `touch-zones` —
+ * but that touch changes NOTHING. Every key below is one `shellHitTest` or
+ * `deckPlanFor` produced, fed down the identical `shellKey` path a keyboard
+ * takes, and the assertion each time is that the state and the effects are the
+ * ones the keyboard run produces. The shell state machine has no idea a
+ * touchscreen exists, and if it ever acquires one, these fail.
+ */
+describe("the shell, driven entirely by touch", () => {
+  /** The middle of a rectangle in the shell's page coordinates. */
+  const middle = (rect: { x1: number; y1: number; x2: number; y2: number }) => ({
+    x: (rect.x1 + rect.x2) / 2,
+    y: (rect.y1 + rect.y2) / 2,
+  });
+
+  it("reaches a loading table from the credits roll with taps alone", () => {
+    const store = fakeStore();
+    const state = createShell(store);
+    const effects: ShellEffect[] = [];
+    const tap = (x: number, y: number): void => {
+      for (const item of shellHitTest(state, x, y)) effects.push(...shellKey(state, store, item));
+    };
+
+    expect(state.phase).toBe("attract");
+    tap(160, 128);
+    expect(state.phase).toBe("menu");
+
+    const tables = middle(MENU_RECTS[0]!);
+    tap(tables.x, tables.y);
+    expect(state.phase).toBe("select");
+
+    // The second table, by tapping the name one row below the pinned entry.
+    tap(SELECT_NAME_BOX.x1 + 4, SELECT_ROW_Y + SELECT_ROW_PITCH);
+    expect(state.cursor).toBe(1);
+
+    const name = middle(SELECT_NAME_BOX);
+    tap(name.x, name.y);
+    expect(state.phase).toBe("loading");
+    expect(effects).toEqual([{ kind: "load-table", tableId: SHELL_TABLES[1]!.id }]);
+  });
+
+  it("produces exactly what the keyboard produces, key for key", () => {
+    const byTouch = { store: fakeStore(), state: createShell(fakeStore()) };
+    byTouch.state = createShell(byTouch.store);
+    const byKey = { store: fakeStore(), state: createShell(fakeStore()) };
+    byKey.state = createShell(byKey.store);
+
+    const touched: ShellEffect[] = [];
+    for (const [x, y] of [
+      [160, 128],
+      [middle(MENU_RECTS[0]!).x, middle(MENU_RECTS[0]!).y],
+      [middle(SELECT_INFO_BOX).x, middle(SELECT_INFO_BOX).y],
+    ] as const) {
+      for (const item of shellHitTest(byTouch.state, x, y)) {
+        touched.push(...shellKey(byTouch.state, byTouch.store, item));
+      }
+    }
+
+    const typed = press(byKey.state, byKey.store, SPACE, SELECT, RIGHT, SELECT);
+
+    expect(byTouch.state.phase).toBe("info");
+    expect(byTouch.state.phase).toBe(byKey.state.phase);
+    expect(byTouch.state.column).toBe(byKey.state.column);
+    expect(byTouch.state.cursor).toBe(byKey.state.cursor);
+    expect(touched).toEqual(typed);
+  });
+
+  it("navigates every menu from the deck, with no hit testing at all", () => {
+    const store = fakeStore();
+    const state = createShell(store);
+    const deckTap = (slot: "left" | "up" | "down" | "right" | "action"): ShellEffect[] => {
+      const binding = deckPlanFor(state.phase, false)[slot];
+      if (binding.hidden || binding.key === null) return [];
+      return shellKey(state, store, binding.key);
+    };
+
+    deckTap("action");
+    expect(state.phase).toBe("menu");
+    deckTap("action");
+    expect(state.phase).toBe("select");
+    deckTap("down");
+    expect(state.cursor).toBe(1);
+    deckTap("right");
+    expect(state.column).toBe(1);
+    deckTap("action");
+    expect(state.phase).toBe("info");
+    deckTap("action");
+    expect(state.phase).toBe("select");
+    const effects = deckTap("action");
+    expect(state.phase).toBe("loading");
+    expect(effects).toEqual([{ kind: "load-table", tableId: SHELL_TABLES[1]!.id }]);
+  });
+
+  it("quits the table from the deck's QUIT and only from it", () => {
+    const quiet = intoPlay("babewatch");
+    press(quiet.state, quiet.store, BACK);
+    expect(quiet.state.phase).toBe("quit-confirm");
+
+    // Every tap on the glass resumes; the shell never sees a 'Y' from one.
+    for (const y of [40, 128, 220]) {
+      for (const item of shellHitTest(quiet.state, 160, y)) {
+        shellKey(quiet.state, quiet.store, item);
+      }
+      expect(quiet.state.phase).toBe("play");
+      press(quiet.state, quiet.store, BACK);
+    }
+
+    const plan = deckPlanFor("quit-confirm", false);
+    expect(plan.left.key).not.toBeNull();
+    const resume = shellKey(quiet.state, quiet.store, plan.left.key!);
+    expect(resume).toEqual([]);
+    expect(quiet.state.phase).toBe("play");
+
+    press(quiet.state, quiet.store, BACK);
+    const left = shellKey(quiet.state, quiet.store, plan.right.key!);
+    expect(left).toEqual([{ kind: "leave-table" }]);
+    expect(quiet.state.phase).toBe("attract");
+  });
+
+  it("types and commits initials from the soft keyboard and the deck", () => {
+    const { state, store } = intoPlay("law-n-justice");
+    shellGameEnded(state, 2_000_000_000);
+    shellTick(state, store, GAME_OVER_TICKS);
+    shellTick(state, store, HIGHSCORE_FANFARE_TICKS);
+    expect(state.phase).toBe("initials");
+
+    // What `touch.ts` synthesises from an `input` event, character by character.
+    press(state, store, key("text", "A"), key("text", "B"));
+    expect(state.initials).toBe("AB");
+    // What it synthesises from a backspace.
+    press(state, store, key("erase"));
+    expect(state.initials).toBe("A");
+
+    // And the deck's OK, which is the floor: a player whose soft keyboard never
+    // appears can still finish rather than being stuck on the card forever.
+    const plan = deckPlanFor("initials", false);
+    press(state, store, plan.right.key!);
+    expect(state.phase).toBe("ladder");
+    expect(store.saved.get("law-n-justice")?.map((entry) => entry.initials)).toContain("A");
+  });
+
+  it("starts a game from a tap on the table's own attract screen", () => {
+    const { state, store } = intoPlay("extreme-sports");
+    state.phase = "ladder";
+    const effects: ShellEffect[] = [];
+    for (const item of shellHitTest(state, 160, 128)) {
+      effects.push(...shellKey(state, store, item));
+    }
+    expect(state.phase).toBe("play");
+    expect(effects).toEqual([{ kind: "start-game" }]);
   });
 });

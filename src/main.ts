@@ -34,7 +34,7 @@ import { InputRouter, isControl } from "./browser/input.js";
 import type { Control, KeyEventLike } from "./browser/input.js";
 import {
   GameLoop,
-  canvasSizeFor,
+  ballInLane,
   createGame,
   currentScore,
   debugSnapshot,
@@ -43,14 +43,12 @@ import {
   tickGame,
 } from "./browser/game-loop.js";
 import type { Game, GameDebugState, GameTickReport } from "./browser/game-loop.js";
-import {
-  integerScaleFor,
-  setPlayfieldArtwork,
-  setPlayfieldArtworkHd,
-} from "./browser/playfield-renderer.js";
+import { setPlayfieldArtwork, setPlayfieldArtworkHd } from "./browser/playfield-renderer.js";
+import { canvasFitFor } from "./browser/canvas-fit.js";
+import { COARSE_POINTER_QUERY, attachTouch } from "./browser/touch.js";
+import type { TouchHandle } from "./browser/touch.js";
 import { setLampOverlaysHd } from "./browser/lamp-layer.js";
 import { setMovingSpritesHd } from "./browser/sprite-layer.js";
-import { HD_SCALE } from "./browser/hd-scale.js";
 import { loadTableMap } from "./game/table-map.js";
 import { loadTableArt, tableArtUrl } from "./game/table-art.js";
 import {
@@ -84,7 +82,7 @@ import {
   shellTableLoaded,
   shellTick,
 } from "./browser/shell.js";
-import type { ShellEffect, ShellState } from "./browser/shell.js";
+import type { ShellEffect, ShellKey, ShellState } from "./browser/shell.js";
 import { renderShell, shellDrawsOverPlayfield } from "./browser/shell-screens.js";
 import type { ShellArtworkSource } from "./browser/shell-screens.js";
 import { createShellSkin } from "./browser/shell-skin.js";
@@ -158,6 +156,23 @@ function requireCanvas(): HTMLCanvasElement {
   return element;
 }
 
+/**
+ * The box the picture is fitted into.
+ *
+ * Sized by the stylesheet — `100svh` minus the deck minus the safe-area insets
+ * on a phone, the window minus the page's own padding on a desktop — and
+ * MEASURED here rather than computed. That is the whole of the fix for
+ * `window.innerHeight - 120`: the 120 was desktop chrome expressed as a
+ * constant, it does not exist on a phone, and in landscape it cost the canvas a
+ * third of its height. Falling back to the canvas's parent keeps a hand-edited
+ * page working.
+ */
+function requireStage(canvas: HTMLCanvasElement): HTMLElement {
+  const element = document.getElementById("stage");
+  if (element instanceof HTMLElement) return element;
+  return canvas.parentElement ?? document.body;
+}
+
 function requireContext(canvas: HTMLCanvasElement): CanvasRenderingContext2D {
   // `alpha: false` lets the compositor skip blending the canvas over the page,
   // which for a full-bleed opaque playfield is free performance.
@@ -176,48 +191,64 @@ function requireContext(canvas: HTMLCanvasElement): CanvasRenderingContext2D {
  */
 let hdActive = false;
 
+/** `navigator.connection.saveData`, which counts as a coarse pointer would. */
+function dataSaverRequested(): boolean {
+  const connection = (navigator as Navigator & { connection?: { saveData?: boolean } }).connection;
+  return connection?.saveData === true;
+}
+
+function coarsePointer(): boolean {
+  try {
+    return window.matchMedia(COARSE_POINTER_QUERY).matches;
+  } catch {
+    return false;
+  }
+}
+
 /**
- * Picks the magnification and resizes the backing store to match.
+ * Picks the magnification, resizes the backing store, and sizes the element.
  *
- * NATIVE MODE: whole numbers only, from `integerScaleFor`. The CSS keeps the
- * element at its natural pixel size, so one source pixel is always an exact
- * square block of device pixels and the rails never wobble.
+ * The decision itself is `canvasFitFor`, which is pure and tested; everything
+ * here is measurement and assignment. Three outcomes:
  *
- * HD MODE: the backing store is fixed at `HD_SCALE` (1344x1024 — a 4x
- * supersampled window) and CSS fits the element to the viewport instead,
- * aspect preserved. That deliberately repeals the "CSS must not scale the
- * element" rule, which existed to protect a NATIVE-resolution picture from
- * fractional resampling; a 4x supersampled picture is protected BY the
- * browser's bilinear downscale — exactly how Pinball Fantasies HD ships its
- * 4x masters into a ≤3x canvas. `image-rendering: pixelated` is lifted for
- * the same reason, and only in this mode.
+ * NATIVE ON A FINE POINTER: whole numbers only. The element is left at its
+ * natural pixel size, so one source pixel is always an exact square block of
+ * device pixels and the rails never wobble.
+ *
+ * OTHERWISE — HD, or a coarse pointer in either mode — the element is fitted to
+ * the stage with `image-rendering: auto`. That deliberately repeals the "CSS
+ * must not scale the element" rule, which existed to protect a
+ * NATIVE-resolution picture from fractional resampling; a supersampled picture
+ * is protected BY the browser's bilinear downscale, exactly how Pinball
+ * Fantasies HD ships its 4x masters into a smaller canvas. On a phone the
+ * NATIVE branch has to be fitted too, or a build without the HD assets renders
+ * 336 x 256 in the corner of the screen and is unplayable — easy to miss,
+ * because a development machine always has the HD assets.
  */
-function fitCanvas(canvas: HTMLCanvasElement): number {
-  if (hdActive) {
-    const size = canvasSizeFor(HD_SCALE);
-    if (canvas.width !== size.width || canvas.height !== size.height) {
-      canvas.width = size.width;
-      canvas.height = size.height;
-    }
-    const fit = Math.min(
-      window.innerWidth / size.width,
-      Math.max(0.1, window.innerHeight - 120) / size.height,
-    );
-    canvas.style.width = `${Math.max(1, Math.round(size.width * fit))}px`;
-    canvas.style.height = `${Math.max(1, Math.round(size.height * fit))}px`;
-    canvas.style.imageRendering = "auto";
-    return HD_SCALE;
+function fitCanvas(canvas: HTMLCanvasElement, stage: HTMLElement, touch: boolean): number {
+  const fit = canvasFitFor(
+    { width: stage.clientWidth, height: stage.clientHeight },
+    {
+      hd: hdActive,
+      coarsePointer: touch || coarsePointer(),
+      dataSaver: dataSaverRequested(),
+      devicePixelRatio: window.devicePixelRatio,
+    },
+  );
+  if (canvas.width !== fit.canvasWidth || canvas.height !== fit.canvasHeight) {
+    canvas.width = fit.canvasWidth;
+    canvas.height = fit.canvasHeight;
   }
-  const scale = integerScaleFor(window.innerWidth, window.innerHeight - 120);
-  const size = canvasSizeFor(scale);
-  if (canvas.width !== size.width || canvas.height !== size.height) {
-    canvas.width = size.width;
-    canvas.height = size.height;
+  if (fit.cssWidth === null || fit.cssHeight === null) {
+    canvas.style.removeProperty("width");
+    canvas.style.removeProperty("height");
+    canvas.style.removeProperty("image-rendering");
+    return fit.scale;
   }
-  canvas.style.removeProperty("width");
-  canvas.style.removeProperty("height");
-  canvas.style.removeProperty("image-rendering");
-  return scale;
+  canvas.style.width = `${fit.cssWidth}px`;
+  canvas.style.height = `${fit.cssHeight}px`;
+  canvas.style.imageRendering = fit.smooth ? "auto" : "pixelated";
+  return fit.scale;
 }
 
 /**
@@ -381,6 +412,7 @@ function readStorage(): Pick<Storage, "getItem" | "setItem"> | null {
 
 async function boot(): Promise<void> {
   const canvas = requireCanvas();
+  const stage = requireStage(canvas);
   const context = requireContext(canvas);
   const router = new InputRouter();
   const sound = new SoundDeck();
@@ -398,7 +430,20 @@ async function boot(): Promise<void> {
   tableMusic.setMuted(music.muted());
   const opened = new Map<TableId, LoadedTable>();
 
-  let scale = fitCanvas(canvas);
+  /**
+   * The touch chrome, attached below once the shell exists.
+   *
+   * Held in a mutable so `refit` can ask whether the deck is showing without
+   * the two having to be constructed in the same breath — the deck needs the
+   * shell, the shell's first frame needs a fitted canvas.
+   */
+  let touch: TouchHandle | null = null;
+  const refit = (): number => fitCanvas(canvas, stage, touch?.active() ?? false);
+
+  let scale = refit();
+  /** The stage size the canvas was last fitted to. See the frame loop. */
+  let stageWidth = stage.clientWidth;
+  let stageHeight = stage.clientHeight;
   let table: LoadedTable | null = null;
   /** Set by the tick hook the moment a game reports its last ball gone. */
   let endedWithScore: number | null = null;
@@ -549,7 +594,7 @@ async function boot(): Promise<void> {
       setMovingSpritesHd(map, ballHd !== null && batsHd !== null ? { ball: ballHd, bats: batsHd } : null);
       if (!hdActive) {
         hdActive = true;
-        scale = fitCanvas(canvas);
+        scale = refit();
       }
     }
     const game = createGame(map);
@@ -670,13 +715,37 @@ async function boot(): Promise<void> {
   // Input
   // -------------------------------------------------------------------------
 
-  const onKeyDown = (event: Event): void => {
-    const keyEvent = event as KeyEventLike;
-    // Autoplay policies keep an audio context suspended until the player has
-    // touched the page. A keypress is exactly that.
+  /**
+   * The gesture that lets a browser make a sound.
+   *
+   * Autoplay policies keep an audio context suspended until the player has
+   * touched the page, and on a phone the FIRST touch is the only chance the
+   * page gets — which is why `sound.context()` is called here rather than
+   * merely resumed: the context is constructed inside the gesture task if it
+   * does not exist yet, and all three owners (the effects deck, the shell
+   * module and the table module) are resumed over it.
+   *
+   * Not `{ once: true }`, which is where the sibling Pinball Fantasies build
+   * and the sibling Pinball Dreams build differ and where Dreams is right: iOS
+   * re-suspends a context after an interruption — a phone call, the control
+   * centre — and a listener that has already removed itself cannot recover.
+   * `resumeAudio` guards on `state !== "suspended"`, so the repeat is free.
+   */
+  const unlockAudio = (): void => {
+    sound.context();
     sound.resume();
     music.resume();
     tableMusic.resume();
+  };
+
+  const onKeyDown = (event: Event): void => {
+    const keyEvent = event as KeyEventLike;
+    // A keypress is a gesture; so is a touch, which is wired below.
+    unlockAudio();
+    // The soft keyboard on the initials screen has its own element and its own
+    // `input` handler. Letting the window listener see the same keystroke would
+    // type every character twice.
+    if (touch?.ownsKeyboard(event.target) === true) return;
 
     // The mute toggle, from any phase. The backquote is bound to no game
     // control, no shell navigation, no function-key table pick and no
@@ -725,18 +794,87 @@ async function boot(): Promise<void> {
     if (router.handleKeyUp(keyEvent) !== null) keyEvent.preventDefault?.();
   };
 
+  /**
+   * One synthesised key, down exactly the path a keyboard key takes.
+   *
+   * `ShellKey` is already device-free, so the touch layer produces them and
+   * hands them here rather than extending the shell's vocabulary — which is why
+   * `src/browser/shell.ts` and its tests are untouched by the whole mobile
+   * round. The flush mirrors the ESC-in-play path above: leaving the table with
+   * a bat held would otherwise carry the hold into the next game.
+   */
+  const routeShellKey = (key: ShellKey): void => {
+    const before = shell.phase;
+    apply(shellKey(shell, store, key));
+    if (before === "play" && shell.phase !== "play") flushInput();
+  };
+
+  touch = attachTouch({
+    router,
+    canvas,
+    shellState: () => shell,
+    ballInLane: () => table !== null && ballInLane(table.game),
+    shellKey: routeShellKey,
+    gesture: unlockAudio,
+    toggleMute: () => {
+      const muted = music.toggleMuted();
+      tableMusic.setMuted(muted);
+      return muted;
+    },
+    muted: () => music.muted(),
+  });
+
   window.addEventListener("keydown", onKeyDown);
   window.addEventListener("keyup", onKeyUp);
   window.addEventListener("blur", () => router.releaseAll());
+  // A touch is a gesture too, and on a phone it is the only one there will be.
+  // Capture phase so it is seen before any handler that stops the event.
+  window.addEventListener("pointerdown", unlockAudio, { capture: true });
 
-  window.addEventListener("resize", () => {
-    scale = fitCanvas(canvas);
+  const onViewportChange = (): void => {
+    scale = refit();
     draw();
-  });
+  };
+  window.addEventListener("resize", onViewportChange);
+  // The stylesheet owns how big the stage is — `100svh` minus the deck minus
+  // the safe-area insets — so the honest way to learn its size is to be told.
+  // A `resize` listener alone misses a deck that relabels to a taller row and
+  // misses the address bar settling on a phone.
+  if (typeof ResizeObserver !== "undefined") {
+    new ResizeObserver(onViewportChange).observe(stage);
+  }
+  // Rotating releases everything: the sibling Pinball Fantasies build does the
+  // same, because a rotation can swallow the pointer-up for a bat that was held
+  // across it and leave the flipper welded down.
+  window.addEventListener("orientationchange", () => router.releaseAll());
 
-  // A hidden tab gets no animation frames, so the scheduler would bank the
-  // whole absence as catch-up. Pausing it means the game resumes where it was
-  // rather than fast-forwarding through the ball the player was not watching.
+  /**
+   * The page going away.
+   *
+   * A hidden tab gets no animation frames, so the scheduler would bank the
+   * whole absence as catch-up. Pausing it means the game resumes where it was
+   * rather than fast-forwarding through the ball the player was not watching;
+   * the music stops for the matching reason, since its scheduler would run its
+   * lookahead dry and leave the looped voices droning.
+   *
+   * `pagehide` as well as `visibilitychange`, because iOS often fires only the
+   * former when the app is swiped away or the page enters the back/forward
+   * cache; `pageshow`, because a bfcache restore can resurrect a page whose
+   * pointers ended while it was frozen. Both siblings listen for both.
+   */
+  const suspendPage = (): void => {
+    table?.loop.scheduler.pause();
+    router.releaseAll();
+    music.stop();
+    tableMusic.stop();
+  };
+  const resumePage = (): void => {
+    router.releaseAll();
+    table?.loop.scheduler.resume();
+  };
+  window.addEventListener("pagehide", suspendPage);
+  window.addEventListener("pageshow", resumePage);
+
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
       table?.loop.scheduler.pause();
@@ -768,6 +906,20 @@ async function boot(): Promise<void> {
    */
   const frame = (timeMs: number): void => {
     pollGamepads(router);
+    // Read the layout BEFORE the deck writes to it, so a relabel never forces a
+    // synchronous reflow. Two integers compared per frame is nothing, and it
+    // makes the fit self-healing: the `ResizeObserver` above reacts sooner, but
+    // this catches the deck appearing for the first time, a browser without an
+    // observer, and anything else that changes the box without a resize event.
+    if (stage.clientWidth !== stageWidth || stage.clientHeight !== stageHeight) {
+      stageWidth = stage.clientWidth;
+      stageHeight = stage.clientHeight;
+      scale = refit();
+    }
+    // The deck's five buttons are a function of the phase — the cabinet's
+    // controls in play, a d-pad everywhere else — so something has to follow
+    // the phase. It only touches the DOM when a label actually changed.
+    touch?.refresh();
     // The music follows the shell's phase: the front-end module over every
     // menu and card, the table's own module over the ball. One call a frame
     // each handles the transitions and pumps the scheduler's lookahead

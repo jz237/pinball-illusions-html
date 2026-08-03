@@ -284,6 +284,38 @@ claimed by the build's manifest.
 are read by the engine at fixed addresses and their labels do not exist as text
 anywhere in the release.
 
+### On a phone
+
+The cabinet grows a five-button deck under the picture and a small bar above it,
+and nothing else changes: touch goes through `InputRouter.pointerDown` /
+`pointerUp` and reaches `tickGame` as exactly the `ControlSnapshot` a keyboard
+produces, so the simulation never learns there is a touchscreen. The deck
+appears on a coarse pointer — `(hover: none) and (pointer: coarse)`, never a
+user-agent string — or the moment a finger actually touches the glass, so a
+laptop with a touchscreen gets it when its owner uses the screen and not before.
+
+| Button | In a game | In a menu |
+|---|---|---|
+| LEFT / RIGHT | the two bats; hold to cradle | move left / right |
+| UP | the upper bat | move up |
+| NUDGE | shove the cabinet | move down |
+| LAUNCH | fire the ball, and only while one is on the rod | select |
+
+The menu screens are painted into the canvas rather than built out of HTML, so
+they are also tappable directly: the menu's two boxes, table select's name and
+Info boxes, and the scrolling name list, all hit-tested against the renderer's
+own coordinates. "REALLY QUIT TABLE?" takes 'Y' and nothing else, exactly as the
+original does, so the deck offers QUIT and PLAY ON by name and a stray tap on
+the glass always means PLAY ON. Initials are typed on the phone's own keyboard.
+
+Portrait and landscape both work and neither is locked or nagged about; in
+landscape the deck moves to the left and right edges, which is worth about half
+as much picture again, because this machine's window is wide and short where
+both sibling remakes' are tall. There is no accelerometer: the nudge is a
+button, iOS gates motion behind a permission prompt, a real shake is
+indistinguishable from walking, and this table's tilt is a measured mechanism
+that a noisy continuous signal would trip for players who did nothing.
+
 ### Not started
 
 The intro (`intro.bin` is a FreeAnim animation plus an SNT! tune, and its frame
