@@ -375,9 +375,23 @@ export interface LockCapture {
  * order, so when two balls are in the same saucer on the same tick the lower ball
  * id wins, every time.
  *
- * The velocity is zeroed but the POSITION is not touched, because the original
- * does not touch it: the ball stops where it rolled in. That also means a lock
- * can never place a ball inside geometry, which a saucer-centre snap could.
+ * NEITHER THE POSITION NOR THE VELOCITY IS TOUCHED, because the original's
+ * capture handler at +0x00552A touches neither: it flags the ball held
+ * (`ori.b #$80,$1(a4)`) and stops integrating it, and the ball record keeps the
+ * velocity words it entered with. That is not an idle detail — the popper's
+ * eject at +0x007114 does `andi.l #$ff00ff,$e(a4)` before adding the authored
+ * impulse, i.e. it KEEPS THE LOW BYTE of each stored entry-velocity word, so
+ * the ejected ball carries up to 255/256 px/f of the capture approach in each
+ * axis. Zeroing here (as this function did until round 8) silently deleted that
+ * carry and made every eject bit-identical; the original's own three filmed
+ * untouched launches leave the same saucer on visibly different lines, and the
+ * kept low bytes are the mechanism. Verified live against the reference
+ * emulator (ramwatch run C, 2026-08-03): ball captured at centre (164,33) with
+ * entry velocity intact in the record through the whole hold.
+ *
+ * Held balls stay out of the simulation through `ballIsInPlay`, which tests
+ * `heldBy`, not the velocity, so the kept words are inert until the eject reads
+ * them.
  */
 export function captureBalls(bank: LockBank, balls: readonly BallState[]): readonly LockCapture[] {
   const captures: LockCapture[] = [];
@@ -387,8 +401,6 @@ export function captureBalls(bank: LockBank, balls: readonly BallState[]): reado
       if (!ball.active || ball.heldBy !== null) continue;
       if (!lockCovers(device, ball)) continue;
       ball.heldBy = device.id;
-      ball.velocityX = 0;
-      ball.velocityY = 0;
       bank.held.set(device.id, ball.id);
       captures.push({ deviceId: device.id, ballId: ball.id });
       break;

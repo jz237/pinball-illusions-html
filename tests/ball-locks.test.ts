@@ -284,11 +284,15 @@ describe("capture", () => {
     expect(captured).toEqual([{ deviceId: device.id, ballId: ball.id }]);
     expect(ball.heldBy).toBe(device.id);
     expect(ball.active).toBe(true);
-    // The original's capture handler never touches the position, so nor does this.
+    // The original's capture handler at +0x00552A touches NEITHER the position
+    // NOR the velocity: the ball record keeps its entry words through the hold
+    // and the popper's eject at +0x007114 reads their low bytes back into the
+    // authored impulse. The freeze is `ballIsInPlay` skipping held balls, not a
+    // zeroed velocity.
     expect(q10ToPixel(ball.x)).toBe(at.x);
     expect(q10ToPixel(ball.y)).toBe(at.y);
-    expect(ball.velocityX).toBe(0);
-    expect(ball.velocityY).toBe(0);
+    expect(ball.velocityX).toBe(500);
+    expect(ball.velocityY).toBe(-700);
     expect(heldBallIn(bank, device.id)).toBe(ball.id);
   });
 

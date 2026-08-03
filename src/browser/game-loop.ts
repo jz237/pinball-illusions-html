@@ -1753,10 +1753,42 @@ function runLockEjects(game: Game): {
   ball.heldBy = null;
   ball.x = pixelsToQ10(eject.x);
   ball.y = pixelsToQ10(eject.y);
-  ball.velocityX = originalVelocityToQ10(eject.velocityX);
-  ball.velocityY = originalVelocityToQ10(eject.velocityY);
+  ball.velocityX = ejectVelocity(ball.velocityX, eject.velocityX);
+  ball.velocityY = ejectVelocity(ball.velocityY, eject.velocityY);
   ball.level = eject.level;
   return { ejected: [ballId], zones: [{ level: lock.level, index: lock.zoneIndex }] };
+}
+
+/**
+ * One axis of the eject velocity: the authored impulse PLUS the low byte of the
+ * held ball's own entry-velocity word.
+ *
+ * Decoded from the popper, +0x007114..+0x007120:
+ *
+ *     007114  andi.l  #$ff00ff,$e(a4)     ; keep only the LOW BYTE of each of
+ *     00711C  add.w   d0,$e(a4)           ;   the ball's velocity words, then
+ *     007120  add.w   d1,$10(a4)          ;   ADD the authored impulse words
+ *
+ * The capture at +0x00552A never clears the ball's velocity, so those low bytes
+ * are the remnant of the capture approach — up to 255 original units (just
+ * under a pixel a frame) per axis, always non-negative before the add because a
+ * byte is unsigned. The sum is a 68000 `add.w`: it wraps at sixteen bits and
+ * the integrator reads the result as signed. This is the original's own eject
+ * entropy — the reason its three filmed untouched launches leave the top-lane
+ * saucer on different lines — and it was measured live in the reference
+ * emulator (ramwatch run C: hold record h4+0x39EA, authored impulse (500,0),
+ * ejected ball moving (+2.37,+0.39) px/f, not (+1.95,0)).
+ *
+ * The recon's Q10 words carry two more fraction bits than the original's
+ * velocity units; `>> 2` is the exact bridge back to original units
+ * (Q10_PER_ORIGINAL_VELOCITY_UNIT is 4), and the two dropped bits are noise the
+ * original could not have held either.
+ */
+function ejectVelocity(entryQ10: number, impulseUnits: number): number {
+  const entryLowByte = (entryQ10 >> 2) & 0xff;
+  let word = (impulseUnits + entryLowByte) & 0xffff;
+  if (word >= 0x8000) word -= 0x10000;
+  return originalVelocityToQ10(word);
 }
 
 /** The authored eject of a saucer, from the shipped devices document. */
