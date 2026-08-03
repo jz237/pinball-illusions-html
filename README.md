@@ -128,13 +128,21 @@ and shipped in `public/generated/flipper-bats.json` and
   uses the record; closing the gap moves the ball and belongs in its own round.
 
 And the **sound effects** are decoded and shipped in
-`public/generated/tables/*.audio.json` plus one WAV per sample:
+`public/generated/tables/*.audio.json` plus one WAV per sample, with the
+engine's own seven sounds beside them in `public/generated/engine.audio.json`:
 
 - Slots 7 and 8 are not raw PCM: every one begins `SNT!` and is a ProTracker-
   derived module bank, with the effect PCM appended after the last bank. The
   26-byte sound record's layout is proven by the DMA servicer at `$7958`, and its
   period is a **pitch** — every value is an exact ProTracker period and records
   that share a sample form chromatic runs across adjacent lane rectangles.
+- The engine bank is `main.bin` hunks 10/11 — flipper up- and down-stroke, ball
+  serve, ball drain, level transfer, lock capture and device eject — wired to
+  the tick report's own event fields, and the table manifests carry the
+  award/mode sting layer (lock-eject voices, award fanfares, the universal
+  script stings, Extreme Sports' mission callouts) keyed by the ids the mode VM
+  already reports. The full census of what the original plays and from where is
+  `research/SOUND_CENSUS.md`.
 - `src/browser/audio.ts` plays them through Web Audio on one channel with the
   original's priority rule, and is **strictly downstream of the simulation**:
   nothing under `src/game/` imports it, and `tests/audio.test.ts` runs the same
@@ -372,9 +380,10 @@ this project draws is between **functional geometry** and **creative content**:
   This section used to say audio was "newly created — synthesised or
   independently recreated rather than sampled", and while the missions were being
   decoded the sound records turned out to be decodable too. So the effects now
-  shipped are the machine's own samples, taken out of the `SNT!` banks at the
-  Paula period each sound record names, written to `public/generated/tables/*.wav`
-  and claimed by a `disk-derived-audio` manifest carrying each file's sha256.
+  shipped are the machine's own samples — the tables' out of the `SNT!` banks,
+  the engine's out of `main.bin` hunk 11 — at the Paula period each sound record
+  names, written to `public/generated/tables/*.wav` and `public/generated/engine.snd-*.wav`
+  and claimed by `disk-derived-audio` manifests carrying each file's sha256.
   Several of them are speech, which is a heavier rights question than a still
   picture, so they go through exactly the same authorization gate: `npm run
   guard:public` refuses a build containing a sound file no manifest accounts for,

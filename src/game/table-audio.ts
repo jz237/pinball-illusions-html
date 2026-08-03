@@ -30,13 +30,19 @@
  */
 
 import { TABLE_IDS } from "./contracts.js";
-import type { TableAudioDocument, TableId } from "./contracts.js";
+import type { EngineAudioDocument, TableAudioDocument, TableId } from "./contracts.js";
 
-/** The only document schema this loader understands. */
+/** The only per-table document schema this loader understands. */
 export const TABLE_AUDIO_SCHEMA = "pinball-illusions/table-audio/v1";
+
+/** The engine-sound document schema; same samples, event-name triggers. */
+export const ENGINE_AUDIO_SCHEMA = "pinball-illusions/engine-audio/v1";
 
 /** Where the exported documents live under the site root (Vite serves `public/`). */
 export const TABLE_AUDIO_BASE_PATH = "generated/tables/";
+
+/** Where the engine manifest and its WAVs live. */
+export const ENGINE_AUDIO_BASE_PATH = "generated/";
 
 /** Paula's volume register is 0..64, and it is a plain linear multiplier. */
 export const PAULA_MAX_VOLUME = 64;
@@ -44,11 +50,12 @@ export const PAULA_MAX_VOLUME = 64;
 /**
  * One sound effect.
  *
- * `provenance` is "decoded" for a kind-2 record, whose sample pointer is a
- * relocated address this decode follows, and "inferred" for a kind-5 record,
- * whose (bank, instrument) pair is resolved by a rule main.seg00 never executes.
- * See the exporter's header for the evidence behind the inference and for why it
- * is still labelled one.
+ * `provenance` is "decoded" for every current export: a kind-2 record's sample
+ * pointer is a relocated address the decode follows, and a kind-5 record's
+ * (bank, instrument) pair is resolved by the rule the table loader at main.seg00
+ * `$343E` executes — the resolver an earlier round could not find, whose absence
+ * is why "inferred" exists in this union. The value stays accepted so an older
+ * manifest still parses.
  */
 export interface AudioSample {
   readonly index: number;
@@ -121,6 +128,21 @@ export function parseTableAudioDocument(doc: TableAudioDocument): TableAudio {
     throw new Error(`${label} has a non-string or empty displayName`);
   }
 
+  const samples = parseSamples(raw, label);
+  const triggers = parseTriggers(raw, label, samples);
+
+  return Object.freeze({
+    tableId,
+    displayName,
+    samples: Object.freeze(samples),
+    sampleForAward(awardId: string): AudioSample | null {
+      return triggers.get(awardId) ?? null;
+    },
+  });
+}
+
+/** The `samples` array of either document shape, checked field by field. */
+function parseSamples(raw: Record<string, unknown>, label: string): AudioSample[] {
   const rawSamples = raw["samples"];
   if (!Array.isArray(rawSamples)) throw new Error(`${label} has non-array samples`);
   const samples: AudioSample[] = [];
@@ -160,7 +182,15 @@ export function parseTableAudioDocument(doc: TableAudioDocument): TableAudio {
     );
   }
   if (samples.length === 0) throw new Error(`${label} carries no samples`);
+  return samples;
+}
 
+/** The `triggers` array of either document shape, as an id -> sample map. */
+function parseTriggers(
+  raw: Record<string, unknown>,
+  label: string,
+  samples: readonly AudioSample[],
+): Map<string, AudioSample> {
   const rawTriggers = raw["triggers"];
   if (!Array.isArray(rawTriggers)) throw new Error(`${label} has non-array triggers`);
   const triggers = new Map<string, AudioSample>();
@@ -176,13 +206,50 @@ export function parseTableAudioDocument(doc: TableAudioDocument): TableAudio {
     if (sample === undefined) throw new Error(`${label} trigger ${id} names sample ${index}`);
     triggers.set(id, sample);
   }
+  return triggers;
+}
 
+// ---------------------------------------------------------------------------
+// The engine sounds
+// ---------------------------------------------------------------------------
+
+/**
+ * The ENGINE'S OWN SOUNDS — the seven effects `main.bin` plays itself, decoded
+ * from its hunks 10/11 and shared by all three tables. Same sample shape as a
+ * table's; the triggers are the engine's event names — `flipper-raise`,
+ * `flipper-rest`, `serve`, `drain`, `level-transfer`, `capture`, `eject` — and
+ * `src/browser/audio.ts` maps the tick report onto them.
+ */
+export interface EngineAudio {
+  readonly displayName: string;
+  readonly samples: readonly AudioSample[];
+  /** The sample one engine event plays, or null. */
+  sampleFor(triggerId: string): AudioSample | null;
+}
+
+/** Expands the engine document, checking every field. */
+export function parseEngineAudioDocument(doc: EngineAudioDocument): EngineAudio {
+  const raw = doc as unknown as Record<string, unknown> | null | undefined;
+  if (raw === null || raw === undefined || typeof raw !== "object") {
+    throw new Error(`engine audio document must be an object, got ${describeValue(doc)}`);
+  }
+  if (raw["schema"] !== ENGINE_AUDIO_SCHEMA) {
+    throw new Error(
+      `engine audio document has schema ${describeValue(raw["schema"])}, expected "${ENGINE_AUDIO_SCHEMA}"`,
+    );
+  }
+  const label = "engine audio";
+  const displayName = raw["displayName"];
+  if (typeof displayName !== "string" || displayName.length === 0) {
+    throw new Error(`${label} has a non-string or empty displayName`);
+  }
+  const samples = parseSamples(raw, label);
+  const triggers = parseTriggers(raw, label, samples);
   return Object.freeze({
-    tableId,
     displayName,
     samples: Object.freeze(samples),
-    sampleForAward(awardId: string): AudioSample | null {
-      return triggers.get(awardId) ?? null;
+    sampleFor(triggerId: string): AudioSample | null {
+      return triggers.get(triggerId) ?? null;
     },
   });
 }
@@ -243,4 +310,26 @@ export async function loadTableAudio(
   const audio = parseTableAudioDocument(doc);
   registerTableAudio(audio);
   return audio;
+}
+
+/** URL of the engine manifest, relative to the site root. */
+export function engineAudioUrl(basePath: string = ENGINE_AUDIO_BASE_PATH): string {
+  return `${basePath}engine.audio.json`;
+}
+
+/**
+ * Fetches and parses the engine's sound manifest. No registry: there is one
+ * document for the whole machine and the caller keeps it.
+ */
+export async function loadEngineAudio(
+  fetchImpl: TableAudioFetch = defaultFetch,
+  basePath: string = ENGINE_AUDIO_BASE_PATH,
+): Promise<EngineAudio> {
+  const url = engineAudioUrl(basePath);
+  const response = await fetchImpl(url);
+  if (!response.ok) {
+    throw new Error(`failed to fetch ${url}: HTTP ${response.status} ${response.statusText}`);
+  }
+  const doc = (await response.json()) as EngineAudioDocument;
+  return parseEngineAudioDocument(doc);
 }

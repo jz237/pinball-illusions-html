@@ -64,25 +64,67 @@
 // ---------------------------------------------------------------------------
 // WHAT PLAYS WHAT
 // ---------------------------------------------------------------------------
-// Three bindings, all uniform across the three tables:
+// Seven binding chains, all uniform across the three tables:
 //
-//     device record        +$08 -> sound record
-//     bumper record        +$02 -> sound record
-//     slingshot record     +$02 -> sound record
-//     zone object          +$02 -> sound record
+//     device record        +$08 -> sound record         id device-N
+//     bumper record        +$02 -> sound record         id bumper-N
+//     slingshot record     +$02 -> sound record         id slingshot-N
+//     zone object          +$02 -> sound record         id zone-L-N
+//     lock zone object     +$10 -> sound record         id zone-eject-L-N
+//     element record       +$10 / +$3C -> sound record  id mode-element-N
+//     display record       op-0x10 operand -> record    id mode-element-N /
+//                                                          mode-start-N /
+//                                                          mode-message-N
 //
 // They are exported keyed by the SAME id the scoring layer gives an award —
-// `device-36`, `bumper-16`, `zone-0-8` — so the browser's audio layer can map a
-// tick report to a sound without knowing anything about the packages.
+// `device-36`, `bumper-16`, `zone-0-8`, `mode-element-15` — so the browser's
+// audio layer can map a tick report to a sound without knowing anything about
+// the packages.
 //
-// KIND 5 IS AN INFERENCE and is labelled one in the manifest. main.seg00 never
-// reads +$12 or +$14, so the code that turns (bank, instrument) into an address
-// is somewhere this project has not disassembled. It is a strong inference: every
-// (bank, instrument) pair on all three tables lands on a live sample in the named
-// bank, the discriminating case works (Law 'n Justice +$9E36 is bank 0 sample 29
-// and bank 1 has no sample 29), and the four Law 'n Justice records sharing
-// instrument 7 differ only in period — 508/428/381/339 = A-1/C-2/D-2/E-2, a lane
-// rollover scale. But it is not proof, and the manifest says so per sample.
+// THE LOCK-ZONE EJECT VOICE (+$10 on the type-4 zone object) is played by the
+// popper at main.seg00 $6FD8-$6FE2/$705A-$7060 during the eject countdown; the
+// game loop reports which saucer ejected, and `zone-eject-L-N` is that saucer.
+//
+// THE ELEMENT AND DISPLAY CHAINS are the award/mode sting layer:
+//
+//   * element +$10 is the AWARD-path sound the interpreter at $5CF8 plays when
+//     an element is AWARDed (the modes exporter's ELEMENT_SOUND_AWARD, whose
+//     presence flag ships in the modes document — CHECK 6 below ties the two
+//     exports together element by element). +$3C is a second award-path sound
+//     slot a few records carry (BabeWatch's jackpot fanfare r96A4 hangs there);
+//     it is used only when +$10 is empty.
+//   * display records — element +$14 (START path), +$18 (AWARD path), and the
+//     message records MESSAGE shows — are programs for the display VM whose
+//     opcode table is at main.seg00 $6748, and its op 0x10 ($6940) plays the
+//     sound record its operand names. Those operands are found mechanically:
+//     every relocated longword whose preceding word is 0x0010 and whose target
+//     reads as a sound record (the same period/kind/volume test as CHECK 2).
+//     Each site is attributed to the display record it sits inside — the
+//     nearest known display start at or below it, always within 0x42 bytes on
+//     the shipped tables — and keyed by how the runtime learns that display
+//     ran: `mode-message-N` when the record is in the message pool (the mode
+//     VM reports every shown message, including the ones element starts and
+//     awards push), else `mode-element-N` / `mode-start-N` for the awarding or
+//     starting element. One record per trigger: the direct award sound wins
+//     over a display sting, and only a container's first site binds — the
+//     original can layer several on its one channel, a manifest maps one.
+//
+// This is how the two universal script stings ship — Law 'n Justice's r9E50
+// (28 sites, priority 120) and BabeWatch's r9740 (43 sites) — and Extreme
+// Sports' five 0.5-0.8 s mission callouts, none of which any earlier chain
+// reached. See research/SOUND_CENSUS.md for the full per-record inventory.
+//
+// KIND 5 IS DECODED — the resolver the earlier export could not find is in
+// main.seg00 at $343E. It runs at table-load time: it walks the whole record
+// array from descriptor +$7C (stride 26), and for each kind-5 record indexes
+// the per-bank instrument table at $3456 by (instrument - 1), storing the
+// resolved sample pointer into the record's own +$16 ($3468) and deriving the
+// chunk length from the directory length and the period ($346E-$3486, constant
+// $11519 = PAL clock / 50). That is exactly the (bank, instrument) -> address
+// rule this exporter applies, so the manifest now labels kind-5 samples
+// "decoded" like the rest. The corroboration that used to justify the
+// inference — every pair lands on a live sample, the bank-0 discriminating
+// case, the instrument-7 rollover scale A-1/C-2/D-2/E-2 — still holds.
 //
 // ---------------------------------------------------------------------------
 // THE CHECKS, ALL FATAL
@@ -95,6 +137,12 @@
 //    in the effect tail rather than in the middle of a module's instruments.
 // 4. EVERY KIND-5 (bank, instrument) PAIR NAMES A LIVE SAMPLE in that bank.
 // 5. THE RELOCATION TABLES PARSE TO THE BYTE on every slot of every package.
+// 6. THE ELEMENT POOL MATCHES THE SHIPPED MODES DOCUMENT: same element count,
+//    and per element the same "has an award sound" / "has a start sound" flags
+//    the modes exporter recorded. The `mode-element-N` ids only mean anything
+//    because N is the same N the mode VM reports, and this is what pins it.
+// 7. EVERY OP-0x10 SITE LIES INSIDE A KNOWN DISPLAY RECORD — between a display
+//    or message start and the next known record, never past ATTRIBUTION_SPAN.
 //
 // Usage:
 //   node scripts/export-table-audio.mjs <segment-dir> [out-dir] [--check]
@@ -102,6 +150,7 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { createHash } from "node:crypto";
+import { findScripts } from "./export-table-modes.mjs";
 
 const PREAMBLE = 4;
 const DEVICE_SLOTS = 160;
@@ -121,6 +170,28 @@ const HEADER_BANK_1 = 0x78;
 const DEVICE_SOUND = 0x08;
 const HIT_SOUND = 0x02;
 const ZONE_SOUND = 0x02;
+/** The eject voice a type-4 (lock) zone object carries; see the header. */
+const ZONE_EJECT_SOUND = 0x10;
+/** Zone record: the type word and the lock type the eject chain applies to. */
+const ZONE_TYPE = 0x08;
+const ZONE_OBJECT = 0x0a;
+const ZONE_TYPE_LOCK = 4;
+
+/** Element record sound and display slots (the modes exporter's offsets). */
+const ELEMENT_SOUND_START = 0x0c;
+const ELEMENT_SOUND_AWARD = 0x10;
+const ELEMENT_SOUND_AWARD_ALT = 0x3c;
+const ELEMENT_DISPLAY_START = 0x14;
+const ELEMENT_DISPLAY_AWARD = 0x18;
+
+/** The display VM's play-record opcode; operand is a relocated longword. */
+const OP_PLAY_RECORD = 0x0010;
+/**
+ * How far past a display record's start an op-0x10 site may sit and still be
+ * that record's. The farthest site on the shipped tables is +0x42; anything
+ * beyond this is CHECK 7 refusing an attribution rather than guessing one.
+ */
+const ATTRIBUTION_SPAN = 0x80;
 
 /** Sound record fields. Each is quoted to its instruction in the header. */
 const SOUND_KIND = 0x00;
@@ -406,10 +477,16 @@ function bindings(pkg) {
       const at = { hunk: zones.hunk, offset: zones.offset + ZONE_RECORD_BYTES * index };
       if (!inBounds(pkg, at, ZONE_RECORD_BYTES) || readS16(pkg, at, 0) < 0) break;
       if (index > 200) throw new Error(`${pkg.stem}: zone list on level ${level} is not terminated`);
-      const object = follow(pkg, at, 10);
+      const object = follow(pkg, at, ZONE_OBJECT);
       if (object === null) continue;
       const sound = follow(pkg, object, ZONE_SOUND);
       if (sound !== null) found.push({ id: `zone-${level}-${index}`, sound });
+      // The lock's eject voice, on the saucer's own object. Only a type-4 zone
+      // is a lock; on every other type +$10 is not a sound slot.
+      if (readU16(pkg, at, ZONE_TYPE) === ZONE_TYPE_LOCK) {
+        const eject = follow(pkg, object, ZONE_EJECT_SOUND);
+        if (eject !== null) found.push({ id: `zone-eject-${level}-${index}`, sound: eject });
+      }
     }
   }
 
@@ -439,6 +516,144 @@ function bindings(pkg) {
   }
 
   return found;
+}
+
+// ---------------------------------------------------------------------------
+// The mode bindings: element sounds and display-script stings
+// ---------------------------------------------------------------------------
+
+/**
+ * Everything the award/mode layer plays, keyed the way the mode VM reports it:
+ * `mode-element-N` fires with the element's award (it is already an award id
+ * in the tick report), `mode-start-N` with `elementStarts`, `mode-message-N`
+ * with `messagesShown`. See the header for the two chains and CHECKs 6 and 7.
+ *
+ * `modesDoc` is the SHIPPED modes document, and it is required: the element
+ * indices here are only meaningful because they are derived by exactly the
+ * walk `export-table-modes.mjs` ships, and CHECK 6 refuses to export against a
+ * document that disagrees.
+ */
+function modeBindings(pkg, modesDoc) {
+  const scripts = findScripts(pkg);
+
+  // The pools, exactly as the modes exporter derives them: every element and
+  // message operand of every surviving script, sorted by address.
+  const elementKeys = new Set();
+  const messageKeys = new Set();
+  for (const script of scripts.values()) {
+    for (const op of script.ops) {
+      for (const arg of op.args) {
+        if (arg.target === null || arg.target === undefined) continue;
+        if (arg.kind === "e") elementKeys.add(key(arg.target));
+        if (arg.kind === "m") messageKeys.add(key(arg.target));
+      }
+    }
+  }
+  const byKey = (set) =>
+    [...set]
+      .map((k) => {
+        const [hunk, offset] = k.split(":").map(Number);
+        return { hunk, offset };
+      })
+      .sort((a, b) => a.hunk - b.hunk || a.offset - b.offset);
+  const elements = byKey(elementKeys);
+  const messages = byKey(messageKeys);
+  const messageIndex = new Map(messages.map((at, index) => [key(at), index]));
+
+  // CHECK 6 — this pool must be the modes document's pool, element for element.
+  const shipped = Array.isArray(modesDoc?.elements) ? modesDoc.elements : null;
+  if (shipped === null || shipped.length !== elements.length) {
+    throw new Error(
+      `${pkg.stem}: derived ${elements.length} elements but the modes document ships ` +
+        `${shipped === null ? "none" : shipped.length}; re-run export-table-modes.mjs first`,
+    );
+  }
+  for (const [index, at] of elements.entries()) {
+    const start = follow(pkg, at, ELEMENT_SOUND_START) !== null;
+    const award = follow(pkg, at, ELEMENT_SOUND_AWARD) !== null;
+    if (Boolean(shipped[index].soundStart) !== start || Boolean(shipped[index].soundAward) !== award) {
+      throw new Error(
+        `${pkg.stem}: element ${index} sound flags (start ${start}, award ${award}) disagree ` +
+          `with the shipped modes document; the two exports are not looking at the same pool`,
+      );
+    }
+  }
+
+  // Containers: every display record the runtime can report having run, keyed
+  // by the id it reports. The message pool claims an address first — the mode
+  // VM pushes an element's display onto `messagesShown` whenever that display
+  // is in the pool, so binding it as a message avoids firing twice.
+  const containers = new Map();
+  const admit = (at, id) => {
+    if (at !== null && !containers.has(key(at))) containers.set(key(at), { at, id });
+  };
+  for (const [index, at] of messages.entries()) admit(at, `mode-message-${index}`);
+  for (const [index, at] of elements.entries()) {
+    const award = follow(pkg, at, ELEMENT_DISPLAY_AWARD);
+    if (award !== null && !messageIndex.has(key(award))) admit(award, `mode-element-${index}`);
+    const start = follow(pkg, at, ELEMENT_DISPLAY_START);
+    if (start !== null && !messageIndex.has(key(start))) admit(start, `mode-start-${index}`);
+  }
+  const containersByHunk = new Map();
+  for (const container of containers.values()) {
+    const list = containersByHunk.get(container.at.hunk) ?? [];
+    list.push(container);
+    containersByHunk.set(container.at.hunk, list);
+  }
+  for (const list of containersByHunk.values()) list.sort((a, b) => a.at.offset - b.at.offset);
+
+  // Every op-0x10 site: a relocated longword whose preceding word is the
+  // play-record opcode and whose target reads as a sound record. The record
+  // test is what makes the scan safe — see `readSoundRecord`.
+  const sites = [];
+  for (const where of pkg.relocations.keys()) {
+    const [hunk, offset] = where.split(":").map(Number);
+    if (offset < 2) continue;
+    const at = { hunk, offset };
+    if (!inBounds(pkg, at, 4)) continue;
+    if (readU16(pkg, { hunk, offset: offset - 2 }) !== OP_PLAY_RECORD) continue;
+    const target = follow(pkg, at, 0);
+    if (target === null || readSoundRecord(pkg, target) === null) continue;
+    sites.push({ hunk, offset: offset - 2, target });
+  }
+  sites.sort((a, b) => a.hunk - b.hunk || a.offset - b.offset);
+
+  const found = [];
+  // The direct element sounds first, so they win the id over a display sting.
+  for (const [index, at] of elements.entries()) {
+    const award = follow(pkg, at, ELEMENT_SOUND_AWARD) ?? follow(pkg, at, ELEMENT_SOUND_AWARD_ALT);
+    if (award !== null) found.push({ id: `mode-element-${index}`, sound: award });
+    const start = follow(pkg, at, ELEMENT_SOUND_START);
+    if (start !== null) found.push({ id: `mode-start-${index}`, sound: start });
+  }
+
+  // Then the display stings, first site per container.
+  const claimed = new Set();
+  let layered = 0;
+  for (const site of sites) {
+    let holder = null;
+    for (const container of containersByHunk.get(site.hunk) ?? []) {
+      if (container.at.offset <= site.offset) holder = container;
+      else break;
+    }
+    // CHECK 7 — a site outside every known display record would mean the
+    // display pools are incomplete, and guessing an id would wire a sound to
+    // an event that never fires (or the wrong one).
+    if (holder === null || site.offset - holder.at.offset >= ATTRIBUTION_SPAN) {
+      throw new Error(
+        `${pkg.stem}: op-0x10 site at hunk ${site.hunk}+${site.offset} is not inside any known ` +
+          `display record; the nearest starts ${holder === null ? "nowhere" : `${site.offset - holder.at.offset} bytes back`}`,
+      );
+    }
+    if (claimed.has(key(holder.at))) {
+      layered += 1; // a second sting in one display: the manifest maps one.
+      continue;
+    }
+    claimed.add(key(holder.at));
+    found.push({ id: holder.id, sound: site.target });
+  }
+
+  return { found, stats: { elements: elements.length, messages: messages.length, sites: sites.length, layered } };
 }
 
 // ---------------------------------------------------------------------------
@@ -477,7 +692,7 @@ function toWav(pcm, rate) {
 // Assembling one table
 // ---------------------------------------------------------------------------
 
-function decode(pkg, table) {
+function decode(pkg, table, modesDoc) {
   const audio = new Map();
   for (let hunk = 0; hunk < pkg.bodies.length; hunk += 1) {
     const slot = readBanks(pkg, hunk);
@@ -487,11 +702,16 @@ function decode(pkg, table) {
 
   const samples = [];
   const byRecord = new Map();
-  const triggers = [];
+  /** id -> sample index; FIRST binding of an id wins, so the direct chains
+   * (and among the mode chains, the award interpreter's own slot) take
+   * precedence over later stings on the same id. */
+  const triggerById = new Map();
+  const modes = modeBindings(pkg, modesDoc);
 
-  for (const binding of bindings(pkg)) {
+  for (const binding of [...bindings(pkg), ...modes.found]) {
     const record = readSoundRecord(pkg, binding.sound);
     if (record === null) continue;
+    if (triggerById.has(binding.id)) continue;
     const recordKey = key(binding.sound);
     let index = byRecord.get(recordKey);
     if (index === undefined) {
@@ -515,20 +735,19 @@ function decode(pkg, table) {
         priority: record.priority,
         kind: record.kind === KIND_SAMPLE ? "sample" : "instrument",
         milliseconds: Math.round((pcm.length / rate) * 1000),
-        // Kind 5's (bank, instrument) resolution is inference, not proof.
-        provenance: record.kind === KIND_SAMPLE ? "decoded" : "inferred",
+        // Both kinds are decoded: kind 2's pointer is a relocation this walk
+        // follows, and kind 5's (bank, instrument) rule is the loader at
+        // main.seg00 $343E — see the header.
+        provenance: "decoded",
       });
     }
-    triggers.push({ id: binding.id, sample: index });
+    triggerById.set(binding.id, index);
   }
 
-  triggers.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-  const unique = [];
-  for (const trigger of triggers) {
-    if (unique.length > 0 && unique[unique.length - 1].id === trigger.id) continue;
-    unique.push(trigger);
-  }
-  return { samples, triggers: unique, banks: [...audio.values()] };
+  const triggers = [...triggerById.entries()]
+    .map(([id, sample]) => ({ id, sample }))
+    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  return { samples, triggers, banks: [...audio.values()], modeStats: modes.stats };
 }
 
 function buildDocument(table, decoded) {
@@ -567,7 +786,14 @@ function main(argv) {
   for (const table of TABLES) {
     let decoded;
     try {
-      decoded = decode(loadPackage(segDir, table.stem), table);
+      // The shipped modes document pins the element/message indices the mode
+      // triggers are keyed by (CHECK 6), so it must exist before this runs.
+      const modesPath = join(outDir, `${table.tableId}.modes.json`);
+      if (!existsSync(modesPath)) {
+        throw new Error(`${modesPath} is missing; run export-table-modes.mjs first`);
+      }
+      const modesDoc = JSON.parse(readFileSync(modesPath, "utf8"));
+      decoded = decode(loadPackage(segDir, table.stem), table, modesDoc);
     } catch (error) {
       console.error(`  ${table.tableId.padStart(15)}: ${error instanceof Error ? error.message : error}`);
       failures += 1;
@@ -604,6 +830,13 @@ function main(argv) {
         `${total.toLocaleString()} bytes of WAV, ${decoded.triggers.length} binding(s) -> ${out}`,
     );
     const pad = " ".repeat(15);
+    console.log(
+      `  ${pad}  mode layer: ${decoded.modeStats.sites} op-0x10 site(s) over ` +
+        `${decoded.modeStats.elements} elements / ${decoded.modeStats.messages} messages` +
+        (decoded.modeStats.layered > 0
+          ? `, ${decoded.modeStats.layered} layered sting(s) beyond the first per display`
+          : ""),
+    );
     for (const sample of decoded.samples) {
       console.log(
         `  ${pad}    ${String(sample.index).padStart(2)} ${sample.kind.padEnd(10)} ` +

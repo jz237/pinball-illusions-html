@@ -30,7 +30,7 @@ rules dump and nothing here is sufficient to write mode logic from.
 | Mode timer values | **A−** | Every `WAIT`'s duration is an operand in the script; the seconds-per-tick multiplier is a system field, so PAL is assumed — §12 |
 | Combo windows, hurry-up rates | **D** | The ladder counters are decoded (award effect 21); the pop that reads the `$23DC` stack is not |
 | Script/bytecode grammar | **A−** | **All 31 opcodes, lengths and operands decoded**; nine operand *record types* still unidentified — §12 |
-| Sound effects | **A−** | Records, banks, periods and bindings decoded and shipped; the kind-5 resolver is inference — §13 |
+| Sound effects | **A** | Records, banks, periods and bindings decoded and shipped, engine bank included; the kind-5 resolver is decoded at `$343E` — §13, `research/SOUND_CENSUS.md` |
 | Music | **D** | Banks, sample directories and instruments decoded; the packed pattern format is not |
 
 ~~**The single most important negative:** we can now say what an award is *worth* but not
@@ -220,9 +220,14 @@ Engine handler 0 (`main.seg00` `0x55CE`) uses a *different* record. Decoded from
         movea.l $4(a0),a2     ; a2 -> per-player once-only bit byte
         move.w $DBE(a5),d0    ; current player index
         bset   d0,(a2)        ; Z = "this was the FIRST hit"
-   first hit  -> sound #$0C ; lea $12(a1),a3 ; jsr $6B96
-   repeat hit -> sound #$08 ; lea $1A(a1),a3 ; jsr $6BCC
+   first hit  -> $63C6 with d0=#$0C ; lea $12(a1),a3 ; jsr $6B96
+   repeat hit -> $63C6 with d0=#$08 ; lea $1A(a1),a3 ; jsr $6BCC
 ```
+
+(`$63C6` was annotated "sound #$0C / sound #$08" here for a while; it is **not a sound
+call** — it queues a LAMP FLASH of duration d0 for the lamp in a2 on the `$1200(a5)`
+list serviced by `$63E6/$6430`. The sounds this family plays go through `$6CD0` from the
+node's own record slots. Corrected by the census in `research/SOUND_CENSUS.md`.)
 
 so family B is:
 
@@ -372,11 +377,20 @@ Opcode census (relocated longwords classified by the preceding word), Table001:
 | `0x07` | 4 | `0x12` | 3 | | |
 | `0x08` | 5 | | | | |
 
-Only two opcodes are proven: **`0x0003` = display message** (operand → message record;
-verified for 45 of Table003's 52 in-script strings and 66 of Table001's) and
-**`0x001A` = a second text-display op** used for jackpot banners. `0x0010` and `0x0013`
-always point into the sound/effect descriptor table. Everything else is a census entry,
-not a decoding. **[disk] for the census, [open] for the semantics.**
+Only two opcodes were proven when this census was taken: **`0x0003` = display message**
+(operand → message record; verified for 45 of Table003's 52 in-script strings and 66 of
+Table001's) and **`0x001A` = a second text-display op** used for jackpot banners. Two
+more are now settled (research/SOUND_CENSUS.md §1.1, corrections 3-4):
+
+- **`0x0010` is the play-record op** — handler `$6940`, dispatched through the opcode
+  table at `$6748` (handler = `$674C`+disp); its operand longword names a 26-byte sound
+  record (§13.1), NOT an entry of the 8-byte table at `0x9E6E` as previously read here.
+  The audio exporter walks exactly these operands for the display stings and callouts.
+- **`0x0013` does not play anything** — handler `$6938` stores its operand word into
+  `$23C6(a5)`, the repeat counter consumed by op `0x11` (`$6906`).
+
+Everything else is a census entry, not a decoding. **[disk] for the census and the two
+ops above, [open] for the rest.**
 
 ### 2.10 Mode objects
 
@@ -1230,24 +1244,40 @@ first difference of every effect sample is 2-4x smaller read signed than sign-fl
 
     device record     +$08 -> sound record      bumper record    +$02 -> sound record
     slingshot record  +$02 -> sound record      zone object      +$02 -> sound record
+    lock zone object  +$10 -> eject voice       element record   +$10/+$3C -> award sound
+    element record    +$0C -> start sound       display record   op-0x10 -> sting/callout
 
 Uniform across all three tables. `$779E` starts an effect only if
 `cmp.w $2(a1),d7 / bcs skip` lets it — a sounding effect is never displaced by a lower
 priority — and `$09D2` sets DMACON `#$8`, i.e. **AUD3**: effects own Paula channel 3 and
 the music has 0-2. **[disk]**
 
+**The engine has seven sounds of its own** — `main.bin` hunk 10 is exactly seven 26-byte
+records whose PCM is hunk 11 (27,096 bytes), and the ten `lea` operands that use them
+classify as: flipper full-raise (`$A7A2/$A7C8`, the 0→FF edges of the per-side flags
+`$23F5/$23F6`), flipper release (`$A79A`, the FF→0 edge), **ball drain** (`$52B4`), ball
+serve (`$45E0`/`$5110`/`$6616` — game start, next ball, multiball add), level transfer
+up/down (`$B258/$B270`), capture (`$5574`) and generic device eject (`$701A`). Full
+inventory and evidence: `research/SOUND_CENSUS.md`. **[disk]**
+
 ### 13.3 What is still open
 
-- **The kind-5 resolver.** `main.seg00` never reads `+$12` or `+$14`; the code that turns
-  (bank, instrument) into an address is elsewhere, presumably in `pkg/Pinball`. The
-  inference is strong — every pair on all three tables lands on a live sample, the
-  discriminating case works, and the four Law 'n Justice records sharing instrument 7
-  differ only in period (A-1/C-2/D-2/E-2, a rollover scale) — but it is inference, and
-  the shipped manifest marks those samples `"provenance": "inferred"`. **[open]**
+- ~~The kind-5 resolver~~ **FOUND — main.seg00 `$343E`, and it is a load-time pass,**
+  which is why no per-trigger site ever reads `+$12`/`+$14`: the table loader walks the
+  whole record array from descriptor `+$7C` (stride 26) and, for each kind-5 record,
+  indexes the per-bank instrument table at `$3456` (entry stride `$20`, index
+  `instrument-1`), stores the resolved sample pointer into the record's own `+$16`
+  (`move.l $0(a0),$16(a2)` at `$3468`) and derives the chunk length from the directory
+  length and the period (`$346E-$3486`, constant `$11519` = PAL clock / 50). That is
+  the rule the exporter applies, so the shipped manifests now mark kind-5 samples
+  `"provenance": "decoded"`. The old corroboration (live-sample test, the bank-0
+  discriminating case, the instrument-7 rollover scale A-1/C-2/D-2/E-2) stands as
+  confirmation. **[disk]**
 - **The packed pattern format.** 366-518 bytes per pattern where ProTracker needs 1024,
   so it is compressed and no music can be played back. Only instruments are extracted.
   **[open]**
-- **The drain has no sound.** No zone object on any table carries a sound record at the
-  outlanes or the middle, and there is no drain entry in the device chain. A drain is
-  therefore silent in this reconstruction rather than being given an invented sample.
-  **[open]**
+- ~~The drain has no sound~~ **WRONG, and withdrawn.** True of the table packages — no
+  zone object carries a drain sound — but the drain sound is the ENGINE'S: `main.seg00`
+  plays its own record (hunk 10 `+$34`, 336 ms, priority 45) from `$52B4` inside the
+  per-frame loop that tests each ball's drained flag. The reconstruction plays it on
+  every ball out. See §13.2 and `research/SOUND_CENSUS.md` §1.2. **[disk]**

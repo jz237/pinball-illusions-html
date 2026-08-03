@@ -78,6 +78,8 @@ function reportAt(tick: number, over: Partial<GameTickReport> = {}): GameTickRep
     swallowed: [],
     locked: [],
     ejected: [],
+    ejectedFrom: [],
+    levelTransfers: [],
     multiballStarted: false,
     missionStarted: -1,
     missionEnded: false,
@@ -87,6 +89,8 @@ function reportAt(tick: number, over: Partial<GameTickReport> = {}): GameTickRep
     messagesShown: [],
     justTilted: false,
     gameOver: false,
+    flipperRaised: [],
+    flipperRested: [],
     ...over,
   };
 }

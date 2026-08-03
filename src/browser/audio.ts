@@ -33,28 +33,49 @@
  *
  * `EffectChannel` is that, and only that: one source node, the priority it is
  * playing at, and when it will finish. There is no mixer, no reverb and no
- * ducking, because the machine had none.
+ * ducking, because the machine had none. The ENGINE'S sounds and the TABLE'S
+ * sounds go through the one channel together, exactly as they share AUD3.
  *
  * ---------------------------------------------------------------------------
- * WHAT IS BOUND, AND WHAT IS NOT
+ * WHAT IS BOUND, AND FROM WHERE
  * ---------------------------------------------------------------------------
- * Bound, from the packages: every device (drop targets and stand-ups), both
- * bumper banks, both slingshots, and every trigger zone that carries a sound —
- * the lane rollovers, the ramp entries and the ball locks. A mission start
- * plays the sound of the element it lights, because that is where the mode's
- * sound record hangs.
+ * Two manifests feed one bank. The TABLE manifest carries the package's own
+ * records — devices, bumpers, slingshots, trigger zones, the lock-eject
+ * voices, and the award/mode sting layer — keyed by the ids the tick report
+ * already carries (`device-36`, `zone-0-8`, `mode-element-15`, ...). The
+ * ENGINE manifest carries the seven sounds `main.bin` plays itself, keyed by
+ * event name; `playTick` maps the report's fields onto them:
  *
- * NOT bound: THE DRAIN. No zone object on any of the three tables carries a
- * sound record at the outlanes or the middle, and there is no drain entry in the
- * device chain either. Something in the original certainly makes a noise when
- * the ball goes — but it is not in the data this decode can see, and inventing a
- * sample for it would be putting a noise in the player's ears that the machine
- * never made. So a drain is silent, and this paragraph is the reason.
+ *     report.served          -> "serve"           (h10+$4E, sites $45E0/$5110/$6616)
+ *     report.drained         -> "drain"           (h10+$34, site $52B4)
+ *     report.locked          -> "capture"         (h10+$82, site $5574)
+ *     report.ejectedFrom     -> the saucer's own `zone-eject-L-N` record, or
+ *                               the generic "eject" (h10+$9C, site $701A)
+ *     report.levelTransfers  -> "level-transfer"  (h10+$68, sites $B258/$B270)
+ *     report.flipperRaised   -> "flipper-raise"   (h10+$00, sites $A7A2/$A7C8)
+ *     report.flipperRested   -> "flipper-rest"    (h10+$1A, site $A79A)
+ *
+ * THE DRAIN IS NO LONGER SILENT. An earlier round bound nothing to it and
+ * argued from the table packages — no zone object carries a drain sound, which
+ * is true — but the sound is the ENGINE'S: main.seg00 plays its own drain
+ * record from `$52B4` on every ball out. The census (research/SOUND_CENSUS.md)
+ * corrected the record, and the ball search's write-offs go through the same
+ * drain lifecycle, so they drain audibly too.
+ *
+ * STILL SILENT, BY DECODE: the LAUNCH — the fixed kick at 0x65EE has no sound
+ * call; the serve jingle is the lane's delivery sound and the shot itself makes
+ * none — the TILT, whose only effect is the music/effects state change, and
+ * GAME OVER, which has no dedicated record; the last thing the machine plays
+ * there is the final drain, and that is what this port plays too.
  */
 
 import type { Award } from "../game/scoring.js";
-import type { AudioSample, TableAudio } from "../game/table-audio.js";
-import { PAULA_MAX_VOLUME, audioSampleUrl } from "../game/table-audio.js";
+import type { AudioSample, EngineAudio, TableAudio } from "../game/table-audio.js";
+import {
+  ENGINE_AUDIO_BASE_PATH,
+  PAULA_MAX_VOLUME,
+  audioSampleUrl,
+} from "../game/table-audio.js";
 import type { GameTickReport } from "./game-loop.js";
 
 /** The slice of `AudioContext` this module uses, so a test can supply one. */
@@ -79,23 +100,33 @@ interface EffectChannel {
 export interface AudioBank {
   readonly host: AudioHost;
   readonly audio: TableAudio;
-  /** Sample index to decoded buffer. Absent while a WAV is still decoding. */
-  readonly buffers: Map<number, AudioBuffer>;
+  /** The engine's seven sounds, or null when their manifest did not load. */
+  readonly engine: EngineAudio | null;
+  /**
+   * Decoded buffers keyed by the sample's FILE NAME, which is unique across
+   * both manifests where the numeric index is not. Absent while decoding.
+   */
+  readonly buffers: Map<string, AudioBuffer>;
   readonly channel: EffectChannel;
   /** Player's mute. Nothing else in the machine reads it. */
   muted: boolean;
-  /** Samples that failed to fetch or decode, so a caller can say so once. */
-  readonly failed: Set<number>;
+  /** Files that failed to fetch or decode, so a caller can say so once. */
+  readonly failed: Set<string>;
 }
 
-export function createAudioBank(host: AudioHost, audio: TableAudio): AudioBank {
+export function createAudioBank(
+  host: AudioHost,
+  audio: TableAudio,
+  engine: EngineAudio | null = null,
+): AudioBank {
   return {
     host,
     audio,
-    buffers: new Map<number, AudioBuffer>(),
+    engine,
+    buffers: new Map<string, AudioBuffer>(),
     channel: { source: null, priority: 0, until: 0 },
     muted: false,
-    failed: new Set<number>(),
+    failed: new Set<string>(),
   };
 }
 
@@ -108,30 +139,43 @@ export type AudioFetch = (url: string) => Promise<AudioFetchResponse>;
 
 const defaultFetch: AudioFetch = (url) => fetch(url);
 
+async function loadSamples(
+  bank: AudioBank,
+  samples: readonly AudioSample[],
+  fetchImpl: AudioFetch,
+  basePath: string | undefined,
+): Promise<void> {
+  for (const sample of samples) {
+    try {
+      const response = await fetchImpl(audioSampleUrl(sample, basePath));
+      if (!response.ok) {
+        bank.failed.add(sample.file);
+        continue;
+      }
+      bank.buffers.set(sample.file, await bank.host.decodeAudioData(await response.arrayBuffer()));
+    } catch {
+      bank.failed.add(sample.file);
+    }
+  }
+}
+
 /**
- * Fetches and decodes every sample the manifest lists.
+ * Fetches and decodes every sample both manifests list.
  *
  * Resolves when it is done and NEVER REJECTS: a sample that will not load is
- * recorded in `failed` and the rest of the table still has sound. Loading is
- * sequential rather than parallel because the whole bank is a few tens of
+ * recorded in `failed` and the rest of the machine still has sound. Loading is
+ * sequential rather than parallel because the whole bank is under two hundred
  * kilobytes and a burst of parallel decodes on the boot path buys nothing.
  */
 export async function loadAudioBank(
   bank: AudioBank,
   fetchImpl: AudioFetch = defaultFetch,
   basePath?: string,
+  engineBasePath: string = ENGINE_AUDIO_BASE_PATH,
 ): Promise<void> {
-  for (const sample of bank.audio.samples) {
-    try {
-      const response = await fetchImpl(audioSampleUrl(sample, basePath));
-      if (!response.ok) {
-        bank.failed.add(sample.index);
-        continue;
-      }
-      bank.buffers.set(sample.index, await bank.host.decodeAudioData(await response.arrayBuffer()));
-    } catch {
-      bank.failed.add(sample.index);
-    }
+  await loadSamples(bank, bank.audio.samples, fetchImpl, basePath);
+  if (bank.engine !== null) {
+    await loadSamples(bank, bank.engine.samples, fetchImpl, engineBasePath);
   }
 }
 
@@ -147,7 +191,7 @@ export async function loadAudioBank(
  */
 export function playSample(bank: AudioBank, sample: AudioSample): boolean {
   if (bank.muted) return false;
-  const buffer = bank.buffers.get(sample.index);
+  const buffer = bank.buffers.get(sample.file);
   if (buffer === undefined) return false;
 
   const now = bank.host.currentTime;
@@ -181,18 +225,68 @@ export function playAward(bank: AudioBank, award: Award): boolean {
 }
 
 /**
+ * Plays a table-manifest trigger by id. Answers whether the id is BOUND —
+ * not whether it sounded, because a bound sound refused by a louder one is
+ * still the event's sound and must not fall through to a substitute.
+ */
+function playTableTrigger(bank: AudioBank, id: string): boolean {
+  const sample = bank.audio.sampleForAward(id);
+  if (sample === null) return false;
+  playSample(bank, sample);
+  return true;
+}
+
+/** Plays one of the engine's seven sounds, if the manifest loaded. */
+function playEngineTrigger(bank: AudioBank, id: string): void {
+  const sample = bank.engine?.sampleFor(id) ?? null;
+  if (sample !== null) playSample(bank, sample);
+}
+
+/**
  * Plays one tick's worth of sound.
  *
- * Takes a finished tick report and nothing else. Awards are visited in the order
- * they scored, so the priority rule decides between two events on the same frame
- * exactly as it would between two frames — and the loudest one wins whichever
- * order the physics happened to produce them in.
+ * Takes a finished tick report and nothing else. Within the tick the requests
+ * are made in the order below, and the priority rule decides between them
+ * exactly as it decides between two frames — so a flipper thump (priority 40)
+ * never displaces the mission callout it landed under, while a drain (45)
+ * speaks over the flipper that failed to save it.
  *
- * The drain is deliberately silent; see the header.
+ * Awards are visited in the order they scored; they include the mode VM's
+ * `mode-element-N` awards, which is how the award fanfares and the display
+ * stings attributed to an element's AWARD path fire. `elementStarts` and
+ * `messagesShown` carry the START-path sounds and the message stings — the
+ * original queues those display programs on its ring and the sting plays when
+ * the display does; this port plays it on the tick the record is queued, which
+ * is at most a few frames early.
  */
 export function playTick(bank: AudioBank, report: GameTickReport): void {
   if (bank.muted) return;
   for (const award of report.awards) playAward(bank, award);
+  for (const element of report.elementStarts) playTableTrigger(bank, `mode-start-${element}`);
+  for (const message of report.messagesShown) playTableTrigger(bank, `mode-message-${message}`);
+
+  if (report.served) playEngineTrigger(bank, "serve");
+  if (report.locked.length > 0) playEngineTrigger(bank, "capture");
+  for (const zone of report.ejectedFrom) {
+    // The saucer's own eject voice when the table records one (the object's
+    // +$10 record); the engine's generic eject otherwise — the popper's own
+    // fallback for held objects without a sub-record.
+    if (!playTableTrigger(bank, `zone-eject-${zone.level}-${zone.index}`)) {
+      playEngineTrigger(bank, "eject");
+    }
+  }
+  if (report.levelTransfers.length > 0) playEngineTrigger(bank, "level-transfer");
+  // `drained` includes the ball search's write-offs on purpose: a written-off
+  // ball ends through the drain lifecycle, so it drains audibly.
+  if (report.drained.length > 0) playEngineTrigger(bank, "drain");
+  for (const side of report.flipperRaised) {
+    void side; // one flag per side, one call per flag, as $A790 makes them
+    playEngineTrigger(bank, "flipper-raise");
+  }
+  for (const side of report.flipperRested) {
+    void side;
+    playEngineTrigger(bank, "flipper-rest");
+  }
 }
 
 /**

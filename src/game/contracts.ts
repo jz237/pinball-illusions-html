@@ -224,6 +224,25 @@ export interface TableAudioDocument {
 }
 
 /**
+ * On-disk shape of `public/generated/engine.audio.json`: the seven sounds the
+ * ENGINE plays itself — flipper strokes, serve, drain, level transfer, capture,
+ * eject — decoded from `main.bin` hunks 10/11 and table-independent. Same
+ * sample shape as the table documents; the triggers are event names rather than
+ * award ids. See `scripts/export-engine-audio.mjs` for where it comes from.
+ */
+export interface EngineAudioDocument {
+  readonly schema: "pinball-illusions/engine-audio/v1";
+  readonly displayName: string;
+  readonly provenance: {
+    readonly sourceClass: string;
+    readonly description: string;
+    readonly authorizationRequired: boolean;
+  };
+  readonly samples: readonly Readonly<Record<string, unknown>>[];
+  readonly triggers: readonly Readonly<Record<string, unknown>>[];
+}
+
+/**
  * On-disk shape of `public/generated/flipper-bats.json`: the 3-bitplane pose
  * bank every bat on every table is drawn from, plus each table's decoded
  * flipper records. ONE shared document — the raster is table-independent, which

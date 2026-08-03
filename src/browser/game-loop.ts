@@ -166,6 +166,7 @@ import {
   applyFlipperReactions,
   createFlipperBank,
   flipperInputFrom,
+  isFullyFlipped,
   resolveFlipperContacts,
   tickFlipperBank,
 } from "../game/flippers.js";
@@ -662,6 +663,21 @@ export interface GameTickReport {
    * element at a time. These are NOT serves — the ball never left play.
    */
   readonly ejected: readonly number[];
+  /**
+   * The saucer each of `ejected` came out of, parallel to it: the lock zone's
+   * level and index. The audio layer keys the eject voice on the saucer —
+   * the original plays the record the held zone object carries at `+$10`
+   * (main.seg00 $6FD8/$705A), so which saucer it was is part of the event.
+   */
+  readonly ejectedFrom: readonly { readonly level: PlayfieldLevel; readonly index: number }[];
+  /**
+   * Ids of balls that crossed between the two collision lines during this
+   * tick's physics step — the zone-action-10/11 transfers and the surface
+   * hand-offs, but NOT lock ejects (those choose a level too, and are already
+   * reported above) and not serves. The original plays its level-transfer
+   * record from the two handlers at $B252/$B26A on exactly these crossings.
+   */
+  readonly levelTransfers: readonly number[];
   /** True on the tick a multiball was lit and the saucers gave their balls back. */
   readonly multiballStarted: boolean;
   /** Index into the table's mission list started this tick, or -1. */
@@ -688,6 +704,32 @@ export interface GameTickReport {
   readonly messagesShown: readonly number[];
   readonly justTilted: boolean;
   readonly gameOver: boolean;
+  /**
+   * Flipper sides whose full-raise flag rose this tick — some bat of the side
+   * reached the top of its stroke while none was there before. The original's
+   * `$23F5` (left) / `$23F6` (right) 0->FF edges, the up-stroke sound's trigger
+   * at $A7A2/$A7C8. A side with two bats (the upper flipper rides its side's
+   * button) flags once, exactly as one byte per side can.
+   */
+  readonly flipperRaised: readonly FlipperSide[];
+  /** The FF->0 edges of the same flags: the side left full raise ($A79A). */
+  readonly flipperRested: readonly FlipperSide[];
+}
+
+/** The two flipper flag bytes the original keeps, `$23F5` and `$23F6`. */
+export type FlipperSide = "left" | "right";
+
+/** Which sides have some bat at the top of its stroke. */
+function raisedSides(bank: FlipperBank): { left: boolean; right: boolean } {
+  let left = false;
+  let right = false;
+  for (const config of bank.configs) {
+    const state = bank.states.get(config.id);
+    if (state === undefined || !isFullyFlipped(config, state)) continue;
+    if (config.role === "left") left = true;
+    else if (config.role === "right") right = true;
+  }
+  return { left, right };
 }
 
 /** One control per nudge direction, in a fixed order so ticks are reproducible. */
@@ -902,6 +944,8 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     swallowed: [],
     locked: [],
     ejected: [],
+    ejectedFrom: [],
+    levelTransfers: [],
     multiballStarted: false,
     missionStarted: -1,
     missionEnded: false,
@@ -911,6 +955,8 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     messagesShown: [],
     justTilted: false,
     gameOver: false,
+    flipperRaised: [],
+    flipperRested: [],
   };
 
   if (game.phase !== "in-play" || game.paused) return idle;
@@ -1055,6 +1101,7 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
 
   // ---- flippers ----------------------------------------------------------
   const live = flippersLive(game.tilt);
+  const raisedBefore = raisedSides(game.flippers);
   const bankTick = tickFlipperBank(
     game.flippers,
     flipperInputFrom(
@@ -1065,6 +1112,16 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     ),
   );
   game.flippers = bankTick.bank;
+  // The stroke edges, for the report. OBSERVATION ONLY: nothing below reads
+  // these back, and the reactions applied after the physics change a bat's
+  // rate, never its stroke, so this is the whole tick's answer.
+  const raisedAfter = raisedSides(game.flippers);
+  const flipperRaised: FlipperSide[] = [];
+  const flipperRested: FlipperSide[] = [];
+  for (const side of ["left", "right"] as const) {
+    if (raisedAfter[side] && !raisedBefore[side]) flipperRaised.push(side);
+    if (!raisedAfter[side] && raisedBefore[side]) flipperRested.push(side);
+  }
 
   // ---- physics -----------------------------------------------------------
   const forces: SimulationForces = {
@@ -1078,8 +1135,12 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
   // bat line inside one tick is tested only where it ended — on the wrong
   // side. That endpoint-only seam was the reconstruction's #1 defect (B1).
   const flipperStarts = new Map<number, { readonly x: Q10; readonly y: Q10 }>();
+  /** Which line each in-play ball was on entering the step, for the report. */
+  const levelsBefore = new Map<number, PlayfieldLevel>();
   for (const ball of game.balls.balls) {
-    if (ballIsInPlay(ball)) flipperStarts.set(ball.id, { x: ball.x, y: ball.y });
+    if (!ballIsInPlay(ball)) continue;
+    flipperStarts.set(ball.id, { x: ball.x, y: ball.y });
+    levelsBefore.set(ball.id, ball.level);
   }
   // The drive is spread in LAST so a caller cannot switch it off through
   // `options.simulation` without noticing they have done it — and it is the
@@ -1093,6 +1154,15 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     // which is the original's gate at +0x00B216/+0x00B234.
     poweredKicksLive: poweredSurfacesLive(game.tilt),
   });
+  // The step is where the two collision lines exchange balls (zone actions 10
+  // and 11 and the surface hand-offs), so a line change across it IS a level
+  // transfer. Read immediately, before the popper and the rod pin also assign
+  // levels for their own, separately reported reasons.
+  const levelTransfers: number[] = [];
+  for (const ball of game.balls.balls) {
+    const before = levelsBefore.get(ball.id);
+    if (before !== undefined && ball.level !== before) levelTransfers.push(ball.id);
+  }
   const flipperContacts = resolveFlipperContacts(
     game.balls.balls,
     bankTick.sweeps,
@@ -1165,7 +1235,7 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
   // One tick of a saucer's hold timer and, at its end, the authored eject.
   // AFTER `runModes`, because `PUSH` is what queues an element; BEFORE the ball
   // search, so a ball just spat back onto the playfield is never counted still.
-  const ejected = runLockEjects(game);
+  const ejectTick = runLockEjects(game);
 
   // ---- ball search -------------------------------------------------------
   //
@@ -1240,7 +1310,9 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     writtenOff: lost,
     swallowed: search.swallowed,
     locked: lockTick.locked,
-    ejected,
+    ejected: ejectTick.ejected,
+    ejectedFrom: ejectTick.zones,
+    levelTransfers,
     multiballStarted: game.multiball && !wasMultiball,
     missionStarted: modeTick.missionStarted,
     missionEnded: modeTick.missionEnded,
@@ -1250,6 +1322,8 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     messagesShown: modeTick.messagesShown,
     justTilted,
     gameOver,
+    flipperRaised,
+    flipperRested,
   };
 }
 
@@ -1607,10 +1681,15 @@ function runLocks(game: Game): {
  * the upper line, delivers to the MAIN one at the same (71,98) its three
  * level-0 sisters use.
  */
-function runLockEjects(game: Game): readonly number[] {
+function runLockEjects(game: Game): {
+  readonly ejected: readonly number[];
+  /** The lock zone each eject came out of, parallel to `ejected`. */
+  readonly zones: readonly { readonly level: PlayfieldLevel; readonly index: number }[];
+} {
+  const none = { ejected: [], zones: [] };
   if (game.lockEjecting === null) {
     const next = game.lockEjectStack.shift();
-    if (next === undefined) return [];
+    if (next === undefined) return none;
     const lock = game.locks.locks.find((one) => one.id === next);
     const eject = lock === undefined ? null : ejectFor(game, lock);
     // A saucer whose eject data did not survive (a synthetic devices document,
@@ -1621,32 +1700,32 @@ function runLockEjects(game: Game): readonly number[] {
         oweServes(game, 1);
         pruneInactiveBalls(game.balls);
       }
-      return [];
+      return none;
     }
     game.lockEjecting = { deviceId: next, ticksLeft: eject.holdTicks };
-    return [];
+    return none;
   }
 
   game.lockEjecting.ticksLeft -= 1;
-  if (game.lockEjecting.ticksLeft > 0) return [];
+  if (game.lockEjecting.ticksLeft > 0) return none;
 
   const deviceId = game.lockEjecting.deviceId;
   game.lockEjecting = null;
   const ballId = heldBallIn(game.locks, deviceId);
   const lock = game.locks.locks.find((one) => one.id === deviceId);
-  if (ballId === null || lock === undefined) return [];
+  if (ballId === null || lock === undefined) return none;
   const eject = ejectFor(game, lock);
-  if (eject === null) return [];
+  if (eject === null) return none;
   const ball = ballById(game.balls, ballId);
   game.locks.held.delete(deviceId);
-  if (ball === undefined) return [];
+  if (ball === undefined) return none;
   ball.heldBy = null;
   ball.x = pixelsToQ10(eject.x);
   ball.y = pixelsToQ10(eject.y);
   ball.velocityX = originalVelocityToQ10(eject.velocityX);
   ball.velocityY = originalVelocityToQ10(eject.velocityY);
   ball.level = eject.level;
-  return [ballId];
+  return { ejected: [ballId], zones: [{ level: lock.level, index: lock.zoneIndex }] };
 }
 
 /** The authored eject of a saucer, from the shipped devices document. */

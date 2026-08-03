@@ -11,9 +11,13 @@ import { describe, expect, it } from "vitest";
 import { readFileSync, readdirSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { TABLE_IDS } from "../src/game/contracts.js";
-import type { TableAudioDocument, TableId } from "../src/game/contracts.js";
-import { PAULA_MAX_VOLUME, parseTableAudioDocument } from "../src/game/table-audio.js";
-import type { AudioSample, TableAudio } from "../src/game/table-audio.js";
+import type { EngineAudioDocument, TableAudioDocument, TableId } from "../src/game/contracts.js";
+import {
+  PAULA_MAX_VOLUME,
+  parseEngineAudioDocument,
+  parseTableAudioDocument,
+} from "../src/game/table-audio.js";
+import type { AudioSample, EngineAudio, TableAudio } from "../src/game/table-audio.js";
 import {
   createAudioBank,
   loadAudioBank,
@@ -30,7 +34,7 @@ import {
   runTicks,
   startGame,
 } from "../src/browser/game-loop.js";
-import type { InputSource } from "../src/browser/game-loop.js";
+import type { GameTickReport, InputSource } from "../src/browser/game-loop.js";
 import { IDLE_SNAPSHOT, controlForKeyEvent } from "../src/browser/input.js";
 import { mapFor } from "./table-fixtures.js";
 import { renderSongStream, songStreamFor } from "../src/audio/song-stream.js";
@@ -61,6 +65,44 @@ function documentFor(tableId: TableId): TableAudioDocument {
 
 function audioFor(tableId: TableId): TableAudio {
   return parseTableAudioDocument(documentFor(tableId));
+}
+
+function engineDocument(): EngineAudioDocument {
+  const url = new URL("../public/generated/engine.audio.json", import.meta.url);
+  return JSON.parse(readFileSync(url, "utf8")) as EngineAudioDocument;
+}
+
+function engineFor(): EngineAudio {
+  return parseEngineAudioDocument(engineDocument());
+}
+
+/** A whole report with nothing in it but what the test wants to say. */
+function reportWith(over: Partial<GameTickReport> = {}): GameTickReport {
+  return {
+    tick: 1,
+    stepped: true,
+    served: false,
+    launched: false,
+    drained: [],
+    writtenOff: [],
+    swallowed: [],
+    locked: [],
+    ejected: [],
+    ejectedFrom: [],
+    levelTransfers: [],
+    multiballStarted: false,
+    missionStarted: -1,
+    missionEnded: false,
+    awards: [],
+    elementStarts: [],
+    elementAwards: [],
+    messagesShown: [],
+    justTilted: false,
+    gameOver: false,
+    flipperRaised: [],
+    flipperRested: [],
+    ...over,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -191,17 +233,19 @@ describe("the shipped sound manifests", () => {
     }
   });
 
-  it("labels the kind-5 samples as inferred rather than decoded", () => {
-    // The (bank, instrument) resolver is not in main.seg00. Extreme Sports' lane
-    // chime is resolved by inference and the manifest has to say so.
+  it("labels every sample decoded, kind-5 included", () => {
+    // The (bank, instrument) resolver was found: the table loader at
+    // main.seg00 $343E resolves every kind-5 record at load time, exactly the
+    // rule the exporter applies, so the old "inferred" label is retired.
     const kinds = new Set(
       TABLE_IDS.flatMap((tableId) => audioFor(tableId).samples).map(
         (sample) => `${sample.kind}:${sample.provenance}`,
       ),
     );
     expect(kinds.has("sample:decoded")).toBe(true);
+    expect(kinds.has("instrument:decoded")).toBe(true);
     for (const kind of kinds) {
-      expect(["sample:decoded", "instrument:inferred"]).toContain(kind);
+      expect(["sample:decoded", "instrument:decoded"]).toContain(kind);
     }
   });
 });
@@ -233,6 +277,142 @@ describe("the sound manifest parser refuses", () => {
     expect(() =>
       parseTableAudioDocument(mutate((doc) => { (doc["triggers"] as { sample: number }[])[0]!.sample = 99; })),
     ).toThrow(/trigger/);
+  });
+});
+
+describe("the engine sound manifest", () => {
+  const EVENTS = [
+    "flipper-raise",
+    "flipper-rest",
+    "serve",
+    "drain",
+    "level-transfer",
+    "capture",
+    "eject",
+  ] as const;
+
+  it("parses, binds its seven events, and every WAV matches its digest", () => {
+    const engine = engineFor();
+    expect(engine.samples.length).toBe(7);
+    for (const sample of engine.samples) {
+      const file = new URL(`../public/generated/${sample.file}`, import.meta.url);
+      const bytes = readFileSync(file);
+      expect(createHash("sha256").update(bytes).digest("hex"), sample.file).toBe(sample.sha256);
+      expect(bytes.length).toBe(44 + sample.bytes);
+      expect(bytes.readUInt32LE(24), `${sample.file} rate`).toBe(sample.rate);
+      expect(sample.rate).toBe(Math.round(3546895 / sample.period));
+      expect(sample.provenance).toBe("decoded");
+    }
+    for (const id of EVENTS) expect(engine.sampleFor(id), id).not.toBeNull();
+    expect(engine.sampleFor("tilt")).toBeNull(); // no tilt sample exists to bind
+  });
+
+  it("keeps the records' own priorities: serve over drain over the flippers", () => {
+    // Straight out of main.bin hunk 10: these are what decide which of two
+    // same-frame events the one channel actually voices.
+    const engine = engineFor();
+    const priority = (id: string) => (engine.sampleFor(id) as AudioSample).priority;
+    expect(priority("serve")).toBe(50);
+    expect(priority("drain")).toBe(45);
+    expect(priority("capture")).toBe(43);
+    expect(priority("eject")).toBe(43);
+    expect(priority("level-transfer")).toBe(41);
+    expect(priority("flipper-raise")).toBe(40);
+    expect(priority("flipper-rest")).toBe(20);
+  });
+});
+
+describe("the tick report reaches the engine sounds", () => {
+  function stubbedBank(tableId: TableId = "law-n-justice"): {
+    bank: AudioBank;
+    host: FakeHost;
+    tags: Map<unknown, string>;
+  } {
+    const host = new FakeHost();
+    const bank = createAudioBank(host, audioFor(tableId), engineFor());
+    const tags = new Map<unknown, string>();
+    const admit = (sample: AudioSample): void => {
+      const buffer = { file: sample.file } as unknown as AudioBuffer;
+      tags.set(buffer, sample.file);
+      bank.buffers.set(sample.file, buffer);
+    };
+    for (const sample of bank.audio.samples) admit(sample);
+    for (const sample of (bank.engine as EngineAudio).samples) admit(sample);
+    return { bank, host, tags };
+  }
+  const startedFiles = (host: FakeHost, tags: Map<unknown, string>): (string | undefined)[] =>
+    host.started.map((one) => tags.get(one.buffer));
+  const engineFile = (bank: AudioBank, id: string): string =>
+    ((bank.engine as EngineAudio).sampleFor(id) as AudioSample).file;
+
+  it("a serve, a drain, a capture, a transfer and both flipper strokes all sound", () => {
+    const { bank, host, tags } = stubbedBank();
+    const ticks: Partial<GameTickReport>[] = [
+      { served: true },
+      { drained: [0] },
+      { locked: [1] },
+      { levelTransfers: [0] },
+      { flipperRaised: ["left"] },
+      { flipperRested: ["left"] },
+    ];
+    for (const over of ticks) {
+      playTick(bank, reportWith(over));
+      host.currentTime += 10; // let each effect end so nothing is refused
+    }
+    expect(startedFiles(host, tags)).toEqual([
+      engineFile(bank, "serve"),
+      engineFile(bank, "drain"),
+      engineFile(bank, "capture"),
+      engineFile(bank, "level-transfer"),
+      engineFile(bank, "flipper-raise"),
+      engineFile(bank, "flipper-rest"),
+    ]);
+  });
+
+  it("an eject plays the saucer's own voice when the table has one, else the engine's", () => {
+    const { bank, host, tags } = stubbedBank(); // LNJ records zone-eject-0-5..7
+    const own = bank.audio.sampleForAward("zone-eject-0-5") as AudioSample;
+    expect(own).not.toBeNull();
+    playTick(bank, reportWith({ ejected: [0], ejectedFrom: [{ level: 0, index: 5 }] }));
+    host.currentTime += 10;
+    playTick(bank, reportWith({ ejected: [0], ejectedFrom: [{ level: 0, index: 99 }] }));
+    expect(startedFiles(host, tags)).toEqual([own.file, engineFile(bank, "eject")]);
+  });
+
+  it("a flipper thump cannot displace a sounding mission callout", () => {
+    const { bank, host } = stubbedBank();
+    const callout = bank.audio.samples.find((one) => one.priority >= 100) as AudioSample;
+    expect(playSample(bank, callout)).toBe(true);
+    // Priority 40 against a sounding 100: both flags dropped, $779E's refusal.
+    playTick(bank, reportWith({ flipperRaised: ["left", "right"] }));
+    expect(host.started.length).toBe(1);
+    // Once it has ended the flipper sounds — and the drain (45) displaces the
+    // thump (40), because a ball out speaks over the bat that missed it.
+    host.currentTime = bank.channel.until + 1;
+    playTick(bank, reportWith({ flipperRaised: ["left"] }));
+    playTick(bank, reportWith({ drained: [0] }));
+    expect(host.started.length).toBe(3);
+  });
+
+  it("mode starts and shown messages fire the sting layer", () => {
+    // BabeWatch binds mode-message-0 and mode-start-7; see the exporter's log.
+    const { bank, host } = stubbedBank("babewatch");
+    expect(bank.audio.sampleForAward("mode-message-0")).not.toBeNull();
+    expect(bank.audio.sampleForAward("mode-start-7")).not.toBeNull();
+    playTick(bank, reportWith({ messagesShown: [0] }));
+    host.currentTime += 10;
+    playTick(bank, reportWith({ elementStarts: [7] }));
+    expect(host.started.length).toBe(2);
+  });
+
+  it("a bank with no engine manifest plays the table and keeps engine events silent", () => {
+    const host = new FakeHost();
+    const bank = createAudioBank(host, audioFor("law-n-justice"));
+    for (const sample of bank.audio.samples) {
+      bank.buffers.set(sample.file, { length: sample.bytes } as unknown as AudioBuffer);
+    }
+    playTick(bank, reportWith({ served: true, drained: [0], flipperRaised: ["left"] }));
+    expect(host.started.length).toBe(0);
   });
 });
 
@@ -303,11 +483,12 @@ describe("audio cannot reach the simulation", () => {
 
     const loud = createGame(mapFor("law-n-justice"), { ballsPerGame: 3 });
     startGame(loud);
-    const bank = createAudioBank(new FakeHost(), audioFor("law-n-justice"));
+    const bank = createAudioBank(new FakeHost(), audioFor("law-n-justice"), engineFor());
     // Buffers on purpose, so `playSample` really runs rather than bailing out on
-    // a missing one: the point is that the WORK happening changes nothing.
-    for (const sample of bank.audio.samples) {
-      bank.buffers.set(sample.index, { length: sample.bytes } as unknown as AudioBuffer);
+    // a missing one: the point is that the WORK happening changes nothing. The
+    // engine bank is stubbed too, so the serve/drain/flipper paths all run.
+    for (const sample of [...bank.audio.samples, ...(bank.engine as EngineAudio).samples]) {
+      bank.buffers.set(sample.file, { length: sample.bytes } as unknown as AudioBuffer);
     }
     for (const report of runTicks(loud, idle(), 3_000)) playTick(bank, report);
 

@@ -67,7 +67,8 @@ import { loadTableBall } from "./game/table-ball.js";
 import { loadFlipperBats } from "./game/flipper-bats.js";
 import { loadTablePanel, tablePanelFor } from "./game/table-panel.js";
 import { PanelDisplay } from "./browser/panel-display.js";
-import { loadTableAudio } from "./game/table-audio.js";
+import { loadEngineAudio, loadTableAudio } from "./game/table-audio.js";
+import type { EngineAudio } from "./game/table-audio.js";
 import { createAudioBank, loadAudioBank, playTick, resumeAudio } from "./browser/audio.js";
 import type { AudioBank } from "./browser/audio.js";
 import { TABLE_IDS } from "./game/contracts.js";
@@ -252,9 +253,20 @@ class SoundDeck {
   #context: AudioContext | null = null;
   readonly #banks = new Map<TableId, AudioBank>();
   #current: AudioBank | null = null;
+  /**
+   * The engine's seven sounds — one manifest for the whole machine, fetched
+   * once and shared by every table's bank. Null (forever, if the fetch fails)
+   * costs exactly the engine's events their sound and nothing else.
+   */
+  #engine: Promise<EngineAudio | null> | null = null;
 
   get bank(): AudioBank | null {
     return this.#current;
+  }
+
+  #engineAudio(): Promise<EngineAudio | null> {
+    this.#engine ??= loadEngineAudio().catch(() => null);
+    return this.#engine;
   }
 
   #host(): AudioContext | null {
@@ -289,8 +301,8 @@ class SoundDeck {
     if (host === null) return;
     void (async () => {
       try {
-        const audio = await loadTableAudio(tableId);
-        const bank = createAudioBank(host, audio);
+        const [audio, engine] = await Promise.all([loadTableAudio(tableId), this.#engineAudio()]);
+        const bank = createAudioBank(host, audio, engine);
         await loadAudioBank(bank);
         this.#banks.set(tableId, bank);
         this.#current = bank;
