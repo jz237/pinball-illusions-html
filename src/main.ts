@@ -23,11 +23,15 @@
  * 2. ROUTE. One keydown listener, and it decides per phase who the key belongs
  *    to. In `play` the game gets everything except ESC; everywhere else the
  *    shell gets everything it recognises and the game gets nothing at all.
- * 3. DRIVE. One animation frame loop. In `play` it advances the simulation
- *    through `GameLoop.frame`; in every other phase it advances the shell's own
- *    clock and draws a menu. The simulation's scheduler is paused whenever the
- *    shell is showing, so time spent in a menu is never banked as catch-up ticks
- *    against the next ball.
+ * 3. DRIVE. One animation frame loop and TWO fixed-step clocks, both at 50 Hz.
+ *    In `play` it advances the simulation through `GameLoop.frame` and gives the
+ *    shell the same tick count; in every other phase `ShellClock` converts the
+ *    frame's elapsed real time into whole shell ticks. Whichever clock is not
+ *    driving is paused, so time spent in a menu is never banked as catch-up
+ *    ticks against the next ball and time spent on the table is never banked
+ *    against the credits roll. This loop used to advance the shell by a literal
+ *    one tick per animation frame, which ran the whole front end at the
+ *    display's refresh rate — 2.88x too fast on a 144 Hz screen.
  */
 
 import { InputRouter, isControl } from "./browser/input.js";
@@ -83,6 +87,7 @@ import {
   shellTick,
 } from "./browser/shell.js";
 import type { ShellEffect, ShellKey, ShellState } from "./browser/shell.js";
+import { ShellClock } from "./browser/shell-clock.js";
 import { renderShell, shellDrawsOverPlayfield } from "./browser/shell-screens.js";
 import type { ShellArtworkSource } from "./browser/shell-screens.js";
 import { createShellSkin } from "./browser/shell-skin.js";
@@ -420,6 +425,15 @@ async function boot(): Promise<void> {
   const storage = readStorage();
   const store = createScoreStore(storage);
   const shell = createShell(store);
+  /**
+   * The shell's own 50 Hz clock, for every frame the playfield is not driving.
+   *
+   * One per page rather than one per table, and never reset: the backdrop
+   * service's palette lap and the credits roll are free-running counters that
+   * the original does not restart when you move between screens, and neither
+   * does this.
+   */
+  const shellClock = new ShellClock();
   // The shell music: driven by `shell.phase` from the frame loop below, over
   // the deck's shared context. Never awaited, never read by the simulation.
   const music = createShellMusic(storage, () => sound.context());
@@ -864,6 +878,11 @@ async function boot(): Promise<void> {
    */
   const suspendPage = (): void => {
     table?.loop.scheduler.pause();
+    // The shell's clock for the same reason the simulation's: a page that comes
+    // back after ten minutes must not spend its first frame turning credits
+    // pages. The catch-up clamp would bound it at eight ticks anyway; pausing
+    // means those eight are not run either.
+    shellClock.pause();
     router.releaseAll();
     music.stop();
     tableMusic.stop();
@@ -871,6 +890,7 @@ async function boot(): Promise<void> {
   const resumePage = (): void => {
     router.releaseAll();
     table?.loop.scheduler.resume();
+    shellClock.resume();
   };
   window.addEventListener("pagehide", suspendPage);
   window.addEventListener("pageshow", resumePage);
@@ -878,6 +898,7 @@ async function boot(): Promise<void> {
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
       table?.loop.scheduler.pause();
+      shellClock.pause();
       router.releaseAll();
       // A hidden tab gets no frames, so the music's scheduler would run its
       // lookahead dry and leave the looped voices droning. Stop it; the first
@@ -887,6 +908,7 @@ async function boot(): Promise<void> {
       tableMusic.stop();
     } else {
       table?.loop.scheduler.resume();
+      shellClock.resume();
     }
   });
 
@@ -901,8 +923,11 @@ async function boot(): Promise<void> {
    * worth and `GameLoop.frame` runs and draws them; the shell's clock is then
    * advanced by the same count, so the two never drift. In every other phase the
    * simulation is stopped dead — its scheduler paused, so the wall time is not
-   * banked — and the shell is advanced one tick per frame, which is what the
-   * attract roll and the info screen's typewriter run on.
+   * banked — and `shellClock` decides instead, at the same fixed 50 Hz.
+   *
+   * Exactly one of the two clocks is running at any moment, and the crossing is
+   * a pause on one and a re-seed on the other. That is what stops either from
+   * charging for the time the other owned.
    */
   const frame = (timeMs: number): void => {
     pollGamepads(router);
@@ -933,6 +958,10 @@ async function boot(): Promise<void> {
       // re-seeds on the next `advance`, so calling it every frame would hand
       // the simulation an empty batch forever.
       if (table.loop.scheduler.paused) table.loop.scheduler.resume();
+      // The playfield is driving the shell this frame; the shell's own clock
+      // must not also charge for it, or every ball played would turn credits
+      // pages behind the table.
+      if (!shellClock.paused) shellClock.pause();
       const ticks = table.loop.frame(timeMs);
       apply(shellTick(shell, store, ticks));
       if (endedWithScore !== null) {
@@ -948,7 +977,7 @@ async function boot(): Promise<void> {
     }
 
     if (table !== null && !table.loop.scheduler.paused) table.loop.scheduler.pause();
-    apply(shellTick(shell, store, 1));
+    apply(shellClock.frame(timeMs, shell, store));
     draw();
     window.requestAnimationFrame(frame);
   };

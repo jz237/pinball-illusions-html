@@ -127,6 +127,11 @@ const DERIVED_MARKERS = [
   { class: "disk-derived-panel-animations", noun: "score panel animation" },
   { class: "disk-derived-audio", noun: "sound effect" },
   { class: "disk-derived-shell-artwork", noun: "shell artwork" },
+  // The LOADING logo: five bitplanes and a 32-colour copper palette, and the
+  // only shell picture that does NOT live in menudata.bin — it is loaded before
+  // any table package, so it ships as its own manifest plus one PNG through the
+  // single-image branch rather than joining the shell-artwork images[] array.
+  { class: "disk-derived-loading-logo", noun: "loading logo" },
   // The front-end module. It ships as a decoded document plus one WAV per live
   // instrument, each digest-claimed through the samples[] branch below — never
   // as a `.mod`, which FORBIDDEN_EXT still refuses and should go on refusing.
@@ -154,6 +159,7 @@ const MEDIA_MARKERS = new Map([
   ["disk-derived-playfield-artwork", { noun: "playfield artwork", extensions: IMAGE_EXT }],
   ["disk-derived-audio", { noun: "sound effect", extensions: AUDIO_EXT }],
   ["disk-derived-shell-artwork", { noun: "shell artwork", extensions: IMAGE_EXT }],
+  ["disk-derived-loading-logo", { noun: "loading logo", extensions: IMAGE_EXT }],
   ["disk-derived-shell-music", { noun: "front-end music", extensions: AUDIO_EXT }],
   ["disk-derived-table-music", { noun: "in-game music", extensions: AUDIO_EXT }],
   ["disk-derived-playfield-artwork-hd", { noun: "HD playfield artwork", extensions: IMAGE_EXT }],
@@ -169,6 +175,7 @@ const SINGLE_IMAGE_CLASSES = new Set([
   "disk-derived-lamp-overlays-hd",
   "disk-derived-ball-sprite-hd",
   "disk-derived-flipper-sprites-hd",
+  "disk-derived-loading-logo",
 ]);
 
 /** Tolerates both `"sourceClass":"x"` and the spaced form a formatter might emit. */

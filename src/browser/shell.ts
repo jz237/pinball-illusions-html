@@ -48,12 +48,18 @@
  *   - "Exit" returns to the attract screen. The original exits to Workbench;
  *     a browser tab has nowhere to go, and a page that blanks itself is worse
  *     than one that goes back to the title.
- *   - the attract pages. The original rotates nineteen pages of the developers'
- *     own credits and greetings, which is authored prose rather than functional
- *     data and is not reproduced. What rotates here is written fresh.
  *   - the timings of the game-over and ladder rolls are the original's 100
- *     frames and 3 seconds, but at this reconstruction's 50 Hz tick rather than
- *     the Amiga's 50 Hz field, which is the same number for a different reason.
+ *     frames and 3 seconds, at this reconstruction's 50 Hz tick against the
+ *     Amiga's 50 Hz field. That is now the same number for the same reason:
+ *     `ShellClock` gives the shell the simulation's own fixed-step accumulator,
+ *     where this file's clocks used to be advanced once per animation frame and
+ *     so ran at whatever the display refreshed at.
+ *
+ * The ATTRACT PAGES are the disk's own — see `ATTRACT_PAGES` below, which also
+ * records what from that array deliberately does not ship. This header used to
+ * say they were "written fresh"; that was true of an earlier round and stopped
+ * being true when the page display lists were decoded out of `menudata.bin`
+ * hunk 4 and confirmed against 221 filmed page instances.
  */
 
 import { TABLE_IDS } from "../game/contracts.js";
@@ -755,30 +761,57 @@ export function shellKey(state: ShellState, store: ScoreStore, key: ShellKey): S
 }
 
 /**
+ * Marks the presentation clock against the phase, resetting it on a change.
+ *
+ * Returns true when it reset, so the caller can leave the tick that discovered
+ * the change at zero rather than immediately counting it — the screen has been
+ * up for no whole ticks at all at the moment it is entered.
+ */
+function markPhase(state: ShellState): boolean {
+  if (state.phaseMark === state.phase) return false;
+  state.phaseMark = state.phase;
+  state.frameTicks = 0;
+  return true;
+}
+
+/**
  * Advances the shell's own clocks by `ticks`.
  *
  * Only the screens that roll have one. Called every animation frame by the host
- * with the number of simulation ticks that frame was worth, so the attract page
- * rotation runs on the same clock the physics does and a slow frame does not
- * make the credits crawl.
+ * with the number of ticks that frame was WORTH — the simulation's own count
+ * while a ball is in play, and `ShellClock`'s otherwise, which is a fixed 50 Hz
+ * accumulator over the same `FixedStepScheduler`. It used to be called with a
+ * literal 1 every animation frame in the menus, which ran the whole front end at
+ * the display's refresh rate: 2.88x too fast on a 144 Hz screen, against a page
+ * cycle the film measures as a hard 176 frames.
+ *
+ * A FRAME MAY THEREFORE BE WORTH ZERO TICKS, and that is the reason the phase
+ * mark is taken before the loop as well as inside it. `frameTicks` is not
+ * elapsed time — it is bookkeeping about WHICH SCREEN IS SHOWING, read by the
+ * renderer for the info screen's typewriter and its picture dissolve — so a
+ * screen entered by a keystroke must start at zero on the very next frame
+ * DRAWN, not on the next frame that happens to owe a tick. Without it a 144 Hz
+ * display opens the info screen for two frames with the previous screen's count,
+ * i.e. with the typewriter already finished, and then restarts it.
+ *
+ * For any `ticks >= 1` this is exactly what it always did: the tick that
+ * discovers the change leaves the clock at zero and the next one counts 1.
  */
 export function shellTick(state: ShellState, store: ScoreStore, ticks = 1): ShellEffect[] {
   if (!Number.isInteger(ticks) || ticks < 0) {
     throw new RangeError(`ticks must be a non-negative whole number: ${ticks}`);
   }
   const effects: ShellEffect[] = [];
+  let entered = markPhase(state);
   for (let i = 0; i < ticks; i += 1) {
     // The backdrop service's clock: free-running, ahead of everything else,
     // because it belongs to no screen.
     state.ticks += 1;
-    // The presentation clock first, so a screen entered by a keystroke starts
-    // its animation on the very next tick rather than one frame late.
-    if (state.phaseMark !== state.phase) {
-      state.phaseMark = state.phase;
-      state.frameTicks = 0;
-    } else {
-      state.frameTicks += 1;
-    }
+    // The presentation clock. A phase this loop itself moved to — game-over ->
+    // fanfare -> initials — is marked here instead.
+    if (markPhase(state)) entered = true;
+    if (entered) entered = false;
+    else state.frameTicks += 1;
     if (state.phase === "attract") {
       state.attractTicks += 1;
       if (state.attractTicks >= ATTRACT_PAGE_TICKS) {

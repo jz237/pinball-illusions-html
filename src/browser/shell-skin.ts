@@ -51,6 +51,7 @@ import {
   STRIP_HEIGHT,
   STRIP_WIDTH,
 } from "../game/shell-art.js";
+import type { LoadingLogo } from "../game/loading-logo.js";
 
 /** The slice of a canvas this module needs from its factory. */
 export interface SkinCanvas {
@@ -274,6 +275,20 @@ export interface ShellSkin {
    * $fff / $aaa / $777 measured off the filmed screen, exactly.
    */
   fontAtlas(font: SkinFontKey, colour: string): CanvasImageSource;
+  /**
+   * The LOADER's own `Loading` strip, painted through its own fixed palette, or
+   * null when the asset is not in the build.
+   *
+   * It is the one picture in the shell that does not come out of
+   * `menudata.bin` and the one whose palette does not move: the loader writes
+   * its 32 colours once from its own copper list and never fades them, so
+   * unlike a backdrop strip this is built once and kept. Nullable rather than
+   * required because the shell has to stay usable in a build without the
+   * authorized assets, exactly as it does without a skin at all.
+   */
+  loadingLogo(): CanvasImageSource | null;
+  /** The strip's first row on the shell's 320 x 256 screen, or null with it. */
+  loadingLogoTop(): number | null;
 }
 
 /**
@@ -314,7 +329,11 @@ interface StripSurface {
   painted: Uint8Array;
 }
 
-export function createShellSkin(art: ShellArt, createCanvas: SkinCanvasFactory): ShellSkin {
+export function createShellSkin(
+  art: ShellArt,
+  createCanvas: SkinCanvasFactory,
+  logo: LoadingLogo | null = null,
+): ShellSkin {
   const strips = new Map<ShellBackdropRole, StripSurface>();
 
   const backdrop = (role: ShellBackdropRole, palette: Uint8Array): CanvasImageSource => {
@@ -379,5 +398,35 @@ export function createShellSkin(art: ShellArt, createCanvas: SkinCanvasFactory):
     return built as unknown as CanvasImageSource;
   };
 
-  return { art, backdrop, fontAtlas };
+  let logoSurface: SkinCanvas | null = null;
+  const loadingLogo = (): CanvasImageSource | null => {
+    if (logo === null) return null;
+    if (logoSurface === null) {
+      const rgba = new Uint8ClampedArray(logo.width * logo.height * 4);
+      for (let i = 0; i < logo.indices.length; i += 1) {
+        const index = logo.indices[i] ?? 0;
+        // Index 0 is the bare screen — the loader's own border colour shows
+        // through it — so it is left transparent rather than painted black.
+        // The page under it is black anyway; leaving it clear means the strip
+        // could be drawn over anything without a 320-px black bar.
+        if (index === 0) continue;
+        const entry = index * 3;
+        const at = i * 4;
+        rgba[at] = logo.rgb[entry] ?? 0;
+        rgba[at + 1] = logo.rgb[entry + 1] ?? 0;
+        rgba[at + 2] = logo.rgb[entry + 2] ?? 0;
+        rgba[at + 3] = 255;
+      }
+      logoSurface = surface(createCanvas, logo.width, logo.height, rgba);
+    }
+    return logoSurface as unknown as CanvasImageSource;
+  };
+
+  return {
+    art,
+    backdrop,
+    fontAtlas,
+    loadingLogo,
+    loadingLogoTop: () => logo?.top ?? null,
+  };
 }
