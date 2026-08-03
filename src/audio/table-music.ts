@@ -13,11 +13,14 @@
  * the engine's decoded CUE RECORDS besides. This module fetches all of it and
  * hands back what the browser controller plays with:
  *
- *   songs      one `TrackerSong` per bank
- *   voices     per bank: instrument number -> the bank's own voice id
- *   bank       an `InstrumentBank` over both banks' WAV PCM
- *   cues       the decoded {command, position, bank} records
- *   sections   `sectionStream(...)`, the section renderer below
+ *   songs       one `TrackerSong` per bank
+ *   voices      per bank: instrument number -> the bank's own voice id
+ *   bank        an `InstrumentBank` over both banks' WAV PCM
+ *   cues        the decoded {command, position, bank} records
+ *   modeCues    the mission VM's opcode-19 sites, keyed `script:pc` of the
+ *               modes document — the MODE / JACKPOT MUSIC SWITCHES
+ *   elementCues element +$0C / +$10 sound slots that hold a music command
+ *   section()   `sectionStream(...)` memoised per (bank, order position)
  *
  * ---------------------------------------------------------------------------
  * WHY SECTIONS AND NOT ONE STREAM
@@ -87,6 +90,26 @@ export interface TableMusicCue {
   readonly bank: number;
 }
 
+/**
+ * THE THREE COMMANDS, decoded at main.seg00 $6868 (the poster) and $7D66..
+ * $7E44 (the player's per-frame reader). The runtime's controller implements
+ * exactly these three and nothing else.
+ */
+export const MUSIC_COMMAND_QUEUE = -1;
+export const MUSIC_COMMAND_BACKGROUND = -2;
+/** Anything above zero is an override; the value itself is never read. */
+export function isMusicOverride(command: number): boolean {
+  return command > 0;
+}
+
+/** The key a mode cue is filed under: the modes document's script and pc. */
+export function modeCueKey(script: number, pc: number): string {
+  return `${script}:${pc}`;
+}
+
+/** An element's two sound slots: +$0C on START, +$10 on AWARD. */
+export type ElementCueField = "start" | "award";
+
 export interface TableMusicAsset {
   readonly tableId: string;
   readonly songs: readonly [TrackerSong, TrackerSong];
@@ -107,12 +130,37 @@ export interface TableMusicAsset {
      * gap on every filmed tilt.
      */
     readonly tilt: TableMusicCue;
-    /** Decoded but not yet driven: the shell owns these screens today. */
+    /** Decoded but not driven: the shell owns these screens here. */
     readonly gameOver: TableMusicCue;
     readonly highScore: TableMusicCue;
-    /** The end-of-ball bonus routine's stop record; unwired, see exporter. */
+    /**
+     * The end-of-ball bonus routine's own record: a -2 into a section that
+     * ends in F00. Its firing moment is the routine's FIRST instruction
+     * (`lea <record>,a0 / jsr ([$4,a4])`, a4 = the service table at $5766
+     * whose +$04 is $6CD0), and the routine is called at $51BE on every ball
+     * end — so the music stops for the bonus count.
+     */
     readonly endStop: TableMusicCue;
   };
+  /**
+   * THE MODE / JACKPOT SWITCHES, keyed `script:pc` of the modes document: one
+   * per mission-VM opcode-19 instruction (handler $5B3E, straight into the
+   * mailbox poster $6868). The controller fires one when the mode VM reports
+   * having executed that instruction.
+   */
+  readonly modeCues: ReadonlyMap<string, TableMusicCue>;
+  /** Element sound slots whose record is a music command, by element index. */
+  readonly elementCues: {
+    readonly start: ReadonlyMap<number, TableMusicCue>;
+    readonly award: ReadonlyMap<number, TableMusicCue>;
+  };
+  /**
+   * One rendered section per (bank, order position), built on demand and kept:
+   * a table has dozens of reachable sections and the long ones cost real work
+   * to render, so a cue that repeats never pays twice. Answers null for a
+   * position the bank does not have.
+   */
+  section(bank: number, position: number): TrackerCommandStream | null;
 }
 
 /** The minimum a fetch has to look like; `shell-music.ts` uses the same. */
@@ -142,11 +190,29 @@ interface RawBank {
   readonly patterns: readonly (readonly number[])[];
 }
 
+interface RawModeCue {
+  readonly script: number;
+  readonly pc: number;
+  readonly command: number;
+  readonly position: number;
+  readonly bank: number;
+}
+
+interface RawElementCue {
+  readonly element: number;
+  readonly field: string;
+  readonly command: number;
+  readonly position: number;
+  readonly bank: number;
+}
+
 interface RawDocument {
   readonly schema: string;
   readonly tableId: string;
   readonly banks: readonly RawBank[];
   readonly cues: Readonly<Record<string, { command: number; position: number; bank: number }>>;
+  readonly modeCues?: readonly RawModeCue[];
+  readonly elementCues?: readonly RawElementCue[];
   readonly samples: readonly {
     readonly bank: number;
     readonly instrument: number;
@@ -235,6 +301,8 @@ export function parseTableMusicDocument(doc: unknown): {
   readonly descriptors: readonly (readonly RawDescriptor[])[];
   readonly files: readonly { readonly bank: number; readonly instrument: number; readonly file: string }[];
   readonly cues: TableMusicAsset["cues"];
+  readonly modeCues: ReadonlyMap<string, TableMusicCue>;
+  readonly elementCues: TableMusicAsset["elementCues"];
 } {
   const raw = doc as RawDocument | null;
   if (raw === null || typeof raw !== "object") fail("document is not an object");
@@ -272,6 +340,48 @@ export function parseTableMusicDocument(doc: unknown): {
     cues[name] = { command, position, bank };
   }
 
+  /**
+   * A cue's (bank, position) has to name a real order slot, whatever fires it
+   * — a manifest that says otherwise would have the controller render a
+   * section that does not exist. Same rule the named cues pass above.
+   */
+  const checkedCue = (
+    what: string,
+    command: number,
+    position: number,
+    bank: number,
+  ): TableMusicCue => {
+    if (!Number.isInteger(command) || command === 0) fail(`${what} command ${String(command)}`);
+    if (bank !== 0 && bank !== 1) fail(`${what} bank ${String(bank)}`);
+    const songLength = raw.banks[bank]?.songLength ?? 0;
+    if (!Number.isInteger(position) || position < 0 || position >= songLength) {
+      fail(`${what} position ${String(position)} outside bank ${bank}'s ${songLength} orders`);
+    }
+    return { command, position, bank };
+  };
+
+  const modeCues = new Map<string, TableMusicCue>();
+  for (const cue of raw.modeCues ?? []) {
+    if (!Number.isInteger(cue.script) || cue.script < 0) fail(`mode cue script ${String(cue.script)}`);
+    if (!Number.isInteger(cue.pc) || cue.pc < 0 || cue.pc % 2 !== 0) fail(`mode cue pc ${String(cue.pc)}`);
+    const key = modeCueKey(cue.script, cue.pc);
+    if (modeCues.has(key)) fail(`two mode cues at ${key}`);
+    modeCues.set(key, checkedCue(`mode cue ${key}`, cue.command, cue.position, cue.bank));
+  }
+
+  const elementStart = new Map<number, TableMusicCue>();
+  const elementAward = new Map<number, TableMusicCue>();
+  for (const cue of raw.elementCues ?? []) {
+    if (!Number.isInteger(cue.element) || cue.element < 0) fail(`element cue ${String(cue.element)}`);
+    if (cue.field !== "start" && cue.field !== "award") fail(`element cue field ${String(cue.field)}`);
+    const into = cue.field === "start" ? elementStart : elementAward;
+    if (into.has(cue.element)) fail(`two ${cue.field} cues on element ${cue.element}`);
+    into.set(
+      cue.element,
+      checkedCue(`element ${cue.element} ${cue.field} cue`, cue.command, cue.position, cue.bank),
+    );
+  }
+
   const files: { bank: number; instrument: number; file: string }[] = [];
   for (const sample of raw.samples ?? []) {
     if (typeof sample.file !== "string") fail("sample without a file");
@@ -290,6 +400,8 @@ export function parseTableMusicDocument(doc: unknown): {
     descriptors: [first.descriptors, second.descriptors],
     files,
     cues: cues as unknown as TableMusicAsset["cues"],
+    modeCues,
+    elementCues: { start: elementStart, award: elementAward },
   };
 }
 
@@ -425,11 +537,46 @@ export async function loadTableMusic(
   }
   if (instruments.size === 0) return null;
 
+  return assembleTableMusic(parsed, (id) => instruments.get(id) ?? null);
+}
+
+/**
+ * Ties a parsed document to an instrument bank and hangs the memoised section
+ * renderer off it. Split out so a test can assemble an asset without a fetch.
+ *
+ * A section that will not render (a bank whose order list the position is
+ * outside, or a run that neither loops nor stops) answers null and the cue is
+ * dropped: one unrenderable position must not take the table's music down.
+ */
+export function assembleTableMusic(
+  parsed: ReturnType<typeof parseTableMusicDocument>,
+  bank: InstrumentBank,
+): TableMusicAsset {
+  const sections = new Map<string, TrackerCommandStream | null>();
   return {
     tableId: parsed.tableId,
     songs: parsed.songs,
     voices: parsed.voices,
-    bank: (id) => instruments.get(id) ?? null,
+    bank,
     cues: parsed.cues,
+    modeCues: parsed.modeCues,
+    elementCues: parsed.elementCues,
+    section(bankIndex: number, position: number): TrackerCommandStream | null {
+      const slot = bankIndex === 0 ? 0 : 1;
+      const key = `${slot}:${position}`;
+      const cached = sections.get(key);
+      if (cached !== undefined) return cached;
+      let stream: TrackerCommandStream | null = null;
+      try {
+        const song = parsed.songs[slot];
+        if (song !== undefined && position >= 0 && position < song.orders.length) {
+          stream = sectionStream(song, parsed.voices[slot] ?? {}, position);
+        }
+      } catch {
+        stream = null;
+      }
+      sections.set(key, stream);
+      return stream;
+    },
   };
 }

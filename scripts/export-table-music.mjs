@@ -62,8 +62,67 @@
 // (-1, pos 1, bank 0 on all three tables — the queued return to the main
 // tune; the nearest such pointer below the entry, since the layout varies
 // per table) and, two bytes past the entry on all three, a second stop-type
-// record (-2 into an F00 section) whose firing moment is not yet established
-// on film; it ships as decoded data under `endStop`, unwired.
+// record (-2 into an F00 section) under `endStop`.
+//
+// THE END-STOP'S FIRING MOMENT, now decoded rather than guessed: the bonus
+// routine's FIRST TWO INSTRUCTIONS are `lea <endStop>,a0 / jsr ([$4,a4])`,
+// and a4 is `$5766` (loaded at $51B8), the engine's service table for
+// per-table code, whose `+$04` is `$6CD0` — the record dispatcher. So the
+// end-of-ball bonus routine opens by firing that record, which is a -2 into a
+// section that ends in F00: THE MUSIC STOPS FOR THE BONUS COUNT, and the next
+// ball's ball-start cue clears the stop flag ($7DD2 `tst.b $21c / clr.b`) and
+// brings the vamp back. The runtime drives it on ball end.
+//
+// ---------------------------------------------------------------------------
+// THE OTHER THIRTY-ODD KIND-4 RECORDS PER TABLE, AND WHAT FIRES THEM
+// ---------------------------------------------------------------------------
+// The five descriptor cues are not the whole census: Law 'n Justice carries
+// 43 distinct kind-4 records, BabeWatch 38 and Extreme Sports 38, reached by
+// 88 / 84 / 81 relocated pointers. Every one of those pointers is classified
+// here, and the classification is exhaustive — the exporter refuses a package
+// with a kind-4 pointer it cannot place.
+//
+//   A  DESCRIPTOR  +$84/$88/$8C/$90/$94, block-copied to $22EE(a5) at load
+//      ($32F6). The five named cues. 4 sites per table (+$84 is kind 0).
+//
+//   B  MISSION-VM OPCODE 19 — the mode background switch, and the round's
+//      centrepiece. The mission bytecode's dispatch is at $58FC: the opcode
+//      table is at $5912 (stride 4, {u16 handlerDisp, u16 length}) and the
+//      handler is `$5916 + disp` (`jsr ($0E,PC,D0.w)` at $5906, whose
+//      extension word sits at $5908). Opcode 19's entry is {disp $0228,
+//      len 6}, so its handler is $5B3E:
+//
+//          005B3E  movea.l $2(a1),a0
+//          005B42  bra.w   $6868
+//
+//      — straight into the mailbox poster, bypassing $6CD0 entirely. So
+//      OPCODE 19 IS THE MUSIC-CUE OPCODE and every one of its operands is a
+//      kind-4 record. `export-table-modes.mjs` used to label it ANIMATE on
+//      the shape of a guess; it is renamed MUSIC there, with this cite.
+//      32 / 27 / 32 sites, and they are the mission scripts' own: a mission
+//      opens with `-2 <its mode background>` and closes with `-2 pos 1` (or
+//      the queued `-1 pos 1`), which is the switch a player hears.
+//
+//   C  DISPLAY/ANIM-VM OPCODE $10 — the award and jackpot STINGS. That VM
+//      runs at $6700 (table $6748, stride 4, handler = $674C + disp) over a
+//      record's own instruction stream at +$6 with its PC at +$4; opcode $10
+//      is {disp $01F4, len 6} = $6940 `movea.l $2(a1),a0 / jsr $6CD0`. These
+//      are almost all bank-1 one-shot overrides (command > 0). 51 / 45 / 44
+//      sites. NOT WIRED — see the runtime's header for why.
+//
+//   D  ELEMENT RECORD +$0C / +$10 — the mode VM's START and AWARD sound
+//      slots, played through $6CD0 like any other record; where the record is
+//      kind 4 the "sound" is a music command. One site on BabeWatch, none on
+//      the other two. Wired: the runtime already reports element starts and
+//      awards.
+//
+//   E  THE TABLE'S OWN 68k in slot 4. The bonus routine's end-stop `lea` is
+//      one of these (wired, above). The rest are BabeWatch's: a routine at
+//      h4+0x85EC..0x8712 that COPIES a 12-word record over the ball-start
+//      record at h4+0x982E (`lea $982E,a2 / move.w #$B,d0 / move.w (a0)+,(a2)+
+//      / dbra`), choosing its source from the three-entry table at h4+0x872E
+//      — the {-2 pos 0, -2 pos 16, -2 pos 29} trio, which is the JUKEBOX the
+//      attract screens advertise. Not emulated in this port, so not wired.
 //
 // So the audible shape of a ball, which the reconstruction reproduces, is:
 //
@@ -91,6 +150,34 @@
 //   controls:  every cross-table pairing and music001 itself score at noise
 //              (+0.01..+0.04 waveform).
 //
+// THE END-STOP, film-verified in the mode round (2026-08-03) by sliding the
+// rendered section over each capture's whole 48 kHz track:
+//
+//   BabeWatch  take1  +0.775 at 18.05 s — the ball-1 centre drain is filmed at
+//                     f888-892 = 17.76-17.84 s, so the outro starts 0.21-0.29 s
+//                     after it; its 2.36 s runs out at 20.41 s and the film
+//                     then sits at RMS 0.021 (the music is 0.128) for 0.62 s
+//                     until the ball-2 serve's vamp at 21.03 s, NCC +0.901;
+//              take2  +0.816 at 19.16 s and +0.815 at 33.00 s — the ball-2
+//                     drain is filmed at f1640 = 32.80 s, 0.20 s earlier;
+//              take1b +0.814 at 14.24 s.
+//   Extreme    take1 +0.656/+0.605, take3 +0.647, take2 +0.404.
+//   Law 'n J   +0.307 — above the film's own 99th-percentile background
+//                     (+0.05) and above the cross-table ceiling, but the one
+//                     table where it is suggestive rather than decisive.
+//   specificity: each end-stop template scores at most +0.14 against EVERY
+//              other section of its own table, and at most +0.14 in any film
+//              of another table. The hits above are the section and nothing
+//              else.
+//
+// NO MODE ENTRY IS ALIGNABLE IN ANY CAPTURE. Every mode background section
+// slid over every film peaks at +0.02..+0.17 — inside the cross-table control
+// band — including at Extreme Sports take3's filmed "DON'T MOVE" callout
+// (f~2310), where what identifies is the MAIN TUNE (+0.359) and no mode
+// section reaches +0.12. The captures are 60-90 s of mostly unshot balls and
+// no mission starts in them. The mode switches therefore ship on the decode
+// alone, which is unambiguous: opcode 19's operand can only be a music record.
+//
 // ---------------------------------------------------------------------------
 // THE BANK AND THE CELLS
 // ---------------------------------------------------------------------------
@@ -109,6 +196,11 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { createHash } from "node:crypto";
+
+// The script and element POOLS have to be the ones the modes document ships,
+// or a cue keyed by script index would name a different script there. Same
+// decoder, same sort, one source of truth.
+import { findScripts, key as poolKey } from "./export-table-modes.mjs";
 
 const PREAMBLE = 4;
 
@@ -136,6 +228,18 @@ const RECORD_COMMAND = 0x02;
 const RECORD_POSITION = 0x04;
 const RECORD_BANK = 0x06;
 const KIND_MUSIC = 4;
+/** The record's flags byte; the dispatcher masks the kind with 7, so >= 8 is not one. */
+const RECORD_FLAGS_MAX = 8;
+
+/** The mission VM's music opcode, handler $5B3E (`movea.l $2(a1),a0 / bra $6868`). */
+const MISSION_OP_MUSIC = 19;
+/** The display/anim VM's play-record opcode, handler $6940 (`jsr $6CD0`). */
+const DISPLAY_OP_PLAY = 0x10;
+/** Element record sound slots; kind 4 in one of these is a music command. */
+const ELEMENT_SOUND_START = 0x0c;
+const ELEMENT_SOUND_AWARD = 0x10;
+/** Where the five registered cues hang off the descriptor. */
+const DESCRIPTOR_CUE_SLOTS = [0x84, 0x88, 0x8c, 0x90, 0x94];
 
 /** SNT! bank layout ($7BF8). */
 const BANK_SAMPLES = 31;
@@ -481,6 +585,225 @@ function assertStopsWithF00(banks, cue, label) {
 }
 
 // ---------------------------------------------------------------------------
+// The kind-4 census: every music-cue record, and every site that fires it
+// ---------------------------------------------------------------------------
+
+/** Every relocated long in the package, as {hunk, offset, targetHunk}. */
+function relocationEntries(pkg) {
+  const out = [];
+  for (const [entry, target] of pkg.relocations) {
+    const split = entry.indexOf(":");
+    out.push({
+      hunk: Number(entry.slice(0, split)),
+      offset: Number(entry.slice(split + 1)),
+      target,
+    });
+  }
+  return out.sort((a, b) => a.hunk - b.hunk || a.offset - b.offset);
+}
+
+/**
+ * The element and script POOLS, exactly as `export-table-modes.mjs` builds and
+ * numbers them: elements are what the mission opcodes address with an element
+ * operand, scripts are what `findScripts` survives with, and both are sorted by
+ * (hunk, offset). A cue keyed by one of these indices means the same record in
+ * both documents, which is the whole point of importing the decoder.
+ */
+function modePools(pkg) {
+  const scripts = findScripts(pkg);
+  const elementKeys = new Set();
+  for (const script of scripts.values()) {
+    for (const op of script.ops) {
+      for (const arg of op.args) {
+        if (arg.kind === "e" && arg.target !== null && arg.target !== undefined) {
+          elementKeys.add(poolKey(arg.target));
+        }
+      }
+    }
+  }
+  const byKey = (keys) =>
+    [...keys]
+      .map((entry) => {
+        const split = entry.indexOf(":");
+        return { hunk: Number(entry.slice(0, split)), offset: Number(entry.slice(split + 1)) };
+      })
+      .sort((a, b) => a.hunk - b.hunk || a.offset - b.offset);
+
+  const elementList = byKey(elementKeys);
+  const scriptList = [...scripts.values()].sort(
+    (a, b) => a.at.hunk - b.at.hunk || a.at.offset - b.at.offset,
+  );
+  return {
+    elementIndex: new Map(elementList.map((at, index) => [poolKey(at), index])),
+    scriptIndex: new Map(scriptList.map((script, index) => [poolKey(script.at), index])),
+    scriptList,
+  };
+}
+
+/**
+ * CHECK 6 — EVERY kind-4 pointer in the package is placed. The five paths are
+ * in the header; a pointer that matches none of them is a structure this
+ * exporter has not decoded, and refusing is the correct output. The check is
+ * what makes the "43 / 38 / 38 records, 88 / 84 / 81 sites" census a fact
+ * rather than a sample.
+ */
+function censusKind4(pkg, banks, bonusAt, table) {
+  const { elementIndex, scriptIndex, scriptList } = modePools(pkg);
+
+  // Every instruction of every surviving script, addressed by the byte offset
+  // its OPERAND lives at, so a pointer inside a script names its own opcode.
+  const missionOperand = new Map();
+  for (const script of scriptList) {
+    const index = scriptIndex.get(poolKey(script.at));
+    for (const op of script.ops) {
+      missionOperand.set(`${script.at.hunk}:${script.at.offset + 4 + op.pc + 2}`, {
+        script: index,
+        pc: op.pc,
+        op: op.index,
+      });
+    }
+  }
+
+  const records = new Map();
+  const sites = [];
+  for (const entry of relocationEntries(pkg)) {
+    const body = pkg.bodies[entry.hunk];
+    if (body === undefined || entry.offset + 4 > body.length) continue;
+    const value = body.readUInt32BE(entry.offset);
+    const targetBody = pkg.bodies[entry.target];
+    if (targetBody === undefined || value + 8 > targetBody.length) continue;
+    if (targetBody.readUInt8(value + RECORD_KIND) !== KIND_MUSIC) continue;
+    if (targetBody.readUInt8(value + 1) >= RECORD_FLAGS_MAX) continue;
+
+    const at = { hunk: entry.target, offset: value };
+    const recordKey = poolKey(at);
+    if (!records.has(recordKey)) {
+      records.set(recordKey, {
+        key: recordKey,
+        label: `h${at.hunk}+0x${at.offset.toString(16).toUpperCase()}`,
+        command: targetBody.readInt16BE(value + RECORD_COMMAND),
+        position: targetBody.readUInt16BE(value + RECORD_POSITION),
+        bank: targetBody.readUInt16BE(value + RECORD_BANK),
+        sites: 0,
+      });
+    }
+    const record = records.get(recordKey);
+    record.sites += 1;
+
+    // A — the descriptor's five registered cue slots.
+    if (entry.hunk === 0 && DESCRIPTOR_CUE_SLOTS.includes(entry.offset)) {
+      sites.push({ path: "descriptor", record: recordKey, slot: entry.offset });
+      continue;
+    }
+    // E — the bonus routine's own `lea` operand, two bytes past its entry.
+    if (bonusAt !== null && entry.hunk === bonusAt.hunk && entry.offset === bonusAt.offset + BONUS_END_STOP) {
+      sites.push({ path: "ball-end", record: recordKey });
+      continue;
+    }
+    // B — a mission-VM opcode 19 operand.
+    const mission = missionOperand.get(`${entry.hunk}:${entry.offset}`);
+    if (mission !== undefined) {
+      if (mission.op !== MISSION_OP_MUSIC) {
+        throw new Error(
+          `${table.stem}: script ${mission.script} op ${mission.op} at +0x${mission.pc.toString(16)} ` +
+            `points at kind-4 record ${recordKey}, but only opcode ${MISSION_OP_MUSIC} may`,
+        );
+      }
+      sites.push({ path: "mission-op19", record: recordKey, script: mission.script, pc: mission.pc });
+      continue;
+    }
+    // D — an element record's START or AWARD sound slot.
+    let placed = false;
+    for (const delta of [ELEMENT_SOUND_START, ELEMENT_SOUND_AWARD]) {
+      const owner = elementIndex.get(`${entry.hunk}:${entry.offset - delta}`);
+      if (owner === undefined) continue;
+      sites.push({
+        path: "element",
+        record: recordKey,
+        element: owner,
+        field: delta === ELEMENT_SOUND_START ? "start" : "award",
+      });
+      placed = true;
+      break;
+    }
+    if (placed) continue;
+    // C — a display/anim-VM opcode $10 operand: the record's stream is words,
+    // and the opcode sits immediately before its longword operand.
+    if (entry.offset >= 2 && body.readUInt16BE(entry.offset - 2) === DISPLAY_OP_PLAY) {
+      sites.push({ path: "display-op10", record: recordKey });
+      continue;
+    }
+    // E — the table's own 68k, or a table it indexes: `lea $xxxxxxxx.l,An` is
+    // 0x4?F9, and BabeWatch's jukebox trio is a plain pointer array.
+    const before = entry.offset >= 2 ? body.readUInt16BE(entry.offset - 2) : 0;
+    if ((before & 0xf1ff) === 0x41f9 || before === 0 || records.has(`${entry.hunk}:${before}`)) {
+      sites.push({ path: "table-code", record: recordKey });
+      continue;
+    }
+    throw new Error(
+      `${table.stem}: kind-4 pointer at h${entry.hunk}+0x${entry.offset.toString(16)} -> ${recordKey} ` +
+        `is in no known structure (preceding word 0x${before.toString(16).padStart(4, "0")})`,
+    );
+  }
+
+  // CHECK 7 — every record names a real order position in the bank it names.
+  for (const record of records.values()) {
+    const bank = banks[record.bank];
+    if (bank === undefined) {
+      throw new Error(`${table.stem}: record ${record.label} names bank ${record.bank}`);
+    }
+    if (record.position >= bank.songLength) {
+      throw new Error(
+        `${table.stem}: record ${record.label} names position ${record.position} of bank ` +
+          `${record.bank}'s ${bank.songLength} orders`,
+      );
+    }
+    if (record.command === 0) {
+      throw new Error(`${table.stem}: record ${record.label} carries command 0, which posts nothing`);
+    }
+  }
+
+  const modeCues = sites
+    .filter((site) => site.path === "mission-op19")
+    .map((site) => {
+      const record = records.get(site.record);
+      return {
+        script: site.script,
+        pc: site.pc,
+        command: record.command,
+        position: record.position,
+        bank: record.bank,
+      };
+    })
+    .sort((a, b) => a.script - b.script || a.pc - b.pc);
+
+  const elementCues = sites
+    .filter((site) => site.path === "element")
+    .map((site) => {
+      const record = records.get(site.record);
+      return {
+        element: site.element,
+        field: site.field,
+        command: record.command,
+        position: record.position,
+        bank: record.bank,
+      };
+    })
+    .sort((a, b) => a.element - b.element || a.field.localeCompare(b.field));
+
+  const byPath = {};
+  for (const site of sites) byPath[site.path] = (byPath[site.path] ?? 0) + 1;
+
+  return {
+    records: [...records.values()],
+    sites,
+    modeCues,
+    elementCues,
+    census: { records: records.size, sites: sites.length, byPath },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // WAV
 // ---------------------------------------------------------------------------
 
@@ -541,9 +864,10 @@ function decodeTable(pkg, table) {
   if (tilt.kind !== KIND_MUSIC) throw new Error(`${table.stem} tilt cue: kind ${tilt.kind}`);
   assertStopsWithF00(banks, tilt, `${table.stem} tilt cue`);
 
-  // Decoded but not yet driven by the runtime: the game-over and high-score
-  // cues, and the bonus routine's own end-stop record. Shipped as data so
-  // the next round starts from facts.
+  // The game-over and high-score cues stay decoded data: the SHELL owns those
+  // screens in this reconstruction and plays its own module there. The
+  // end-stop record is the bonus routine's, and its firing moment is now the
+  // routine's own first instruction — see the header.
   const gameOver = readCue(pkg, descriptorPointer(pkg, HEADER_CUE_GAME_OVER), `${table.stem} game-over cue`);
   const highScore = readCue(pkg, descriptorPointer(pkg, HEADER_CUE_HIGH_SCORE), `${table.stem} high-score cue`);
   const endStop = expectCue(
@@ -552,6 +876,29 @@ function decodeTable(pkg, table) {
     { command: -2 },
   );
   assertStopsWithF00(banks, endStop, `${table.stem} end-stop record`);
+
+  // The whole kind-4 population and where each record is fired from.
+  const census = censusKind4(pkg, banks, bonusAt, table);
+
+  // CHECK 8 — the census must have found the SAME five descriptor cues and the
+  // SAME end-stop the pointer walk above reads, or the two decoders disagree
+  // about what a music record is.
+  const found = (path) => census.sites.filter((site) => site.path === path).length;
+  if (found("descriptor") !== 4) {
+    throw new Error(`${table.stem}: ${found("descriptor")} descriptor cue sites, expected 4`);
+  }
+  if (found("ball-end") !== 1) {
+    throw new Error(`${table.stem}: ${found("ball-end")} ball-end sites, expected 1`);
+  }
+  const ballEndSite = census.sites.find((site) => site.path === "ball-end");
+  const ballEndRecord = census.records.find((record) => record.key === ballEndSite.record);
+  if (
+    ballEndRecord.command !== endStop.command ||
+    ballEndRecord.position !== endStop.position ||
+    ballEndRecord.bank !== endStop.bank
+  ) {
+    throw new Error(`${table.stem}: the census's ball-end record is not the end-stop cue`);
+  }
 
   // The WAVs, one per live instrument per bank.
   const files = [];
@@ -573,7 +920,12 @@ function decodeTable(pkg, table) {
     }
   }
 
-  return { banks, cues: { ballStart, queueMain, tilt, gameOver, highScore, endStop }, files };
+  return {
+    banks,
+    cues: { ballStart, queueMain, tilt, gameOver, highScore, endStop },
+    census,
+    files,
+  };
 }
 
 function cueDocument(cue) {
@@ -605,9 +957,10 @@ function buildDocument(table, decoded) {
       ),
     })),
     /**
-     * The decoded engine cues. `vamp`, `main` and `tilt` are what the
-     * runtime drives; the rest ship as decoded data for rounds that wire
-     * the screens they belong to.
+     * The decoded engine cues. `vamp`, `main`, `tilt` and `endStop` are what
+     * the runtime drives; `gameOver` and `highScore` ship as decoded data,
+     * because the shell owns those screens here and plays its own module on
+     * them.
      */
     cues: {
       // `vamp` and `main` restate the ball-start and queue-main records under
@@ -621,6 +974,23 @@ function buildDocument(table, decoded) {
       highScore: cueDocument(decoded.cues.highScore),
       endStop: cueDocument(decoded.cues.endStop),
     },
+    /**
+     * The MODE / JACKPOT SWITCHES: every mission-VM opcode-19 site, keyed by
+     * the script index and pc of the MODES document — same pools, same
+     * numbering, because this exporter imports that decoder. The runtime fires
+     * one when its mode VM executes that instruction, which is the machine's
+     * own moment.
+     */
+    modeCues: decoded.census.modeCues,
+    /** Element START / AWARD sound slots whose record is a music command. */
+    elementCues: decoded.census.elementCues,
+    /**
+     * The whole kind-4 population, by firing path, so the unwired parts are
+     * counted in the shipped document rather than only in a commit message.
+     * `display-op10` and `table-code` are decoded and deliberately not driven;
+     * see the runtime header.
+     */
+    census: decoded.census.census,
     samples: decoded.files.map(({ wav, ...rest }) => rest),
   };
 }
@@ -691,6 +1061,16 @@ function main(argv) {
         `game-over ${decoded.cues.gameOver.command}/${decoded.cues.gameOver.position}/b${decoded.cues.gameOver.bank}, ` +
         `high-score ${decoded.cues.highScore.command}/${decoded.cues.highScore.position}/b${decoded.cues.highScore.bank}, ` +
         `end-stop ${decoded.cues.endStop.command}/${decoded.cues.endStop.position}/b${decoded.cues.endStop.bank}`,
+    );
+    const { census } = decoded.census;
+    console.log(
+      `               kind-4 census: ${census.records} records, ${census.sites} sites — ` +
+        Object.entries(census.byPath)
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([path, count]) => `${path} ${count}`)
+          .join(", ") +
+        `; wired: ${decoded.census.modeCues.length} mode cues, ` +
+        `${decoded.census.elementCues.length} element cues`,
     );
   }
   return failures > 0 ? 1 : 0;

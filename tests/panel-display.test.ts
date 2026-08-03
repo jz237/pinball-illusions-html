@@ -87,6 +87,7 @@ function reportAt(tick: number, over: Partial<GameTickReport> = {}): GameTickRep
     elementStarts: [],
     elementAwards: [],
     messagesShown: [],
+    musicCues: [],
     justTilted: false,
     gameOver: false,
     flipperRaised: [],

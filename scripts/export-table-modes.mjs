@@ -224,7 +224,20 @@ const OPCODES = [
   { index: 16, name: "CLEAR_BYTE", length: 6, args: "o" },
   { index: 17, name: "MESSAGE", length: 6, args: "m" },
   { index: 18, name: "SET_MAX", length: 14, args: "oii" },
-  { index: 19, name: "ANIMATE", length: 6, args: "o" },
+  // MUSIC — decoded, not guessed. The handler is `$5916 + $0228 = $5B3E`
+  // (the dispatch's `jsr ($0E,PC,D0.w)` sits at 0x5906 with its extension
+  // word at 0x5908, so handlers are based at 0x5916), and it is two
+  // instructions:
+  //     005B3E  movea.l $2(a1),a0
+  //     005B42  bra.w   $6868
+  // $6868 is the MUSIC MAILBOX poster — command at record +$2, order position
+  // at +$4, bank at +$6 — reached here DIRECTLY, not through the record
+  // dispatcher $6CD0. So this opcode's operand is always a kind-4 music
+  // record, and this is where a mission switches the background tune. The
+  // operand stays kind "o" in THIS document (which has no music-record pool);
+  // `export-table-music.mjs` resolves it, keyed by this script index and pc.
+  // It was labelled ANIMATE on nothing but the shape of its handler.
+  { index: 19, name: "MUSIC", length: 6, args: "o" },
   { index: 20, name: "NATIVE", length: 6, args: "o" },
   // SET_COUNT's pointer is a progress-counter record. Where that record hosts a
   // decoded effect-6 launcher table the operand is exported as the LADDER index

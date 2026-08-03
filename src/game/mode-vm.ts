@@ -129,7 +129,30 @@ const OP_SET_BALL_SAVE = 11;
 const OP_CLEAR_DONE = 12;
 const OP_LAMP_OFF = 14;
 const OP_MESSAGE = 17;
-const OP_ANIMATE = 19;
+/**
+ * Opcode 19: POST A MUSIC COMMAND. Decoded; it used to be called OP_ANIMATE on
+ * nothing but the shape of its handler. The dispatch at 0x58FC bases its
+ * handlers at 0x5916 (`jsr ($0E,PC,D0.w)` at 0x5906, extension word at
+ * 0x5908), and the table entry at 0x5912 + 4*19 is {disp $0228, len 6}, so the
+ * handler is +0x005B3E — two instructions:
+ *
+ *     005B3E  movea.l $2(a1),a0
+ *     005B42  bra.w   $6868
+ *
+ * and $6868 is the music player's MAILBOX POSTER: the kind-4 record's command
+ * (+$2), order position (+$4) and bank (+$6) go to $2412/$2416/$2418, which
+ * the player reads on its next frame. It does not go through the record
+ * dispatcher $6CD0 at all, so the operand is ALWAYS a music record.
+ *
+ * That makes this the instruction a mission switches its background tune with:
+ * the missions open with a `-2 <mode section>` and close with `-2 pos 1` or
+ * the queued `-1 pos 1` back to the main tune. The simulation has no idea what
+ * a tune is — it reports the SITE it executed (this script's index and this
+ * instruction's pc, both indices into data it already owns, exactly as
+ * `messagesShown` reports display records) and `src/browser/table-music.ts`
+ * resolves it through the music manifest's own decode. Nothing flows back.
+ */
+const OP_MUSIC = 19;
 const OP_NATIVE = 20;
 const OP_SET_COUNT = 21;
 const OP_JMP_IF_UNLIT = 23;
@@ -529,8 +552,22 @@ export interface ModeTickReport {
   readonly lockEjects: readonly LockDevice[];
   /** Lock devices whose held ball `BALL_REMOVE` took off the table. */
   readonly lockRemoves: readonly LockDevice[];
+  /**
+   * Every opcode-19 (MUSIC) instruction executed this tick, in execution
+   * order, as the SITE that executed it: the script's index and the
+   * instruction's pc, both indices into data the modes document already ships.
+   * The music manifest maps the same pair to the decoded {command, position,
+   * bank}. See `OP_MUSIC`.
+   */
+  readonly musicCues: readonly ModeMusicCue[];
   /** Opcodes executed whose behaviour is not decoded. See the header. */
   readonly unimplemented: number;
+}
+
+/** One executed music opcode, named the way the manifests key it. */
+export interface ModeMusicCue {
+  readonly script: number;
+  readonly pc: number;
 }
 
 /** A tick in which the mission machine did nothing at all. */
@@ -545,6 +582,7 @@ export const EMPTY_MODE_TICK: ModeTickReport = Object.freeze({
   ballsRemoved: 0,
   lockEjects: Object.freeze([]),
   lockRemoves: Object.freeze([]),
+  musicCues: Object.freeze([]),
   unimplemented: 0,
 });
 
@@ -559,6 +597,7 @@ interface Accumulator {
   ballsRemoved: number;
   lockEjects: LockDevice[];
   lockRemoves: LockDevice[];
+  musicCues: ModeMusicCue[];
   unimplemented: number;
 }
 
@@ -919,11 +958,16 @@ function step(
       state.resumePc = args[0] ?? -1;
       return next;
 
+    case OP_MUSIC:
+      // The site, not the sound: the presentation resolves `script:pc` through
+      // the music manifest. See OP_MUSIC's note for the handler cite.
+      out.musicCues.push({ script: script.index, pc: instruction.pc });
+      return next;
+
     case OP_VIEW_WIDE:
-    case OP_ANIMATE:
     case OP_NATIVE:
-      // VIEW_WIDE asks for a screen mode this port does not have; ANIMATE and
-      // NATIVE reach graphics and per-table 68k code that is not being emulated.
+      // VIEW_WIDE asks for a screen mode this port does not have; NATIVE
+      // reaches per-table 68k code that is not being emulated.
       out.unimplemented += 1;
       return next;
 
@@ -1038,6 +1082,7 @@ export function tickModes(modes: TableModes, state: ModeState): ModeTickReport {
     ballsRemoved: 0,
     lockEjects: [],
     lockRemoves: [],
+    musicCues: [],
     unimplemented: 0,
   };
 
@@ -1062,6 +1107,7 @@ export function tickModes(modes: TableModes, state: ModeState): ModeTickReport {
     out.ballsRemoved === 0 &&
     out.lockEjects.length === 0 &&
     out.lockRemoves.length === 0 &&
+    out.musicCues.length === 0 &&
     out.unimplemented === 0
   ) {
     return EMPTY_MODE_TICK;
@@ -1077,6 +1123,7 @@ export function tickModes(modes: TableModes, state: ModeState): ModeTickReport {
     ballsRemoved: out.ballsRemoved,
     lockEjects: out.lockEjects,
     lockRemoves: out.lockRemoves,
+    musicCues: out.musicCues,
     unimplemented: out.unimplemented,
   };
 }

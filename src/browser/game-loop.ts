@@ -209,7 +209,7 @@ import { FLIPPER_BATS_PATH, flipperBats } from "../game/flipper-bats.js";
 import { tableBallFor } from "../game/table-ball.js";
 import { drawMovingSprites } from "./sprite-layer.js";
 import type { BallFrameState, BatFrameState } from "../game/moving-sprites.js";
-import type { ModeState, ModeTickReport } from "../game/mode-vm.js";
+import type { ModeMusicCue, ModeState, ModeTickReport } from "../game/mode-vm.js";
 import {
   EMPTY_MODE_TICK,
   createModeState,
@@ -732,6 +732,17 @@ export interface GameTickReport {
   readonly elementAwards: readonly number[];
   /** Message-record indices the mode VM put on the display this tick. */
   readonly messagesShown: readonly number[];
+  /**
+   * MUSIC OPCODE SITES the mode VM executed this tick, in execution order:
+   * `{script, pc}` pairs into the modes document. Opcode 19's handler
+   * (main.seg00 $5B3E) posts the record's command / order position / bank
+   * straight to the music player's mailbox at $6868, so these are the MODE and
+   * JACKPOT MUSIC SWITCHES; `src/audio/table-music.ts` carries the decoded
+   * record for each site and `src/browser/table-music.ts` plays it. As with
+   * `messagesShown`, the simulation reports indices into data it already owns
+   * and knows nothing about sound.
+   */
+  readonly musicCues: readonly ModeMusicCue[];
   readonly justTilted: boolean;
   readonly gameOver: boolean;
   /**
@@ -984,6 +995,7 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     elementStarts: [],
     elementAwards: [],
     messagesShown: [],
+    musicCues: [],
     justTilted: false,
     gameOver: false,
     flipperRaised: [],
@@ -1424,6 +1436,7 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     elementStarts: modeTick.elementStarts,
     elementAwards: modeTick.awards.map((award) => award.element),
     messagesShown: modeTick.messagesShown,
+    musicCues: modeTick.musicCues,
     justTilted,
     gameOver,
     flipperRaised,

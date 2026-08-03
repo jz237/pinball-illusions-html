@@ -423,13 +423,24 @@ export function pumpTracker(output: TrackerOutput, lookaheadSeconds: number = 0.
 /**
  * Starts a song. Builds the context on first use (this is the lazy edge);
  * answers whether playback actually began — false means no audio device, and
- * false is not an error. `atContextTime` pins millisecond 0 of the song;
+ * false is not an error. `atContextTime` pins the moment playback begins;
  * omitted, the song starts now.
+ *
+ * `fromMs` ENTERS THE STREAM PART-WAY THROUGH ITS OWN PASS, which is how a
+ * background resumes after an override has interrupted it: the module engine
+ * saves the whole song state at $815E and copies it back at $821C, so the
+ * interrupted tune carries on from the row it was on rather than restarting.
+ * Here that is an offset of the song clock — `startContextTime` is pushed back
+ * so song millisecond `fromMs` lands at `atContextTime` — and the commands
+ * before it are skipped rather than scheduled in the past. The note that was
+ * mid-flight at the interruption is NOT re-triggered; that is the one part of
+ * the register file this model does not carry.
  */
 export function startTracker(
   output: TrackerOutput,
   stream: TrackerCommandStream,
   atContextTime?: number,
+  fromMs: number = 0,
 ): boolean {
   const host = ensureHost(output);
   if (host === null) return false;
@@ -438,9 +449,10 @@ export function startTracker(
   // loop boundary, exactly where the machine's queued command lands — is a
   // splice rather than a gap.
   stopTracker(output, atContextTime);
+  const entryMs = Math.min(Math.max(fromMs, 0), stream.durationMs);
   output.stream = stream;
-  output.startContextTime = atContextTime ?? host.currentTime;
-  output.nextIndex = 0;
+  output.startContextTime = (atContextTime ?? host.currentTime) - entryMs / 1000;
+  output.nextIndex = entryMs === 0 ? 0 : restartIndex(stream, entryMs);
   output.passOffsetMs = 0;
   output.playing = true;
   pumpTracker(output);

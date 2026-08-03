@@ -97,6 +97,7 @@ function reportWith(over: Partial<GameTickReport> = {}): GameTickReport {
     elementStarts: [],
     elementAwards: [],
     messagesShown: [],
+    musicCues: [],
     justTilted: false,
     gameOver: false,
     flipperRaised: [],

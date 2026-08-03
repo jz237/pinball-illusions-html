@@ -15,20 +15,112 @@
  *   launch      -> the MAIN TUNE from position 1 — QUEUED (-1/1/0): the
  *                  switch lands exactly on the vamp's next lap boundary,
  *                  measured to the frame on six filmed launches
+ *   a mission   -> its own MODE BACKGROUND, and back to the main tune when it
+ *                  ends: the mission bytecode's opcode 19 (see below)
  *   tilt        -> the TILT JINGLE (the +$94 cue; phase 8 is the tilted
  *                  state): a short sequence ending in F00, the player's stop
  *                  flag — the films' only silent gameplay spans, with the
  *                  decoded length matching the filmed tilt-to-silence gap on
  *                  all three filmed tilts
- *   next serve  -> the vamp again (the ball-start cue re-fires per ball)
+ *   ball end    -> the END-STOP record, a -2 into another F00 section: the
+ *                  music plays a short outro and stops for the bonus count.
+ *                  Film-verified: on BabeWatch the rendered section identifies
+ *                  at waveform NCC +0.775 / +0.816 / +0.814 across the three
+ *                  captures, each starting 0.20-0.44 s after a filmed centre
+ *                  drain, against a cross-table ceiling of +0.14
+ *   next serve  -> the vamp again (the ball-start cue re-fires per ball and
+ *                  clears the stop flag, $7DD2). On take 1 the 0.62 s between
+ *                  the outro's F00 and that vamp sits at RMS 0.021 against the
+ *                  music's 0.128 — the silence the F00 asks for
  *
- * The game-over / high-score / enter-initials sections the engine also
- * switches to are decoded and shipped in the manifest, but those moments
- * belong to the SHELL in this reconstruction (its cards come up on the frame
- * the game ends), so the shell's own front-end module plays there and the
- * cues stay data. Mode and jackpot background switches (the tables' other
- * kind-4 records) are not wired yet either — the main loop plays through a
- * mode, which is what the captures mostly show anyway.
+ * The MODE BACKGROUNDS are decoded but NOT film-verified: slid over all seven
+ * captures they peak at +0.02..+0.17, inside the cross-table control band. No
+ * mission starts in any capture. They ship on the decode, which is not
+ * ambiguous — opcode 19 goes straight to the mailbox poster, so its operand
+ * can only be a music record — but the honest statement is that no ear has
+ * checked them against the machine.
+ *
+ * ---------------------------------------------------------------------------
+ * THE THREE COMMANDS A CUE CARRIES ($6868 posts, $7D66.. executes)
+ * ---------------------------------------------------------------------------
+ * Every kind-4 record is {command, order position, bank}. The player keeps a
+ * CURRENT song (state +$108..) and a SAVED song (+$000..) and a mailbox at
+ * $2412/$2416/$2418, and the command decides which of three things happens:
+ *
+ *   cmd -2  SET BACKGROUND ($7DD2). `$81B0` writes the saved slot with a CLEAN
+ *           channel state; if no override is sounding, `$81F8` promotes it to
+ *           current straight away. If one IS sounding, only the slot changes —
+ *           i.e. the override's return target is retargeted, and the switch
+ *           happens when the override ends. This is the mode background.
+ *
+ *   cmd -1  QUEUE ($7E0C). Same slot write, but the switch waits for the
+ *           CURRENT section's own Bxx: the loop-jump handler at $8860 tests
+ *           the queued flag $219 FIRST and, if it is up, activates the queued
+ *           song there. That is the launch's lap-boundary entry, measured to
+ *           the frame on film, and it is what a mission's closing `-1 pos 1`
+ *           uses too.
+ *
+ *   cmd >0  OVERRIDE ($7D88 -> $815E). Saves the whole current song AND its
+ *           channel state (132 words), then starts (bank, position) now. At
+ *           the override's own Bxx, $8860 falls to `jsr $821C`, which copies
+ *           those 132 words back — the background resumes EXACTLY where it was
+ *           interrupted. A nested override does not re-save ($815E's `tst.b
+ *           $21a / bne` skips the copy), so the innermost sting still returns
+ *           to the background and not to the sting it interrupted. An override
+ *           whose section ends in F00 never reaches a Bxx and so never
+ *           returns: F00 sets the stop flag at $883A and the player halts.
+ *           That is the tilt jingle on BabeWatch and Extreme Sports, whose
+ *           tilt cues are overrides rather than background sets.
+ *
+ * The reconstruction implements those three and nothing else. Resuming a
+ * background "exactly where it was" is done by song TIME, not by restoring
+ * per-channel Paula registers: the note that was sounding at the interruption
+ * is not re-triggered, which is the one place this deviates from the 132-word
+ * copy. Labelled here rather than hidden.
+ *
+ * ---------------------------------------------------------------------------
+ * WHERE THE MODE SWITCHES COME FROM, AND WHAT IS NOT WIRED
+ * ---------------------------------------------------------------------------
+ * Each table carries 38-43 distinct kind-4 records reached by 81-88 relocated
+ * pointers, and `scripts/export-table-music.mjs` classifies every one of them.
+ * Four paths reach this controller:
+ *
+ *   the five descriptor cues (ball start, tilt, game over, high score,
+ *   attract), the BONUS ROUTINE's end-stop record, the MISSION VM's opcode 19
+ *   (32 / 27 / 32 sites — the mode backgrounds and the returns to the main
+ *   tune), and an ELEMENT's +$0C / +$10 sound slot where the record is kind 4
+ *   (one site, BabeWatch's).
+ *
+ * TWO PATHS ARE DELIBERATELY NOT WIRED, and the reasons are structural:
+ *
+ *   DISPLAY/ANIM-VM OPCODE $10 (51 / 45 / 44 sites, nearly all of the bank-1
+ *   award and jackpot stings). Those records live inside display programs run
+ *   by the VM at $6700, and a display program only runs if $6C2C's PRIORITY
+ *   ARBITRATION admits it: `cmp.b $23b2(a5),d0 / bcs` DROPS a record whose
+ *   priority pair is below what is on the ring, `bhi` FLUSHES the ring for a
+ *   higher one, and only an equal-major/higher-minor pair appends. This port
+ *   reconstructs which display records a mission shows, not the ring, its
+ *   priorities or the per-frame VM, so `report.messagesShown` is a SUPERSET of
+ *   what the machine runs.
+ *
+ *   `src/browser/audio.ts` already accepts that superset for the kind-2/5
+ *   stings in the very same display records, and the difference is the cost of
+ *   being wrong: a spurious EFFECT is 300 ms on a channel the music yields
+ *   anyway, guarded by $779E's own priority test, while a spurious music
+ *   OVERRIDE takes the whole tune away for one to seven seconds and gives it
+ *   back at a Bxx. With no film evidence either way — no capture contains a
+ *   mode entry at all — that is not a trade this round makes. The sites are
+ *   counted in the manifest's `census` so the next round starts from the
+ *   number, and the fix is the display ring, not another id namespace.
+ *
+ *   THE TABLE'S OWN 68k (6 sites, BabeWatch only). Its routine at h4+0x85EC
+ *   copies a 12-word record over the ball-start record at h4+0x982E, choosing
+ *   between {-2 pos 0, -2 pos 16, -2 pos 29} from the table at h4+0x872E —
+ *   the JUKEBOX. Per-table 68k is not emulated at all here (mode VM opcode 20,
+ *   NATIVE, is a counted no-op), so the selector's state does not exist.
+ *
+ * The GAME-OVER and HIGH-SCORE cues stay data as well: those screens belong to
+ * the shell in this reconstruction and its own front-end module plays on them.
  *
  * ---------------------------------------------------------------------------
  * CHANNEL 3 BELONGS TO THE EFFECTS WHILE ONE IS SOUNDING
@@ -66,8 +158,14 @@ import type {
   TrackerHost,
   TrackerOutput,
 } from "../audio/tracker-output.js";
-import { loadTableMusic, sectionStream } from "../audio/table-music.js";
-import type { TableMusicAsset, TableMusicFetch } from "../audio/table-music.js";
+import {
+  MUSIC_COMMAND_BACKGROUND,
+  MUSIC_COMMAND_QUEUE,
+  isMusicOverride,
+  loadTableMusic,
+  modeCueKey,
+} from "../audio/table-music.js";
+import type { TableMusicAsset, TableMusicCue, TableMusicFetch } from "../audio/table-music.js";
 
 /**
  * The phases the table music plays in: the ball, and the "REALLY QUIT
@@ -83,13 +181,17 @@ export const TABLE_MUSIC_PHASES: ReadonlySet<ShellPhase> = new Set<ShellPhase>([
 /** The default scheduler lookahead `pumpTracker` runs with, in seconds. */
 const LOOKAHEAD_SECONDS = 0.5;
 
-/** What the controller is playing, or about to. */
-type SectionName = "vamp" | "main" | "tilt";
+/** One (bank, order position) the controller can play. */
+interface SectionRef {
+  readonly bank: number;
+  readonly position: number;
+}
 
-interface SectionSet {
-  readonly vamp: TrackerCommandStream;
-  readonly main: TrackerCommandStream;
-  readonly tilt: TrackerCommandStream;
+/** What is sounding: the background suite, or an override on top of it. */
+interface Sounding extends SectionRef {
+  readonly stream: TrackerCommandStream;
+  /** True while this is an override; false for the background. */
+  readonly override: boolean;
 }
 
 export interface TableMusic {
@@ -103,11 +205,11 @@ export interface TableMusic {
   /** Forgets the live table: leaving the playfield for the shell. */
   clear(): void;
   /**
-   * Reads one finished tick report: `served` starts the vamp, `launched`
-   * queues the main tune for the vamp's next lap boundary, `justTilted`
-   * plays the tilt jingle. Order within one tick follows the machine's own
-   * cue order (a tilt posted after a serve wins, exactly as the last mailbox
-   * write would).
+   * Reads one finished tick report and fires the cues it implies, in the
+   * machine's own order: the mode VM's music opcodes first (they ran inside
+   * the tick), then the ball transitions the loop reports around them. Order
+   * within one tick follows the machine's own cue order — the last mailbox
+   * write wins, so a tilt posted after a serve wins.
    */
   observe(report: GameTickReport): void;
   /**
@@ -132,19 +234,35 @@ export function createTableMusic(
   let bank: InstrumentBank = () => null;
   const output = createTrackerOutput(hostFactory, (id) => bank(id));
 
-  /** Loaded assets and their pre-rendered sections, keyed by table id. */
-  const loaded = new Map<string, { asset: TableMusicAsset; sections: SectionSet } | null>();
+  /** Loaded assets, keyed by table id; null is a table with no manifest. */
+  const loaded = new Map<string, TableMusicAsset | null>();
   const inFlight = new Map<string, Promise<void>>();
 
   let currentTableId: string | null = null;
-  let current: { asset: TableMusicAsset; sections: SectionSet } | null = null;
+  let current: TableMusicAsset | null = null;
 
-  /** What is sounding (or 'silent'), and the pending queued switch. */
-  let playing: SectionName | "silent" = "silent";
-  /** True after a tilt: nothing plays until the next serve. */
-  let stopped = false;
-  /** The queued main switch: sound at the vamp's next lap boundary. */
-  let mainQueued = false;
+  /** What is sounding right now, or null for silence. */
+  let sounding: Sounding | null = null;
+  /**
+   * The BACKGROUND SLOT — the player's saved song ($0(a2)): what a -2 writes,
+   * what an override returns to, what a queued switch becomes.
+   */
+  let background: SectionRef | null = null;
+  /**
+   * Where the interrupted background was when an override started, in song
+   * milliseconds, and which section it was. Null when nothing is overriding.
+   * This is the 132-word save at $815E, kept as a time rather than a register
+   * file; see the header.
+   */
+  let saved: { readonly section: SectionRef; readonly offsetMs: number } | null = null;
+  /** The pending queued switch (-1): lands at the current section's Bxx. */
+  let queued: SectionRef | null = null;
+  /**
+   * The player's STOP FLAG $21C, as the context time it goes up: a section
+   * ending in F00 raises it on that row ($883A), and from then on the player
+   * is halted until a cue clears it. Null while the sounding section loops.
+   */
+  let stopsAt: number | null = null;
   /**
    * Balls on the playfield, tracked from the reports so a BALL-START serve
    * (balls were zero — the engine's $49BE/$4FC4 moments, which fire the
@@ -154,47 +272,136 @@ export function createTableMusic(
    */
   let ballsLive = 0;
 
-  const sectionsOf = (asset: TableMusicAsset): SectionSet => {
-    const streamFor = (cue: { position: number; bank: number }): TrackerCommandStream => {
-      const song = asset.songs[cue.bank === 0 ? 0 : 1];
-      const voices = asset.voices[cue.bank === 0 ? 0 : 1];
-      return sectionStream(song, voices, cue.position);
-    };
-    return {
-      vamp: streamFor(asset.cues.vamp),
-      main: streamFor(asset.cues.main),
-      tilt: streamFor(asset.cues.tilt),
-    };
+  const streamFor = (ref: SectionRef): TrackerCommandStream | null =>
+    current === null ? null : current.section(ref.bank, ref.position);
+
+  /** Song milliseconds elapsed in whatever is sounding, at `now`. */
+  const elapsedMs = (now: number): number => {
+    if (sounding === null) return 0;
+    const passed = Math.max(0, now - output.startContextTime) * 1000;
+    const lap = sounding.stream.durationMs - (sounding.stream.restartMs ?? 0);
+    if (sounding.stream.restartMs === null || lap <= 0) return passed;
+    if (passed <= sounding.stream.durationMs) return passed;
+    return sounding.stream.restartMs + ((passed - sounding.stream.restartMs) % lap);
   };
 
-  const start = (name: SectionName, atContextTime?: number): void => {
-    if (current === null) return;
-    playing = name;
-    mainQueued = false;
-    startTracker(output, current.sections[name], atContextTime);
+  /**
+   * Starts a section now (or at `atContextTime`), optionally `fromMs` into its
+   * own pass — the override's return. Answers whether anything sounds.
+   */
+  const play = (
+    ref: SectionRef,
+    override: boolean,
+    atContextTime?: number,
+    fromMs = 0,
+  ): boolean => {
+    const stream = streamFor(ref);
+    if (stream === null) return false;
+    sounding = { ...ref, stream, override };
+    queued = null;
+    startTracker(output, stream, atContextTime, fromMs);
+    // A section with no loop point ends in F00, and its last row is where the
+    // machine's stop flag goes up.
+    stopsAt =
+      stream.restartMs === null
+        ? output.startContextTime + stream.durationMs / 1000
+        : null;
+    return true;
   };
+
+  /** True once the sounding section's F00 has raised the stop flag. */
+  const halted = (now: number): boolean =>
+    sounding === null || (stopsAt !== null && now >= stopsAt);
 
   const silence = (): void => {
-    playing = "silent";
-    mainQueued = false;
+    sounding = null;
+    background = null;
+    saved = null;
+    queued = null;
     ballsLive = 0;
+    stopsAt = null;
     stopTracker(output);
   };
 
   /**
-   * The vamp's next lap boundary, in context time. Lap length is the vamp
-   * stream's own pass (`restartMs` is 0 on every shipped vamp — the section
-   * re-enters its own position — and the subtraction keeps the maths honest
-   * if a table ever ships otherwise).
+   * One decoded cue record, executed the way $7D66.. executes it.
+   *
+   * The stop flag is cleared by a BACKGROUND set exactly where the machine
+   * clears it ($7DD2's `tst.b $21c / clr.b $21a / clr.b $21c`), which is why
+   * the next ball's -2/0/0 ends the post-tilt and post-bonus silence.
    */
-  const nextVampBoundary = (now: number): number | null => {
-    const stream = current?.sections.vamp ?? null;
-    if (stream === null || playing !== "vamp") return null;
-    const lapSeconds = (stream.durationMs - (stream.restartMs ?? 0)) / 1000;
-    if (lapSeconds <= 0) return now;
-    const elapsed = now - output.startContextTime;
-    const laps = Math.max(1, Math.ceil(elapsed / lapSeconds + 1e-6));
-    return output.startContextTime + laps * lapSeconds;
+  const fire = (cue: TableMusicCue): void => {
+    if (current === null) return;
+    const ref = { bank: cue.bank, position: cue.position };
+    const host = output.host;
+    const now = host?.currentTime ?? 0;
+
+    if (isMusicOverride(cue.command)) {
+      // $7D88: the stop flag comes down ($21C), the current song is saved with
+      // its whole state ($815E — skipped if an override is already sounding,
+      // so the innermost sting still returns to the background), and the
+      // override starts now.
+      if (saved === null && sounding !== null && !sounding.override && !halted(now)) {
+        saved = {
+          section: { bank: sounding.bank, position: sounding.position },
+          offsetMs: elapsedMs(now),
+        };
+      }
+      play(ref, true);
+      return;
+    }
+
+    if (cue.command === MUSIC_COMMAND_BACKGROUND) {
+      // $7DD2: clear the stop, write the background slot ($81B0), and promote
+      // it now unless an override is sounding — in which case only the slot
+      // moves and the override's Bxx will land on it, from a CLEAN state
+      // ($81B0 wipes the saved channel block, hence offset 0).
+      background = ref;
+      if (sounding !== null && sounding.override && !halted(now)) {
+        saved = { section: ref, offsetMs: 0 };
+        return;
+      }
+      // $81F8 promotes the slot AND clears the override flag: nothing is
+      // waiting to come back any more.
+      saved = null;
+      play(ref, false);
+      return;
+    }
+
+    if (cue.command === MUSIC_COMMAND_QUEUE) {
+      // $7E0C: the slot is written and the switch waits for the current
+      // section's Bxx. A queue arriving while the player is HALTED takes the
+      // machine's own branch into the background path instead ($7E14/$7E1E
+      // `tst.b $21c / bne -> $7DD2`), so it sounds at once.
+      background = ref;
+      if (halted(now)) {
+        saved = null;
+        play(ref, false);
+        return;
+      }
+      queued = ref;
+    }
+  };
+
+  /** The cue at a mode-VM site, or null if that site carries none. */
+  const modeCue = (script: number, pc: number): TableMusicCue | null =>
+    current?.modeCues.get(modeCueKey(script, pc)) ?? null;
+
+  /**
+   * The next Bxx of whatever is sounding, in context time — the boundary a
+   * queued switch lands on, and the moment an override returns. A section that
+   * ends in F00 has no Bxx and answers null.
+   */
+  const nextBoundary = (now: number): number | null => {
+    if (sounding === null) return null;
+    const stream = sounding.stream;
+    if (stream.restartMs === null) return null;
+    const lapSeconds = (stream.durationMs - stream.restartMs) / 1000;
+    const firstEnd = output.startContextTime + stream.durationMs / 1000;
+    if (lapSeconds <= 0) return firstEnd;
+    if (now < firstEnd) return firstEnd;
+    const laps = Math.ceil((now - firstEnd) / lapSeconds + 1e-6);
+    return firstEnd + laps * lapSeconds;
   };
 
   return {
@@ -205,29 +412,26 @@ export function createTableMusic(
       const cached = loaded.get(tableId);
       if (cached !== undefined) {
         current = cached;
-        bank = cached === null ? () => null : cached.asset.bank;
+        bank = cached === null ? () => null : cached.bank;
         silence();
-        stopped = false;
         return;
       }
       current = null;
       bank = () => null;
       silence();
-      stopped = false;
       if (inFlight.has(tableId)) return;
       const task = (async () => {
-        let entry: { asset: TableMusicAsset; sections: SectionSet } | null = null;
+        let asset: TableMusicAsset | null = null;
         try {
-          const asset = await loadTableMusic(tableId, fetcher);
-          if (asset !== null) entry = { asset, sections: sectionsOf(asset) };
+          asset = await loadTableMusic(tableId, fetcher);
         } catch {
-          entry = null; // an undecodable asset is a silent table
+          asset = null; // an undecodable asset is a silent table
         }
-        loaded.set(tableId, entry);
+        loaded.set(tableId, asset);
         inFlight.delete(tableId);
         if (currentTableId === tableId) {
-          current = entry;
-          bank = entry === null ? () => null : entry.asset.bank;
+          current = asset;
+          bank = asset === null ? () => null : asset.bank;
         }
       })();
       inFlight.set(tableId, task);
@@ -238,60 +442,106 @@ export function createTableMusic(
       current = null;
       bank = () => null;
       silence();
-      stopped = false;
     },
 
     observe(report: GameTickReport): void {
-      if (current === null) return;
+      const asset = current;
+      if (asset === null) return;
+
+      // The mission VM's own music opcodes, in the order it executed them.
+      for (const site of report.musicCues) {
+        const cue = modeCue(site.script, site.pc);
+        if (cue !== null) fire(cue);
+      }
+      // An element's START / AWARD sound slot holding a music command.
+      for (const element of report.elementStarts) {
+        const cue = asset.elementCues.start.get(element);
+        if (cue !== undefined) fire(cue);
+      }
+      for (const element of report.elementAwards) {
+        const cue = asset.elementCues.award.get(element);
+        if (cue !== undefined) fire(cue);
+      }
+
       // The ball-start cue fires when a ball arrives on an EMPTY playfield —
       // game start and every next ball ($49BE/$4FC4) — and puts the vamp up;
-      // it also ends the post-tilt silence ($7DD2 clears the stop flag
-      // $21C). A multiball add-a-ball serve fires no music cue.
+      // it also ends the post-tilt and post-bonus silence ($7DD2 clears the
+      // stop flag $21C). A multiball add-a-ball serve fires no music cue.
       if (report.served) {
-        if (ballsLive === 0) {
-          stopped = false;
-          start("vamp");
-        }
+        if (ballsLive === 0) fire(asset.cues.ballStart);
         ballsLive += 1;
       }
-      ballsLive = Math.max(0, ballsLive - report.drained.length);
-      // The launch queues the main tune (-1): the switch happens at the
-      // vamp's lap boundary, which `update` executes when it comes close.
-      if (report.launched && playing === "vamp") mainQueued = true;
-      // The tilt: the jingle, immediately (its own F00 then silences
-      // everything until the next serve).
-      if (report.justTilted) {
-        stopped = true;
-        start("tilt");
+      // A ball ending runs the table's end-of-ball bonus routine ($51BE), and
+      // that routine's first instruction fires its end-stop record: a -2 into
+      // a section that ends in F00, so the music stops for the bonus count. A
+      // multiball drain that leaves balls in play is not a ball end.
+      const ended = report.drained.length;
+      if (ended > 0) {
+        ballsLive = Math.max(0, ballsLive - ended);
+        if (ballsLive === 0) fire(asset.cues.endStop);
       }
+      // The launch queues the main tune (-1): the switch happens at the vamp's
+      // lap boundary, which `update` executes when it comes close.
+      //
+      // RECONSTRUCTION, and unchanged from the round that measured it. The
+      // queue-main record's only decoded sites are mission-VM opcode 19 inside
+      // scripts nothing statically points at (they hang off the `$23DC` PUSH
+      // stack, RULES_SPEC §12.4), so no ENGINE site for it is decoded — but
+      // six filmed launches enter the main tune exactly on the vamp's next lap
+      // boundary, which is what a queue does and nothing else does. It is
+      // fired only while the SERVE SECTION is up, so a mission background that
+      // is running when a ball is launched keeps playing, as the machine's own
+      // background slot would.
+      if (
+        report.launched &&
+        sounding !== null &&
+        sounding.bank === asset.cues.ballStart.bank &&
+        sounding.position === asset.cues.ballStart.position
+      ) {
+        fire(asset.cues.queueMain);
+      }
+      // The tilt: its own cue, an override on two tables and a background set
+      // on the third, and on all three a section ending in F00.
+      if (report.justTilted) fire(asset.cues.tilt);
       if (report.gameOver) ballsLive = 0;
     },
 
     update(phase: ShellPhase, effects: AudioBank | null): void {
       if (!TABLE_MUSIC_PHASES.has(phase) || current === null) {
-        if (playing !== "silent") silence();
+        if (sounding !== null) silence();
         return;
       }
       const host = output.host;
       const now = host?.currentTime ?? 0;
 
-      // Execute a queued main switch once its boundary is inside the
-      // lookahead window; until then, cap the pump at the boundary so the
-      // vamp never schedules past its own last lap.
+      // The Bxx: a queued switch lands there ($8860's $219 path), and failing
+      // that an override returns to the background there ($821C). Until the
+      // boundary is inside the lookahead the pump is capped at it, so the
+      // current section never schedules past its own last lap.
       let lookahead = LOOKAHEAD_SECONDS;
-      if (mainQueued && playing === "vamp" && host !== null) {
-        const boundary = nextVampBoundary(now);
+      if (host !== null && sounding !== null && (queued !== null || sounding.override)) {
+        const boundary = nextBoundary(now);
         if (boundary !== null) {
           if (boundary - now <= LOOKAHEAD_SECONDS * 0.9) {
-            start("main", boundary);
+            const back = saved;
+            if (queued !== null) {
+              const target = queued;
+              background = target;
+              saved = null;
+              play(target, false, boundary);
+            } else if (back !== null) {
+              saved = null;
+              play(back.section, false, boundary, back.offsetMs);
+            } else if (background !== null) {
+              play(background, false, boundary);
+            }
           } else {
             lookahead = Math.max(boundary - now - 0.001, 0.05);
           }
         }
       }
 
-      if (playing !== "silent" && !stopped) pumpTracker(output, lookahead);
-      else if (playing === "tilt") pumpTracker(output, lookahead);
+      if (sounding !== null) pumpTracker(output, lookahead);
 
       // The channel-3 gate: while an effect is sounding on the shared
       // context's clock, the module's channel 3 is held silent, exactly as

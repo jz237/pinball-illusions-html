@@ -84,9 +84,10 @@ run 1995-01-04 to 1995-04-05, consistent with the 1995 AGA release.
 
 Each table is a single self-contained ~750 KB package. `flipdat1.bin` appears once
 (disk 2) and is presumably shared flipper animation/behaviour data loaded for every
-table; `music001.bin` likewise appears once and is presumably the shared or
-BabeWatch-jukebox music bank. Both inferences are **unverified** and must be
-confirmed before being relied on.
+table — that inference is **unverified**. `music001.bin` is **settled**: it is the
+shell's front-end module and nothing else (see its own section below), and it is NOT
+the BabeWatch jukebox — the jukebox picks between three sections of BabeWatch's own
+bank 0 through the pointer table at h4+0x872E.
 
 ## `tables.bin` — the table index (104 bytes)
 
@@ -723,9 +724,16 @@ rate sanity: mean absolute sample-to-sample delta is 4–16 of 255 (noise would 
 
 Still open, none affecting the identification: which shell screen triggers the
 `$E74` load site (its d0 = `$11` start argument exceeds songlen 14 and is clamped
-to 0 by `$7B18–$7B2C`, so it plays the same either way); the jukebox's concrete
-song-index → order-position table in Table002; whether anything streams music001's
-instrument 1 through the kind-5 / `$7812` 26-byte-record path.
+to 0 by `$7B18–$7B2C`, so it plays the same either way); whether anything streams
+music001's instrument 1 through the kind-5 / `$7812` 26-byte-record path.
+
+~~The jukebox's concrete song-index → order-position table in Table002~~ **FOUND, and
+it is not music001's:** BabeWatch's own 68k in slot 4 (h4+0x85EC..0x8712) COPIES a
+12-word record over its ball-start record at h4+0x982E — `lea $982E,a2 / move.w #$B,d0
+/ move.w (a0)+,(a2)+ / dbra` — choosing its source from the three-entry pointer table
+at h4+0x872E, whose entries are the kind-4 records `-2 pos 0`, `-2 pos 16` and
+`-2 pos 29` of the table's OWN bank 0. So the jukebox picks which section the serve
+puts up, out of BabeWatch's own module. Not wired: per-table 68k is not emulated here.
 
 ## Closed questions
 
@@ -759,7 +767,10 @@ Recorded so nobody spends effort re-opening them:
    `$6868` and the mailbox at `$2412`. Every pattern of all six banks decodes bit-exactly
    under the `$7F8A` cell encoding, tiling each bank's offset table with zero slack.
    Decoded, shipped and film-verified by `scripts/export-table-music.mjs` and
-   `docs/RULES_SPEC.md` §13.3. Identify `flipdat1.bin` remains.
+   `docs/RULES_SPEC.md` §13.3, including the MODE / JACKPOT switches: the whole kind-4
+   population is censused (43 / 38 / 38 records, 88 / 84 / 81 pointers, every pointer
+   classified) and the opcode that fires the mode backgrounds is mission-VM 19, handler
+   `$5B3E`. Identify `flipdat1.bin` remains.
    (~~and `music001.bin`~~ — **CLOSED**: one `SNT!` tracker module, the shell's
    front-end music; see the section above. Correlated against the gameplay captures it
    plays no part in play — waveform NCC +0.01..+0.02, noise, on all three tables.)

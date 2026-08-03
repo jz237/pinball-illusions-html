@@ -385,6 +385,9 @@ more are now settled (research/SOUND_CENSUS.md §1.1, corrections 3-4):
 - **`0x0010` is the play-record op** — handler `$6940`, dispatched through the opcode
   table at `$6748` (handler = `$674C`+disp); its operand longword names a 26-byte sound
   record (§13.1), NOT an entry of the 8-byte table at `0x9E6E` as previously read here.
+  (`0x9E6E` is in fact Law 'n Justice's own kind-4 MUSIC-CUE array — the ball-start
+  record is its first entry — so the operands that land there are music commands, not
+  effects; see §13.3.)
   The audio exporter walks exactly these operands for the display stings and callouts.
 - **`0x0013` does not play anything** — handler `$6938` stores its operand word into
   `$23C6(a5)`, the repeat counter consumed by op `0x11` (`$6906`).
@@ -1181,6 +1184,11 @@ HOSTAGES*, *SHOOT FLASHING ARROWS / TO CALM DOWN RIOTS*.
 
 ### 12.4 What is still open
 
+- ~~Opcode 19 is `ANIMATE`~~ **WRONG, and withdrawn: it is the MUSIC command post.**
+  Handler `$5B3E` (= `$5916 + $0228`) is `movea.l $2(a1),a0 / bra.w $6868`, and `$6868`
+  is the music player's mailbox poster; the operand is always a kind-4 music record.
+  It is the instruction a mission switches its background tune with — see §13.3.
+  **[disk]**
 - **Nine of the pointer-taking opcodes address an unidentified record type**:
   `KICK_IF`, `LINK_RESTORE`, `SET_VALUE`, `RESET_GROUP`, `RESTORE_POS`, `CLEAR_BYTE`,
   `SET_MAX`, `SET_COUNT`, `SET_COUNT_SELF`. Their operands fail the packed-BCD test that
@@ -1292,8 +1300,42 @@ inventory and evidence: `research/SOUND_CENSUS.md`. **[disk]**
   (`src/browser/table-music.ts`) and film-verified per table (serve vamp waveform NCC
   +0.65..+0.90; the main tune entering exactly on vamp lap boundaries on six filmed
   launches; the tilt jingle's length matching the filmed tilt-to-silence gap on all
-  three filmed tilts, envelope NCC +0.89..+0.98). Mode/jackpot background switches
-  (the tables' other kind-4 records) remain unwired. **[disk]**
+  three filmed tilts, envelope NCC +0.89..+0.98). **[disk]**
+- ~~The mode/jackpot background switches~~ **MAPPED AND WIRED, and the opcode that
+  fires them is named.** The whole kind-4 population is censused per package — 43 / 38
+  / 38 records reached by 88 / 84 / 81 relocated pointers, every pointer classified or
+  the exporter refuses. The paths are: the five descriptor cues; the BONUS ROUTINE's
+  own end-stop record; MISSION-VM OPCODE 19 (32 / 27 / 32 sites); an ELEMENT record's
+  `+$0C`/`+$10` sound slot (1 site, BabeWatch); the DISPLAY/ANIM VM's opcode `$10`
+  (51 / 45 / 44 sites); and BabeWatch's own 68k (6 sites).
+  **Opcode 19 is the music command post, not `ANIMATE`.** The mission dispatch at
+  `$58FC` bases its handlers at `$5916` (`jsr ($0E,PC,D0.w)` at `$5906`, extension word
+  at `$5908`); the table entry at `$5912 + 4*19` is {disp `$0228`, len 6}, so the
+  handler is `$5B3E` — `movea.l $2(a1),a0 / bra.w $6868`, straight into the mailbox
+  poster, never through `$6CD0`. Its operand is therefore always a kind-4 record, and
+  the missions use it to open on their own background (`-2 <section>`) and close back
+  on the main tune (`-2 pos 1`, or the queued `-1 pos 1`). §12.1's opcode table is
+  corrected accordingly.
+  **The end-stop record's firing moment is the end-of-ball bonus routine's first
+  instruction:** descriptor `+$80` opens `lea <record>,a0 / jsr ([$4,a4])` with
+  a4 = `$5766` (loaded at `$51B8`), the per-table service table whose `+$04` is
+  `$6CD0` — and `$51BE` calls that routine on every ball end. The record is a `-2`
+  into a section ending in `F00`, so the music plays a short outro and stops for the
+  bonus count. FILM-VERIFIED: waveform NCC **+0.78 / +0.81 / +0.82** on the three
+  BabeWatch captures, each starting 0.20-0.44 s after a filmed centre drain, against a
+  cross-table control ceiling of +0.14 and an in-film background (99th percentile) of
+  +0.05-0.07; on take 1 and take 2 the 2.36 s outro is followed by 0.62 s at RMS 0.02
+  — an order of magnitude under the music — and then the next serve's vamp at +0.90 /
+  +0.96. Present and specific on Extreme Sports too (+0.65 / +0.40 / +0.65).
+  **Still unwired, on purpose:** the display-VM stings, because `$6C2C`'s priority
+  arbitration DROPS a display record below what is on the ring (`cmp.b $23b2(a5),d0 /
+  bcs`, flushes on `bhi`) and this port models neither the ring nor the VM, so
+  `messagesShown` is a superset of what the machine runs — `src/browser/audio.ts`
+  accepts that superset for the kind-2/5 stings in the same records, but a spurious
+  300 ms priority-guarded effect and a spurious one-to-seven-second music override are
+  different errors; and BabeWatch's jukebox, which is per-table 68k. NO MODE ENTRY IS ALIGNABLE IN ANY CAPTURE: every mode
+  background section correlates at +0.02..+0.17 everywhere in every film, inside the
+  cross-table control band, so the mode switches ship on the decode alone. **[disk]**
 - ~~The drain has no sound~~ **WRONG, and withdrawn.** True of the table packages — no
   zone object carries a drain sound — but the drain sound is the ENGINE'S: `main.seg00`
   plays its own record (hunk 10 `+$34`, 336 ms, priority 45) from `$52B4` inside the

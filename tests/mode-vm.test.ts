@@ -91,6 +91,9 @@ const OPCODES = Array.from({ length: 32 }, (_, index) => {
     10: ["JMP", 4, "c"],
     12: ["CLEAR_DONE", 6, "e"],
     14: ["LAMP_OFF", 6, "e"],
+    // The music command post, handler main.seg00 $5B3E. Its operand is the
+    // kind-4 record, which this document has no pool for and exports as -1.
+    19: ["MUSIC", 6, "o"],
     23: ["JMP_IF_UNLIT", 8, "ec"],
     27: ["BALLS_UP_TO", 4, "w"],
     28: ["WAIT", 10, "ewc"],
@@ -250,6 +253,64 @@ describe("the background queue", () => {
     const state = createModeState(modes);
     queueScript(state, -1);
     expect(state.queueWrite).toBe(0);
+  });
+});
+
+describe("the MUSIC opcode", () => {
+  /**
+   * Opcode 19 is the MUSIC command post — handler main.seg00 $5B3E, two
+   * instructions into the mailbox poster $6868 — and this port reports the
+   * SITE it executed, `{script, pc}` into the modes document, for the audio
+   * layer to resolve through the music manifest. It carries no sound and no
+   * state: a report field, like `messagesShown`.
+   */
+  function musicFixture(): TableModes {
+    const doc = fixtureDocument() as unknown as Record<string, unknown>;
+    const scripts = [...(doc["scripts"] as Record<string, unknown>[])];
+    scripts.push({
+      index: scripts.length,
+      ops: [
+        { pc: 0, op: 19, args: [-1] },
+        { pc: 6, op: 1, args: [0] },
+        { pc: 12, op: 19, args: [-1] },
+        { pc: 18, op: 0, args: [] },
+      ],
+    });
+    doc["scripts"] = scripts;
+    return parseTableModesDocument(doc as unknown as TableModesDocument);
+  }
+
+  it("reports the script and pc of every opcode-19 it runs, in order", () => {
+    const modes = musicFixture();
+    const state = createModeState(modes);
+    const site = modes.scripts.length - 1;
+    queueScript(state, site);
+    const seen: { script: number; pc: number }[] = [];
+    for (let tick = 0; tick < 8; tick += 1) {
+      for (const cue of tickModes(modes, state).musicCues) seen.push({ ...cue });
+    }
+    expect(seen).toEqual([
+      { script: site, pc: 0 },
+      { script: site, pc: 12 },
+    ]);
+  });
+
+  it("is no longer counted as an opcode nobody has decoded", () => {
+    const modes = musicFixture();
+    const state = createModeState(modes);
+    queueScript(state, modes.scripts.length - 1);
+    let unimplemented = 0;
+    for (let tick = 0; tick < 8; tick += 1) unimplemented += tickModes(modes, state).unimplemented;
+    expect(unimplemented).toBe(0);
+  });
+
+  it("a tick with no music opcode carries no cues at all", () => {
+    const modes = musicFixture();
+    const state = createModeState(modes);
+    queueScript(state, 3); // START element 2, then END.
+    for (let tick = 0; tick < 4; tick += 1) {
+      expect(tickModes(modes, state).musicCues).toEqual([]);
+    }
   });
 });
 
