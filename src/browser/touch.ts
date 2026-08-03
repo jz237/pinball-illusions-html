@@ -84,6 +84,16 @@ export interface TouchHost {
   /** Toggles the music mute and returns the new state. */
   toggleMute(): boolean;
   muted(): boolean;
+  /**
+   * Flips the RENDER-LAYER framing (full table <-> Amiga view) and returns
+   * the new one. A presentation hook, not a control: the view used to be the
+   * sim-side `toggleWholeTableView` control tapped through the router, and
+   * the Fantasies-parity round moved the whole framing out of the simulation
+   * (research/FANTASIES_PARITY_BRIEF.md §2.4), so the button follows it.
+   */
+  toggleFraming(): "full-table" | "amiga";
+  /** The framing currently showing, for the button's own label. */
+  framing(): "full-table" | "amiga";
 }
 
 export interface TouchHandle {
@@ -306,15 +316,37 @@ export function attachTouch(host: TouchHost): TouchHandle {
   }
 
   const viewToggle = barButton("view");
+  /** The framing the button is currently labelled with; null until painted. */
+  let framingPainted: "full-table" | "amiga" | null = null;
+  const paintFraming = (): void => {
+    if (viewToggle === null) return;
+    const framing = host.framing();
+    if (framing === framingPainted) return;
+    framingPainted = framing;
+    // Labelled with the CURRENT framing, `aria-pressed` marking the Amiga
+    // side — the exact convention of Fantasies HD's game-bar button
+    // (`game-mode.ts` there): the label names what you are looking at, the
+    // title says what a press does.
+    viewToggle.textContent = framing === "full-table" ? "FULL TABLE" : "AMIGA VIEW";
+    viewToggle.setAttribute("aria-pressed", framing === "amiga" ? "true" : "false");
+    viewToggle.setAttribute(
+      "title",
+      framing === "full-table"
+        ? "Showing the whole table. Press for the Amiga view: the original 336x256 scrolling window."
+        : "Showing the Amiga view. Press to see the whole table at once.",
+    );
+  };
   if (viewToggle !== null) {
     on(viewToggle, "pointerdown", (event) => {
       event.preventDefault();
       host.gesture();
       noteFinger(event);
-      // A tap, not a hold: `toggleWholeTableView` is edge-triggered and the
-      // camera keeps whichever side of the toggle it landed on.
-      host.router.tap("toggleWholeTableView", `pointer:${(event as PointerEvent).pointerId}`);
+      // The render-layer framing, not a sim control: the router never hears
+      // about the view any more (see TouchHost.toggleFraming).
+      host.toggleFraming();
+      paintFraming();
     });
+    paintFraming();
   }
 
   const mute = barButton("mute");
@@ -499,6 +531,9 @@ export function attachTouch(host: TouchHost): TouchHandle {
       holdScreen(visible && state.phase === "play");
     }
     paintMute();
+    // The framing can change under the button — F9/F10, pad button 3 — so the
+    // label follows it here as well as on the button's own tap.
+    paintFraming();
   };
 
   return {

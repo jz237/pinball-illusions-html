@@ -929,13 +929,36 @@ describe("the top bar", () => {
     expect(h.log.keys).toEqual([TOUCH_KEYS.back]);
   });
 
-  it("taps the whole-table view rather than holding it", () => {
+  it("flips the render-layer framing, and the router never hears about it", () => {
+    // The view used to be the sim-side `toggleWholeTableView` control tapped
+    // through the router. The Fantasies-parity round moved the framing out of
+    // the simulation entirely, so the button now goes through the host's
+    // presentation hook and the router's snapshot must stay silent.
     const { h } = fixture({ coarse: true, phase: "play" });
+    expect(h.framing).toBe("full-table");
     h.dispatch(h.bar("view"), "pointerdown", { pointerId: 6 });
+    expect(h.log.framingToggles).toBe(1);
+    expect(h.framing).toBe("amiga");
     const snapshot = h.router.sample();
-    expect(snapshot.controls.toggleWholeTableView.pressed).toBe(true);
-    expect(snapshot.controls.toggleWholeTableView.released).toBe(true);
+    expect(snapshot.controls.toggleWholeTableView.pressed).toBe(false);
+    expect(snapshot.controls.toggleWholeTableView.released).toBe(false);
     expect(snapshot.controls.toggleWholeTableView.down).toBe(false);
+  });
+
+  it("labels the view button with the CURRENT framing, Fantasies' convention", () => {
+    const { h, touch } = fixture({ coarse: true, phase: "play" });
+    touch.refresh();
+    expect(h.bar("view").textContent).toBe("FULL TABLE");
+    expect(h.bar("view").getAttribute("aria-pressed")).toBe("false");
+
+    h.dispatch(h.bar("view"), "pointerdown", { pointerId: 6 });
+    expect(h.bar("view").textContent).toBe("AMIGA VIEW");
+    expect(h.bar("view").getAttribute("aria-pressed")).toBe("true");
+
+    // A framing change from elsewhere — F9, the pad — relabels on refresh.
+    h.framing = "full-table";
+    touch.refresh();
+    expect(h.bar("view").textContent).toBe("FULL TABLE");
   });
 
   it("runs the audio unlock from the bar too", () => {

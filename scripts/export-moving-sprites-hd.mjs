@@ -1,4 +1,9 @@
-#!/usr/bin/env node
+// No shebang: `tests/hd-assets.test.ts` imports this file as a module, and
+// vite-node's vm wrapper rejects a hashbang that is no longer at byte 0 in a
+// checkout it chooses to inline (a git worktree, CI). Run it as `node
+// scripts/<name>.mjs`, which never needed the line - hd-pipeline.mjs, the
+// library half of this pipeline, has always been shebang-free for the same
+// reason.
 // Exports the HD moving sprites — the two things on a table that move:
 //
 //   tables/<t>.ball-hd.png   68x68 RGBA — the 17x17 disk ball sprite through

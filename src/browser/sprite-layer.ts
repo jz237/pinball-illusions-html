@@ -59,9 +59,11 @@ import {
   RASTER_HEIGHT,
   RASTER_WIDTH,
   hdBlitSmoothing,
+  hdFullTableSmoothing,
   playfieldArtwork,
   playfieldArtworkHd,
   playfieldBlitGeometry,
+  playfieldFullTableGeometry,
   rasterToCanvas,
 } from "./playfield-renderer.js";
 import type { BlitContext, PixelTarget } from "./playfield-renderer.js";
@@ -379,6 +381,11 @@ function hdPoseCanvas(layer: HdSpriteLayer, pose: number): CanvasImageSource | n
  * The HD path runs only when the table's full HD sprite set is registered and
  * every pose it needs resolves; anything less falls back to the native path
  * for the whole frame.
+ *
+ * `fullTable` selects the presentation-layer full-table framing, exactly as
+ * on the playfield and lamp layers: full-source geometry, camera unread.
+ * WHERE each sprite sits on the overlay is the simulation's own numbers in
+ * both framings.
  */
 export function drawMovingSprites(
   context: BlitContext,
@@ -389,6 +396,7 @@ export function drawMovingSprites(
   ball: TableBall | null,
   batStates: readonly BatFrameState[],
   balls: readonly BallFrameState[],
+  fullTable = false,
 ): void {
   const hd = bats === null || ball === null ? null : hdLayerFor(map, bats, ball);
   if (hd !== null) {
@@ -410,8 +418,12 @@ export function drawMovingSprites(
         hd.ballSurface.context.putImageData(image, 0, 0);
         hd.context.drawImage(hd.ballSurface.canvas, placement.x, placement.y);
       }
-      const geometry = playfieldBlitGeometry(map, camera, scale);
-      context.imageSmoothingEnabled = hdBlitSmoothing(camera, scale);
+      const geometry = fullTable
+        ? playfieldFullTableGeometry(map, scale)
+        : playfieldBlitGeometry(map, camera, scale);
+      context.imageSmoothingEnabled = fullTable
+        ? hdFullTableSmoothing(scale)
+        : hdBlitSmoothing(camera, scale);
       context.drawImage(
         hd.canvas,
         geometry.sourceX * HD_SCALE,
@@ -464,7 +476,9 @@ export function drawMovingSprites(
     surface.context.drawImage(layer.ballSurface.canvas, placement.x, placement.y);
   }
 
-  const geometry = playfieldBlitGeometry(map, camera, scale);
+  const geometry = fullTable
+    ? playfieldFullTableGeometry(map, scale)
+    : playfieldBlitGeometry(map, camera, scale);
   context.imageSmoothingEnabled = false;
   context.drawImage(
     surface.canvas,

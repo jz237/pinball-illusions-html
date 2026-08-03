@@ -139,15 +139,193 @@ body {
 }
 
 /* ------------------------------------------------------------------------- */
+/* The front door                                                            */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * The HTML title screen — the same kind of page Pinball Fantasies HD boots
+ * to. Structure lives in index.html, data is filled by front-door.ts, and
+ * `data-door-mode` on <html> says which of the three surfaces owns the
+ * screen: "door" (this page), "canvas" (the decoded attract and menus), or
+ * "game" (a table, with the game bar over it). Everything here is CSS-drawn:
+ * the wordmark is gradient TEXT — Fantasies ships no logo art either — and
+ * the only rasters are the gated, manifest-claimed table thumbnails.
+ */
+html[data-door-mode="door"] .cabinet {
+  display: none;
+}
+
+.door {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 26px;
+  width: min(100%, 1080px);
+  max-height: 100%;
+  overflow-y: auto;
+  padding: 40px 20px calc(20px + env(safe-area-inset-bottom));
+}
+
+.door[hidden] {
+  display: none;
+}
+
+.door__mast {
+  text-align: center;
+}
+
+.door__eyebrow {
+  margin: 0 0 10px;
+  color: var(--ink-dim);
+  font-size: 12px;
+  letter-spacing: 0.28em;
+  text-transform: uppercase;
+}
+
+/* The wordmark: CSS gradient text, exactly Fantasies' trick — no logo art
+   needs to exist. Two tones so "Illusions" carries the heat. */
+.door__wordmark {
+  margin: 0;
+  font-size: clamp(34px, 7vw, 62px);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  line-height: 1.05;
+  background: linear-gradient(180deg, #eaf2ff 0%, #9fb7d8 55%, #5d7396 100%);
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+}
+
+.door__wordmark-accent {
+  background: linear-gradient(180deg, #ffd98a 0%, #ffab3d 45%, #c96a16 100%);
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+}
+
+.door__tagline {
+  margin: 12px auto 0;
+  max-width: 560px;
+  color: var(--ink);
+}
+
+.door__cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 18px;
+  width: 100%;
+  max-width: 900px;
+}
+
+.door__card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 12px 14px;
+  border: 1px solid var(--edge);
+  border-radius: 10px;
+  background: linear-gradient(180deg, #131a26 0%, #0b0f18 100%);
+  color: var(--ink);
+  text-decoration: none;
+  transition: transform 120ms ease, border-color 120ms ease;
+}
+
+.door__card:hover,
+.door__card:focus-visible {
+  transform: translateY(-3px);
+  border-color: #3a4c68;
+  outline: none;
+}
+
+/* The thumbnail well: a top-of-table crop of the gated HD master. The
+   gradient behind it is the placeholder an unauthorized build shows. */
+.door__thumb {
+  display: block;
+  aspect-ratio: 7 / 5;
+  overflow: hidden;
+  border-radius: 6px;
+  background:
+    radial-gradient(ellipse at 50% 20%, #223046 0%, #0d1320 75%);
+}
+
+.door__thumb-art {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: top;
+}
+
+.door__thumb-art[hidden] {
+  display: none;
+}
+
+.door__card-name {
+  font-size: 17px;
+  font-weight: 700;
+  color: #eaf2ff;
+  letter-spacing: 0.03em;
+}
+
+.door__card-blurb {
+  font-size: 12px;
+  color: var(--ink-dim);
+  min-height: 2.6em;
+}
+
+.door__card-champ {
+  font-size: 12px;
+  color: #ffd98a;
+}
+
+.door__card-play {
+  align-self: flex-start;
+  margin-top: 2px;
+  padding: 4px 14px;
+  border-radius: 999px;
+  background: linear-gradient(180deg, #ffab3d 0%, #d97a1a 100%);
+  color: #1a1206;
+  font-weight: 700;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.door__foot {
+  text-align: center;
+  color: var(--ink-dim);
+  font-size: 12px;
+}
+
+.door__keys {
+  margin: 0 0 6px;
+  color: var(--ink);
+}
+
+.door__tribute,
+.door__version {
+  margin: 0;
+}
+
+/* ------------------------------------------------------------------------- */
 /* The touch chrome                                                          */
 /* ------------------------------------------------------------------------- */
 
 /*
  * Hidden until `touch.ts` says otherwise. A build opened on a desktop is
- * byte-for-byte the cabinet it always was.
+ * byte-for-byte the cabinet it always was — except over a running table,
+ * where the game bar (the same strip, grown a title and a key hint) shows;
+ * see the game-bar block at the end of this sheet.
  */
 .topbar,
 .deck {
+  display: none;
+}
+
+/* The bar's two display-only spans exist for the desktop game bar; the touch
+   top bar stays its three buttons. */
+.topbar__title,
+.topbar__keys {
   display: none;
 }
 
@@ -347,4 +525,44 @@ html[data-touch="on"] .deck {
     grid-area: stage;
     align-self: end;
   }
+}
+
+/* ------------------------------------------------------------------------- */
+/* The game bar (desktop)                                                    */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * Fantasies-style: while a table owns the screen on a fine pointer, the top
+ * strip becomes the game bar — back to the cards (through the decoded
+ * quit-confirm), the table's name, a key hint, the framing button labelled
+ * with the CURRENT framing, and the sound toggle. On touch the strip stays
+ * the three-button top bar it always was (`data-touch` rules above), which
+ * is why this block is scoped to :not([data-touch="on"]) and sits last.
+ */
+html[data-door-mode="game"]:not([data-touch="on"]) .topbar {
+  display: grid;
+  grid-template-columns: auto auto 1fr auto auto;
+  align-items: center;
+  width: 100%;
+  gap: 10px;
+}
+
+html[data-door-mode="game"]:not([data-touch="on"]) .topbar__title {
+  display: block;
+  color: #cfe0f5;
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  justify-self: start;
+}
+
+html[data-door-mode="game"]:not([data-touch="on"]) .topbar__keys {
+  display: block;
+  color: var(--ink-dim);
+  font-size: 11px;
+  justify-self: end;
+}
+
+html[data-door-mode="game"]:not([data-touch="on"]) .topbar__button {
+  padding: 4px 12px;
 }

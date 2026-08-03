@@ -45,9 +45,11 @@ import {
   RASTER_HEIGHT,
   RASTER_WIDTH,
   hdBlitSmoothing,
+  hdFullTableSmoothing,
   playfieldArtwork,
   playfieldArtworkHd,
   playfieldBlitGeometry,
+  playfieldFullTableGeometry,
   rasterToCanvas,
 } from "./playfield-renderer.js";
 import type { BlitContext } from "./playfield-renderer.js";
@@ -194,6 +196,11 @@ function hdLayerFor(map: TableMap, lamps: TableLamps): HdLampLayer | null {
  * Reads the mode VM's state and the tick; writes pixels; touches neither. A
  * null `modeState` (a table with no mission layer) draws every lamp dim,
  * which is the idle machine's true face.
+ *
+ * `fullTable` selects the presentation-layer full-table framing, exactly as it
+ * does on `drawPlayfield`: full-source geometry, camera unread. WHICH lamps
+ * draw is identical in both framings — the framing changes geometry, never
+ * behaviour.
  */
 export function drawLampOverlays(
   context: BlitContext,
@@ -203,6 +210,7 @@ export function drawLampOverlays(
   lamps: TableLamps,
   modeState: ModeState | null,
   tick: number,
+  fullTable = false,
 ): void {
   const modes = lampModes(lamps, modeState);
 
@@ -218,8 +226,12 @@ export function drawLampOverlays(
       if (lampVisible(modes[patch.index] ?? 0, tick, lamps.blinkHalfPeriodFrames)) continue;
       hd.context.drawImage(face, patch.destX, patch.destY);
     }
-    const geometry = playfieldBlitGeometry(map, camera, scale);
-    context.imageSmoothingEnabled = hdBlitSmoothing(camera, scale);
+    const geometry = fullTable
+      ? playfieldFullTableGeometry(map, scale)
+      : playfieldBlitGeometry(map, camera, scale);
+    context.imageSmoothingEnabled = fullTable
+      ? hdFullTableSmoothing(scale)
+      : hdBlitSmoothing(camera, scale);
     context.drawImage(
       hd.canvas,
       geometry.sourceX * HD_SCALE,
@@ -245,7 +257,9 @@ export function drawLampOverlays(
     layer.context.drawImage(face, sprite.x, sprite.y);
   }
 
-  const geometry = playfieldBlitGeometry(map, camera, scale);
+  const geometry = fullTable
+    ? playfieldFullTableGeometry(map, scale)
+    : playfieldBlitGeometry(map, camera, scale);
   context.imageSmoothingEnabled = false;
   context.drawImage(
     layer.canvas,

@@ -161,6 +161,11 @@ const DERIVED_MARKERS = [
   { class: "disk-derived-lamp-overlays-hd", noun: "HD lamp patch atlas" },
   { class: "disk-derived-ball-sprite-hd", noun: "HD ball sprite" },
   { class: "disk-derived-flipper-sprites-hd", noun: "HD flipper bat atlas" },
+  // The front door's card thumbnails: top-of-table crops of the HD masters
+  // (scripts/export-shell-thumbs.mjs). A crop of a derived picture is still
+  // disk-derived, so each ships as one WebP claimed by its own manifest
+  // through the single-image branch, behind the same gate as everything else.
+  { class: "disk-derived-table-thumbnail", noun: "table thumbnail" },
 ];
 
 /** Manifest classes that must account for the binary files they ship beside. */
@@ -175,6 +180,7 @@ const MEDIA_MARKERS = new Map([
   ["disk-derived-lamp-overlays-hd", { noun: "HD lamp patch atlas", extensions: IMAGE_EXT }],
   ["disk-derived-ball-sprite-hd", { noun: "HD ball sprite", extensions: IMAGE_EXT }],
   ["disk-derived-flipper-sprites-hd", { noun: "HD flipper bat atlas", extensions: IMAGE_EXT }],
+  ["disk-derived-table-thumbnail", { noun: "table thumbnail", extensions: IMAGE_EXT }],
 ]);
 
 /** Classes whose manifest claims exactly one raster through an `image` field. */
@@ -185,6 +191,7 @@ const SINGLE_IMAGE_CLASSES = new Set([
   "disk-derived-ball-sprite-hd",
   "disk-derived-flipper-sprites-hd",
   "disk-derived-loading-logo",
+  "disk-derived-table-thumbnail",
 ]);
 
 /** Tolerates both `"sourceClass":"x"` and the spaced form a formatter might emit. */
