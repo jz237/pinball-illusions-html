@@ -402,13 +402,23 @@ export interface PanelBonusView {
 /**
  * THE BONUS PANEL'S TWO LINES, AND THE ONE PLACE THIS LAYOUT DIVERGES.
  *
- * The machine draws the bonus on a TALLER surface than this strip. Its text
- * plane is 1920 bytes at a 40-byte stride — 48 rows — and the routine puts the
- * caption on Y=2 and the figure on the row the field drawer's `d4 = 10` selects
- * (Law 'n Justice hunk 4 +0x29F6/+0x29FA, +0x2B2E/+0x2B32, +0x2B68/+0x2B6C).
- * This port's panel is the sixteen rows the slot-5 objects are authored for, and
- * the shipped panel font is eight rows tall, so two lines fill it exactly and
- * there is nowhere to put an eight-row gap between them.
+ * The routine puts the caption on Y=2 and the figure on the row the field
+ * drawer's `d4 = 10` selects (Law 'n Justice hunk 4 +0x29F6/+0x29FA,
+ * +0x2B2E/+0x2B32, +0x2B68/+0x2B6C), and FILM SAYS BOTH OF THOSE ARE ROWS OF THE
+ * SAME SIXTEEN-ROW STRIP THIS PORT HAS. What used to be written here — that the
+ * machine draws the bonus "on a TALLER surface than this strip", its text plane
+ * being 1920 bytes at a 40-byte stride, 48 rows — was an inference, and it is
+ * wrong about what is on screen. Read off a native-resolution capture of a real
+ * 1,000,000 x2 bonus (`research\view\reference\session5`), the machine's DMD is a
+ * 160 x 16 dot matrix on this same 320-px strip, its caption sits on dot rows
+ * 2..6 and its figure on 10..14, and nothing is drawn outside those sixteen rows.
+ * Its panel font is FIVE rows tall.
+ *
+ * So what cannot be matched is only the height. The shipped panel font is eight
+ * rows, so a caption at row 2 would run to row 9 and a figure at row 10 to row
+ * 17 — two rows off the end. The PITCH is reproduced exactly: the machine puts
+ * its two lines eight rows apart (2 -> 10) and so does this (0 -> 8); the pair
+ * sits two rows high because eight-row glyphs will not fit at row 2.
  *
  * So the ROWS are this port's — caption on the top eight, figure on the bottom
  * eight — and everything else about the layout is the machine's: which caption,

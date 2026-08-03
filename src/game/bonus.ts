@@ -128,6 +128,36 @@
  * +0x2A38/+0x2B32/+0x2B6C/+0x2B82.
  *
  * ---------------------------------------------------------------------------
+ * THE FLASH AND THE MULTIPLY ARE FILM-MEASURED TOO, ON A REAL EARNED BONUS
+ * ---------------------------------------------------------------------------
+ * When this module was written no filmed ball had ever earned a bonus, so the
+ * flash panel and the multiply shipped on the disassembly alone. Both have since
+ * been filmed: `research\view\reference\session5` is one Law 'n Justice ball
+ * that took the lower-level zone 13 shot, was paid element 14's 1,000,000 into
+ * the accumulator and stepped its ladder onto award effect 5 for a multiplier of
+ * two, and then drained with no key touched. Native resolution, one frame per
+ * PAL frame, read back as the machine's own 160 x 16 dot matrix:
+ *
+ *   - EIGHT half-cycles, alternating, the FIRST one LIT; visible lengths
+ *     9, 10, 10, 10, 10, 10, 10, 10. The nine is the same one-frame accounting
+ *     as the 149-of-150 below: one of the first half-cycle's ten passes falls on
+ *     the frame the text plane is still cleared on.
+ *   - a LIT frame and a DARK frame differ in EXACTLY the two multiplier caption
+ *     columns and in nothing else, so the blink is the caption alone.
+ *   - the caption columns measure centre 38.5 and 278.5 on the 320-px strip —
+ *     `move.w #$28,(a0)` and `move.w #$118,(a0)`, 240 apart, mirror-symmetric.
+ *   - the flash shows 1,000,000, the RAW accumulator, not the 2,000,000 product.
+ *   - `TOTAL BONUS` then holds for EXACTLY 100 frames, dot-identical on every
+ *     one of them, showing 2,000,000.
+ *   - the score goes 375,000 -> 2,375,000 in one step at the end, which is the
+ *     multiply — `bonus x max(multiplier, 1)` — checked end to end.
+ *
+ * X4, X6, X8 and X10 (and Extreme Sports' X3/X5) are still decode-only: only a
+ * multiplier of two has ever been filmed. So is the combo panel, whose count was
+ * zero on this ball as on every other, and so is the abort, which this capture
+ * deliberately never triggered.
+ *
+ * ---------------------------------------------------------------------------
  * THE 150-FRAME "NO BONUS" HOLD IS FILM-MEASURED, TO THE FRAME
  * ---------------------------------------------------------------------------
  * Seventeen end-of-ball events were read frame by frame out of the nine
