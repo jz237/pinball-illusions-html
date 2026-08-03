@@ -97,11 +97,52 @@ const TICKS = 4000;
  * 1 -> 4 (LnJ), 1 -> 22 (BW), 8 -> 13 (ES). Tip-flip sweep byte-identical to
  * HEAD, pass-under 0/1122. Film side-by-side unchanged at
  * 98.4508/99.8645/99.1322 with byte-identical rasters.
+ *
+ * RE-PIN, THE BAT JOINS THE RESPONDER (the Law 'n Justice chain round): a bat
+ * contact used to be answered by a SECOND contact model. It took its restitution
+ * from the flipper row of the 256-entry surface table (through `FLIPPER_SURFACE`)
+ * but its tangential loss from this port's own Coulomb rule, and it never saw
+ * the row's `$34` graze gate at all. The machine has one responder: the bat's
+ * mask blit at main.seg00 +0x00B2A2 and the map's at +0x00B4B0 leave the same
+ * 68-byte buffer for the same ring evaluator at +0x00A9C4, and the four words at
+ * `$34/$36/$38/$3A` were loaded by `movem.w (a0,d2.w*8),d3-d6` at +0x00AE14 from
+ * the surface id under the contact BEFORE the id was even range-checked. For a
+ * bat that id is 1..4 — id n selects record slot n-1 (`adda.w #0/$1FA/$3F4/$5EE`
+ * at +0xAE80/86/90/9A) — and every shipped surface map PAINTS each bat's swept
+ * footprint with its own id over empty collision layer, which is how the id was
+ * confirmed per bat rather than assumed (`tests/flippers.test.ts` re-derives all
+ * nine). So `flippers.ts` now hands `reflectVelocity` that row.
+ *
+ * What moved: the tangential toll at a bat. Coulomb charged `friction *
+ * normalImpulse` — 36% of the along-face speed at the Law 'n Justice apron
+ * contact this was measured on — where the row's `$3A` = 12800 charges
+ * `tangent * 160 / $3A` = 1.25% plus the fixed per-contact decay. The NORMAL
+ * channel is unchanged: both rules take 115/256 of it. Measured on that contact,
+ * a ball arriving on the resting left bat at (2.53,12.45) px/tick left it at
+ * (6.69,-1.53) and now leaves at (9.48,2.38), against the film's own measured
+ * (10.0-11.5, 2.5-3.5) eastbound roll. Every bat contact on every table moves,
+ * so all three hashes move.
+ *
+ * The gates, measured on both trees with one driver: census 90 games x 3 tables
+ * at 12,000 ticks, 90/90 completed everywhere on both; LnJ write-offs 3 -> 0
+ * (the (24,304) upper-bat pocket is gone), ES 0 -> 2 at (238,588) — a ball
+ * SPITTED on the one-pixel-thick right drain-funnel wall, which holds a ball
+ * identically on HEAD (verified by placing one there on both trees) and is
+ * therefore a map-geometry trap this change reaches rather than creates. Anomaly
+ * sweep 80 games x 3 tables at 20,000: write-offs, swallowed, search pulses,
+ * award-burst, award-sub-debounce, kicker-runaway and pinch-orbit all zero on
+ * both trees; teleport 3 -> 3 and over-clamp 2 -> 5 across the three tables, all
+ * of them the resolver's whole-pixel `separate()` push at a bat rather than a
+ * velocity step, and the same events HEAD already had on BabeWatch; one Law 'n
+ * Justice game out of 240 is still rallying at 20,000 ticks (37,865,000 by
+ * 60,000, ball touring the whole table, ball search never fired). Tip-flip sweep
+ * pass-under 0/1044. Film side-by-side unchanged at 98.4508/99.8645/99.1322 with
+ * byte-identical rasters.
  */
 const PINNED: Record<TableId, string> = {
-  "law-n-justice": "b3b85bcc6ff8a5aec89669300baa8773a5735ca390c7cb82e6a971ebae5e1563",
-  "babewatch": "3dfe1fff6ed571a5011fb85231f89abbf5562d899e9916c47b77955dd4a5d855",
-  "extreme-sports": "00ab840e4a34ad584b1f3546b0e652de23a7ec4438a4b7f3adad229847adc4a5",
+  "law-n-justice": "72a6dc68c72c0279b24921f77d62a6aeb2e540759765f8f2d0ba16ad58d5e7c9",
+  "babewatch": "850a3af57b3a9412031a8de4d98cba8aa987167e26f375ddfe565f990cbd3dcb",
+  "extreme-sports": "babdc0c7a875777d8002336927269d05d9797e4e395e87c09f4dd317e5d26dd2",
 };
 
 /** Same shape as the determinism harness's input: behaviour = f(tick index). */

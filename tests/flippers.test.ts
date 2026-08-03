@@ -104,7 +104,8 @@ import {
   batPoseForStroke,
   clearFlipperBats,
 } from "../src/game/flipper-bats.js";
-import { flipperBatsFixture } from "./table-fixtures.js";
+import { devicesFor, flipperBatsFixture, mapFor as shippedMapFor } from "./table-fixtures.js";
+import { FLIPPER_ID_MAX, FLIPPER_ID_MIN, surfaceResponseFor } from "../src/game/surface-physics.js";
 
 const BALL_RADIUS: Q10 = pixelsToQ10(BALL_RADIUS_PIXELS);
 
@@ -921,10 +922,20 @@ describe("a flipper at rest", () => {
         .toEqual({ tick, through: false });
     }
     // It really was over the bat for most of the run, and it really was carried:
-    // 114 of the 122 ticks it spent there reported a contact. The eight that did
+    // 92 of the 97 ticks it spent there reported a contact. The five that did
     // not are a rolling ball momentarily a fraction of a pixel clear of its own
     // probe ring, not a ball falling — `worstFace` below is what says that.
-    expect(overTheBat).toBeGreaterThan(100);
+    //
+    // RE-MEASURED, responder round: 122 ticks over the bat became 97 and 114
+    // carried became 92, because the bat's tangential rule is now the row's own
+    // `$3A` slip (1.25% a contact) instead of this port's Coulomb bite (which
+    // took a fifth of the normal impulse), so the ball rolls off the tapering
+    // blade FASTER and reaches its far end 25 ticks sooner. The floor is written
+    // at 80 rather than at the measurement so that a re-measurement of the slip
+    // divisor does not fail a test whose claim is about support, not speed —
+    // and the claim itself, asserted on every one of those ticks above, is
+    // unchanged: never through the bat, never unsupported.
+    expect(overTheBat).toBeGreaterThan(80);
     expect(held).toBeGreaterThanOrEqual(Math.ceil(0.9 * overTheBat));
     // And it stayed a clear ball radius off the axis the whole time, which is
     // the "held up" half of the claim.
@@ -1732,6 +1743,79 @@ describe("placement", () => {
       expect(upper.restAngle).toBe(poseToAngleUnits(record.restPose));
       // Handedness IS which way the poses count, and it agrees with the key.
       expect(upper.direction).toBe(record.role === "right" ? 1 : -1);
+    }
+  });
+
+  it("takes its responder row from the id the shipped map paints under it", () => {
+    // THE BAT IS NOT A SECOND CONTACT MODEL, and this is what pins that.
+    //
+    // The machine loads the four responder words by SURFACE ID before it even
+    // range-checks the id (`movem.w (a0,d2.w*8),d3-d6` at main.seg00 +0x00AE14),
+    // and the four flipper ids select the four record slots (id n -> slot n-1,
+    // the `adda.w #0/$1FA/$3F4/$5EE` at +0xAE80/86/90/9A). Every shipped surface
+    // map paints each bat's SWEPT FOOTPRINT with that bat's own id, and the
+    // collision layer under those pixels is empty — they exist to name the bat
+    // to the responder and nothing else. So the id on the record is checked
+    // against the map that carries it, on all three tables, rather than trusted.
+    for (const id of TABLE_IDS) {
+      const devices = devicesFor(id);
+      const map = shippedMapFor(id);
+      const seen = new Map<number, { x0: number; y0: number; x1: number; y1: number }>();
+      for (const level of [0, 1] as const) {
+        for (let y = 0; y < 600; y += 1) {
+          for (let x = 0; x < 336; x += 1) {
+            const surface = devices.surfaceIdAt(level, x, y);
+            if (surface < FLIPPER_ID_MIN || surface > FLIPPER_ID_MAX) continue;
+            // A footprint, not geometry: nothing solid is ever painted with it.
+            expect({
+              surface,
+              solid: map.materialAt(x, y) & (level === 0 ? 1 : 2),
+            }).toEqual({ surface, solid: 0 });
+            const box = seen.get(surface) ?? { x0: x, y0: y, x1: x, y1: y };
+            box.x0 = Math.min(box.x0, x);
+            box.y0 = Math.min(box.y0, y);
+            box.x1 = Math.max(box.x1, x);
+            box.y1 = Math.max(box.y1, y);
+            seen.set(surface, box);
+          }
+        }
+      }
+      // Exactly three footprints on a table with exactly three bats, and each
+      // bat's own pivot is inside the footprint its record's id names.
+      expect([...seen.keys()].sort()).toEqual(
+        flipperConfigsFor(id)
+          .map((config) => config.surfaceId)
+          .sort(),
+      );
+      for (const config of flipperConfigsFor(id)) {
+        const box = seen.get(config.surfaceId);
+        const pivotX = q10ToPixel(config.pivotX);
+        const pivotY = q10ToPixel(config.pivotY);
+        expect({
+          bat: `${id}/${config.id}`,
+          inside:
+            box !== undefined &&
+            pivotX >= box.x0 &&
+            pivotX <= box.x1 &&
+            pivotY >= box.y0 &&
+            pivotY <= box.y1,
+        }).toEqual({ bat: `${id}/${config.id}`, inside: true });
+        // And the row it selects is the flipper row, not some neighbour's.
+        const row = surfaceResponseFor(config.surfaceId).constants;
+        expect({
+          bat: config.id,
+          grazeLimit: row.grazeLimit,
+          restitution: row.restitution,
+          minImpact: row.minImpact,
+          slipDivisor: row.slipDivisor,
+        }).toEqual({
+          bat: config.id,
+          grazeLimit: 24,
+          restitution: 115,
+          minImpact: -800,
+          slipDivisor: 12800,
+        });
+      }
     }
   });
 

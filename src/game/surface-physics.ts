@@ -319,9 +319,23 @@ export const SURFACE_CONSTANT_ROWS: readonly SurfaceConstants[] = Object.freeze(
       Object.freeze([192, 255] as const),
     ]),
   }),
-  // The four flipper ids. Their pixels are the bats' swept footprint rather than
-  // a wall, and `flippers.ts` resolves bat contacts itself, so this row is
-  // decoded and recorded but never reached by the contact path.
+  // The four flipper ids, one per record slot: id n selects slot n-1, and the
+  // shipped surface maps paint each bat's SWEPT FOOTPRINT with its own id (see
+  // `flippers.ts`'s `FlipperRecord.surfaceId`). The collision layer is empty
+  // under all of them, so the map's own contact path never reaches this row.
+  // What reaches it is `flippers.ts`'s `resolveOne`, which looks the row up by
+  // the bat's id and hands it to the same `reflectVelocity` a wall contact goes
+  // through — in the machine the bat's mask blit at +0x00B2A2 and the map's at
+  // +0x00B4B0 leave the same 68-byte buffer for the same evaluator, and the four
+  // words were loaded from the surface id before either ran.
+  //
+  // It is the tightest graze gate on the table (24 against a plain wall's 34: a
+  // bat cancels any contact shallower than atan(16/24) = 34 degrees off its
+  // face) and the second-least slippery slip divisor after rubber. Until the
+  // responder round the bats took this row's restitution through
+  // `FLIPPER_SURFACE` but this port's Coulomb friction instead of its slip rule,
+  // which cost a ball 36% of its along-face speed at a contact where the machine
+  // charges 1.25%.
   Object.freeze({
     grazeLimit: 24,
     restitution: 115,

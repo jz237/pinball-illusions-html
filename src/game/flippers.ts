@@ -178,6 +178,12 @@ import {
 } from "./collision-probe.js";
 import type { BatPoseBody, BatStrokeShape } from "./flipper-bats.js";
 import { batBodySolid, batPoseBody, batPoseForStroke } from "./flipper-bats.js";
+import {
+  FLIPPER_ID_MAX,
+  FLIPPER_ID_MIN,
+  originalRestitutionToQ10,
+  surfaceResponseFor,
+} from "./surface-physics.js";
 import type { Q10 } from "../core/fixed-point.js";
 import { Q10_ONE, pixelsToQ10, q10Clamp, q10Multiply, q10ToPixel } from "../core/fixed-point.js";
 import {
@@ -550,29 +556,46 @@ export function flipperRateTaken(dx: number, dy: number): number {
  * The bat's surface, in the same shape the map's materials use so that the one
  * audited reflection routine can be reused verbatim.
  *
- * `index` is a placeholder: `reflectVelocity` reads only elasticity, friction
- * and kick, and a flipper is not a map material at all. `kick` is zero on
- * purpose — a flipper's power comes from the swing, and a fake outward impulse
- * on top would also fire a ball off a bat that is standing still.
+ * IT NO LONGER DECIDES ANYTHING, and that is the point of this note. Since the
+ * responder round, `resolveOne` hands `reflectVelocity` the bat's own row of the
+ * 256-entry surface table (`surfaceResponseFor(config.surfaceId)`), and a
+ * supplied surface OUTRANKS the behaviour for every coefficient the row carries:
+ * the restitution, the `$34` graze gate and the `$3A` slip rule all come from
+ * the row, and the kick is zero for ids 1..4 in the shipped table. So this
+ * record is now the bat's MATERIAL IDENTITY — what it is, for anything that asks
+ * — and not its physics.
  *
- * ELASTICITY IS NOW MEASURED. The flipper ids 1..4 select the hunk-8 surface
- * row with restitution word 115 — the same 256-row table every other surface's
- * restitution is read from (`surface-physics.ts`, and the disassembly's static
- * bat model: "a resting or held-at-top bat acts as a static wall with id-1..4
- * hunk-8 constants: restitution 115/256"). 115 * 4 = 460 Q10. The old 400 was
- * chosen; the measured value keeps the property it was chosen for — one tick of
- * gravity bounces at 460/1024 * 128 = 57 Q10, far under the rest threshold, so
- * a cradled ball still settles instead of chattering.
+ * WHY IT SURVIVES AT ALL. `reflectVelocity` still takes a `MaterialBehaviour`,
+ * because a synthetic map with no surface layer has nothing else to answer with,
+ * and several unit harnesses reflect a ball off a bat without a table. Its
+ * numbers are therefore kept honest rather than deleted:
  *
- * Friction stays this port's own 205: the original's tangential rule is a
- * fraction of the SLIP against ball spin (word $3A = 12800 for the bat), which
- * a spinless BallState cannot hold — see the long note in `ball-physics.ts`.
+ *   ELASTICITY IS THE ROW'S, derived from it rather than restated, so the two
+ *   cannot drift: the flipper ids 1..4 select the hunk-8 row with restitution
+ *   word 115 — the same 256-row table every other surface's restitution is read
+ *   from — and 115 * 4 = 460 Q10. It keeps the property the old chosen 400 was
+ *   picked for: one tick of gravity bounces at 460/1024 * 128 = 57 Q10, far
+ *   under the rest threshold, so a cradled ball settles instead of chattering.
+ *
+ *   FRICTION 205 IS STILL THIS PORT'S OWN and is now unreachable on a real
+ *   contact. The original's tangential rule is a fraction of the SLIP against
+ *   ball spin (word `$3A` = 12800 for the bat), and its spinless limit — 160/$3A
+ *   per contact, 1.25% — is what the row applies. 205 remains only as the
+ *   no-surface fallback the physics unit tests measure.
+ *
+ * `kick` is zero on purpose, and the row agrees: a flipper's power comes from
+ * the swing, and a fake outward impulse on top would also fire a ball off a bat
+ * that is standing still.
+ *
+ * `index` is a placeholder for the material-index slot; a flipper is not a map
+ * material. The RESPONDER id — the thing that selects behaviour — is
+ * per-flipper and lives on the record.
  */
 export const FLIPPER_SURFACE: MaterialBehaviour = Object.freeze({
   index: 1,
   kind: "flipper",
   passable: false,
-  elasticity: 460,
+  elasticity: originalRestitutionToQ10(surfaceResponseFor(FLIPPER_ID_MIN).constants.restitution),
   friction: 205,
   kick: 0,
   confidence: "measured",
@@ -588,6 +611,14 @@ export type FlipperRole = "left" | "right" | "upper";
 export interface FlipperConfig {
   readonly id: string;
   readonly role: FlipperRole;
+  /**
+   * This bat's row in the shared 256-entry responder table, 1..4, straight off
+   * the record. `FlipperRecord.surfaceId` has the derivation; `resolveOne` is
+   * what reads it, and it is the reason a bat contact and a wall contact are
+   * answered by the same code with different constants rather than by two
+   * different models.
+   */
+  readonly surfaceId: number;
   /** Pivot in Q10 playfield coordinates. */
   readonly pivotX: Q10;
   readonly pivotY: Q10;
@@ -746,6 +777,26 @@ export const FLIPPER_PLACEMENT_NOTE =
 export interface FlipperRecord {
   /** Matches `FlipperConfig.id` and the drawn record's id in the pose bank. */
   readonly id: string;
+  /**
+   * THE RESPONDER ID: which row of `surface-physics.ts`'s 256-entry table a
+   * contact with THIS bat reads its four constants out of.
+   *
+   * It is `slot + 1`, and that is the disassembly's own arithmetic rather than a
+   * convention: `adda.w #0/$1FA/$3F4/$5EE` at main.seg00 +0xAE80/86/90/9A steps
+   * `$2346(a5)` by the 0x1FA record stride, so SURFACE ID n SELECTS SLOT n-1.
+   *
+   * The shipped data says the same thing independently, which is what makes this
+   * a measurement rather than a reading: every table's surface-id map PAINTS
+   * each bat's swept footprint with that bat's own id. Law 'n Justice carries 1
+   * over (29,295)-(84,348) — its upper bat pivots at (37,302) — 3 over
+   * (78,517)-(133,593) and 4 over (150,517)-(205,593), its two lower pivots.
+   * BabeWatch and Extreme Sports carry 2 on the UPPER collision line around
+   * their upper bats and the same 3 and 4 below. Neither of those two paints a
+   * 1 anywhere and Law 'n Justice paints no 2, which is exactly the unused slot
+   * each table's record array declares with type byte 3.
+   * `tests/flippers.test.ts` re-derives all nine from the three shipped maps.
+   */
+  readonly surfaceId: number;
   /** Whole playfield pixels, word +2 and word +4 of the record. */
   readonly pivotXPixels: number;
   readonly pivotYPixels: number;
@@ -790,6 +841,7 @@ export const FLIPPER_RECORDS: Readonly<Record<TableId, readonly FlipperRecord[]>
     // the main playfield.
     Object.freeze({
       id: "upper",
+      surfaceId: 1,
       pivotXPixels: 37,
       pivotYPixels: 302,
       restPose: 23,
@@ -805,6 +857,7 @@ export const FLIPPER_RECORDS: Readonly<Record<TableId, readonly FlipperRecord[]>
     }),
     Object.freeze({
       id: "lower-left",
+      surfaceId: 3,
       pivotXPixels: 86,
       pivotYPixels: 556,
       restPose: 10,
@@ -820,6 +873,7 @@ export const FLIPPER_RECORDS: Readonly<Record<TableId, readonly FlipperRecord[]>
     }),
     Object.freeze({
       id: "lower-right",
+      surfaceId: 4,
       pivotXPixels: 199,
       pivotYPixels: 556,
       restPose: 50,
@@ -840,6 +894,7 @@ export const FLIPPER_RECORDS: Readonly<Record<TableId, readonly FlipperRecord[]>
     // coil acceleration 10 against 20, spring 15 against 30 — with the same caps.
     Object.freeze({
       id: "upper",
+      surfaceId: 2,
       pivotXPixels: 205,
       pivotYPixels: 115,
       restPose: 35,
@@ -855,6 +910,7 @@ export const FLIPPER_RECORDS: Readonly<Record<TableId, readonly FlipperRecord[]>
     }),
     Object.freeze({
       id: "lower-left",
+      surfaceId: 3,
       pivotXPixels: 112,
       pivotYPixels: 556,
       restPose: 10,
@@ -870,6 +926,7 @@ export const FLIPPER_RECORDS: Readonly<Record<TableId, readonly FlipperRecord[]>
     }),
     Object.freeze({
       id: "lower-right",
+      surfaceId: 4,
       pivotXPixels: 227,
       pivotYPixels: 556,
       restPose: 50,
@@ -889,6 +946,7 @@ export const FLIPPER_RECORDS: Readonly<Record<TableId, readonly FlipperRecord[]>
     // sweep on the same pose numbers as a lower-right bat, softened coil.
     Object.freeze({
       id: "upper",
+      surfaceId: 2,
       pivotXPixels: 182,
       pivotYPixels: 194,
       restPose: 50,
@@ -904,6 +962,7 @@ export const FLIPPER_RECORDS: Readonly<Record<TableId, readonly FlipperRecord[]>
     }),
     Object.freeze({
       id: "lower-left",
+      surfaceId: 3,
       pivotXPixels: 113,
       pivotYPixels: 556,
       restPose: 10,
@@ -919,6 +978,7 @@ export const FLIPPER_RECORDS: Readonly<Record<TableId, readonly FlipperRecord[]>
     }),
     Object.freeze({
       id: "lower-right",
+      surfaceId: 4,
       pivotXPixels: 227,
       pivotYPixels: 556,
       restPose: 50,
@@ -993,6 +1053,7 @@ function flipperFromRecord(record: FlipperRecord): FlipperConfig {
   return {
     id: record.id,
     role: record.role,
+    surfaceId: record.surfaceId,
     pivotX: pixelsToQ10(record.pivotXPixels),
     pivotY: pixelsToQ10(record.pivotYPixels),
     restPose: record.restPose,
@@ -1041,6 +1102,19 @@ export function hasUpperFlipper(_tableId: TableId): boolean {
 
 /** Rejects a configuration that could not produce a sane stroke. */
 export function validateFlipperConfig(config: FlipperConfig): FlipperConfig {
+  // A bat with no responder row has no restitution and no slip rule, and the
+  // table lookup would answer some other material's row rather than fail. The
+  // four ids are the four record slots; see `FlipperRecord.surfaceId`.
+  if (
+    !Number.isInteger(config.surfaceId) ||
+    config.surfaceId < FLIPPER_ID_MIN ||
+    config.surfaceId > FLIPPER_ID_MAX
+  ) {
+    throw new RangeError(
+      `flipper "${config.id}" has responder id ${config.surfaceId}; the four bat slots are ` +
+        `${FLIPPER_ID_MIN}..${FLIPPER_ID_MAX}`,
+    );
+  }
   if (!Number.isInteger(config.sweep) || config.sweep <= 0) {
     throw new RangeError(`flipper sweep must be a positive whole number: ${config.sweep}`);
   }
@@ -1835,9 +1909,38 @@ function resolveOne(
       // Then the ordinary bounce, in the WORLD frame — the original has no bat
       // frame, and `reflectVelocity` returns untouched when the ball is already
       // leaving, which is exactly the `tst.w d0 / ble` that skips the bounce at
-      // +0x00B550 once the kick above has sent the ball outward. A bat standing
-      // still reaches this with nothing added and behaves as it always has.
-      reflectVelocity(ball, config.surface, touch.normalX, touch.normalY, restThreshold);
+      // +0x00B550 once the kick above has sent the ball outward.
+      //
+      // AND IT IS THE MAP'S OWN RESPONDER, WITH THE BAT'S OWN ROW. This used to
+      // pass no surface at all, which sent a bat contact down `reflectVelocity`'s
+      // no-surface branch: the row's restitution by way of `FLIPPER_SURFACE`, but
+      // this port's Coulomb friction instead of the row's `$3A` slip and none of
+      // the row's `$34` graze gate. That was a second contact model living behind
+      // the bats, and the machine has one: the mask blit at +0x00B2A2 leaves its
+      // result in the same 68-byte buffer as the map blit at +0x00B4B0, the same
+      // ring evaluator at +0x00A9C4 reads it, and the four constants at
+      // `$34/$36/$38/$3A` were loaded by `movem.w (a0,d2.w*8),d3-d6` at
+      // +0x00AE14 from the surface id under the contact — which for a bat is the
+      // id the shipped maps paint over its own swept footprint (1..4, see
+      // `FlipperRecord.surfaceId`). So the bat inherits the whole responder and
+      // not merely its normal.
+      //
+      // WHAT MOVED, measured on the Law 'n Justice apron: a ball arriving on the
+      // resting left bat at (2.53,12.45) px/tick left it at (6.69,-1.53) under
+      // the Coulomb rule and leaves at (9.24,-0.35) under the row's, against the
+      // film's own 10.0-11.5 px/tick eastbound roll. The normal channel is
+      // untouched — both rules take 115/256 of it, which is what
+      // `FLIPPER_SURFACE.elasticity` already carried — and the difference is
+      // entirely tangential: Coulomb charged 36% of the along-face speed to one
+      // contact where `$3A` = 12800 charges 1.25% plus the fixed decay.
+      reflectVelocity(
+        ball,
+        config.surface,
+        touch.normalX,
+        touch.normalY,
+        restThreshold,
+        surfaceResponseFor(config.surfaceId),
+      );
 
       separate(ball, touch, clamp);
 
