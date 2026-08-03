@@ -109,6 +109,15 @@ export interface ModeElement {
   readonly score: number;
   readonly bonus: number;
   readonly effect: number;
+  /**
+   * Award effect 5's BONUS MULTIPLIER: the element's +$34 read as a WORD, which
+   * is what `move.w $34(a2),$12(a0)` at +0x0060D4 stores into the player record.
+   * Zero for every other effect, because the same field is a POINTER there.
+   *
+   * The shipped ladders are 2/4/6/8/10 on Law 'n Justice and BabeWatch — the
+   * x2..x10 insert row on the playfield art — and 2/3/4/5 on Extreme Sports.
+   */
+  readonly multiplier: number;
   /** The record's own countdown field; -1 is "no timer". */
   readonly countdown: number;
   readonly lampStart: boolean;
@@ -427,6 +436,7 @@ export function parseTableModesDocument(doc: TableModesDocument): TableModes {
         score: requireWholeNumber(item["score"], `${where} score`, 0, Number.MAX_SAFE_INTEGER),
         bonus: requireWholeNumber(item["bonus"], `${where} bonus`, 0, Number.MAX_SAFE_INTEGER),
         effect: requireWholeNumber(item["effect"], `${where} effect`, 0, 0xffff),
+        multiplier: requireWholeNumber(item["multiplier"] ?? 0, `${where} multiplier`, 0, 99),
         countdown: requireWholeNumber(item["countdown"], `${where} countdown`, -0x8000, 0x7fff),
         lampStart: item["lampStart"] === true,
         lampAward: item["lampAward"] === true,

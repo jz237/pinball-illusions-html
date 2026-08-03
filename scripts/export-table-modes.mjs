@@ -163,6 +163,16 @@ const ELEMENT_EFFECT = 0x2c;
 const ELEMENT_COUNTDOWN = 0x2e;
 /** Award effect 21's counter record, and the ladder step it queues on reaching its target. */
 const ELEMENT_COUNTER = 0x34;
+/**
+ * The SAME +$34, read as a plain WORD instead of as a pointer, which is what
+ * award effect 5's handler does: `move.w $34(a2), $12(a0)` at +0x0060D4, storing
+ * it straight into the current player record's BONUS MULTIPLIER. The field is
+ * overloaded by effect — a pointer for effects 6 and 21, an immediate for 5 —
+ * so it is read as a word ONLY for effect-5 elements, and `elementMultiplier`
+ * refuses one whose +$34 is relocated (that would be the top half of an address,
+ * not a multiplier).
+ */
+const EFFECT_SET_MULTIPLIER = 5;
 const COUNTER_TARGET = 0x04;
 const COUNTER_CONTINUATION = 0x48;
 /**
@@ -553,6 +563,32 @@ function ladderOf(pkg, record, scriptIndex) {
     entries.push({ id, script });
     delta += LADDER_ENTRY_BYTES;
   }
+}
+
+/**
+ * The BONUS MULTIPLIER an effect-5 element sets, or 0 for every other element.
+ *
+ * Refuses a relocated +$34, because that is a pointer and its top word is not a
+ * multiplier; refuses anything outside 0..99 for the same reason. On all three
+ * shipped tables the survivors are a clean ladder — 2/4/6/8/10 on Law 'n Justice
+ * and BabeWatch, 2/4/6/8 on Extreme Sports — which is exactly the x2..x10 insert
+ * row on the playfield art, and exactly what the routine's own lamp index
+ * (`$12(a0)` >> 1, minus 1, at Table001 h4 +0x2A1C) is shaped to address.
+ */
+function elementMultiplier(pkg, at) {
+  if (readU16(pkg, at, ELEMENT_EFFECT) !== EFFECT_SET_MULTIPLIER) return 0;
+  if (!inBounds(pkg, at, ELEMENT_COUNTER + 2)) return 0;
+  if (pkg.relocations.has(`${at.hunk}:${at.offset + ELEMENT_COUNTER}`)) {
+    throw new Error(
+      `${pkg.stem}: effect-5 element at ${key(at)} has a RELOCATED +$34; ` +
+        "award effect 5 reads that field as an immediate multiplier, so this is not one",
+    );
+  }
+  const value = readU16(pkg, at, ELEMENT_COUNTER);
+  if (value > 99) {
+    throw new Error(`${pkg.stem}: effect-5 element at ${key(at)} sets multiplier ${value}`);
+  }
+  return value;
 }
 
 /** The progress-counter continuation an element's award effect 21 queues. */
@@ -981,6 +1017,7 @@ function decode(pkg, table) {
     score: readBcd(pkg, at, ELEMENT_SCORE, "element score"),
     bonus: readBcd(pkg, at, ELEMENT_BONUS, "element bonus"),
     effect: readU16(pkg, at, ELEMENT_EFFECT),
+    multiplier: elementMultiplier(pkg, at),
     countdown: readS16(pkg, at, ELEMENT_COUNTDOWN),
     lampStart: follow(pkg, at, ELEMENT_LAMP_START) !== null,
     lampAward: follow(pkg, at, ELEMENT_LAMP_AWARD) !== null,

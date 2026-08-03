@@ -100,6 +100,7 @@ function reportWith(over: Partial<GameTickReport> = {}): GameTickReport {
     musicCues: [],
     justTilted: false,
     gameOver: false,
+    bonus: null,
     flipperRaised: [],
     flipperRested: [],
     ...over,

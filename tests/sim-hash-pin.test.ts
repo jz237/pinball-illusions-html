@@ -138,11 +138,48 @@ const TICKS = 4000;
  * 60,000, ball touring the whole table, ball search never fired). Tip-flip sweep
  * pass-under 0/1044. Film side-by-side unchanged at 98.4508/99.8645/99.1322 with
  * byte-identical rasters.
+ *
+ * RE-PIN, THE END-OF-BALL BONUS (the bonus round): a ball used to end and the
+ * accumulator behind it was thrown away — 23 Law 'n Justice mission elements
+ * carry a non-zero bonus and five of the corpus pay 5,000,000, and nothing in
+ * the game read a byte of it. `$5136` is now reconstructed (see `bonus.ts`), and
+ * it MOVES TICKS as well as score: a ball end that is not a tilt now occupies
+ * the machine while its panels run — 150 frames for "NO BONUS", 80 + 100 for a
+ * bonus that pays — and the lane stays shut for the whole of it, exactly as the
+ * original's state-4 handler does not return until the routine has. Every ball
+ * end on every table therefore moves every tick after it, and the three hashes
+ * move with them. This script drains and re-serves several times inside its
+ * 4,000 ticks, so all three are covered.
+ *
+ * The 150 frames are `move.w #$96,d0 / jsr ([$c,a4])` at Law 'n Justice hunk 4
+ * +0x2B8E, and they are FILM-MEASURED: eight uninterrupted "NO BONUS" panels
+ * across three tables each lasted exactly 149 visible frames. The four filmed
+ * SHORT ones are the decoded early-out at `$526C` — any key-down after the
+ * 25-pass grace — which is reconstructed too, and which is why this script's
+ * flipping player sees ~26-tick panels rather than 150-tick ones.
+ *
+ * The gates, measured on both trees with one driver: census 90 games x 3 tables
+ * at 12,000 ticks, 90/90 completed on both everywhere, write-offs 0/0/2 on both,
+ * the same single Extreme Sports site (238,588). Score medians moved 647,500 ->
+ * 607,500 (LnJ), 912,500 -> 917,500 (BW) and 295,000 -> 325,000 (ES) — they did
+ * NOT systematically rise, and the reason is measured rather than guessed: this
+ * census player banks a bonus on only 5/270, 9/270 and 19/270 ball ends and
+ * never once lights a multiplier, so the paid total over ninety games is
+ * 2,500,000 / 1,125,000 / 235,000 and the medians are dominated by the trajectory
+ * re-roll the panel's ~28 ticks per ball end causes. Anomaly sweep 80 games x 3
+ * tables at 20,000 ticks in the round-5 profile mix: completed 80/80/80 and
+ * drains 240/240/240 on both trees, and write-offs, swallowed, search-pulses,
+ * wall-crawl, award-burst, kicker-runaway and pinch-orbit ALL ZERO on both;
+ * teleport 1/0/1 and over-clamp 0/0/1 unchanged; jitter 117/65/99 -> 126/67/116
+ * and award-sub-debounce 2/5/0 -> 2/4/0, both at the known cradle sites the
+ * round-5 INDEX already records as parity artefacts. Tip-flip sweep
+ * BYTE-IDENTICAL to HEAD, pass-under 0/1044. Film side-by-side unchanged at
+ * 98.4508/99.8645/99.1322 with byte-identical rasters.
  */
 const PINNED: Record<TableId, string> = {
-  "law-n-justice": "72a6dc68c72c0279b24921f77d62a6aeb2e540759765f8f2d0ba16ad58d5e7c9",
-  "babewatch": "850a3af57b3a9412031a8de4d98cba8aa987167e26f375ddfe565f990cbd3dcb",
-  "extreme-sports": "babdc0c7a875777d8002336927269d05d9797e4e395e87c09f4dd317e5d26dd2",
+  "law-n-justice": "6eadefa2a35b3a57cfb5b470096dc237626c082f08f7df537985cfa1dc286955",
+  "babewatch": "dd969b9ddcd84edfe046ba8fd6dc2e9663f0ab150e6c3e919fb4784dfcbde2de",
+  "extreme-sports": "c5e54dfbf1e35ff2def60535c00ba679ce33e1662a0e9db0cb07f9e1b06feef1",
 };
 
 /** Same shape as the determinism harness's input: behaviour = f(tick index). */

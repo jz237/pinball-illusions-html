@@ -389,6 +389,70 @@ function scorePenY(font: ShellFont): number {
 }
 
 /**
+ * What the END-OF-BALL BONUS wants on the strip. See `bonus.ts` for the routine
+ * and `game-loop.ts` for the `BonusView` this is fed from.
+ */
+export interface PanelBonusView {
+  readonly caption: string;
+  readonly value: number | null;
+  readonly multiplier: string;
+  readonly multiplierLit: boolean;
+}
+
+/**
+ * THE BONUS PANEL'S TWO LINES, AND THE ONE PLACE THIS LAYOUT DIVERGES.
+ *
+ * The machine draws the bonus on a TALLER surface than this strip. Its text
+ * plane is 1920 bytes at a 40-byte stride — 48 rows — and the routine puts the
+ * caption on Y=2 and the figure on the row the field drawer's `d4 = 10` selects
+ * (Law 'n Justice hunk 4 +0x29F6/+0x29FA, +0x2B2E/+0x2B32, +0x2B68/+0x2B6C).
+ * This port's panel is the sixteen rows the slot-5 objects are authored for, and
+ * the shipped panel font is eight rows tall, so two lines fill it exactly and
+ * there is nowhere to put an eight-row gap between them.
+ *
+ * So the ROWS are this port's — caption on the top eight, figure on the bottom
+ * eight — and everything else about the layout is the machine's: which caption,
+ * which figure, which columns, and for how long. Computed from the font rather
+ * than written down, the same argument as `scorePenY`, so a font with different
+ * metrics still lands on the two halves.
+ */
+function bonusPenY(font: ShellFont, line: 0 | 1): number {
+  const zero = font.glyphs["0".charCodeAt(0)];
+  return line * Math.floor(PANEL_HEIGHT / 2) - (zero?.yOffset ?? 0);
+}
+
+/**
+ * The three columns. Every bonus record carries `align = 2`, which `$73D0`
+ * decodes as CENTRE (+0x007416), so all three are centred on their X: captions
+ * and figures on X=160, the strip's own middle, and the multiplier label on
+ * X=40 and again on X=280 — `move.w #$28,(a0)` at +0x2A2E and `move.w #$118,(a0)`
+ * at +0x2A3A, the same record drawn twice, mirror-symmetric about 320 pixels.
+ */
+const BONUS_CENTRE_X = 160;
+const BONUS_MULTIPLIER_LEFT_X = 40;
+const BONUS_MULTIPLIER_RIGHT_X = 280;
+
+function drawBonus(target: PixelTarget, font: ShellFont, bonus: PanelBonusView): void {
+  const caption = bonusPenY(font, 0);
+  const figure = bonusPenY(font, 1);
+  const centred = (text: string, x: number, penY: number): void => {
+    if (text.length === 0) return;
+    const penX = alignShellText(font, text, x, "center");
+    drawText(target, font, text, penX, penY, PANEL_AMBER, PANEL_WHITE);
+  };
+  centred(bonus.caption, BONUS_CENTRE_X, caption);
+  if (bonus.multiplierLit && bonus.multiplier.length > 0) {
+    centred(bonus.multiplier, BONUS_MULTIPLIER_LEFT_X, caption);
+    centred(bonus.multiplier, BONUS_MULTIPLIER_RIGHT_X, caption);
+  }
+  // The figure is grouped exactly as the score is, because the machine draws it
+  // with the very same `$71BA` it draws the score with.
+  if (bonus.value !== null) {
+    centred(formatPanelScore(bonus.value), BONUS_CENTRE_X, figure);
+  }
+}
+
+/**
  * Renders the panel for a playback state into a 320 x 16 target.
  *
  * An animation on screen draws its current frame's two planes; an idle queue
@@ -397,12 +461,19 @@ function scorePenY(font: ShellFont): number {
  * amber fill over white outline on the unlit glass. The target must be
  * exactly panel-sized, the same 1:1 contract as `renderPlayfieldInto`, and
  * nothing is ever written outside it. Returns the target for convenience.
+ *
+ * `bonus` OUTRANKS BOTH OF THEM, because the machine's does: `$5136` calls
+ * `$6B06` — which zeroes the whole text plane — immediately before and after the
+ * table's routine (+0x0051AC, +0x0051C4), and the routine clears it again ahead
+ * of every panel it puts up. Nothing queued survives an end-of-ball bonus on
+ * screen, and the score does not show through it either.
  */
 export function renderPanelInto(
   state: PanelState,
   score: number,
   font: ShellFont,
   target: PixelTarget,
+  bonus?: PanelBonusView | null,
 ): PixelTarget {
   if (target.width !== PANEL_WIDTH || target.height !== PANEL_HEIGHT) {
     throw new RangeError(
@@ -417,6 +488,10 @@ export function renderPanelInto(
   }
 
   clearPanel(target);
+  if (bonus !== undefined && bonus !== null) {
+    drawBonus(target, font, bonus);
+    return target;
+  }
   const frame = currentPanelFrame(state);
   if (frame !== null) {
     drawFrame(target, frame);

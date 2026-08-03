@@ -184,7 +184,10 @@ const OP_SET_RESUME = 30;
 const OP_SET_LOOP = 31;
 
 /** Award effects with decoded handlers. Everything else is left alone. */
+const EFFECT_HOLD_BONUS = 2;
+const EFFECT_SET_MULTIPLIER = 5;
 const EFFECT_COUNT_DISPATCH = 6;
+const EFFECT_HOLD_MULTIPLIER = 8;
 const EFFECT_ADVANCE_LADDER = 21;
 const EFFECT_ADD_TIME = 23;
 
@@ -560,6 +563,18 @@ export interface ModeTickReport {
    * bank}. See `OP_MUSIC`.
    */
   readonly musicCues: readonly ModeMusicCue[];
+  /**
+   * The BONUS MULTIPLIER an award effect 5 set this tick, or -1 for none.
+   *
+   * Reported, not applied: it belongs to the player record's `+$12`, which the
+   * scoring state owns. -1 rather than 0 because 0 is a value the field can
+   * legally hold — it is what every ball starts with.
+   */
+  readonly bonusMultiplier: number;
+  /** An award effect 2 fired: this ball's bonus survives into the next one. */
+  readonly holdBonus: boolean;
+  /** An award effect 8 fired: this ball's multiplier survives into the next one. */
+  readonly holdMultiplier: boolean;
   /** Opcodes executed whose behaviour is not decoded. See the header. */
   readonly unimplemented: number;
 }
@@ -583,6 +598,9 @@ export const EMPTY_MODE_TICK: ModeTickReport = Object.freeze({
   lockEjects: Object.freeze([]),
   lockRemoves: Object.freeze([]),
   musicCues: Object.freeze([]),
+  bonusMultiplier: -1,
+  holdBonus: false,
+  holdMultiplier: false,
   unimplemented: 0,
 });
 
@@ -598,6 +616,9 @@ interface Accumulator {
   lockEjects: LockDevice[];
   lockRemoves: LockDevice[];
   musicCues: ModeMusicCue[];
+  bonusMultiplier: number;
+  holdBonus: boolean;
+  holdMultiplier: boolean;
   unimplemented: number;
 }
 
@@ -683,12 +704,26 @@ function awardElement(
     effect: element.effect,
   });
   pushMessage(modes, out, element.displayAward);
-  applyAwardEffect(modes, state, index, element);
+  applyAwardEffect(modes, state, out, index, element);
 }
 
 /**
- * The award-effect table at 0x5D0E. Three of its entries are decoded well
- * enough to run and all three matter for progression; the rest are left alone.
+ * The award-effect table at 0x5D0E. Six of its entries are decoded well
+ * enough to run and all six matter — three for progression, three for the
+ * end-of-ball bonus; the rest are left alone.
+ *
+ *    2, handler 0x6086 — HOLD BONUS. Its tail is `st.b $11(a0)` on the current
+ *       player record (+0x00609E), and +$11 is the byte `$427C` tests before
+ *       clearing the accumulator for the next ball. BabeWatch's element 72 is
+ *       the corpus's only user, and BabeWatch's package carries the string
+ *       "BONUS HELD" (h4+0x6332) to say so.
+ *    5, handler 0x60D0 — SET THE BONUS MULTIPLIER, `move.w $34(a2),$12(a0)`
+ *       (+0x0060D4): the element's own +$34, as an immediate. This is the
+ *       x2..x10 insert row, and it SETS rather than advances — the ladder is
+ *       five separate elements, one per rung, and whichever the player lights
+ *       last is the one that stands.
+ *    8, handler 0x60A8 — HOLD MULTIPLIER, `st.b $14(a0)` (+0x0060AC), the same
+ *       shape as effect 2 for the other field. Law 'n Justice's element 64.
  *
  *    6, handler 0x5E5A — the COUNT DISPATCH, and the decoded multiball lock
  *       rule. Increments the per-game counter shared by every element pointing
@@ -709,9 +744,26 @@ function awardElement(
 function applyAwardEffect(
   modes: TableModes,
   state: ModeState,
+  out: Accumulator,
   index: number,
   element: ModeElement,
 ): void {
+  // The three player-record effects. They are REPORTED rather than applied: the
+  // fields they write live in the scoring state (see `scoring.ts` for the record
+  // map), which this module deliberately cannot reach. Last one this tick wins,
+  // which is what three consecutive `move.w`s into one word would also do.
+  if (element.effect === EFFECT_SET_MULTIPLIER) {
+    out.bonusMultiplier = element.multiplier;
+    return;
+  }
+  if (element.effect === EFFECT_HOLD_BONUS) {
+    out.holdBonus = true;
+    return;
+  }
+  if (element.effect === EFFECT_HOLD_MULTIPLIER) {
+    out.holdMultiplier = true;
+    return;
+  }
   if (element.effect === EFFECT_COUNT_DISPATCH) {
     const ladder = element.ladder < 0 ? undefined : modes.ladders[element.ladder];
     if (ladder === undefined || ladder.entries.length === 0) return;
@@ -1083,6 +1135,9 @@ export function tickModes(modes: TableModes, state: ModeState): ModeTickReport {
     lockEjects: [],
     lockRemoves: [],
     musicCues: [],
+    bonusMultiplier: -1,
+    holdBonus: false,
+    holdMultiplier: false,
     unimplemented: 0,
   };
 
@@ -1108,6 +1163,9 @@ export function tickModes(modes: TableModes, state: ModeState): ModeTickReport {
     out.lockEjects.length === 0 &&
     out.lockRemoves.length === 0 &&
     out.musicCues.length === 0 &&
+    out.bonusMultiplier < 0 &&
+    !out.holdBonus &&
+    !out.holdMultiplier &&
     out.unimplemented === 0
   ) {
     return EMPTY_MODE_TICK;
@@ -1124,6 +1182,9 @@ export function tickModes(modes: TableModes, state: ModeState): ModeTickReport {
     lockEjects: out.lockEjects,
     lockRemoves: out.lockRemoves,
     musicCues: out.musicCues,
+    bonusMultiplier: out.bonusMultiplier,
+    holdBonus: out.holdBonus,
+    holdMultiplier: out.holdMultiplier,
     unimplemented: out.unimplemented,
   };
 }

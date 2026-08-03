@@ -37,6 +37,14 @@ import {
   troughPlacement,
 } from "../src/game/plunger.js";
 import { FixedStepScheduler } from "../src/core/fixed-step-scheduler.js";
+import { BONUS_NONE_FRAMES } from "../src/game/bonus.js";
+
+/**
+ * Ticks an unearned ball end costs: the "NO BONUS" hold, plus a little slack
+ * for the drain and the serve that bracket it. Decoded, not chosen — see
+ * `bonus.ts` and the test that pins it.
+ */
+const BONUS_HOLD_TICKS = BONUS_NONE_FRAMES + 10;
 
 /**
  * Parsed once: it is read-only and expanding 336x600 per test is wasteful.
@@ -224,8 +232,16 @@ describe("the ball lifecycle", () => {
   it("replaces a drained ball with the next one", () => {
     // A drain line partway up the table turns every serve into an immediate
     // drain, which exercises the lifecycle without needing a plausible shot.
+    //
+    // THE BUDGETS IN THIS BLOCK ARE END-OF-BALL BONUS BUDGETS. Every ball end
+    // now runs the decoded bonus phase before the next serve, and a ball that
+    // scored nothing gets the "NO BONUS" panel's 150 frames (`bonus.ts`, the
+    // `move.w #$96,d0` at Law 'n Justice hunk 4 +0x2B8E, film-measured at 149
+    // visible frames eight times over). This player presses nothing, so nothing
+    // dismisses it early either. Only the tick counts moved; every assertion
+    // below is the one that was here before.
     const game = startedGame({ simulation: { drainY: pixelsToQ10(300) } });
-    const reports = runTicks(game, new ScriptedInput(), 8);
+    const reports = runTicks(game, new ScriptedInput(), 8 + BONUS_HOLD_TICKS);
 
     expect(drainedIds(reports)).toEqual([0, 1]);
     expect(game.ballsServed).toBe(2);
@@ -238,7 +254,7 @@ describe("the ball lifecycle", () => {
     const game = startedGame({ simulation: { drainY: pixelsToQ10(300) } });
     expect(game.options.ballsPerGame).toBe(DEFAULT_BALLS_PER_GAME);
 
-    const reports = runTicks(game, new ScriptedInput(), 60);
+    const reports = runTicks(game, new ScriptedInput(), 60 + 3 * BONUS_HOLD_TICKS);
 
     expect(drainedIds(reports)).toEqual([0, 1, 2]);
     expect(game.ballsServed).toBe(DEFAULT_BALLS_PER_GAME);
@@ -253,7 +269,7 @@ describe("the ball lifecycle", () => {
       ballsPerGame: 5,
       simulation: { drainY: pixelsToQ10(300) },
     });
-    runTicks(game, new ScriptedInput(), 60);
+    runTicks(game, new ScriptedInput(), 60 + 5 * BONUS_HOLD_TICKS);
 
     expect(game.ballsServed).toBe(5);
     expect(game.phase).toBe("game-over");
@@ -261,11 +277,14 @@ describe("the ball lifecycle", () => {
 
   it("starts a fresh game from game over", () => {
     const game = startedGame({ simulation: { drainY: pixelsToQ10(300) } });
+    // Late enough that the third ball's bonus has finished and the game is
+    // really over: `start` only restarts from a game that has ended.
+    const restartAt = 40 + 3 * BONUS_HOLD_TICKS;
     const input = new ScriptedInput((tick, router) => {
-      if (tick === 40) router.tap("start");
+      if (tick === restartAt) router.tap("start");
     });
 
-    runTicks(game, input, 41);
+    runTicks(game, input, restartAt + 1);
     expect(game.phase).toBe("in-play");
     expect(game.ballsServed).toBe(0);
     // Ids restart, so two games are comparable in a debug dump.

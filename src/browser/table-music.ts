@@ -475,6 +475,14 @@ export function createTableMusic(
       // that routine's first instruction fires its end-stop record: a -2 into
       // a section that ends in F00, so the music stops for the bonus count. A
       // multiball drain that leaves balls in play is not a ball end.
+      //
+      // THE SILENCE NOW HAS SOMETHING IN IT. When this cue was wired the bonus
+      // count did not exist and the stop was a stop into an immediate re-serve;
+      // `bonus.ts` reconstructs the routine those frames belong to, so the gap
+      // between this record and the next ball-start cue is the length of the
+      // panels the machine is showing — which is what the record was firing for.
+      // The site is unchanged: it is still the drain, because the routine fires
+      // the record on its FIRST instruction and the phase starts on the same tick.
       const ended = report.drained.length;
       if (ended > 0) {
         ballsLive = Math.max(0, ballsLive - ended);

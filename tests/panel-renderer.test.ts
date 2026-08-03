@@ -39,7 +39,12 @@ import {
   renderPanelInto,
   stepPanel,
 } from "../src/browser/panel-renderer.js";
-import type { PanelAnimation, PanelFrame, PanelState } from "../src/browser/panel-renderer.js";
+import type {
+  PanelAnimation,
+  PanelBonusView,
+  PanelFrame,
+  PanelState,
+} from "../src/browser/panel-renderer.js";
 import { BYTES_PER_PIXEL, createPixelTarget } from "../src/browser/playfield-renderer.js";
 import type { PixelTarget } from "../src/browser/playfield-renderer.js";
 import { PANEL_AMBER, PANEL_UNLIT, PANEL_WHITE } from "../src/browser/palette.js";
@@ -75,6 +80,15 @@ function syntheticFont(): ShellFont {
   metrics[",".charCodeAt(0)] = [COMMA_ADVANCE, DIGIT_HEIGHT, 0];
   for (const c of "0123456789") {
     metrics[c.charCodeAt(0)] = [DIGIT_ADVANCE, DIGIT_HEIGHT, 0];
+  }
+  // The bonus captions are words, so the letters have to exist. They are added
+  // AFTER the digits in code order — 'A' is 65 and '9' is 57 — and the space is
+  // given no glyph rows at all, so no digit's row in the accumulated atlas
+  // moves and the score view's pinned hash below still describes the same
+  // pixels it always did.
+  metrics[" ".charCodeAt(0)] = [COMMA_ADVANCE, 0, 0];
+  for (let code = "A".charCodeAt(0); code <= "Z".charCodeAt(0); code += 1) {
+    metrics[code] = [DIGIT_ADVANCE, DIGIT_HEIGHT, 0];
   }
   const rows = metrics.reduce((sum, [, height = 0]) => sum + height, 0);
   const indices = new Uint8Array(FONT_ATLAS_WIDTH * rows);
@@ -217,6 +231,104 @@ describe("the score view", () => {
     const second = renderPanel(createPanelState(), 1234567, FONT);
     expect(hashOf(first)).toBe(hashOf(second));
     expect(hashOf(first)).toBe("d53ccd8e3621427a0081a2d9e562af987d6d66948b640d2254d5a99aad363ece");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The end-of-ball bonus panel
+// ---------------------------------------------------------------------------
+
+describe("the bonus view", () => {
+  const NO_BONUS: PanelBonusView = {
+    caption: "NO BONUS",
+    value: null,
+    multiplier: "",
+    multiplierLit: false,
+  };
+
+  /** Where the lit run on one row starts and ends, or null for an empty row. */
+  function rowBounds(target: PixelTarget, y: number): { min: number; max: number } | null {
+    let min = -1;
+    let max = -1;
+    for (let x = 0; x < PANEL_WIDTH; x += 1) {
+      if (isUnlit(target, x, y)) continue;
+      if (min < 0) min = x;
+      max = x;
+    }
+    return min < 0 ? null : { min, max };
+  }
+
+  function renderBonus(bonus: PanelBonusView, state = createPanelState()): PixelTarget {
+    return renderPanelInto(
+      state,
+      999_999,
+      FONT,
+      createPixelTarget(PANEL_WIDTH, PANEL_HEIGHT),
+      bonus,
+    );
+  }
+
+  /** Left edge of a centred run, the way `$73D0`'s align 2 computes it. */
+  function centredAt(text: string, x: number): number {
+    return x - Math.floor(measureShellText(FONT, text) / 2);
+  }
+
+  it("centres the caption on the strip's middle, which is the record's own X", () => {
+    // Every bonus text record carries X=160 with align=2 (centre); `$73D0`
+    // decodes align 2 at +0x007416.
+    const bounds = rowBounds(renderBonus(NO_BONUS), 3);
+    expect(bounds).not.toBeNull();
+    const width = measureShellText(FONT, "NO BONUS");
+    expect(bounds?.min).toBe(centredAt("NO BONUS", 160));
+    expect(bounds?.max).toBe(centredAt("NO BONUS", 160) + width - 1);
+  });
+
+  it("outranks the score view: the score does not show through it", () => {
+    // `$6B06` clears the whole plane before every panel the routine puts up.
+    expect(isUnlit(renderBonus(NO_BONUS), PANEL_SCORE_RIGHT_X - 1, 3)).toBe(true);
+  });
+
+  it("outranks a queued animation too", () => {
+    const state = queued(animationOf(1, solidFrame(PANEL_WIDTH, PANEL_HEIGHT, 1)));
+    const target = renderBonus(NO_BONUS, state);
+    // A frame that fills the strip would light the corners; a caption does not.
+    expect(isUnlit(target, 0, 0)).toBe(true);
+    expect(isUnlit(target, PANEL_WIDTH - 1, PANEL_HEIGHT - 1)).toBe(true);
+  });
+
+  it("puts the figure on its own line under the caption", () => {
+    const target = renderBonus({
+      caption: "TOTAL BONUS",
+      value: 6_000_000,
+      multiplier: "",
+      multiplierLit: false,
+    });
+    expect(rowBounds(target, 3)).not.toBeNull();
+    const figure = rowBounds(target, 11);
+    expect(figure).not.toBeNull();
+    // Grouped exactly as the score is, because the machine draws it with the
+    // same `$71BA` it draws the score with.
+    expect(figure?.min).toBe(centredAt(formatPanelScore(6_000_000), 160));
+  });
+
+  it("draws the multiplier caption at x=40 and x=280, but only while it is lit", () => {
+    const of = (multiplierLit: boolean): PixelTarget =>
+      renderBonus({ caption: "BONUS", value: 1_500_000, multiplier: "X4", multiplierLit });
+    for (const x of [40, 280]) {
+      expect(isUnlit(of(true), centredAt("X4", x), 3)).toBe(false);
+      expect(isUnlit(of(false), centredAt("X4", x), 3)).toBe(true);
+    }
+  });
+
+  it("stays inside 320 x 16 with the longest caption and a twelve-digit figure", () => {
+    const target = renderBonus({
+      caption: "TOTAL BONUS",
+      value: 999_999_999_999,
+      multiplier: "X10",
+      multiplierLit: true,
+    });
+    expect(target.data).toHaveLength(PANEL_WIDTH * PANEL_HEIGHT * BYTES_PER_PIXEL);
+    expect(isUnlit(target, 0, 0)).toBe(true);
   });
 });
 

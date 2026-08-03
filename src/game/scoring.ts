@@ -72,8 +72,32 @@
  * The second half was wrong, and the thing that was missing is now here. The
  * bonus is fed by the MISSION LAYER: the PLAYFIELD ELEMENT records the mission
  * bytecode awards carry a six-byte packed-BCD bonus at +$26 beside their score at
- * +$1E, and several are non-zero — Extreme Sports' element 12 pays 7,000. See
+ * +$1E, and several are non-zero — Extreme Sports' element 12 pays 7,000, Law 'n
+ * Justice carries 23 such elements and five of the corpus pay 5,000,000. See
  * `mode-vm.ts`, which pays them through the same `addToBcdField` chain below.
+ *
+ * ---------------------------------------------------------------------------
+ * AND WHERE IT GOES: THE END-OF-BALL BONUS, AND THE MULTIPLIER BESIDE IT
+ * ---------------------------------------------------------------------------
+ * The accumulator is cashed at ball end by `$5136`, and the four player-record
+ * fields the routine reads live here rather than in the loop because they are
+ * the player's, exactly as the score and the bonus are. The record is 22 bytes
+ * at `$dc6(a5)` (the array; `$dc2(a5)` is the pointer to the current one and
+ * `$dbe(a5)` the index, `mulu.w #$16,d0 / lea $dc6(a5,d0.w),a0` at +0x00509C):
+ *
+ *     +$02..$07  SCORE            packed BCD
+ *     +$0A..$0F  BONUS            packed BCD, the accumulator
+ *     +$10       EXTRA BALLS      byte, `tst.b $10(a0)` at +0x00505E
+ *     +$11       HOLD BONUS       byte, `st.b $11(a0)` at +0x00609E (effect 2)
+ *     +$12..$13  BONUS MULTIPLIER word, `move.w $34(a2),$12(a0)` at +0x0060D4
+ *     +$14       HOLD MULTIPLIER  byte, `st.b $14(a0)` at +0x0060AC (effect 8)
+ *
+ * `multiplyBcdField` is the routine's arithmetic and `clearBonusForNewBall` is
+ * its `$427C` counterpart; `bonus.ts` owns the phase those two bracket, and its
+ * header is where the whole routine is written out. EXTRA BALLS at +$10 is
+ * decoded, is fed by award effect 1 (+0x00606C `addq.b #1,$10(a0)`, and three
+ * Law 'n Justice elements use it), and is NOT reconstructed here: it changes how
+ * many balls a game has, which is a rule of its own and not this one's.
  */
 
 import type { PlayfieldLevel } from "./contracts.js";
@@ -147,6 +171,42 @@ export function addToBcdField(field: Uint8Array, amount: number): boolean {
 /** Reads a BCD field back as a decimal number. */
 export function readBcdField(field: Uint8Array): number {
   return decodeBcd(field, 0, field.length);
+}
+
+/**
+ * A BCD field times a whole number, by REPEATED ADDITION, because that is the
+ * only multiply the original has.
+ *
+ * `$5136`'s product loop, verbatim (+0x00514A onward):
+ *
+ *     00514A  move.w  $12(a0), d0      ; the player's bonus multiplier
+ *     00514E  beq     $5152            ; 0 falls through with d0 STILL ZERO
+ *     005150  subq.w  #1, d0
+ *     005152  clr.l   $2440(a5)        ; the product, zeroed
+ *     005156  clr.l   $2444(a5)
+ *     00515A  lea     $2448(a5), a1    ; loop top: both pointers re-loaded
+ *     00515E  lea     $10(a0), a2      ; the player's BONUS, end pointer
+ *     005162  andi.b  #$EF, ccr
+ *     005166  abcd    -(a2), -(a1)     ; x6 — product += bonus
+ *     005172  dbra    d0, $515a
+ *
+ * A `dbra` runs its body d0+1 times, so the product is `bonus x max(mult, 1)`:
+ * a multiplier of ZERO pays the bonus ONCE, not nothing, and that is not a
+ * reading of intent — it is what the missing `moveq #0,d0` on the `beq` path
+ * makes the loop do. The shipped multiplier ladders never set 1 (they are
+ * 2/4/6/8/10, see `mode-vm.ts` award effect 5), so 0 is the only value below 2
+ * a player ever has, and it is the value every ball starts with.
+ *
+ * The carry out of the top is dropped exactly as `addPackedBcd` drops it: six
+ * `ABCD`s and no seventh, so a product past twelve digits wraps.
+ */
+export function multiplyBcdField(field: Uint8Array, times: number): Uint8Array {
+  if (!Number.isInteger(times) || times < 0) {
+    throw new RangeError(`a bonus multiplier must be a non-negative whole number: ${times}`);
+  }
+  const product = newBcdField(field.length);
+  for (let i = 0; i <= Math.max(times, 1) - 1; i += 1) addPackedBcd(product, field);
+  return product;
 }
 
 /** The field as digits with thousands separators, for the head-up display. */
@@ -234,6 +294,12 @@ export interface ScoringState {
   readonly flags: Set<string>;
   /** Zone key to the id of the ball currently inside it. */
   readonly occupants: Map<string, number>;
+  /** The player record's `+$12` word: what the end-of-ball bonus is multiplied by. */
+  multiplier: number;
+  /** `+$11`: this ball's bonus survives into the next one. Award effect 2. */
+  holdBonus: boolean;
+  /** `+$14`: this ball's multiplier survives into the next one. Award effect 8. */
+  holdMultiplier: boolean;
 }
 
 export function createScoringState(): ScoringState {
@@ -243,6 +309,9 @@ export function createScoringState(): ScoringState {
     timers: new Map<string, number>(),
     flags: new Set<string>(),
     occupants: new Map<string, number>(),
+    multiplier: 0,
+    holdBonus: false,
+    holdMultiplier: false,
   };
 }
 
@@ -257,6 +326,37 @@ export function createScoringState(): ScoringState {
 export function resetScoringForNewBall(state: ScoringState): void {
   state.timers.clear();
   state.occupants.clear();
+}
+
+/**
+ * Empties the bonus accumulator and the multiplier for the next ball — unless
+ * this ball earned the right to keep them.
+ *
+ * `$427C`, whole, called from the ball-end chain at +0x0050D4 AFTER the bonus
+ * has been paid and after the player rotation, so it clears the record of
+ * whoever is about to shoot:
+ *
+ *     00427C  movea.l $dc2(a5), a0
+ *     004280  tst.b   $11(a0)          ; HOLD BONUS?
+ *     004284  bne     $428e
+ *     004286  clr.l   $8(a0)           ; +$08..$0B
+ *     00428A  clr.l   $c(a0)           ; +$0C..$0F  — together the whole BONUS
+ *     00428E  clr.b   $11(a0)          ; the hold is spent either way
+ *     004292  tst.b   $14(a0)          ; HOLD MULTIPLIER?
+ *     004296  bne     $429c
+ *     004298  clr.w   $12(a0)
+ *     00429C  clr.b   $14(a0)
+ *
+ * Both holds are ONE-BALL grants: the `clr.b` past each test runs on both arms,
+ * so a held bonus is held across exactly one ball end and then cleared like any
+ * other. The two `clr.l`s straddle +$08 and +$09, which are the two pad bytes
+ * ahead of the six-byte field — the field itself is +$0A..+$0F.
+ */
+export function clearBonusForNewBall(state: ScoringState): void {
+  if (!state.holdBonus) state.bonus.fill(0);
+  state.holdBonus = false;
+  if (!state.holdMultiplier) state.multiplier = 0;
+  state.holdMultiplier = false;
 }
 
 /**

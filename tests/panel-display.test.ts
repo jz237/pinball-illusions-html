@@ -90,6 +90,7 @@ function reportAt(tick: number, over: Partial<GameTickReport> = {}): GameTickRep
     musicCues: [],
     justTilted: false,
     gameOver: false,
+    bonus: null,
     flipperRaised: [],
     flipperRested: [],
     ...over,
@@ -147,6 +148,43 @@ describe("queueing from the tick report", () => {
     const before = hashOfStrip(view, 1200);
     for (let tick = 2; tick < 60; tick += 1) view.observe(reportAt(tick));
     expect(hashOfStrip(view, 1200)).toBe(before);
+  });
+});
+
+describe("the end-of-ball bonus", () => {
+  const BONUS = {
+    stage: "none" as const,
+    caption: "NO BONUS",
+    value: null,
+    multiplier: "",
+    multiplierLit: false,
+  };
+
+  it("takes the panel over from the score view while it is up", () => {
+    const view = display();
+    view.observe(reportAt(1));
+    const score = hashOfStrip(view, 1234);
+    view.observe(reportAt(2, { bonus: BONUS }));
+    expect(hashOfStrip(view, 1234)).not.toBe(score);
+    // …and gives it back once the routine has finished.
+    view.observe(reportAt(3));
+    expect(hashOfStrip(view, 1234)).toBe(score);
+  });
+
+  it("takes it over from a queued animation too", () => {
+    const view = display();
+    view.observe(reportAt(1, { elementAwards: [15] }));
+    const playing = hashOfStrip(view, 0);
+    view.observe(reportAt(2, { bonus: BONUS }));
+    expect(hashOfStrip(view, 0)).not.toBe(playing);
+  });
+
+  it("is not remembered across a fresh game", () => {
+    const view = display();
+    view.observe(reportAt(1, { bonus: BONUS }));
+    const showing = hashOfStrip(view, 0);
+    view.reset();
+    expect(hashOfStrip(view, 0)).not.toBe(showing);
   });
 });
 

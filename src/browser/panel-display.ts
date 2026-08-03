@@ -48,7 +48,7 @@ import {
   renderPanelInto,
   stepPanel,
 } from "./panel-renderer.js";
-import type { PanelAnimation, PanelState } from "./panel-renderer.js";
+import type { PanelAnimation, PanelBonusView, PanelState } from "./panel-renderer.js";
 import { createPixelTarget } from "./playfield-renderer.js";
 import type { PixelTarget } from "./playfield-renderer.js";
 import { PANEL_UNLIT } from "./palette.js";
@@ -76,6 +76,14 @@ export class PanelDisplay implements PanelPresenter {
   /** Decoded animations by object id. Immutable once built, shared by replays. */
   readonly #animations = new Map<number, PanelAnimation>();
   #state: PanelState = createPanelState();
+  /**
+   * The end-of-ball bonus panel, from the tick report.
+   *
+   * Held rather than passed to `draw`, so the panel stays what its header says
+   * it is — a pure function of the tick stream — and so a caller that never
+   * heard of the bonus gets it anyway.
+   */
+  #bonus: PanelBonusView | null = null;
 
   // The blit path, all lazy: nothing canvas-shaped exists until `draw` runs.
   readonly #createSurface: PanelSurfaceFactory;
@@ -125,6 +133,7 @@ export class PanelDisplay implements PanelPresenter {
    * the first frame of every speed-1 object.
    */
   observe(report: GameTickReport): void {
+    this.#bonus = report.bonus;
     this.#state = stepPanel(this.#state, 1);
     for (const element of report.elementStarts) {
       this.#enqueue(this.#startsByElement.get(element));
@@ -144,6 +153,7 @@ export class PanelDisplay implements PanelPresenter {
    */
   reset(): void {
     this.#state = createPanelState();
+    this.#bonus = null;
   }
 
   #enqueue(objects: readonly number[] | undefined): void {
@@ -187,7 +197,7 @@ export class PanelDisplay implements PanelPresenter {
    * node test can assert byte for byte through here.
    */
   renderInto(target: PixelTarget, score: number, font: ShellFont): PixelTarget {
-    return renderPanelInto(this.#state, score, font, target);
+    return renderPanelInto(this.#state, score, font, target, this.#bonus);
   }
 
   /**
@@ -205,7 +215,7 @@ export class PanelDisplay implements PanelPresenter {
     const font = this.#font();
     if (font === null) return false;
 
-    renderPanelInto(this.#state, score, font, this.#target);
+    renderPanelInto(this.#state, score, font, this.#target, this.#bonus);
 
     if (this.#surface === null) {
       this.#surface = this.#createSurface(PANEL_WIDTH, PANEL_HEIGHT);

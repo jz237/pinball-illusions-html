@@ -121,7 +121,7 @@
  */
 
 import type { Control, ControlSnapshot } from "./input.js";
-import { isDown, plungerInputFrom, wasPressed } from "./input.js";
+import { CONTROLS, isDown, plungerInputFrom, wasPressed } from "./input.js";
 import type { CameraOptions, CameraState } from "./camera.js";
 import {
   DEFAULT_CAMERA_OPTIONS,
@@ -188,9 +188,11 @@ import { originalVelocityToQ10 } from "../game/timebase.js";
 import { tableDevicesFor } from "../game/table-devices.js";
 import type { Award, ScoringState } from "../game/scoring.js";
 import {
+  addPackedBcd,
   addToBcdField,
   applyAward,
   awardTrigger,
+  clearBonusForNewBall,
   createScoringState,
   formatBcdField,
   readBcdField,
@@ -200,6 +202,17 @@ import {
   scoreZones,
   tickScoring,
 } from "../game/scoring.js";
+import type { BonusPhase, BonusStageKind } from "../game/bonus.js";
+import {
+  beginBonusPhase,
+  bonusCaption,
+  bonusMultiplierCaption,
+  bonusMultiplierLit,
+  bonusPhaseFinished,
+  bonusStage,
+  bonusValue,
+  stepBonusPhase,
+} from "../game/bonus.js";
 import type { TableModes } from "../game/table-modes.js";
 import { tableModesFor } from "../game/table-modes.js";
 import type { TableLamps } from "../game/table-lamps.js";
@@ -612,6 +625,15 @@ export interface Game {
   ballsLocked: number;
   /** Packed-BCD score and bonus, plus the three award debounces. */
   scoring: ScoringState;
+  /**
+   * The end-of-ball bonus being paid right now, or null.
+   *
+   * Non-null from the drain that ended a ball until the last of its panels has
+   * had its frames; the lane stays shut for the whole of it and the score is
+   * paid on the tick it clears. Null on a TILTED ball end, which forfeits.
+   * See `bonus.ts`.
+   */
+  bonus: BonusPhase | null;
   /** The mission machine's state, or null when the table has no mission layer. */
   modeState: ModeState | null;
   /** The lines the running mission last put on the display, newest first. */
@@ -648,6 +670,25 @@ export interface Game {
   paused: boolean;
   /** Player's whole-table override, on top of the automatic multiball reframe. */
   forceFullTable: boolean;
+}
+
+/**
+ * One frame of the end-of-ball bonus display, as the panel needs it.
+ *
+ * The captions are the packages' own ASCII (Law 'n Justice hunk 4 +0x2BC4,
+ * +0x2BD2, +0x2BE6) and the multiplier caption is the row of records at +0x2C0C;
+ * `bonus.ts` is where they and their frame counts are decoded.
+ */
+export interface BonusView {
+  readonly stage: BonusStageKind;
+  /** "BONUS", "TOTAL BONUS", "NO BONUS", or "<n> COMBOS". */
+  readonly caption: string;
+  /** The figure under the caption, or null when the panel is a caption alone. */
+  readonly value: number | null;
+  /** "X2".."X10", or "" when the ball has no multiplier to show. */
+  readonly multiplier: string;
+  /** True on the half-cycles the multiplier caption is drawn. */
+  readonly multiplierLit: boolean;
 }
 
 /** What one tick did, for the presentation and for tests. */
@@ -746,6 +787,14 @@ export interface GameTickReport {
   readonly justTilted: boolean;
   readonly gameOver: boolean;
   /**
+   * The end-of-ball bonus panel this tick, or null when none is up.
+   *
+   * Plain data rather than the phase object, and on the report rather than
+   * behind a getter, so the panel layer keeps its "state advances only in
+   * `observe`" contract and stays a pure function of the tick stream.
+   */
+  readonly bonus: BonusView | null;
+  /**
    * Flipper sides whose full-raise flag rose this tick — some bat of the side
    * reached the top of its stroke while none was there before. The original's
    * `$23F5` (left) / `$23F6` (right) 0->FF edges, the up-stroke sound's trigger
@@ -831,6 +880,7 @@ export function createGame(map: TableMap, options?: Partial<GameOptions>): Game 
     autoLaunchCountdown: 0,
     ballsLocked: 0,
     scoring: createScoringState(),
+    bonus: null,
     modeState: modes === null ? null : createModeState(modes),
     modeMessages: [],
     laneBallId: null,
@@ -872,6 +922,9 @@ export function startGame(game: Game): void {
   // an award is a first hit or a repeat are per GAME, and a new game must not
   // inherit the last one's.
   game.scoring = createScoringState();
+  // Whatever the last game's final ball was still counting out, it is not this
+  // game's: the accumulator behind it has just been replaced.
+  game.bonus = null;
   // A fresh mission machine for the same reason: the DONE bits that say which
   // shots a player has already finished are per game, so a new game must not
   // start with half the table already completed.
@@ -998,11 +1051,36 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     musicCues: [],
     justTilted: false,
     gameOver: false,
+    bonus: null,
     flipperRaised: [],
     flipperRested: [],
   };
 
   if (game.phase !== "in-play" || game.paused) return idle;
+
+  let gameOver = false;
+
+  // ---- the end-of-ball bonus ---------------------------------------------
+  //
+  // Before the serve, because the lane stays shut for the whole of it: the
+  // original's `$5136` is called from the ball-end state and does not return
+  // until its last panel has run out its frames, and only then does the state
+  // machine go on to pick the next ball. See `bonus.ts` for the routine.
+  //
+  // The key argument is `$D00B`, the last key-down byte, which `$51B2` clears
+  // once before the table routine and which `$5230` reads to cut a panel short.
+  // Every control counts, because the machine's byte is written by the KEYBOARD
+  // HANDLER (+0x000850) and not by the game: on film a DEL press — inert during
+  // play — dismissed the panel exactly as ENTER and SHIFT did.
+  if (game.bonus !== null) {
+    stepBonusPhase(game.bonus, anyControlPressed(snapshot));
+    if (bonusPhaseFinished(game.bonus)) {
+      // `$51DA`: one `ABCD` chain, once, after the display and not during it.
+      addPackedBcd(game.scoring.score, game.bonus.total);
+      game.bonus = null;
+      gameOver = endBallAfterBonus(game);
+    }
+  }
 
   // ---- serve -------------------------------------------------------------
   //
@@ -1018,7 +1096,7 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
   if (game.tilt.tilted) game.pendingServes = 0;
 
   let served = false;
-  if (game.laneBallId === null) {
+  if (game.laneBallId === null && game.bonus === null) {
     const owed = game.pendingServes > 0;
     // A SAUCER THAT IS ABOUT TO SPIT THE BALL BACK IS NOT AN EMPTY TABLE.
     //
@@ -1370,7 +1448,6 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
   if (search.swallowed.length > 0) pruneInactiveBalls(game.balls);
 
   // ---- drain -------------------------------------------------------------
-  let gameOver = false;
   const drained = lost.length === 0 ? step.drained : [...step.drained, ...lost];
   if (drained.length > 0) {
     if (game.laneBallId !== null && drained.includes(game.laneBallId)) {
@@ -1398,12 +1475,16 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
       }
       game.modeMessages = [];
       game.multiball = false;
+      // THE BONUS IS READ BEFORE THE TILT IS CLEARED, because the machine does:
+      // `jsr $5136` at +0x00504C tests `$23ED`, and `$5052` clears it only after
+      // the call has returned. Reading the flag here and keeping the answer in
+      // the phase is the same test one tick earlier, and it leaves the tilt
+      // reset exactly where it already was.
+      game.bonus = beginBonusPhase(game.scoring, game.tilt.tilted);
       game.tilt = resetTiltForNewBall();
-      game.serveCountdown = game.options.serveDelayTicks;
-      if (game.ballsServed >= game.options.ballsPerGame) {
-        game.phase = "game-over";
-        gameOver = true;
-      }
+      // A tilted ball forfeits and the machine goes straight on — no multiply,
+      // no panel, not even "NO BONUS". Everything else waits for the count.
+      if (game.bonus === null) gameOver = endBallAfterBonus(game);
     }
   }
 
@@ -1439,8 +1520,60 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     musicCues: modeTick.musicCues,
     justTilted,
     gameOver,
+    bonus: bonusViewOf(game),
     flipperRaised,
     flipperRested,
+  };
+}
+
+/**
+ * True on a tick any control went down: this port's `$D00B`.
+ *
+ * The original's byte is written by the KEYBOARD HANDLER on every key-down
+ * (+0x000850, `btst #7,d0 / bne` throwing away the key-up half), not by the
+ * game, so every key the cabinet has counts and not merely the ones in play
+ * mean something. Every control here, for the same reason.
+ */
+function anyControlPressed(snapshot: ControlSnapshot): boolean {
+  for (const control of CONTROLS) {
+    if (snapshot.controls[control].pressed) return true;
+  }
+  return false;
+}
+
+/**
+ * Everything the ball-end chain does once the bonus has been paid.
+ *
+ * The order is `$5044`'s: the bonus first (its caller), then `$427C` clearing
+ * the accumulator and the multiplier unless the holds veto them (+0x0050D4),
+ * then the next ball. The game-over test is `$5090`, and it too is downstream of
+ * the bonus — the last ball's bonus is paid before the game ends, which is what
+ * the film shows when "NO BONUS" is followed by "GAME OVER".
+ *
+ * Answers whether the game ended.
+ */
+function endBallAfterBonus(game: Game): boolean {
+  clearBonusForNewBall(game.scoring);
+  game.serveCountdown = game.options.serveDelayTicks;
+  if (game.ballsServed >= game.options.ballsPerGame) {
+    game.phase = "game-over";
+    return true;
+  }
+  return false;
+}
+
+/** What the panel should be showing this tick, or null when no bonus is up. */
+function bonusViewOf(game: Game): BonusView | null {
+  const phase = game.bonus;
+  if (phase === null || bonusStage(phase) === null) return null;
+  return {
+    stage: bonusStage(phase) ?? "none",
+    caption: bonusCaption(phase),
+    // The zero panel is a caption and nothing else: `$2B84` draws "NO BONUS"
+    // and never calls the number drawer.
+    value: bonusStage(phase) === "none" ? null : bonusValue(phase),
+    multiplier: bonusMultiplierCaption(phase),
+    multiplierLit: bonusMultiplierLit(phase),
   };
 }
 
@@ -1598,6 +1731,14 @@ function runModes(game: Game, awards: readonly Award[]): ModeTickReport {
     addToBcdField(game.scoring.score, award.score);
     addToBcdField(game.scoring.bonus, award.bonus);
   }
+  // The three player-record award effects the mission machine reports rather
+  // than applies, because the record belongs to the scoring layer: effect 5
+  // SETS the bonus multiplier to the element's own +$34, effects 2 and 8 arm
+  // the one-ball holds `clearBonusForNewBall` tests. See `mode-vm.ts`.
+  if (report.bonusMultiplier >= 0) game.scoring.multiplier = report.bonusMultiplier;
+  if (report.holdBonus) game.scoring.holdBonus = true;
+  if (report.holdMultiplier) game.scoring.holdMultiplier = true;
+
   // The banner is the last thing the mission said, and it goes away with the
   // mission: a display left showing "SHOOT ALL TERRORISTS" after the mode has
   // ended is worse than showing nothing.
@@ -2344,8 +2485,18 @@ export interface GameDebugState {
   readonly ballsLocked: number;
   /** Player score, read back out of the packed-BCD field. */
   readonly score: number;
-  /** Player bonus. Zero throughout the shipped data; see `scoring.ts`. */
+  /** The bonus accumulator, read back out of the packed-BCD field. */
   readonly bonus: number;
+  /** The player record's `+$12`: what the end-of-ball bonus is multiplied by. */
+  readonly bonusMultiplier: number;
+  /**
+   * The end-of-ball bonus panel up right now, or null.
+   *
+   * In the snapshot so the simulation pin covers the phase itself and not only
+   * the score it eventually pays: a change that quietly shortened or skipped a
+   * panel would otherwise show up as nothing until a serve moved.
+   */
+  readonly bonusPhase: BonusView | null;
   /** Device id to ball id for every occupied saucer, in table order. */
   readonly locks: readonly { readonly deviceId: string; readonly ballId: number }[];
   /**
@@ -2422,6 +2573,8 @@ export function debugSnapshot(game: Game): GameDebugState {
     ballsLocked: game.ballsLocked,
     score: readBcdField(game.scoring.score),
     bonus: readBcdField(game.scoring.bonus),
+    bonusMultiplier: game.scoring.multiplier,
+    bonusPhase: bonusViewOf(game),
     // Built from the bank's declared device order, never from the map's
     // iteration order, so this stays a determinism digest.
     locks: game.locks.locks.flatMap((device) => {
@@ -2537,9 +2690,18 @@ function statusLine(game: Game, scoreOnPanel: boolean): string {
   // The original's own attract line reads "RETURN LAUNCHES BALL"; the fixed
   // kick has no charge to meter, so the prompt is the whole of the display.
   const plunger = game.laneBallId === null ? "" : "  ENTER LAUNCHES";
+  // While the bonus counts out, the whole line is the bonus: the machine's own
+  // display shows nothing else during it, and this one has no ball to describe.
+  const view = bonusViewOf(game);
+  if (view !== null) {
+    const figure = view.value === null ? "" : `  ${view.value.toLocaleString("en-US")}`;
+    const lit = view.multiplierLit ? `${view.multiplier}  ` : "";
+    return `${lit}${view.caption}${figure}`;
+  }
   // Digits straight out of the BCD field: what is displayed is what is stored.
   const bonus = readBcdField(game.scoring.bonus);
-  const bonusText = bonus === 0 ? "" : `  BONUS ${formatBcdField(game.scoring.bonus)}`;
+  const times = game.scoring.multiplier >= 2 ? ` X${game.scoring.multiplier}` : "";
+  const bonusText = bonus === 0 ? "" : `  BONUS ${formatBcdField(game.scoring.bonus)}${times}`;
   const scoreText = scoreOnPanel ? "" : `  ${formatBcdField(game.scoring.score)}`;
   return `BALL ${ball} OF ${game.options.ballsPerGame}${scoreText}${bonusText}${plunger}`;
 }
