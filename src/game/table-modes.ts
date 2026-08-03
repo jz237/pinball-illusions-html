@@ -58,11 +58,11 @@ export const TABLE_MODES_BASE_PATH = "generated/tables/";
  *   e  element index, -1 when the operand was NULL
  *   s  script index                    m  message index
  *   o  a record this decode has not identified; always -1 here
- *   l  a count-ladder index (SET_COUNT), -1 when the record hosts no ladder
+ *   n  a progress-counter index (SET_COUNT), -1 when the record is not one
  *   w  a signed word                   c  a branch target, -1 when it dangles
  *   i  a 32-bit immediate
  */
-export type ModeOperandKind = "e" | "s" | "m" | "o" | "l" | "w" | "c" | "i";
+export type ModeOperandKind = "e" | "s" | "m" | "o" | "n" | "w" | "c" | "i";
 
 export interface ModeOpcodeInfo {
   readonly index: number;
@@ -126,16 +126,86 @@ export interface ModeElement {
   readonly soundAward: boolean;
   readonly displayStart: number;
   readonly displayAward: number;
-  /** Award effect 21's ladder step: the script queued when the count is reached. */
-  readonly counterScript: number;
-  readonly counterTarget: number;
+  /**
+   * The PROGRESS COUNTER this element's award effect drives: an index into
+   * `TableModes.counters`, or -1 when the element's +$34 is not one.
+   *
+   * The count lives in the RECORD, not in the element — award effects 6, 16, 18
+   * and 21 all reach `+$06 + 2p` through `movea.l $34(a2),a0` and effect 24
+   * decrements the same word — so every element pointing at one record shares
+   * one count. Law 'n Justice's eight combo elements (28..35) all name counter
+   * 12, and that is the whole of the combo rule's bookkeeping.
+   *
+   * -1 is not merely "no counter": award effect 17's handler (+0x00613A) queues
+   * the SAME +$34 as an event record and effect 5's reads it as an immediate
+   * multiplier, so the field is only a counter where the descriptor's own
+   * counter list says it is. Law 'n Justice's element 11 is the corpus's live
+   * example — its +$34 is a script, and the old per-element reading filed it as
+   * a counter with a cap of 9.
+   */
+  readonly counter: number;
   /**
    * Award effect 6's count ladder: index into `TableModes.ladders`, or -1.
    *
-   * Elements sharing one counter record share one ladder — BabeWatch's three
-   * lock-lit lamps all drive the same per-game lock counter.
+   * The same ladder as `counters[counter].ladder` where this element's effect is
+   * 6, and -1 otherwise. Kept as its own field because it means "the ladder THIS
+   * element's award walks", which is what the multiball-ladder derivation below
+   * and the lock tests ask about; the record's own ladder is on the counter.
    */
   readonly ladder: number;
+}
+
+/**
+ * ONE PROGRESS-COUNTER RECORD, off the descriptor's own list at +$40.
+ *
+ * These are the machine's counters: the multiball lock tallies, the mission
+ * ladders, and — on Law 'n Justice and Extreme Sports — the COMBO count the
+ * end-of-ball bonus pays for. The exporter's header has the whole record map and
+ * the three routines that walk the list; the fields here are the ones the
+ * simulation needs.
+ */
+export interface ModeCounter {
+  readonly index: number;
+  /** The record's flags byte at +$00. See `keepAcrossBall`. */
+  readonly flags: number;
+  /** +$02, what both reset walks write into the count. */
+  readonly reset: number;
+  /**
+   * +$04, the ceiling. ZERO MEANS UNCAPPED, and that is load-bearing in both
+   * directions: `tst.w d2 / beq` at +0x005E66 and +0x005FB4 skips the "already
+   * finished" test, and +0x005E76 / +0x005FC4 then skip the continuation, so an
+   * uncapped counter counts for ever and NEVER fires its `continuation`.
+   */
+  readonly cap: number;
+  /**
+   * The record's packed-BCD step at +$32..$37, as a decimal number.
+   *
+   * What one tick of this counter is worth to the award effects that pay it
+   * (11, 16, 18 — `$5FE4` adds it into the record's own accumulator). Carried
+   * for the same reason the combo value is: Law 'n Justice's combo record's step
+   * is 1,000,000, the same figure its bonus routine multiplies the combo count
+   * by, from a different place in the package.
+   */
+  readonly step: number;
+  /** +$48, the script queued when the count reaches `cap`, or -1. */
+  readonly continuation: number;
+  /** The launcher table inline at +$50: index into `ladders`, or -1. */
+  readonly ladder: number;
+  /**
+   * DECODED: the count survives a drain.
+   *
+   * True when the flags byte carries bit 0 or bit 3. The per-BALL walk at
+   * `main.seg00 +0x00412C` (one caller, `+0x0050BC`) tests bit 0 at +0x004146
+   * and branches away to rebuild the record's BCD accumulator, never reaching
+   * the reset; and tests bit 3 at +0x004158 and branches straight to the next
+   * record. Everything else has both of its per-player counts written back to
+   * `reset` for the player whose ball just ended.
+   *
+   * The per-GAME walk at `+0x0040CA` (one caller, `+0x0045AC`, inside NEW GAME)
+   * has no such test and resets all eight player slots of every record, so this
+   * flag is exactly the difference between a per-game counter and a per-ball one.
+   */
+  readonly keepAcrossBall: boolean;
 }
 
 /**
@@ -230,6 +300,20 @@ export interface TableModes {
   readonly armElements: readonly number[];
   /** The decoded effect-6 count ladders. See `ModeLadder`. */
   readonly ladders: readonly ModeLadder[];
+  /** The progress-counter records, in the descriptor's own list order. */
+  readonly counters: readonly ModeCounter[];
+  /**
+   * DECODED: the counter the end-of-ball bonus pays a combo term for, or -1.
+   *
+   * Law 'n Justice's is counter 12 and Extreme Sports' counter 13; BABEWATCH HAS
+   * NONE, and that is the machine's own doing rather than a hole in the decode —
+   * its bonus routine loads the player index at h4+0x2AC4 and immediately throws
+   * it away with `moveq #$0,d0`, so its combo block is 208 bytes of unreachable
+   * code. The exporter's `comboCounterOf` reads the routine's own
+   * `move.w (bd,PC,d0.w*2),d0` to find the record and refuses anything that is
+   * not on the counter list.
+   */
+  readonly comboCounter: number;
   /**
    * DECODED: the elements armed — and their START lamps lit — at game start.
    *
@@ -324,7 +408,7 @@ function requireArray(value: unknown, label: string): readonly unknown[] {
   return value;
 }
 
-const OPERAND_KINDS: readonly string[] = ["e", "s", "m", "o", "l", "w", "c", "i"];
+const OPERAND_KINDS: readonly string[] = ["e", "s", "m", "o", "n", "w", "c", "i"];
 
 /** The two opcodes that bracket a mission's use of an arm element. */
 const OPCODE_COMPLETE = 3;
@@ -421,6 +505,25 @@ export function parseTableModesDocument(doc: TableModesDocument): TableModes {
     ladders.push(Object.freeze({ index, wrap, entries: Object.freeze(entries) }));
   }
 
+  // --- counters ------------------------------------------------------------
+  const counters: ModeCounter[] = [];
+  for (const [at, entry] of requireArray(raw["counters"] ?? [], `${label} counters`).entries()) {
+    const item = entry as Record<string, unknown>;
+    const where = `${label} counter ${at}`;
+    counters.push(
+      Object.freeze({
+        index: requireWholeNumber(item["index"], `${where} index`, at, at),
+        flags: requireWholeNumber(item["flags"], `${where} flags`, 0, 255),
+        reset: requireWholeNumber(item["reset"], `${where} reset`, 0, 0xffff),
+        cap: requireWholeNumber(item["cap"], `${where} cap`, 0, 0xffff),
+        step: requireWholeNumber(item["step"], `${where} step`, 0, Number.MAX_SAFE_INTEGER),
+        continuation: requireWholeNumber(item["continuation"], `${where} continuation`, -1, scriptCount - 1),
+        ladder: requireWholeNumber(item["ladder"], `${where} ladder`, -1, ladders.length - 1),
+        keepAcrossBall: item["keepAcrossBall"] === true,
+      }),
+    );
+  }
+
   // --- elements ------------------------------------------------------------
   const rawElements = requireArray(raw["elements"], `${label} elements`);
   const elements: ModeElement[] = [];
@@ -444,8 +547,7 @@ export function parseTableModesDocument(doc: TableModesDocument): TableModes {
         soundAward: item["soundAward"] === true,
         displayStart,
         displayAward,
-        counterScript: requireWholeNumber(item["counterScript"], `${where} counterScript`, -1, 0xffff),
-        counterTarget: requireWholeNumber(item["counterTarget"], `${where} counterTarget`, 0, 0xffff),
+        counter: requireWholeNumber(item["counter"] ?? -1, `${where} counter`, -1, counters.length - 1),
         ladder: requireWholeNumber(item["ladder"] ?? -1, `${where} ladder`, -1, ladders.length - 1),
       }),
     );
@@ -494,8 +596,8 @@ export function parseTableModesDocument(doc: TableModesDocument): TableModes {
         if (kind === "m" && (value < -1 || value >= messages.length)) {
           throw new Error(`${where} names message ${value}, and there are ${messages.length}`);
         }
-        if (kind === "l" && (value < -1 || value >= ladders.length)) {
-          throw new Error(`${where} names ladder ${value}, and there are ${ladders.length}`);
+        if (kind === "n" && (value < -1 || value >= counters.length)) {
+          throw new Error(`${where} names counter ${value}, and there are ${counters.length}`);
         }
         // -1 is a branch the record does not contain: several missions share one
         // timeout label that lives outside their own code. The runtime ends the
@@ -520,11 +622,14 @@ export function parseTableModesDocument(doc: TableModesDocument): TableModes {
     });
   });
 
-  for (const [at, element] of elements.entries()) {
-    if (element.counterScript >= scriptCount) {
-      throw new Error(`${label} element ${at} names counter script ${element.counterScript}`);
-    }
-  }
+  // The combo counter, checked against the pool it indexes. -1 is legitimate —
+  // BabeWatch's combo block is dead code — so only an out-of-range index throws.
+  const comboCounter = requireWholeNumber(
+    raw["comboCounter"] ?? -1,
+    `${label} comboCounter`,
+    -1,
+    counters.length - 1,
+  );
 
   // --- missions ------------------------------------------------------------
   const missions: ModeMission[] = [];
@@ -663,6 +768,8 @@ export function parseTableModesDocument(doc: TableModesDocument): TableModes {
     selectable: Object.freeze(selectable),
     armElements: Object.freeze(armElements),
     ladders: Object.freeze(ladders),
+    counters: Object.freeze(counters),
+    comboCounter,
     litAtGameStart: Object.freeze(litAtGameStart),
     keepArmedAcrossBall: Object.freeze(keepArmedAcrossBall),
     keepDoneAcrossBall: Object.freeze(keepDoneAcrossBall),

@@ -186,9 +186,45 @@ const OP_SET_LOOP = 31;
 /** Award effects with decoded handlers. Everything else is left alone. */
 const EFFECT_HOLD_BONUS = 2;
 const EFFECT_SET_MULTIPLIER = 5;
+/**
+ * THE FOUR EFFECTS THAT STEP A PROGRESS COUNTER, and one that steps it back.
+ *
+ * The dispatch table at 0x5D0E is TWENTY-EIGHT LONGWORDS — 0x5D0E + 4*28 is
+ * 0x5D7E, which is effect 0's own handler, and the words past it are not
+ * relocated — and five of the twenty-eight reach `+$06 + 2p` of the record at the
+ * element's +$34:
+ *
+ *      6  0x5E5A  count++, total++, continuation at the cap, then the launcher
+ *                 walk at 0x5EAA WITH the launch (0x5E9E queues entry+$04)
+ *     16  0x5E4E  `bsr $5FE4` (the record's BCD accumulator += its step),
+ *                 `bsr $5E5A` (all of the above), `bsr $61AA` (the accumulator
+ *                 is paid to the player's SCORE through $6BCC)
+ *     18  0x5E46  the first two of those three, without the score payment
+ *     21  0x5FA8  the same body as 0x5E5A and the same launcher walk, but its
+ *                 tail is `bsr.w $5EAA / rts` — the matched entry is NOT queued
+ *     24  0x6220  `tst.w $6(a0,d6.w*2) / beq` then subq #1 on both words
+ *
+ * SIXTEEN AND EIGHTEEN ARE WHY THIS EXISTS: Law 'n Justice's six combo shots are
+ * effect-16 elements, and until the count moved for them the combo term of the
+ * end-of-ball bonus could only ever be zero.
+ *
+ * WHAT IS DELIBERATELY LEFT OUT, and it is the other half of effects 11/16/18:
+ * the record's own packed-BCD ACCUMULATOR at +$3A..$3F, the STEP at +$32..$37
+ * that 0x5FE4 adds into it, the payment of the accumulator to the score at
+ * 0x61AA, the WINDOW TIMER effect 20 (0x620E) writes into +$26 and the per-frame
+ * service at 0x56D4 that clears the accumulator when it expires. That machinery
+ * is the combo's own SCORING — on Law 'n Justice a chain pays 1,000,000, then
+ * 2,000,000, then 3,000,000 while the 5- or 10-second window holds — and it is a
+ * separate feature from the COUNT, which is what the bonus needs and what this
+ * change delivers. `ModeCounter.step` carries the decoded per-tick value so the
+ * day it lands there is nothing left to decode.
+ */
 const EFFECT_COUNT_DISPATCH = 6;
-const EFFECT_HOLD_MULTIPLIER = 8;
+const EFFECT_COUNT_AND_PAY = 16;
+const EFFECT_COUNT_AND_ADD = 18;
 const EFFECT_ADVANCE_LADDER = 21;
+const EFFECT_COUNT_DOWN = 24;
+const EFFECT_HOLD_MULTIPLIER = 8;
 const EFFECT_ADD_TIME = 23;
 
 /**
@@ -239,20 +275,33 @@ export interface ModeState {
   readonly awardLit: Uint8Array;
   /** Frames left on an element's own countdown; 0 is "no timer". */
   readonly timers: Int32Array;
-  /** Award effect 21's progress count, per element. */
-  readonly counts: Int32Array;
   /**
-   * Award effect 6's per-ladder counters — the original's per-player words at
-   * counter-record +$16, the live multiball-lock count. Per GAME, never reset
-   * by a new ball: nothing in the engine resets these per ball (checked — the
-   * only writers are the effect-6 increment, the 0xFFFE wrap subtract and
-   * SET_COUNT). Whether a fresh GAME starts from zero is an unresolved residue
-   * — no code clearing the arrays was found, so either the table module is
-   * reloaded per game or the count persists across games in a session; this
-   * reconstruction takes the reload reading and starts each game at zero,
-   * which the disk image's zeroed fields support.
+   * PER COUNTER RECORD, the original's `+$06 + 2p`: the capped count.
+   *
+   * KEYED BY RECORD AND NOT BY ELEMENT, which is a correction rather than a
+   * refactor. Every effect in `EFFECT_COUNT_*` reaches this word through
+   * `movea.l $34(a2),a0`, so Law 'n Justice's eight combo elements share ONE
+   * count and its six effect-21 mugshot shots share another; the old per-element
+   * array gave each of them its own, and no shared counter could ever reach a cap.
    */
-  readonly ladderCounts: Int32Array;
+  readonly counterCounts: Int32Array;
+  /**
+   * PER COUNTER RECORD, the original's `+$16 + 2p`: the uncapped total.
+   *
+   * The second word every counting effect bumps, and the one the launcher walk
+   * at 0x5EAA reads — so THIS is the multiball lock count, not the capped one.
+   * The 0xFFFE wrap at 0x5F2A subtracts from it in place, which is why a ladder
+   * that has run its length starts over.
+   *
+   * WHETHER IT SURVIVES A DRAIN IS NOW DECODED and it is per record: the
+   * ball-start walk at +0x00412C writes `reset` into both words unless the
+   * record's flags carry bit 0 or bit 3 (`ModeCounter.keepAcrossBall`). Law 'n
+   * Justice's jail ladder and BabeWatch's lock ladder both carry bit 0 and are
+   * therefore per game, which is what this port already did for every ladder;
+   * the ones that do not — BabeWatch's counters 0, 2, 3, 12 and most of Extreme
+   * Sports' — now reset with the ball, as the machine's own walk does.
+   */
+  readonly counterTotals: Int32Array;
 
   /** The background ring at `$2396(a5)`; -1 is an empty slot. */
   readonly queue: Int32Array;
@@ -304,13 +353,19 @@ export function createModeState(modes: TableModes): ModeState {
   // arms — for every player — every element whose flags bit 1 is set, and
   // writes its countdown to -1. See `TableModes.litAtGameStart`.
   for (const element of modes.litAtGameStart) armed[element] = 1;
+  // And the game-start COUNTERS, +0x0040CA, called two instructions before it:
+  // every record's eight per-player slots take the record's own +$02, with no
+  // flag test of any kind. Most are zero; Law 'n Justice's counter 14 starts at
+  // three and Extreme Sports' counter 14 at five.
+  const counterCounts = new Int32Array(modes.counters.length);
+  for (const counter of modes.counters) counterCounts[counter.index] = counter.reset;
   return {
     armed,
     done: new Uint8Array(count),
     awardLit: new Uint8Array(count),
     timers: new Int32Array(count),
-    counts: new Int32Array(count),
-    ladderCounts: new Int32Array(modes.ladders.length),
+    counterCounts,
+    counterTotals: Int32Array.from(counterCounts),
     queue: new Int32Array(MODE_QUEUE_SLOTS).fill(-1),
     queueWrite: 0,
     queueRead: 0,
@@ -345,8 +400,15 @@ export function createModeState(modes: TableModes): ModeState {
  *
  * So a DONE bit is cleared by default and survives only where the table says
  * so, which is the opposite of what this function used to do (it never touched
- * `done` at all). The effect-6 ladder counters stay per game — nothing in the
- * engine resets them per ball.
+ * `done` at all).
+ *
+ * THE PROGRESS COUNTERS RESET HERE TOO, and that is new: `+0x0050BC` calls the
+ * counter walk `+0x00412C` six instructions before it calls this one's
+ * `+0x003F80`, and that walk writes each record's `reset` into both per-player
+ * words UNLESS the record's flags carry bit 0 or bit 3. See
+ * `ModeCounter.keepAcrossBall`. The old note here — "nothing in the engine
+ * resets them per ball" — was looking for a writer of the arrays and missing the
+ * walk that owns them.
  *
  * DIVERGENCE, STATED: `awardLit` (the lamp's +$05 always-on mask) is cleared
  * wholesale here. `+0x003F10` preserves it for lamps in a GROUP whose flags
@@ -363,6 +425,11 @@ export function resetModesForNewBall(modes: TableModes, state: ModeState): void 
     if (!keepDone.has(index)) state.done[index] = 0;
     if (!keepArmed.has(index)) state.armed[index] = 0;
     if (lit.has(index)) state.armed[index] = 1;
+  }
+  for (const counter of modes.counters) {
+    if (counter.keepAcrossBall) continue;
+    state.counterCounts[counter.index] = counter.reset;
+    state.counterTotals[counter.index] = counter.reset;
   }
   state.awardLit.fill(0);
   // The original writes $FFFF — "no countdown" — into +$2E for everything the
@@ -708,6 +775,64 @@ function awardElement(
 }
 
 /**
+ * THE LAUNCHER WALK, main.seg00 0x5EAA, on the record's UNCAPPED total.
+ *
+ * The walk compares `+$16 + 2p` against each ascending id; running off the
+ * 0xFFFE terminator subtracts the wrap word from the total in place (0x5F2A) and
+ * re-walks, which is why a finished ladder starts over. `launch` is the
+ * difference between the two callers: effect 6's tail at 0x5E9E queues the
+ * matched entry's launcher, effect 21's at 0x5FDE discards the result and only
+ * the ladder's own lamp bookkeeping (which this port does not model) happens.
+ */
+function walkLadder(modes: TableModes, state: ModeState, counterIndex: number, launch: boolean): void {
+  const counter = modes.counters[counterIndex];
+  const ladder = counter === undefined || counter.ladder < 0 ? undefined : modes.ladders[counter.ladder];
+  if (ladder === undefined || ladder.entries.length === 0) return;
+  let total = state.counterTotals[counterIndex] ?? 0;
+  // Bounded so a wrap word that cannot catch the total (or a wrap of zero, the
+  // 0xFFFF-terminated tables) ends the walk instead of spinning.
+  const lastId = ladder.entries[ladder.entries.length - 1]?.id ?? 0;
+  while (ladder.wrap > 0 && total > lastId) total -= ladder.wrap;
+  state.counterTotals[counterIndex] = total;
+  if (!launch) return;
+  const entry = ladder.entries.find((one) => one.id === total);
+  if (entry !== undefined) queueScript(state, entry.script);
+}
+
+/**
+ * The body 0x5E5A and 0x5FA8 share, byte for byte down to their last branch.
+ *
+ *     movea.l $34(a2),a0
+ *     move.w  $6(a0,d6.w*2),d0
+ *     move.w  $4(a0),d2          ; the cap
+ *     beq     +                  ; uncapped: never finished, never continues
+ *     cmp.w   d2,d0 / beq  rts   ; ALREADY AT THE CAP: nothing at all happens
+ *   + addq.w  #1,d0
+ *     move.w  d0,$6(a0,d6.w*2)
+ *     addq.w  #1,$16(a0,d6.w*2)
+ *     tst.w   d2 / beq  ladder    ; uncapped -> no continuation, ever
+ *     cmp.w   d2,d0 / bcs ladder  ; not there yet
+ *     move.l  $48(a0),d0 / beq / jsr $6C10
+ *
+ * so the continuation fires EXACTLY ONCE, on the award that reaches the cap, and
+ * the count then sticks. The old per-element reading fired it every
+ * `max(1, cap)` awards and reset the count to zero afterwards, which for the
+ * corpus's uncapped counters meant firing on every single award.
+ */
+function bumpCounter(modes: TableModes, state: ModeState, counterIndex: number, launch: boolean): void {
+  const counter = modes.counters[counterIndex];
+  if (counter === undefined) return;
+  const count = state.counterCounts[counterIndex] ?? 0;
+  if (counter.cap !== 0 && count === counter.cap) return;
+  state.counterCounts[counterIndex] = count + 1;
+  state.counterTotals[counterIndex] = (state.counterTotals[counterIndex] ?? 0) + 1;
+  if (counter.cap !== 0 && count + 1 >= counter.cap && counter.continuation >= 0) {
+    queueScript(state, counter.continuation);
+  }
+  walkLadder(modes, state, counterIndex, launch);
+}
+
+/**
  * The award-effect table at 0x5D0E. Six of its entries are decoded well
  * enough to run and all six matter — three for progression, three for the
  * end-of-ball bonus; the rest are left alone.
@@ -726,18 +851,23 @@ function awardElement(
  *       shape as effect 2 for the other field. Law 'n Justice's element 64.
  *
  *    6, handler 0x5E5A — the COUNT DISPATCH, and the decoded multiball lock
- *       rule. Increments the per-game counter shared by every element pointing
- *       at the same record, then walks the launcher table inline at the
- *       record's +$50 (0x5EAA): the entry whose ascending id equals the count
- *       has its script queued through $6C10, and walking past the 0xFFFE
- *       terminator subtracts the wrap word from the count and re-walks
- *       (0x5F26). The Nth qualifying lock therefore runs the Nth launcher —
- *       "BALL 1 LOCKED" through the multiball MODE_STARTs and the "n MORE TO
- *       START MODE" alternates are all just positions on one linear per-game
- *       counter. See `ModeLadder` in table-modes.ts for the decoded tables.
- *   21, handler 0x5FA8 — the LADDER. Increments the element's progress count and,
- *       when the target in the counter record is reached, queues the next step.
- *       This is how a mission's later shots get armed at all.
+ *       rule. Steps the counter record shared by every element pointing at it,
+ *       then walks the launcher table inline at the record's +$50 (0x5EAA): the
+ *       entry whose ascending id equals the record's TOTAL has its script queued
+ *       through $6C10, and walking past the 0xFFFE terminator subtracts the wrap
+ *       word from the total and re-walks (0x5F26). The Nth qualifying lock
+ *       therefore runs the Nth launcher — "BALL 1 LOCKED" through the multiball
+ *       MODE_STARTs and the "n MORE TO START MODE" alternates are all just
+ *       positions on one linear counter. See `ModeLadder` in table-modes.ts.
+ *   16, handler 0x5E4E and 18, handler 0x5E46 — the COMBO effects. Both step the
+ *       same record the same way; 16 additionally pays the record's own BCD
+ *       accumulator to the score, which this port does not yet do. See the
+ *       `EFFECT_COUNT_*` note for exactly what is and is not reproduced.
+ *   21, handler 0x5FA8 — the LADDER. Steps the record and, when the count
+ *       reaches the record's cap, queues its +$48 continuation ONCE. This is how
+ *       a mission's later shots get armed at all.
+ *   24, handler 0x6220 — steps the same record BACK, and Law 'n Justice's
+ *       element 82 is the corpus's one user: its counter 14 runs 3 up to 6.
  *   23, handler 0x6024 — ADD TIME to the running mode timer. Law 'n Justice's
  *       Bumper Mania says so on the display: "BUMPERS ADD" / "TIME".
  */
@@ -764,33 +894,57 @@ function applyAwardEffect(
     out.holdMultiplier = true;
     return;
   }
-  if (element.effect === EFFECT_COUNT_DISPATCH) {
-    const ladder = element.ladder < 0 ? undefined : modes.ladders[element.ladder];
-    if (ladder === undefined || ladder.entries.length === 0) return;
-    let count = (state.ladderCounts[element.ladder] ?? 0) + 1;
-    // The wrap, exactly as 0x5F26 does it: run off the end, subtract, re-walk.
-    // Bounded so a wrap word that cannot catch the count (or a wrap of zero,
-    // the 0xFFFF-terminated tables) ends the walk instead of spinning.
-    const lastId = ladder.entries[ladder.entries.length - 1]?.id ?? 0;
-    while (ladder.wrap > 0 && count > lastId) count -= ladder.wrap;
-    state.ladderCounts[element.ladder] = count;
-    const entry = ladder.entries.find((one) => one.id === count);
-    if (entry !== undefined) queueScript(state, entry.script);
-    return;
-  }
-  if (element.effect === EFFECT_ADVANCE_LADDER) {
-    state.counts[index] = (state.counts[index] ?? 0) + 1;
-    if (element.counterScript >= 0 && (state.counts[index] ?? 0) >= Math.max(1, element.counterTarget)) {
-      state.counts[index] = 0;
-      queueScript(state, element.counterScript);
+  // The five counting effects, all on the record the element's +$34 names.
+  if (element.counter >= 0) {
+    if (
+      element.effect === EFFECT_COUNT_DISPATCH ||
+      element.effect === EFFECT_COUNT_AND_PAY ||
+      element.effect === EFFECT_COUNT_AND_ADD
+    ) {
+      bumpCounter(modes, state, element.counter, true);
+      return;
     }
-    return;
+    if (element.effect === EFFECT_ADVANCE_LADDER) {
+      bumpCounter(modes, state, element.counter, false);
+      return;
+    }
+    if (element.effect === EFFECT_COUNT_DOWN) {
+      // 0x6220: `tst.w $6(a0,d6.w*2) / beq` guards both decrements, so a count
+      // already at zero stays there and the total does not go negative either.
+      const count = state.counterCounts[element.counter] ?? 0;
+      if (count !== 0) {
+        state.counterCounts[element.counter] = count - 1;
+        state.counterTotals[element.counter] = (state.counterTotals[element.counter] ?? 0) - 1;
+      }
+      return;
+    }
   }
   if (element.effect === EFFECT_ADD_TIME && state.mission >= 0 && state.waitTicks > 0) {
     state.waitTicks += TICKS_PER_SECOND;
     return;
   }
-  void modes;
+  void index;
+}
+
+/**
+ * THE COMBO COUNT the end-of-ball bonus pays for, for the current player.
+ *
+ * The bonus routine reads exactly this word — `move.w $dbe(a5),d0` then
+ * `move.w (bd,PC,d0.w*2),d0` resolving to the counter record's `+$06 + 2p` (Law
+ * 'n Justice h4+0x2A62 -> h4+0x4550, Extreme Sports h4+0x2A52 -> h4+0x37FE) —
+ * and multiplies it by the six packed-BCD bytes at h4+0x2BA2 / +0x2B92, which are
+ * `00 00 01 00 00 00` on both. Zero when the table has no live combo counter,
+ * which on BabeWatch is the machine's own answer and not a gap: see
+ * `TableModes.comboCounter`.
+ *
+ * READ IT BEFORE THE BALL-START RESET. `jsr $5136` at +0x00504C runs the whole
+ * bonus, panels and all, and only then does `+0x0050BC` call the counter walk;
+ * on Extreme Sports, whose combo counter carries neither carry-across bit, the
+ * two orders give different answers.
+ */
+export function comboCount(modes: TableModes, state: ModeState): number {
+  if (modes.comboCounter < 0) return 0;
+  return Math.max(0, state.counterCounts[modes.comboCounter] ?? 0);
 }
 
 /**
@@ -959,15 +1113,16 @@ function step(
     }
 
     case OP_SET_COUNT: {
-      // DECODED: 0x5C64 writes the operand word into both per-player counts of
-      // the named counter record. Where the record hosts a launcher table the
-      // export names the ladder, and this is how BabeWatch's jackpot missions
-      // arm the multiball tiers — SET_COUNT 0/1/3/6 puts the lock counter at
-      // the base of tiers 1..4. A SET_COUNT whose record is not a decoded
-      // ladder still has nowhere to go and stays counted as unimplemented.
-      const ladder = args[0] ?? -1;
-      if (ladder >= 0 && ladder < state.ladderCounts.length) {
-        state.ladderCounts[ladder] = args[1] ?? 0;
+      // DECODED: 0x5C64 writes the operand word into BOTH per-player words of
+      // the named counter record, and this is how BabeWatch's jackpot missions
+      // arm the multiball tiers — SET_COUNT 0/1/3/6 puts the lock counter at the
+      // base of tiers 1..4. The operand now names the record itself rather than
+      // the ladder it happens to host; a pointer that is not on the descriptor's
+      // counter list arrives as -1 and stays counted as unimplemented.
+      const counter = args[0] ?? -1;
+      if (counter >= 0 && counter < state.counterCounts.length) {
+        state.counterCounts[counter] = args[1] ?? 0;
+        state.counterTotals[counter] = args[1] ?? 0;
         return next;
       }
       out.unimplemented += 1;

@@ -140,14 +140,69 @@ const DEVICE_SLOTS = 160;
 const DEVICE_ID_BASE = 32;
 const ZONE_RECORD_BYTES = 14;
 const BCD_BYTES = 6;
-/** Entries in the award-effect dispatch table at main.seg00 0x5D0E. */
-const MAX_AWARD_EFFECT = 63;
+/**
+ * The highest award-effect index there is.
+ *
+ * The dispatch is `move.l ($04,PC,d0.w*4),-(a7)` at +0x005D08 — extension word
+ * 0x0404, whose scale bits are 10 and which Capstone drops, the same trap the
+ * opcode dispatch note above records — so the table at 0x5D0E is LONGWORDS
+ * indexed by the element's +$2C. It runs to 0x5D0E + 4*28 = 0x5D7E, which is
+ * effect 0's own handler and the first word the package stops relocating.
+ * TWENTY-EIGHT EFFECTS, 0..27.
+ *
+ * This bound used to read 63, counting the table in words. Tightening it changes
+ * nothing — all three documents export byte-identically either way — but it is
+ * the refutation `elementLooksReal` leans on, and a bound twice the size of the
+ * table is half a test.
+ */
+const MAX_AWARD_EFFECT = 27;
 
 /** Descriptor offsets, as byte offsets into slot 0's body. */
 const HEADER_LOWER_DEVICES = 0x10;
 const HEADER_LOWER_ZONES = 0x14;
 const HEADER_UPPER_DEVICES = 0x28;
 const HEADER_UPPER_ZONES = 0x2c;
+/**
+ * THE COUNTER LIST — descriptor +$40, a NULL-terminated array of longwords.
+ *
+ * This is the machine's own register of progress-counter records, and it is what
+ * makes the counter a first-class object here rather than "whatever an element's
+ * +$34 happens to point at". The engine copies the 152-byte descriptor to
+ * `$22EE(a5)`, so +$40 is `$232E(a5)`, and exactly three routines walk it:
+ *
+ *     0040CA  movea.l $232e(a5),a0     ; GAME START, from `jsr $40CA` at +0x0045AC
+ *     0040CE  LOOP: move.l (a0)+,d0 / beq        ; NULL terminates
+ *     0040D4  move.l $28(a1),$30(a1) / move.l $2c(a1),$34(a1)
+ *     0040E0  move.w $2(a1),d0 / moveq #$7,d1
+ *     0040E6  move.w d0,$6(a1,d1.w*2) / move.w d0,$16(a1,d1.w*2) / dbra
+ *     0040F2  clr.l $38(a1) / clr.l $3c(a1) / clr.w $26(a1)
+ *     0040FE  lea $50(a1),a2 / clr.b $2(a2) per ladder entry
+ *
+ *     00412C  movea.l $232e(a5),a0     ; BALL START, from `jsr $412C` at +0x0050BC
+ *     004136  clr.l $38(a1) / clr.l $3c(a1) / clr.w $26(a1)
+ *     004142  move.w $dbe(a5),d1       ; the CURRENT player only
+ *     004146  btst.b #$0,(a1) / bne $417C     ; FLAG BIT 0 -> keep the count
+ *     004158  btst.b #$3,(a1) / bne $4130     ; FLAG BIT 3 -> keep the count
+ *     00415E  move.w $2(a1),d0
+ *     004162  move.w d0,$6(a1,d1.w*2) / move.w d0,$16(a1,d1.w*2)
+ *
+ *     0056D4  movea.l $232e(a5),a0     ; the per-frame +$26 countdown service
+ *
+ * so a counter's per-player count is reset for EVERY player at game start and for
+ * the current player at ball start UNLESS the flags byte carries bit 0 or bit 3.
+ * Both are quoted on `COUNTER_FLAG_*` below.
+ *
+ * Capstone drops the scale field of a brief extension word — the same trap the
+ * opcode dispatch note above records — so `$6(a1,d1.w)` in its output is really
+ * `$6(a1,d1.w*2)`: extension word 0x1206 has scale bits 01. That is what makes
+ * the arrays WORD arrays of eight players at +$06..+$15 and +$16..+$25, and it is
+ * corroborated three ways: `moveq #$7,d1` above walks eight slots, the game-start
+ * chain at +0x00457A builds eight player records of $16 bytes at `$dc6(a5)`, and
+ * the bonus routine's own read (see `comboCounterOf`) scales `$dbe(a5)` by two.
+ */
+const HEADER_COUNTERS = 0x40;
+/** The table's own end-of-ball bonus routine, called at `$51BE`. See `comboCounterOf`. */
+const HEADER_BONUS_ROUTINE = 0x80;
 
 /** Element record field offsets. Each is quoted to its instruction above. */
 const ELEMENT_FLAGS = 0x00;
@@ -173,8 +228,45 @@ const ELEMENT_COUNTER = 0x34;
  * not a multiplier).
  */
 const EFFECT_SET_MULTIPLIER = 5;
+
+/**
+ * THE PROGRESS-COUNTER RECORD, decoded field by field from its users.
+ *
+ *   +$00 b  FLAGS. Bit 0 (+0x004146) rebuilds the BCD accumulator from the count
+ *           at ball start and, by branching, SKIPS the count reset. Bit 1
+ *           (+0x005EB4) says the record hosts a launcher table at +$50. Bit 2
+ *           (+0x005E94) marks the fired entry for this player. Bit 3
+ *           (+0x004158) skips the count reset outright.
+ *   +$02 w  RESET VALUE — what both reset walks write into the counts.
+ *   +$04 w  CAP. 0 means uncapped: `tst.w d2 / beq` at +0x005E66 and +0x005FB4
+ *           skip the equality test, and +0x005E76 / +0x005FC4 then skip the
+ *           continuation entirely, so an UNCAPPED COUNTER NEVER FIRES ITS +$48.
+ *   +$06 + 2p  w  per-player COUNT, eight slots.
+ *   +$16 + 2p  w  per-player TOTAL, eight slots. Incremented beside the count and
+ *           never capped; it is the word the launcher walk at +0x005EAA reads and
+ *           the one the 0xFFFE wrap subtracts from at +0x005F2A.
+ *   +$26 w  countdown, serviced at +0x0056D4.
+ *   +$28..$2F  saved copy of +$30..$37, restored by both resets.
+ *   +$30..$37  8-byte slot whose packed-BCD STEP is +$32..$37 (`lea $38(a0),a1`
+ *           then six backwards `abcd` at +0x005FE4).
+ *   +$38..$3F  8-byte slot whose packed-BCD ACCUMULATOR is +$3A..$3F.
+ *   +$40..$47  the same shape again, the BCD TARGET; $FFFFFFFF is "none"
+ *           (`bmi` at +0x00600A).
+ *   +$48 l  CONTINUATION script, queued when the count reaches the cap.
+ *   +$4C l  the wrap script (+0x005F32).
+ *   +$50 ..  the launcher table; see `ladderOf`.
+ */
+const COUNTER_FLAGS = 0x00;
+const COUNTER_RESET = 0x02;
 const COUNTER_TARGET = 0x04;
+const COUNTER_STEP = 0x32;
 const COUNTER_CONTINUATION = 0x48;
+/** Flags bit 0: the ball-start walk branches away before the count reset. */
+const COUNTER_FLAG_BCD_FROM_COUNT = 0x01;
+/** Flags bit 3: the ball-start walk skips the count reset. */
+const COUNTER_FLAG_KEEP_COUNT = 0x08;
+/** Either bit carries the count across a ball; see `HEADER_COUNTERS`. */
+const COUNTER_FLAGS_KEEP_ACROSS_BALL = COUNTER_FLAG_BCD_FROM_COUNT | COUNTER_FLAG_KEEP_COUNT;
 /**
  * Award effect 6's LAUNCHER TABLE, inline at counter record +$50: the decoded
  * multiball-lock dispatch. Handler 0x5E5A takes `a0 = element+$34` (the same
@@ -211,8 +303,8 @@ const MESSAGE_SPAN = 0x40;
  *
  *   e  element record pointer      s  script (event record) pointer
  *   m  display/message pointer     o  opaque pointer (animation, native code)
- *   w  signed word                 c  a PC inside this script
- *   i  32-bit immediate, packed BCD in the high digits
+ *   n  progress-counter record     w  signed word
+ *   c  a PC inside this script     i  32-bit immediate, packed BCD in the high digits
  */
 const OPCODES = [
   { index: 0, name: "END", length: 2, args: "" },
@@ -249,11 +341,11 @@ const OPCODES = [
   // It was labelled ANIMATE on nothing but the shape of its handler.
   { index: 19, name: "MUSIC", length: 6, args: "o" },
   { index: 20, name: "NATIVE", length: 6, args: "o" },
-  // SET_COUNT's pointer is a progress-counter record. Where that record hosts a
-  // decoded effect-6 launcher table the operand is exported as the LADDER index
-  // (kind "l"); handler 0x5C64 writes the word to both per-player counts:
-  // `move.w $6(a1),$6(a2,d6.w) / move.w $6(a1),$16(a2,d6.w)`.
-  { index: 21, name: "SET_COUNT", length: 8, args: "lw" },
+  // SET_COUNT's pointer is a progress-counter record, and now that the pool is
+  // the descriptor's own list at +$40 the operand names it directly (kind "n").
+  // Handler 0x5C64 writes the word to BOTH per-player words of that record:
+  // `move.w $6(a1),$6(a2,d6.w*2) / move.w $6(a1),$16(a2,d6.w*2)`.
+  { index: 21, name: "SET_COUNT", length: 8, args: "nw" },
   { index: 22, name: "SET_COUNT_SELF", length: 6, args: "o" },
   { index: 23, name: "JMP_IF_UNLIT", length: 8, args: "ec" },
   { index: 24, name: "PUSH_LINKED", length: 10, args: "ee" },
@@ -566,6 +658,86 @@ function ladderOf(pkg, record, scriptIndex) {
 }
 
 /**
+ * The records on the descriptor's own COUNTER LIST, in list order.
+ *
+ * A NULL longword ends it, exactly as `move.l (a0)+,d0 / beq` does. Reading the
+ * list rather than collecting whatever the elements' +$34 fields point at is what
+ * keeps non-counters out of the pool: award effect 17's handler (+0x00613A) takes
+ * the SAME +$34 and queues it as an event record, and award effect 5's reads it as
+ * an immediate multiplier, so +$34 is only a counter where the machine says it is.
+ */
+function counterList(pkg) {
+  const base = descriptorPointer(pkg, HEADER_COUNTERS);
+  if (base === null) return [];
+  const out = [];
+  for (let index = 0; ; index += 1) {
+    const at = { hunk: base.hunk, offset: base.offset + 4 * index };
+    if (!inBounds(pkg, at, 4)) break;
+    if (readU32(pkg, at) === 0 && !pkg.relocations.has(key(at))) break;
+    const record = follow(pkg, at);
+    if (record === null) {
+      throw new Error(`${pkg.stem}: counter list entry ${index} at ${key(at)} is not a relocated pointer`);
+    }
+    if (index > 128) throw new Error(`${pkg.stem}: counter list is not terminated`);
+    out.push(record);
+  }
+  return out;
+}
+
+/** Bytes of the table's bonus routine scanned for the combo read. LnJ's is at +0xB4. */
+const COMBO_SCAN_BYTES = 0x200;
+
+/**
+ * THE COMBO COUNTER, decoded out of the table's own end-of-ball bonus routine.
+ *
+ * After the bonus flash and before the "TOTAL BONUS" panel the routine adds
+ * `1,000,000 x <combo count>` to the payable total and holds an "<n> COMBOS"
+ * panel for 100 frames. The count is a per-player word, and which word is named
+ * by two instructions the routine spells out in full:
+ *
+ *     302d 0dbe            move.w  $dbe(a5),d0            ; the player index
+ *     303b 0320 <bd>       move.w  (bd,PC,d0.w*2),d0      ; the COUNT
+ *
+ * The second is a FULL-format PC-relative extension (0x0320: index D0, word,
+ * scale 2, bit 8 set, word base displacement), so its base is the address of the
+ * extension word plus `bd` — and on both live tables that base is a counter
+ * record's +$06:
+ *
+ *     Law 'n Justice  h4+0x2A62, ext at 0x2A68 + 0x1AE8 = 0x4550 = h4+0x454A +$6
+ *     Extreme Sports  h4+0x2A52, ext at 0x2A58 + 0x0DA6 = 0x37FE = h4+0x37F8 +$6
+ *
+ * BABEWATCH'S BLOCK IS DEAD CODE AND THE MACHINE SAYS SO. Its player-index load
+ * at h4+0x2AC4 is followed by `7000` — `moveq #$0,d0` — which throws the index
+ * away before anything reads a table, so the `beq.w` two bytes later is ALWAYS
+ * taken and the 208 bytes at +0x2ACE..+0x2B9D are unreachable. BabeWatch's combo
+ * term is structurally zero by its own code, not merely undecoded, and this
+ * function answers -1 for it on that evidence rather than on a missing pattern.
+ */
+function comboCounterOf(pkg, counterIndexOf) {
+  const routine = descriptorPointer(pkg, HEADER_BONUS_ROUTINE);
+  if (routine === null) return -1;
+  const body = bodyOf(pkg, routine.hunk);
+  const limit = Math.min(body.length - 10, routine.offset + COMBO_SCAN_BYTES);
+  for (let at = routine.offset; at <= limit; at += 2) {
+    if (body.readUInt32BE(at) !== 0x302d0dbe) continue;
+    // The dead read: `moveq #$0,d0` between the load and the test.
+    if (body.readUInt16BE(at + 4) === 0x7000) return -1;
+    if (body.readUInt16BE(at + 4) !== 0x303b || body.readUInt16BE(at + 6) !== 0x0320) continue;
+    const base = at + 6 + body.readUInt16BE(at + 8);
+    const record = { hunk: routine.hunk, offset: base - 0x06 };
+    const index = counterIndexOf(record);
+    if (index < 0) {
+      throw new Error(
+        `${pkg.stem}: the bonus routine's combo read at ${key({ hunk: routine.hunk, offset: at })} ` +
+          `resolves to ${key(record)}+$06, which is not on the descriptor's counter list`,
+      );
+    }
+    return index;
+  }
+  return -1;
+}
+
+/**
  * The BONUS MULTIPLIER an effect-5 element sets, or 0 for every other element.
  *
  * Refuses a relocated +$34, because that is a pointer and its top word is not a
@@ -591,7 +763,14 @@ function elementMultiplier(pkg, at) {
   return value;
 }
 
-/** The progress-counter continuation an element's award effect 21 queues. */
+/**
+ * The continuation script an element's counter record queues, for DISCOVERY.
+ *
+ * Deliberately looser than the counter pool: it follows +$34 -> +$48 for any
+ * element at all, without asking whether +$34 is on the descriptor's counter
+ * list, because `findScripts` only needs a seed and its prune throws away
+ * anything that does not decode. The counters themselves are built from the list.
+ */
 function counterScriptOf(pkg, element) {
   const record = follow(pkg, element, ELEMENT_COUNTER);
   if (record === null) return null;
@@ -997,19 +1176,40 @@ function decode(pkg, table) {
       : -1,
   );
 
-  // The progress counter. AWARD effect 21 (handler 0x5FA8) takes `a0 = P+$34`,
-  // increments the per-player counters there and, when the target at `a0+$04` is
-  // reached, queues the script at `a0+$48` through $6C10. That is how a mission
-  // ladder advances itself, and it is the route by which Law 'n Justice's
-  // h4+0x66FC and h4+0x6CA4 — the only awarders of two of its WAIT elements —
-  // are reached at all.
-  const counters = elementList.map((at) => {
-    const record = follow(pkg, at, ELEMENT_COUNTER);
-    const continuation = counterScriptOf(pkg, at);
-    const found = continuation === null ? undefined : scriptIndex.get(key(continuation));
-    if (record === null || found === undefined) return { script: -1, target: 0 };
-    return { script: found, target: readU16(pkg, record, COUNTER_TARGET) };
+  // THE PROGRESS COUNTERS, taken from the descriptor's own list at +$40 rather
+  // than gathered from the elements — see `counterList` for why that matters.
+  //
+  // The count these records hold is keyed by RECORD, not by element: award
+  // effects 6 (0x5E5A), 16 (0x5E4E), 18 (0x5E46) and 21 (0x5FA8) all reach
+  // `+$06 + 2p` through `movea.l $34(a2),a0`, and effect 24 (0x6220) decrements
+  // the same word, so every element pointing at one record shares one count.
+  // That is why the element carries an INDEX into this pool and no longer
+  // carries a copy of the record's cap and continuation.
+  const counterRecords = counterList(pkg);
+  const counterIndexByKey = new Map(counterRecords.map((at, index) => [key(at), index]));
+  const counterIndexOf = (record) =>
+    record === null ? -1 : (counterIndexByKey.get(key(record)) ?? -1);
+  const counters = counterRecords.map((at, index) => {
+    const continuation = follow(pkg, at, COUNTER_CONTINUATION);
+    const script = continuation === null ? -1 : (scriptIndex.get(key(continuation)) ?? -1);
+    return {
+      index,
+      flags: readU8(pkg, at, COUNTER_FLAGS),
+      reset: readU16(pkg, at, COUNTER_RESET),
+      cap: readU16(pkg, at, COUNTER_TARGET),
+      // The record's own packed-BCD STEP. Exported because it is the value the
+      // combo term is built out of — Law 'n Justice's combo record's is
+      // 00 00 01 00 00 00 at h4+0x457C, the same 1,000,000 the bonus routine's
+      // own constant at h4+0x2BA2 spells — and because a counter with no step
+      // is visibly a plain tally rather than a scoring chain.
+      step: readBcd(pkg, at, COUNTER_STEP, "counter step"),
+      continuation: script,
+      ladder: ladderIndexOf(at),
+      keepAcrossBall: (readU8(pkg, at, COUNTER_FLAGS) & COUNTER_FLAGS_KEEP_ACROSS_BALL) !== 0,
+    };
   });
+  const elementCounter = elementList.map((at) => counterIndexOf(follow(pkg, at, ELEMENT_COUNTER)));
+  const comboCounter = comboCounterOf(pkg, counterIndexOf);
 
   const elements = elementList.map((at, index) => ({
     index,
@@ -1025,8 +1225,7 @@ function decode(pkg, table) {
     soundAward: follow(pkg, at, ELEMENT_SOUND_AWARD) !== null,
     displayStart: messageIndex.get(keyOrNull(follow(pkg, at, ELEMENT_DISPLAY_START))) ?? -1,
     displayAward: messageIndex.get(keyOrNull(follow(pkg, at, ELEMENT_DISPLAY_AWARD))) ?? -1,
-    counterScript: counters[index].script,
-    counterTarget: counters[index].target,
+    counter: elementCounter[index],
     ladder: elementLadder[index],
   }));
 
@@ -1057,10 +1256,9 @@ function decode(pkg, table) {
           return arg.value;
         }
         if (arg.target === null) return -1;
-        // A SET_COUNT whose record hosts a decoded ladder names the ladder;
-        // one whose record does not is exported unresolved, exactly as the
-        // other opaque pointers are.
-        if (arg.kind === "l") return ladderIndexOf(arg.target);
+        // SET_COUNT names a record on the descriptor's counter list; anything
+        // else is exported unresolved, exactly as the opaque pointers are.
+        if (arg.kind === "n") return counterIndexOf(arg.target);
         // CHECK 4 — the operand must be in the pool its opcode requires.
         const pool =
           arg.kind === "e" ? elementIndex : arg.kind === "m" ? messageIndex : arg.kind === "s" ? scriptIndex : null;
@@ -1150,7 +1348,7 @@ function decode(pkg, table) {
   // element a mission waits on must be awarded from something a ball can hit.
   const shootable = new Set();
   for (const binding of [...devices, ...zones, ...locks]) {
-    collectAwards(scriptDocs, elements, binding.script, shootable, new Set());
+    collectAwards(scriptDocs, elements, counters, binding.script, shootable, new Set());
   }
   const waited = new Set();
   const blind = [];
@@ -1172,6 +1370,8 @@ function decode(pkg, table) {
     scripts: scriptDocs,
     missions,
     ladders,
+    counters,
+    comboCounter,
     triggers: { devices, zones, locks },
     selectors: selectors.map((entry, index) => ({
       index,
@@ -1201,15 +1401,16 @@ function keyOrNull(at) {
  * without following `element -> counter script` the reachability check reports
  * false alarms on missions that in fact work.
  */
-function collectAwards(scripts, elements, index, into, seen) {
+function collectAwards(scripts, elements, counters, index, into, seen) {
   if (index < 0 || seen.has(index)) return;
   seen.add(index);
   for (const op of scripts[index].ops) {
     if (op.op === 5 && op.args[0] >= 0) {
       into.add(op.args[0]);
-      collectAwards(scripts, elements, elements[op.args[0]].counterScript, into, seen);
+      const counter = counters[elements[op.args[0]].counter];
+      collectAwards(scripts, elements, counters, counter?.continuation ?? -1, into, seen);
     }
-    if (op.op === 9 && op.args[0] >= 0) collectAwards(scripts, elements, op.args[0], into, seen);
+    if (op.op === 9 && op.args[0] >= 0) collectAwards(scripts, elements, counters, op.args[0], into, seen);
   }
 }
 
@@ -1235,6 +1436,8 @@ function buildDocument(table, decoded) {
     scripts: decoded.scripts,
     missions: decoded.missions,
     ladders: decoded.ladders,
+    counters: decoded.counters,
+    comboCounter: decoded.comboCounter,
     triggers: decoded.triggers,
   };
 }
@@ -1307,6 +1510,16 @@ function main(argv) {
     console.log(
       `  ${pad}  ${decoded.scripts.length} scripts, ${decoded.elements.length} elements, ` +
         `${decoded.messages.length} display records, ${decoded.ladders.length} count ladders`,
+    );
+    const combo = decoded.counters[decoded.comboCounter];
+    console.log(
+      `  ${pad}  ${decoded.counters.length} progress counters (` +
+        `${decoded.counters.filter((one) => one.keepAcrossBall).length} carried across a ball); ` +
+        (combo === undefined
+          ? "no live combo counter — the bonus routine throws its player index away"
+          : `combo counter ${combo.index}, ${combo.step.toLocaleString()} a combo, ` +
+            `${combo.keepAcrossBall ? "PER GAME" : "PER BALL"}, fed by ` +
+            `${decoded.elements.filter((one) => one.counter === combo.index).length} elements`),
     );
     console.log(
       `  ${pad}  ${decoded.missions.length} modes (${selected} on ${decoded.selectors.length} ` +

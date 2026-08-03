@@ -201,6 +201,59 @@ describe("the bonus phase shows the panels the routine shows", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// The combo term
+// ---------------------------------------------------------------------------
+
+describe("the combo panel, between the flash and the total", () => {
+  it("is skipped at a count of zero, which is `beq.w $2B48`", () => {
+    const phase = beginBonusPhase(scoringWith(1_000_000, 2), false, 0) as BonusPhase;
+    expect(phase.stages.map((stage) => stage.kind)).toEqual(["flash", "total"]);
+    expect(phase.comboTotal).toBe(0);
+    expect(readBcdField(phase.total)).toBe(2_000_000);
+  });
+
+  it("holds `<n> COMBOS` for 100 frames and adds 1,000,000 a combo to the total", () => {
+    // `$2A80` multiplies the six packed-BCD bytes at h4+0x2BA2 by the count and
+    // `$2AA0` adds the product into the display total.
+    const phase = beginBonusPhase(scoringWith(1_000_000, 2), false, 3) as BonusPhase;
+    expect(phase.stages.map((stage) => stage.kind)).toEqual(["flash", "combo", "total"]);
+    for (let tick = 0; tick < BONUS_FLASH_FRAMES; tick += 1) stepBonusPhase(phase, false);
+    expect(bonusStage(phase)).toBe("combo");
+    expect(bonusCaption(phase)).toBe("3 COMBOS");
+    expect(bonusValue(phase)).toBe(3_000_000);
+
+    for (let tick = 0; tick < BONUS_TOTAL_FRAMES; tick += 1) stepBonusPhase(phase, false);
+    expect(bonusStage(phase)).toBe("total");
+    // The product of the flash plus the combo term, which is what the score is
+    // finally paid at `$51DA`.
+    expect(bonusValue(phase)).toBe(5_000_000);
+    expect(readBcdField(phase.total)).toBe(5_000_000);
+  });
+
+  it("drops the S at exactly one, which is the `cmpi.w #$1` at +0x2B0C", () => {
+    const one = beginBonusPhase(scoringWith(0, 0), false, 1) as BonusPhase;
+    expect(bonusCaption(one)).toBe("1 COMBO");
+    const two = beginBonusPhase(scoringWith(0, 0), false, 2) as BonusPhase;
+    expect(bonusStage(two)).toBe("combo");
+    expect(bonusCaption(two)).toBe("2 COMBOS");
+  });
+
+  it("pays combos on a ball whose accumulator is empty, and skips the flash", () => {
+    // `$29DC` gates the flash on the PRODUCT alone and `$2B4E` gates the total
+    // on the display total, which the combo term has already been added into —
+    // so a ball with no bonus and one combo shows two panels and pays 1,000,000.
+    const phase = beginBonusPhase(scoringWith(0, 0), false, 1) as BonusPhase;
+    expect(phase.stages.map((stage) => stage.kind)).toEqual(["combo", "total"]);
+    expect(readBcdField(phase.total)).toBe(1_000_000);
+    expect(runToEnd(phase)).toBe(BONUS_TOTAL_FRAMES * 2);
+  });
+
+  it("defaults to no combos, so a caller that has none behaves as before", () => {
+    expect((beginBonusPhase(scoringWith(500_000, 2), false) as BonusPhase).comboCount).toBe(0);
+  });
+});
+
 describe("the multiplier caption blinks four times over the flash", () => {
   it("names the multiplier the ball earned", () => {
     for (const multiplier of [2, 4, 6, 8, 10]) {
@@ -505,8 +558,7 @@ describe("the mission layer reaches the player record's bonus fields", () => {
           soundAward: false,
           displayStart: -1,
           displayAward: -1,
-          counterScript: -1,
-          counterTarget: 0,
+          counter: -1,
         },
       ],
       messages: [],

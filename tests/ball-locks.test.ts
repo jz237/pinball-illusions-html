@@ -518,10 +518,14 @@ describe("a lock in a running game", () => {
     if (jail === undefined) return;
     const ladder = modes.elements[26]?.ladder ?? -1;
     expect(ladder, "element 26 must carry the multiball ladder").toBeGreaterThanOrEqual(0);
+    // The COUNT lives in the counter RECORD (`+$16 + 2p`), not in the element
+    // and not in the ladder: every element pointing at one record shares it.
+    const counter = modes.elements[26]?.counter ?? -1;
+    expect(counter, "element 26 must name a progress counter").toBeGreaterThanOrEqual(0);
 
     dropInto(game, jail);
     runTicks(game, idleInput(), 200);
-    expect(game.modeState?.ladderCounts[ladder]).toBe(0);
+    expect(game.modeState?.counterTotals[counter]).toBe(0);
     const state = debugSnapshot(game);
     expect(state.multiball).toBe(false);
     expect(state.locks, "ejected, not held").toEqual([]);
@@ -537,7 +541,7 @@ describe("a lock in a running game", () => {
     runTicks(game, idleInput(), 60);
     const jail = ballLocksFor("law-n-justice").find((one) => one.id === "right-crater");
     if (jail === undefined) return;
-    const ladder = modes.elements[26]?.ladder ?? -1;
+    const counter = modes.elements[26]?.counter ?? -1;
 
     // Light the jail lamp the decoded way: the script the SHOOT JAIL targets
     // fire, which STARTs element 26.
@@ -551,7 +555,7 @@ describe("a lock in a running game", () => {
     // First counted lock: the alternate. Ball ejected, no multiball.
     dropInto(game, jail);
     const seen = collectMessages(game, idleInput(), 200);
-    expect(game.modeState.ladderCounts[ladder]).toBe(1);
+    expect(game.modeState.counterTotals[counter]).toBe(1);
     expect([...seen].some((line) => line.includes("MORE FOR M-BALL")), [...seen].join(" | ")).toBe(true);
     expect(debugSnapshot(game).multiball).toBe(false);
     expect(debugSnapshot(game).locks, "intermediate locks eject").toEqual([]);
@@ -560,7 +564,7 @@ describe("a lock in a running game", () => {
     // mode's BALL_REMOVE, and the mode tops the table up to two.
     dropInto(game, jail);
     expect(runToMultiball(game, idleInput(), 600), "multiball never started").toBeGreaterThanOrEqual(0);
-    expect(game.modeState.ladderCounts[ladder]).toBe(2);
+    expect(game.modeState.counterTotals[counter]).toBe(2);
     const state = debugSnapshot(game);
     expect(state.multiball).toBe(true);
     expect(state.locks, "BALL_REMOVE emptied the jail").toEqual([]);
@@ -600,11 +604,12 @@ describe("a lock in a running game", () => {
     const modes = modesFor("babewatch");
     const input = playingInput();
     clearTheLane(game, input);
-    const ladder = modes.elements[29]?.ladder ?? -1;
-    expect(ladder).toBeGreaterThanOrEqual(0);
+    const counter = modes.elements[29]?.counter ?? -1;
+    expect(counter).toBeGreaterThanOrEqual(0);
     expect(game.modeState).not.toBeNull();
     if (game.modeState === null) return;
-    game.modeState.ladderCounts[ladder] = 2;
+    game.modeState.counterTotals[counter] = 2;
+    game.modeState.counterCounts[counter] = 2;
     lightLockLamps(game);
 
     const grid = ballLocksFor("babewatch").find((one) => one.id === "grid-top");
@@ -683,9 +688,10 @@ describe("a lock in a running game", () => {
     const game = started("babewatch");
     const modes = modesFor("babewatch");
     clearTheLane(game, playingInput());
-    const ladder = modes.elements[29]?.ladder ?? -1;
+    const counter = modes.elements[29]?.counter ?? -1;
     if (game.modeState === null) return;
-    game.modeState.ladderCounts[ladder] = 2;
+    game.modeState.counterTotals[counter] = 2;
+    game.modeState.counterCounts[counter] = 2;
     lightLockLamps(game);
     const grid = ballLocksFor("babewatch").find((one) => one.id === "grid-top");
     if (grid === undefined) return;

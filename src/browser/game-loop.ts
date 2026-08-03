@@ -225,6 +225,7 @@ import type { BallFrameState, BatFrameState } from "../game/moving-sprites.js";
 import type { ModeMusicCue, ModeState, ModeTickReport } from "../game/mode-vm.js";
 import {
   EMPTY_MODE_TICK,
+  comboCount,
   createModeState,
   litElements,
   missionSecondsLeft,
@@ -1470,6 +1471,14 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
       // game state while `$daa(a5)` is set), which is not reproducible here: the
       // ball is already gone, so nothing could ever advance the script and the
       // machine would hang. See the divergence note in `mode-vm.ts`.
+      // THE COMBO COUNT IS READ BEFORE THE COUNTER WALK, because the machine's
+      // order is `jsr $5136` (the whole bonus) at +0x00504C and only then
+      // `jsr $412C` (the per-ball counter reset) at +0x0050BC. Extreme Sports'
+      // combo counter carries neither carry-across bit, so on that table the two
+      // orders give different answers; Law 'n Justice's carries bit 3 and does
+      // not care. Zero when the table has no live combo counter.
+      const combos =
+        game.modes !== null && game.modeState !== null ? comboCount(game.modes, game.modeState) : 0;
       if (game.modes !== null && game.modeState !== null) {
         resetModesForNewBall(game.modes, game.modeState);
       }
@@ -1480,7 +1489,7 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
       // the call has returned. Reading the flag here and keeping the answer in
       // the phase is the same test one tick earlier, and it leaves the tilt
       // reset exactly where it already was.
-      game.bonus = beginBonusPhase(game.scoring, game.tilt.tilted);
+      game.bonus = beginBonusPhase(game.scoring, game.tilt.tilted, combos);
       game.tilt = resetTiltForNewBall();
       // A tilted ball forfeits and the machine goes straight on — no multiply,
       // no panel, not even "NO BONUS". Everything else waits for the count.

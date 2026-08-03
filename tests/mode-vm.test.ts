@@ -17,6 +17,7 @@ import {
   MODE_MAX_BALLS,
   MODE_QUEUE_SLOTS,
   TICKS_PER_SECOND,
+  comboCount,
   createModeState,
   endMission,
   litElements,
@@ -102,13 +103,13 @@ const OPCODES = Array.from({ length: 32 }, (_, index) => {
   return { index, name: entry[0], length: entry[1], args: entry[2] };
 });
 
-function element(index: number, score: number, bonus = 0, flags = 0) {
+function element(index: number, score: number, bonus = 0, flags = 0, effect = 0, counter = -1) {
   return {
     index,
     flags,
     score,
     bonus,
-    effect: 0,
+    effect,
     countdown: -1,
     lampStart: false,
     lampAward: false,
@@ -116,8 +117,7 @@ function element(index: number, score: number, bonus = 0, flags = 0) {
     soundAward: false,
     displayStart: -1,
     displayAward: -1,
-    counterScript: -1,
-    counterTarget: 0,
+    counter,
   };
 }
 
@@ -185,6 +185,48 @@ function resetFixture(): TableModes {
   return parseTableModesDocument(doc as unknown as TableModesDocument);
 }
 
+/**
+ * The same table with TWO PROGRESS COUNTERS and four elements that step them.
+ *
+ * Counter 0 is the shape of Law 'n Justice's counter 14: a reset value of one,
+ * a cap of three and a continuation. Counter 1 is the shape of its COMBO record:
+ * flags $08 (bit 3 — the ball-start walk at +0x004158 branches past the reset),
+ * uncapped, with a packed-BCD step of 1,000,000.
+ *
+ * Elements 3 and 4 both name counter 0, which is the point of the fixture: the
+ * count belongs to the RECORD, so two different shots step one word.
+ */
+function counterFixture(): TableModes {
+  const doc = fixtureDocument() as unknown as Record<string, unknown>;
+  doc["counters"] = [
+    { index: 0, flags: 0, reset: 1, cap: 3, step: 0, continuation: 2, ladder: -1, keepAcrossBall: false },
+    { index: 1, flags: 0x08, reset: 0, cap: 0, step: 1_000_000, continuation: -1, ladder: -1, keepAcrossBall: true },
+  ];
+  doc["elements"] = [
+    ...(doc["elements"] as unknown[]),
+    element(3, 100, 0, 0, 21, 0),
+    element(4, 100, 0, 0, 21, 0),
+    element(5, 100, 0, 0, 16, 1),
+    element(6, 100, 0, 0, 24, 0),
+  ];
+  doc["scripts"] = [
+    ...(doc["scripts"] as unknown[]),
+    { index: 6, ops: [{ pc: 0, op: 5, args: [3] }, { pc: 6, op: 0, args: [] }] },
+    { index: 7, ops: [{ pc: 0, op: 5, args: [4] }, { pc: 6, op: 0, args: [] }] },
+    { index: 8, ops: [{ pc: 0, op: 5, args: [5] }, { pc: 6, op: 0, args: [] }] },
+    { index: 9, ops: [{ pc: 0, op: 5, args: [6] }, { pc: 6, op: 0, args: [] }] },
+  ];
+  return parseTableModesDocument(doc as unknown as TableModesDocument);
+}
+
+/** Arms `element`, fires the one-op script that AWARDs it, and lets it run. */
+function fireShot(modes: TableModes, state: ModeState, element: number, script: number): void {
+  state.armed[element] = 1;
+  state.done[element] = 0;
+  queueScript(state, script);
+  run(modes, state, 8);
+}
+
 /** Runs `ticks` frames and returns everything that happened, flattened. */
 function run(modes: TableModes, state: ModeState, ticks: number) {
   const awards: { element: number; score: number; bonus: number }[] = [];
@@ -207,7 +249,8 @@ function digest(state: ModeState): string {
     armed: [...state.armed],
     done: [...state.done],
     timers: [...state.timers],
-    counts: [...state.counts],
+    counterCounts: [...state.counterCounts],
+    counterTotals: [...state.counterTotals],
     queue: [...state.queue],
     queueRead: state.queueRead,
     queueWrite: state.queueWrite,
@@ -570,6 +613,83 @@ describe("the opcode corrections that a permanently lit shot forces", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// The progress counters
+// ---------------------------------------------------------------------------
+
+describe("a progress counter, keyed by RECORD and not by element", () => {
+  it("gives every element that names one record the same count", () => {
+    // The correction: `movea.l $34(a2),a0 / move.w $6(a0,d6.w*2),d0` reaches ONE
+    // word whichever element got there. Keyed per element, two shots on one
+    // record would leave two counts of one and neither would reach a cap.
+    const modes = counterFixture();
+    const state = createModeState(modes);
+    expect(state.counterCounts[0], "the game-start walk writes +$02").toBe(1);
+
+    fireShot(modes, state, 3, 6);
+    fireShot(modes, state, 4, 7);
+    expect(state.counterCounts[0]).toBe(3);
+    expect(state.counterTotals[0]).toBe(3);
+  });
+
+  it("fires its continuation ONCE, on the award that reaches the cap", () => {
+    // `+0x005FB8`: an award that finds the count already at the cap returns
+    // without touching anything, so the +$48 script cannot run twice. The old
+    // per-element reading zeroed the count and re-fired every `max(1, cap)`.
+    const modes = counterFixture();
+    const state = createModeState(modes);
+    // Script 2 is the continuation and it AWARDs element 0, so the report says
+    // when it ran. Element 0 stays armed the whole time.
+    let fired = 0;
+    for (let i = 0; i < 6; i += 1) {
+      state.armed[0] = 1;
+      state.done[0] = 0;
+      state.armed[3] = 1;
+      state.done[3] = 0;
+      queueScript(state, 6);
+      fired += run(modes, state, 16).awards.filter((award) => award.element === 0).length;
+    }
+    expect(state.counterCounts[0], "the count sticks at the cap").toBe(3);
+    expect(fired, "the continuation ran more than once").toBe(1);
+  });
+
+  it("never fires a continuation on an UNCAPPED record, however far it counts", () => {
+    // `tst.w d2 / beq` at +0x005E76 and +0x005FC4: a cap of zero skips the
+    // continuation entirely. Every counter in the corpus but two is uncapped,
+    // so the old `Math.max(1, target)` reading fired on EVERY award.
+    const modes = counterFixture();
+    const state = createModeState(modes);
+    for (let i = 0; i < 20; i += 1) fireShot(modes, state, 5, 8);
+    expect(state.counterCounts[1]).toBe(20);
+  });
+
+  it("steps back on effect 24, and never below zero", () => {
+    const modes = counterFixture();
+    const state = createModeState(modes);
+    fireShot(modes, state, 3, 6); // count 1 -> 2
+    fireShot(modes, state, 6, 9); // -> 1
+    fireShot(modes, state, 6, 9); // -> 0
+    fireShot(modes, state, 6, 9); // `tst.w / beq` holds it there
+    expect(state.counterCounts[0]).toBe(0);
+    expect(state.counterTotals[0]).toBe(0);
+  });
+
+  it("resets with the ball unless the record says otherwise", () => {
+    // `+0x00412C` writes +$02 into both words unless flags bit 0 or bit 3 is
+    // set. Counter 0 is plain; counter 1 carries bit 3.
+    const modes = counterFixture();
+    const state = createModeState(modes);
+    fireShot(modes, state, 3, 6);
+    fireShot(modes, state, 5, 8);
+    expect(state.counterCounts[0]).toBe(2);
+    expect(state.counterCounts[1]).toBe(1);
+
+    resetModesForNewBall(modes, state);
+    expect(state.counterCounts[0], "a plain counter goes back to its reset value").toBe(1);
+    expect(state.counterCounts[1], "a bit-3 counter survives the drain").toBe(1);
+  });
+});
+
 describe("the wait machinery", () => {
   it("holds a WAIT with a clock and no shot for the whole clock", () => {
     // The intro pause every mission opens with is `WAIT NULL, 3, <pc>`: three
@@ -700,6 +820,63 @@ describe("on the shipped Law 'n Justice data", () => {
     // Most of them do end on their own; if they ALL parked, the timeout branches
     // would not be working and this test would be asserting nothing.
     expect(parked).toBeLessThan(modes.selectable.length);
+  });
+
+  it("counts a COMBO on each of the six shots the bonus routine pays for", () => {
+    // The decode this pins: the end-of-ball bonus reads `+$06 + 2p` of the
+    // counter record at h4+0x454A (h4+0x2A62 -> h4+0x4550), and the six shots
+    // that step it are the three upper-deck rollovers, the right-hand lower
+    // rollover and the two jail saucers. The bindings are taken from the shipped
+    // trigger tables rather than written down, so a re-export that moved a shot
+    // fails here rather than quietly counting a different one.
+    const modes = modesFor("law-n-justice");
+    const combo = modes.comboCounter;
+    expect(combo, "law-n-justice must carry a combo counter").toBeGreaterThanOrEqual(0);
+
+    const shots = [
+      modes.scriptForZone(1, 7),
+      modes.scriptForZone(1, 8),
+      modes.scriptForZone(1, 9),
+      modes.scriptForZone(0, 13),
+      modes.scriptForLock(0, 5),
+      modes.scriptForLock(0, 7),
+    ];
+    for (const script of shots) expect(script, "a combo shot lost its binding").toBeGreaterThanOrEqual(0);
+
+    const state = createModeState(modes);
+    expect(comboCount(modes, state)).toBe(0);
+    for (const script of shots) {
+      // The element this shot's own script AWARDs into the combo counter. Each
+      // script awards a dozen other things too; only one of them is a combo.
+      const own = (modes.scripts[script]?.ops ?? [])
+        .filter((op) => op.op === 5)
+        .map((op) => op.args[0] ?? -1)
+        .filter((index) => modes.elements[index]?.counter === combo && modes.elements[index]?.effect === 16);
+      expect(own.length, `script ${script} awards ${own.length} combo elements`).toBe(1);
+      const element = own[0] ?? -1;
+      // A combo shot only counts while it is LIT, which is what the previous
+      // shot in the chain does with its 5- or 10-second START_TIMED.
+      state.armed[element] = 1;
+      state.done[element] = 0;
+      queueScript(state, script);
+      run(modes, state, 200);
+    }
+    expect(comboCount(modes, state), "six lit combo shots, six combos").toBe(6);
+
+    // And an UNLIT one pays nothing: AWARD's `bclr` refusal at +0x005CB2 is what
+    // makes the chain a chain rather than six independent shots. Every combo
+    // element goes dark first, because the six scripts spend their lives arming
+    // each other and several are still lit at this point — and only ONE cold
+    // shot is fired, since firing a second would be shooting a lamp the first
+    // had just lit, which is the chain working rather than a bug.
+    for (const element of modes.elements) {
+      if (element.counter !== combo) continue;
+      state.armed[element.index] = 0;
+      state.timers[element.index] = 0;
+    }
+    queueScript(state, shots[0] ?? -1);
+    run(modes, state, 200);
+    expect(comboCount(modes, state), "an unlit combo shot counted").toBe(6);
   });
 
   it("is deterministic: the same frames from the same start give the same state", () => {

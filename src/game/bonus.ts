@@ -204,18 +204,76 @@
  * not only the last ball, which is all the earlier note had.
  *
  * ---------------------------------------------------------------------------
- * WHAT IS NOT RECONSTRUCTED, AND WHY
+ * THE COMBO TERM, AND WHERE THE COUNT COMES FROM
  * ---------------------------------------------------------------------------
- * THE COMBO TERM. The second half adds `comboValue x comboCount` on top, where
- * the count is a per-player word in a table this port has nothing to fill —
- * NOTHING IN THIS RECONSTRUCTION COUNTS COMBOS, and the only two references to
- * the table in the whole of Law 'n Justice hunk 4 are the two READS above
- * (+0x2A66 and +0x2B0E, both resolving to +0x4550; the table is all zeroes on
- * disk). Where it is written is undecoded, so the count is structurally zero
- * here and the stage never runs. The value it would be multiplied by IS decoded
- * — Law 'n Justice's six BCD bytes at hunk 4 +0x2BA2 read 000001000000, so a
- * combo is worth 1,000,000 — and `BonusPhase` carries the stage so that the day
- * combos are decoded the panel is already there to show them.
+ * This used to be the module's open hole: the second half adds
+ * `comboValue x comboCount` on top and nothing in this port could fill the
+ * count. It is now decoded end to end, and the word the routine reads is an
+ * ordinary progress counter.
+ *
+ * WHICH WORD. `move.w $dbe(a5),d0` then `move.w (bd,PC,d0.w*2),d0` — a FULL
+ * format PC-relative extension (0x0320), so the base is the extension word's own
+ * address plus `bd`, and `$dbe(a5)` is the plain player index:
+ *
+ *     Law 'n Justice  h4+0x2A62, ext 0x2A68 + 0x1AE8 = 0x4550 = h4+0x454A + $06
+ *     Extreme Sports  h4+0x2A52, ext 0x2A58 + 0x0DA6 = 0x37FE = h4+0x37F8 + $06
+ *
+ * and both of those records are on the descriptor's own COUNTER LIST at +$40,
+ * whose per-player count array lives at exactly `+$06 + 2p`. So the combo count
+ * is a counter record like any other, and the engine's generic counter actions
+ * are what move it.
+ *
+ * WHAT MOVES IT. Law 'n Justice's six combo shots are ELEMENTS 28..33, award
+ * effect 16 (`0x5E4E`: BCD add, count++, pay); Extreme Sports' seven are
+ * ELEMENTS 3..9, award effect 6 (`0x5E5A`). Elements 34 and 35 on Law 'n Justice
+ * are award effect 20 (`0x620E`) and set the record's +$26 window timer to their
+ * own +$38 — 5 and 10 seconds, which are precisely the `START_TIMED` operands the
+ * six scripts re-arm each other with. In player terms: three upper-deck
+ * rollovers, the right-hand lower rollover and the two jail saucers on Law 'n
+ * Justice; two upper-deck rollovers, the upper-deck lower rollover, the top-left
+ * lower rollover and the two saucers on Extreme Sports.
+ *
+ * WHETHER IT RESETS. Per record, and the two live tables differ:
+ *
+ *   - the ball-start walk `+0x00412C` writes the record's +$02 into both
+ *     per-player words UNLESS its flags byte carries bit 0 (+0x004146) or bit 3
+ *     (+0x004158);
+ *   - the game-start walk `+0x0040CA` does it for all eight player slots of
+ *     every record with no test at all.
+ *
+ * Law 'n Justice's combo record's flags byte is $08 — bit 3 — so ITS COMBO COUNT
+ * IS PER GAME: ball 2's bonus pays for ball 1's combos again. Extreme Sports' is
+ * $00, so ITS COMBO COUNT IS PER BALL. Only two of the corpus's forty-four
+ * counters carry bit 3, which is what makes it a flag rather than a coincidence.
+ *
+ * BABEWATCH HAS NO COMBO TERM, and that is the machine's answer rather than a
+ * gap in this decode. Its bonus routine loads the player index at h4+0x2AC4 and
+ * throws it away with `moveq #$0,d0` two bytes later, so the `beq.w` at +0x2ACA
+ * is always taken and the 208 bytes at +0x2ACE..+0x2B9D are unreachable.
+ *
+ * The value each combo is worth is unchanged and still read straight out of the
+ * package: Law 'n Justice's six BCD bytes at hunk 4 +0x2BA2 are 000001000000, so
+ * a combo is worth 1,000,000, byte-identical at BabeWatch +0x2BF8 and Extreme
+ * Sports +0x2B92. Law 'n Justice's counter record carries the same figure as its
+ * own BCD step at h4+0x457C, from a different place in the package.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT IS STILL NOT RECONSTRUCTED
+ * ---------------------------------------------------------------------------
+ * THE COMBO'S OWN SCORING, which is a different field of the same record. Award
+ * effect 16 is three subroutines — `$5FE4` adds the record's packed-BCD STEP
+ * (+$32..$37) into its ACCUMULATOR (+$3A..$3F), `$5E5A` is the count, and
+ * `$61AA` pays the accumulator to the player's score through `$6BCC` — so a Law
+ * 'n Justice chain pays 1,000,000, then 2,000,000, then 3,000,000 while the
+ * window holds, on top of each element's own 1,000,000. Award effect 20 arms
+ * that window and the per-frame service at `$56D4` clears the accumulator when it
+ * expires. `mode-vm.ts` runs the COUNT and not the accumulator; the fields are
+ * decoded and exported (`ModeCounter.step`), and the panel this file draws does
+ * not depend on them.
+ *
+ * THE COMBO PANEL HAS STILL NEVER BEEN FILMED. Session 5 filmed a real earned
+ * bonus with a multiplier, but its combo count was zero, so the film shows only
+ * that the stage is SKIPPED at zero. What one looks like at one is decode alone.
  *
  * THE PANEL GEOMETRY. `$73D0` and `$71BA` place their text with a row table and
  * a plane-pair selector this port's 320x16 panel does not model; the captions,
@@ -259,9 +317,10 @@ export const BONUS_ABORT_GRACE_FRAMES = 26;
  * BabeWatch +0x2BF8 and Extreme Sports +0x2B92.
  *
  * Read-only in all three packages — nothing points at it but the `ABCD` chain
- * walking back from +0x2BA8 — and unreachable here, because the count it is
- * multiplied by is always zero in this port. Kept because it is decoded, and
- * because the term it belongs to is written out rather than folded away.
+ * walking back from +0x2BA8 — and a per-table constant rather than a field of the
+ * counter record, which is why it stays here: Law 'n Justice's record happens to
+ * carry the same 1,000,000 as its BCD step, and Extreme Sports' record's step is
+ * zero while its bonus still pays 1,000,000 a combo.
  */
 export const COMBO_VALUE_PER_COMBO = 1_000_000;
 
@@ -312,7 +371,7 @@ export interface BonusPhase {
   readonly multiplier: number;
   /** `bonus x max(multiplier, 1)`, the product `$5136` builds. */
   readonly product: number;
-  /** The combo term. Structurally zero here; see the header. */
+  /** The combo counter's per-player word as it stood at the drain. See the header. */
   readonly comboCount: number;
   readonly comboTotal: number;
   /** The display total: product plus combo term, and what the score is paid. */
@@ -326,20 +385,28 @@ export interface BonusPhase {
  * score. Everything else — including a ball that scored nothing at all — owes a
  * phase, because the zero case is not "skip it", it is the "NO BONUS" hold.
  *
+ * `combos` is the combo counter's per-player word AT THE DRAIN — `mode-vm.ts`'s
+ * `comboCount`, which the caller must read BEFORE the ball-start counter walk,
+ * because the machine's order is `jsr $5136` at +0x00504C and only then
+ * `jsr $412C` at +0x0050BC. It defaults to zero so that a table with no live
+ * combo counter, and every test that does not care, behave exactly as before.
+ *
  * The scoring state is READ, never written: the accumulator survives the phase
  * and is cleared afterwards by `clearBonusForNewBall`, which is `$427C` and
  * which the hold flags can veto.
  */
-export function beginBonusPhase(scoring: ScoringState, tilted: boolean): BonusPhase | null {
+export function beginBonusPhase(
+  scoring: ScoringState,
+  tilted: boolean,
+  combos: number = 0,
+): BonusPhase | null {
   if (tilted) return null;
 
   const product = multiplyBcdField(scoring.bonus, scoring.multiplier);
-  // THE COMBO TERM, and the one part of the routine this port cannot run. The
-  // count is a per-player word at the counter object's `+$06`, and nothing here
-  // fills it — see the header. Written out as a term rather than folded away so
-  // that the stage list below reads as the routine does, and so that the day the
-  // count is decoded there is one expression to change.
-  const comboCount = 0;
+  // THE COMBO TERM. `$2A66` reads the counter record's `+$06 + 2p` and `$2A80`
+  // multiplies the six BCD bytes at +0x2BA2 by it; a negative or fractional
+  // count is not a thing the machine can hold, so the word is floored here.
+  const comboCount = Math.max(0, Math.floor(combos));
   const comboValue = newBcdField();
   addToBcdField(comboValue, COMBO_VALUE_PER_COMBO);
   const comboProduct = comboCount === 0 ? newBcdField() : multiplyBcdField(comboValue, comboCount);

@@ -178,6 +178,10 @@ export interface TableModesDocument {
   readonly messages: readonly Readonly<Record<string, unknown>>[];
   readonly scripts: readonly Readonly<Record<string, unknown>>[];
   readonly missions: readonly Readonly<Record<string, unknown>>[];
+  /** The progress-counter records off the descriptor's own list at +$40. */
+  readonly counters?: readonly Readonly<Record<string, unknown>>[];
+  /** Index into `counters` of the one the end-of-ball bonus pays combos for, or -1. */
+  readonly comboCounter?: number;
   readonly triggers: Readonly<Record<string, unknown>>;
 }
 
