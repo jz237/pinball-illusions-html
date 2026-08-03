@@ -1102,16 +1102,30 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
   // ---- flippers ----------------------------------------------------------
   const live = flippersLive(game.tilt);
   const raisedBefore = raisedSides(game.flippers);
-  const bankTick = tickFlipperBank(
-    game.flippers,
-    flipperInputFrom(
-      live && isDown(snapshot, "leftFlipper"),
-      live && isDown(snapshot, "rightFlipper"),
-      // The third bat rides its own side's button — there is no third button.
-      UPPER_FLIPPER_RECORDS[game.map.tableId].role,
-    ),
+  const flipperInput = flipperInputFrom(
+    live && isDown(snapshot, "leftFlipper"),
+    live && isDown(snapshot, "rightFlipper"),
+    // The third bat rides its own side's button — there is no third button.
+    UPPER_FLIPPER_RECORDS[game.map.tableId].role,
   );
+  const bankTick = tickFlipperBank(game.flippers, flipperInput);
   game.flippers = bankTick.bank;
+  // Which bats the PLAYER is driving this tick: button down, or the stroke
+  // still somewhere other than rest (a raised hold, a rising flip, a spring
+  // return). The ball search reads this to tell a cradle from furniture — see
+  // the cradled set below for the two measured sites that forced the split.
+  const drivenBats = new Set<string>();
+  for (const sweep of bankTick.sweeps) {
+    if (
+      flipperInput.get(sweep.config.id) === true ||
+      sweep.from.stroke !== 0 ||
+      sweep.from.rate !== 0 ||
+      sweep.to.stroke !== 0 ||
+      sweep.to.rate !== 0
+    ) {
+      drivenBats.add(sweep.config.id);
+    }
+  }
   // The stroke edges, for the report. OBSERVATION ONLY: nothing below reads
   // these back, and the reactions applied after the physics change a bat's
   // rate, never its stroke, so this is the whole tick's answer.
@@ -1245,8 +1259,25 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
   // every in-play state's service bundle — the only involuntary ball removal
   // in the machine is the y>600 drain test). So a ball the flippers touched
   // this tick is exempt from the search exactly as the rod ball is. B2.
+  //
+  // TOUCHED BY A DRIVEN BAT, not touched by any bat — and the narrowing is
+  // measured, not doctrinal. Law 'n Justice's upper bat rests over two map
+  // pockets, (24,304) and (41,339) on the main level, and a ball wedged in
+  // either one is in mask contact with the RESTING bat on every single tick
+  // (verified: 3,000/3,000 ticks in contact at both sites, velocity exactly
+  // (0,0)). Under the old "any contact" rule those balls were cradle-exempt
+  // forever: the census games that found them ran out their whole 12,000-tick
+  // budget with `stillTicks` pinned at 0 and the game unfinishable. A bat
+  // sitting at rest with its button up is not holding anything for anyone —
+  // it is playfield furniture, and a ball leaning on it is exactly as
+  // searchable as a ball leaning on a wall. The cradle the exemption exists
+  // for — B2, a ball held ON a bat the player is DRIVING — always has the
+  // button down or the stroke off rest, and `drivenBats` is precisely that
+  // test. See `runBallSearch` for the second half of the fix (the freeze).
   const cradled = new Set<number>();
-  for (const contact of flipperContacts) cradled.add(contact.ballId);
+  for (const contact of flipperContacts) {
+    if (drivenBats.has(contact.flipperId)) cradled.add(contact.ballId);
+  }
   const search = runBallSearch(game, cradled);
   const lost = search.lost;
   // A swallowed ball is inactive but NOT drained: it is back in the trough and
@@ -1895,13 +1926,32 @@ function runBallSearch(
   cradled: ReadonlySet<number>,
 ): { lost: number[]; swallowed: number[] } {
   const none: { lost: number[]; swallowed: number[] } = { lost: [], swallowed: [] };
-  // A ball a bat touched this tick is under the player's control — a cradle is
-  // motionless on purpose, exactly like the ball on the rod, and the original
-  // has no ball search at all, let alone one that confiscates a held ball. It
-  // is excluded from the watch list entirely: it neither runs the clock nor
-  // takes a coil pulse nor gets written off. Releasing the flipper puts it
-  // back on the list the next tick.
-  const live = freeBalls(game.balls).filter((ball) => !cradled.has(ball.id));
+  // A ball a DRIVEN bat touched this tick is under the player's control — a
+  // cradle is motionless on purpose, exactly like the ball on the rod, and the
+  // original has no ball search at all, let alone one that confiscates a held
+  // ball. It is excluded from the watch list entirely: it neither runs the
+  // clock nor takes a coil pulse nor gets written off. Releasing the flipper
+  // puts it back on the list the next tick. (Contact with a bat at REST is not
+  // in `cradled` at all — see the caller — because the two pockets flanking
+  // Law 'n Justice's upper bat kept a wedged ball in permanent rest-bat
+  // contact and therefore permanently off this list, and two census games
+  // stalled forever on it.)
+  const free = freeBalls(game.balls);
+  const live = free.filter((ball) => !cradled.has(ball.id));
+  // THE FREEZE, and why it is not a reset: while every free ball is in the
+  // grip of a driven bat there is nothing to watch, but the stroke itself must
+  // not count as "something happened" to a ball it cannot actually move. At
+  // (24,304) the census player's blind 17-tick cadence swept the bat through
+  // the wedged ball on every beat; each sweep was a contact, each contact
+  // emptied the watch list, and under `stillTicks = 0` here the clock could
+  // never climb past the cadence (measured: max 5 of the 500 needed). Holding
+  // the clock instead — no advance, no reset, anchors untouched — lets the
+  // window resume when the bat comes back to rest: if the flip really moved
+  // the ball, the box test resets the clock honestly on the next live tick;
+  // if it did not, the machine is one beat closer to noticing. A genuine B2
+  // cradle freezes here for as long as the button is down and expires never,
+  // which is exactly the exemption the cradle is owed.
+  if (live.length === 0 && free.length > 0 && game.laneBallId === null) return none;
   if (
     live.length === 0 ||
     game.laneBallId !== null ||

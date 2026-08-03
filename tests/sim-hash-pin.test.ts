@@ -34,17 +34,33 @@ import { mapFor } from "./table-fixtures.js";
 const TICKS = 4000;
 
 /**
- * The pinned hashes, one per table, recorded at HEAD 57e6d0c (pre-HD).
+ * The pinned hashes, one per table, recorded at HEAD 57e6d0c (pre-HD) and
+ * RE-PINNED for the ball-search stall fix (see below).
  *
  * To re-derive after an INTENDED simulation change (there should be none in an
  * HD round): run this suite, read the "actual" value out of the failure, and
  * update the constant in the same commit that moved the simulation — with the
  * move itself explained in the commit message.
+ *
+ * RE-PIN, ball-search stall fix: two Law 'n Justice census games stalled
+ * forever because a ball wedged in the map pockets flanking the upper bat —
+ * (24,304) and (41,339), level 0 — was in mask contact with the RESTING bat
+ * on every tick, and any bat contact made it cradle-exempt, so `stillTicks`
+ * was reset to 0 forever and the search never fired. The fix narrows the
+ * cradle exemption to bats the player is DRIVING and freezes (rather than
+ * resets) the clock while every free ball is in a driven bat's grip. That
+ * moves `stillTicks` — a field of every per-tick snapshot hashed here — on
+ * all three tables, and lets the rescue fire where it previously never
+ * could, so the old hashes describe a machine with the stall in it. Verified
+ * while re-pinning: with `stillTicks` excluded from the snapshot, all three
+ * 4,000-tick scripted games hash identically before and after the fix — no
+ * ball position, velocity, score or serve in this script's coverage moved;
+ * only the stillness bookkeeping did.
  */
 const PINNED: Record<TableId, string> = {
-  "law-n-justice": "433677999d399b650e0aecf93a57e792e124e77abe12fce4967a176053e621f7",
-  "babewatch": "e97790d64fd29afc21d6cd2c959f2180e51a0536955c4065aebf2d5e3209059e",
-  "extreme-sports": "cebec27268e6d422089af559fb7c2e74a5140ba5c2b5a010e623379fe1ad864e",
+  "law-n-justice": "258d036a101029117c244a00c5b5ec4b393e3f921097d09744f15569ec3280a5",
+  "babewatch": "42ba53da1772e4b05c956a04c5cb5a23055e93cd82b6f3f215b2c694146e75d4",
+  "extreme-sports": "28fea99c93643581901e95c379c6494b760f237667c3b00204a3260b1932d9f9",
 };
 
 /** Same shape as the determinism harness's input: behaviour = f(tick index). */

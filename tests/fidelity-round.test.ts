@@ -44,6 +44,7 @@ import { tableDevicesFor } from "../src/game/table-devices.js";
 import { SIMULATION_GRAVITY, VELOCITY_CLAMP_Q10 } from "../src/game/timebase.js";
 import {
   BALL_SEARCH_PULSES,
+  BALL_SEARCH_TICKS,
   createGame,
   debugSnapshot,
   runTicks,
@@ -369,6 +370,71 @@ describe("B2: cradling on a raised bat, in the real game", () => {
     // And whatever happened, it was never a search write-off.
     expect(reports.flatMap((r) => r.writtenOff)).toEqual([]);
   });
+});
+
+// ---------------------------------------------------------------------------
+// The upper-bat pocket stall: rest-bat contact must not blind the search
+// ---------------------------------------------------------------------------
+
+describe("the ball search reaches a ball wedged against the RESTING upper bat", () => {
+  // Census finding, exact-contacts round: two Law 'n Justice games stalled
+  // forever with a ball at rest in the map pockets flanking the upper bat
+  // (pivot (37,302), level 0). The ball sat at velocity exactly (0,0) for
+  // 3,000+ ticks with `stillTicks` pinned at 0, because the bat's REST pose
+  // is in mask contact with both pockets on every tick and any bat contact
+  // used to make a ball cradle-exempt — `live.length === 0` in
+  // `runBallSearch` reset the clock 3,000 times out of 3,000. The exemption
+  // is now scoped to bats the player is DRIVING (button down or stroke off
+  // rest), and while every free ball is in a driven bat's grip the clock
+  // FREEZES rather than resets, so a blind flip cadence through the wedged
+  // ball cannot hold the clock under its own beat forever either.
+  const SITES = [
+    [24, 304],
+    [41, 339],
+  ] as const;
+
+  /** A started game with its one ball placed at rest in the named pocket. */
+  function wedgedGame(x: number, y: number): Game {
+    const game = createGame(mapFor("law-n-justice"), { ballsPerGame: 3 });
+    startGame(game);
+    runTicks(game, idle, 60);
+    game.laneBallId = null;
+    const ball = game.balls.balls[0];
+    expect(ball).toBeDefined();
+    if (ball !== undefined) {
+      ball.x = pixelsToQ10(x);
+      ball.y = pixelsToQ10(y);
+      ball.velocityX = 0;
+      ball.velocityY = 0;
+      ball.level = 0;
+    }
+    return game;
+  }
+
+  for (const [x, y] of SITES) {
+    it(`(${x},${y}): the stillness clock runs and the first window pulses`, () => {
+      const game = wedgedGame(x, y);
+      // The defect's signature was stillTicks pinned at 0 by the resting
+      // bat's contact. It must accumulate now.
+      runTicks(game, idle, 100);
+      expect(debugSnapshot(game).stillTicks).toBeGreaterThan(90);
+      // ... and the first expiry must spend a coil pulse on the wedged ball.
+      runTicks(game, idle, BALL_SEARCH_TICKS - 100 + 20);
+      expect(debugSnapshot(game).searchPulses).toBeLessThan(BALL_SEARCH_PULSES);
+    });
+
+    it(`(${x},${y}): the wedged ball is rescued and the game moves on`, () => {
+      const game = wedgedGame(x, y);
+      // Four windows and settling slack — enough for the full pulse budget
+      // and a write-off if the pocket defeats every pulse. Measured: the
+      // pulses free the ball at both sites and it drains as an ordinary
+      // ball-end (idle: 3 pulses at (24,304), 1 at (41,339); census game 14
+      // rescued with a single pulse at t1696 and ran to game-over).
+      runTicks(game, idle, 6 * BALL_SEARCH_TICKS);
+      const end = debugSnapshot(game);
+      expect(end.ballsServed, "the stalled ball never ended").toBeGreaterThanOrEqual(2);
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------
