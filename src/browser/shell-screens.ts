@@ -103,6 +103,7 @@ import {
   shellCharCode,
 } from "../game/shell-art.js";
 import type { ShellFont } from "../game/shell-art.js";
+import { LOADING_LOGO_HEIGHT, LOADING_LOGO_WIDTH } from "../game/loading-logo.js";
 import type { HighScoreEntry } from "../game/high-scores.js";
 import type { TableId } from "../game/contracts.js";
 
@@ -1124,13 +1125,26 @@ function drawInfo(
  * MEASURED, and it is the one shell page that is nothing like the others: the
  * whole 320 x 256 is pure black, with NO navy surround, NO frame and no objects.
  * All the original puts on it is a 147 x 16 painted logo whose ink sits at
- * x 90..236, y 120..135 — a separate image belonging to the loader, not shell
- * art out of `menudata.bin`, and one this project has not decoded and does not
- * ship. So the word is set in the decoded font instead, on the logo's own rows,
- * and the table's name goes under it: the film's geometry, without inventing the
- * film's picture.
+ * x 90..236 — a separate image belonging to the LOADER, not shell art out of
+ * `menudata.bin`. It is decoded and shipped: `src/game/loading-logo.ts` fetches
+ * it, `shell-skin.ts` builds the surface, and this page blits it at the row the
+ * loader's own copper list puts it on. See `loading-logo.ts` for why that row is
+ * 84 and not the 120 the film appears to measure.
+ *
+ * The font fallback below it is not dead code. `loadingLogo()` is nullable on
+ * purpose — a build made without the authorized assets has no logo to draw — and
+ * a shell that still says "Loading" is better than one that says nothing.
  */
 const LOADING_INK_TOP = 120;
+
+/**
+ * Rows between the bottom of the word and the top of the table's name.
+ *
+ * The font fallback sets its 19-row cap block at 118 and its name at 150, so the
+ * gap has always been 13. Keeping the same number under the logo keeps the two
+ * paths looking like the same screen.
+ */
+const LOADING_NAME_GAP = 13;
 
 function drawLoading(ctx: ShellContext, scale: number, state: ShellState, skin: ShellSkin | null): void {
   // Black to all four edges — no ring and no frame, unlike every other page.
@@ -1145,6 +1159,28 @@ function drawLoading(ctx: ShellContext, scale: number, state: ShellState, skin: 
     text(ctx, scale, 160, 150, name, SHELL_DIM, FONT_SMALL, "center");
     return;
   }
+
+  // The disk's own strip: 320 x 16, full screen width, so it lands at shell x 0
+  // and needs no centring of its own — the ink is already where the film puts it.
+  const logo = skin.loadingLogo();
+  const logoTop = skin.loadingLogoTop();
+  if (logo !== null && logoTop !== null) {
+    ctx.drawImage(
+      logo,
+      0,
+      0,
+      LOADING_LOGO_WIDTH,
+      LOADING_LOGO_HEIGHT,
+      px(0, scale),
+      py(logoTop, scale),
+      LOADING_LOGO_WIDTH * scale,
+      LOADING_LOGO_HEIGHT * scale,
+    );
+    const nameTop = logoTop + LOADING_LOGO_HEIGHT + LOADING_NAME_GAP;
+    glyphs(ctx, skin, "font2", scale, 160, nameTop, name, SKIN_DIM, "center");
+    return;
+  }
+
   // Cap height 19 against the logo's 16 rows of ink: one row up puts the block
   // on the same centre line as the original's.
   glyphs(ctx, skin, "font1", scale, 160, LOADING_INK_TOP - 2, "Loading", SKIN_WHITE, "center");

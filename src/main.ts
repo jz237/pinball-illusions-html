@@ -93,6 +93,7 @@ import type { ShellArtworkSource } from "./browser/shell-screens.js";
 import { createShellSkin } from "./browser/shell-skin.js";
 import type { ShellSkin } from "./browser/shell-skin.js";
 import { loadShellArt } from "./game/shell-art.js";
+import { loadLoadingLogo } from "./game/loading-logo.js";
 import { loadShellMusic } from "./audio/shell-music.js";
 import type { ShellFont } from "./game/shell-art.js";
 import {
@@ -479,14 +480,27 @@ async function boot(): Promise<void> {
    */
   let panelFont: ShellFont | null = null;
   void loadShellArt()
-    .then((art) => {
+    .then(async (art) => {
       panelFont = art.font2;
-      skin = createShellSkin(art, (width, height) => {
-        const surface = document.createElement("canvas");
-        surface.width = width;
-        surface.height = height;
-        return surface;
+      // The loading logo is a SEPARATE fetch with its own manifest, because it
+      // belongs to the loader rather than to `menudata.bin`. It must not be able
+      // to take the shell down with it: a build without the authorized assets
+      // has no logo to fetch, and `createShellSkin` takes null for exactly that
+      // case — the Loading page then sets the word in the font instead.
+      const logo = await loadLoadingLogo().catch((error: unknown) => {
+        console.warn("pinball-illusions: loading logo unavailable, using the font", error);
+        return null;
       });
+      skin = createShellSkin(
+        art,
+        (width, height) => {
+          const surface = document.createElement("canvas");
+          surface.width = width;
+          surface.height = height;
+          return surface;
+        },
+        logo,
+      );
     })
     .catch((error: unknown) => {
       console.warn("pinball-illusions: shell artwork unavailable, using placeholder", error);
