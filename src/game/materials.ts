@@ -25,7 +25,7 @@
  * independent investigations (two disassembly, two geometric/connectivity). All
  * four returned "does not block". The disassembly is decisive and the byte
  * patterns below were re-verified directly against
- * `_pinball_research/illusions/seg/main.seg00.bin` (58,448 bytes, address ==
+ * `research/seg/main.seg00.bin` (58,448 bytes, address ==
  * file offset). Each of these is the ONLY occurrence in the whole engine:
  *
  *   +0x00B43E  226C 0054       movea.l $54(a4),a1   ; the collision plane ptr

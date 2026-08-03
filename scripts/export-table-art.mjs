@@ -30,7 +30,7 @@
 // The plane bit order is LSB-first: plane 0 contributes bit 0. An independent
 // hand-written overlay that ordered the planes the other way produced correct
 // shapes with wrong colours. The reference decode, and the source of every
-// constant here, is _pinball_research/illusions/art.py; keep the two in step.
+// constant here, is ../../research/art.py; keep the two in step.
 //
 // Usage:
 //   node scripts/export-table-art.mjs <segment-dir> [out-dir] [--check]

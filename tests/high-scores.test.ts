@@ -84,10 +84,12 @@ describe("the original score file", () => {
 
   it("agrees with the real files still on disk, when they are present", () => {
     // Reads the operator's local research copies if they exist, so the fixture
-    // above can never silently drift from the actual disk contents. Skipped on
-    // any machine without them rather than failing.
+    // above can never silently drift from the actual disk contents. The research
+    // tree is the repo's sibling (`../../research`), so this is resolved relative
+    // to this file rather than through an absolute machine path. Skipped on any
+    // machine without them rather than failing.
     for (const table of [1, 2, 3]) {
-      const path = `D:/Projects/_pinball_research/illusions/meta/score00${table}.bin`;
+      const path = new URL(`../../research/meta/score00${table}.bin`, import.meta.url);
       let bytes: Uint8Array;
       try {
         bytes = new Uint8Array(readFileSync(path));

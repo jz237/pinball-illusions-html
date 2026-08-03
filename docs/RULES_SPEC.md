@@ -10,7 +10,8 @@ target). Tagging is the project's:
 - **[open]** — not established
 
 No byte of game data is committed to this repository. Offsets refer to files derived
-locally under `D:\Projects\_pinball_research\illusions\`.
+locally under the repo's sibling research tree, `..\research\`
+(`D:\Projects\Pinball Illusions\research\` on the operator's machine).
 
 ---
 

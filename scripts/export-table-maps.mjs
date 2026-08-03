@@ -26,7 +26,7 @@
 // sweeping the decoded map against the slot-3 artwork's edge field peaks at
 // dx=0, dy=0 with the payload framed at 4 (lift 2.17 / 2.06 / 2.02) and is flat
 // near zero when framed at 8, where the same peak reappears out at dx=+32.
-// See _pinball_research/illusions/reg_phase.py, which runs both framings side by
+// See ../../research/reg_phase.py, which runs both framings side by
 // side, and the matching header note in export-table-art.mjs: BOTH slots put
 // their spare 4 bytes at the end. `assertAlignment` below cannot catch this —
 // the 32 px slide is horizontal and hits every layer equally, so containment

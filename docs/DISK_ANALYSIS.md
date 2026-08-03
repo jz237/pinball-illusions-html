@@ -2,7 +2,8 @@
 
 Read-only analysis of the operator's own IPF preservation images. **No byte extracted
 from these disks is committed to this repository or shipped in any build.** Derived
-files live only under `D:\Projects\_pinball_research\illusions\` on the local machine.
+files live only under the repo's sibling research tree, `..\research\`
+(`D:\Projects\Pinball Illusions\research\` on the local machine).
 This document records measurements and structure — the facts needed to reimplement
 behaviour — not payload.
 
@@ -33,11 +34,13 @@ Illusions is an ordinary FFS filesystem, so the contents are directly enumerable
 Reproduce the conversion:
 
 ```powershell
+# Run from the repo root; `..` is D:\Projects\Pinball Illusions.
+# disk-analyse is shared preservation tooling and lives outside this project.
 $da = "D:\Projects\_pinball_research\disk-utilities\disk-analyse\disk-analyse.exe"
 foreach ($n in 1..4) {
   & $da -q -f "Pinball Illusions AGA" `
-    "D:\Projects\Pinball Illusions\PinballIllusions_Disk$n.ipf" `
-    "D:\Projects\_pinball_research\illusions\PinballIllusions_Disk$n.adf"
+    "..\disks\PinballIllusions_Disk$n.ipf" `
+    "..\research\PinballIllusions_Disk$n.adf"
 }
 ```
 
@@ -287,9 +290,9 @@ Verified by splitting and decompressing with Teemu Suutari's `ancient` (a clean,
 permissively licensed decompressor — the original depacker is not reused):
 
 ```powershell
-python D:\Projects\_pinball_research\illusions\split_tsl.py `
-  D:\Projects\_pinball_research\illusions\seg `
-  D:\Projects\_pinball_research\illusions\pkg\Table001.bin
+python ..\research\split_tsl.py `
+  ..\research\seg `
+  ..\research\pkg\Table001.bin
 ```
 
 All nine `Table001.bin` segments decompress to **exactly** their declared sizes,

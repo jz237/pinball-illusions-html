@@ -33,7 +33,16 @@ const FORBIDDEN_TEXT = [
   { name: "Windows drive path", re: /[A-Za-z]:\\{1,2}(Users|Projects)\\/ },
   { name: "UNC path", re: /\\\\[A-Za-z0-9_-]+\\[A-Za-z0-9_$-]+/ },
   { name: "file:// URL", re: /file:\/\/\// },
-  { name: "preservation directory", re: /_pinball_research|PinballIllusions_Disk/ },
+  // The preservation tree. `_pinball_research` is the shared research root that
+  // still holds the external tooling; the second alternative is this project's
+  // own research sibling (`Pinball Illusions\research`, plus the `disks` and
+  // `roms` folders beside it) in any separator or percent-encoded spelling. It
+  // deliberately does NOT match the bare game title, which the shell legitimately
+  // ships, only the title followed by one of those directory names.
+  {
+    name: "preservation directory",
+    re: /_pinball_research|PinballIllusions_Disk|Pinball(?:[ _-]|%20)*Illusions[/\\](?:research|disks|roms)\b/i,
+  },
   { name: "AWS access key", re: /\bAKIA[0-9A-Z]{16}\b/ },
   { name: "GitHub token", re: /\bgh[pousr]_[A-Za-z0-9]{36,}\b/ },
   { name: "fal API key", re: /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9a-f]{16,}\b/ },
