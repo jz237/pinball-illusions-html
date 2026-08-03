@@ -203,6 +203,91 @@ const HEADER_UPPER_ZONES = 0x2c;
 const HEADER_COUNTERS = 0x40;
 /** The table's own end-of-ball bonus routine, called at `$51BE`. See `comboCounterOf`. */
 const HEADER_BONUS_ROUTINE = 0x80;
+/**
+ * THE LAMP-GROUP TABLE — descriptor +$38, a NULL-terminated array of pointers
+ * to GROUP records, and the structure that closes the multiplier gap: the ONLY
+ * callers of the three orphan multiplier-arming scripts (Law 'n Justice 237,
+ * BabeWatch 255, Extreme Sports 183) are the +$06 fields of records on this
+ * list.
+ *
+ * GROUP RECORD:
+ *     +$00 l  first LAMP OBJECT (inline at +$0A when the group owns one)
+ *     +$04 b  flags: bit 0 the FIRED latch (runtime), bit 1 SUPPRESS the fire,
+ *             bit 2 keep the lamps' always-on masks across a ball
+ *     +$06 l  the EVENT script, queued through $6C10 when the group completes
+ * and the lamp objects chain through +$10 exactly as `export-table-lamps.mjs`
+ * documents them.
+ *
+ * THE READER is the budgeted per-frame scan at main.seg00 +0x0064D0 (32 lamps
+ * and 8 lamp changes per call, cursor in `$10F4/$10F6(a5)`): a lamp counts as
+ * lit for the current player when its phase byte +$01 is on, its blink bit
+ * (+$02 bit 1) is off, and the player's bit is set in `(+$00 | +$05)` — the
+ * blink test at +0x006506 sets the not-all-lit accumulator BEFORE the phase
+ * test, so A BLINKING LAMP BLOCKS ITS GROUP outright. When every lamp in the
+ * chain is lit the scan fires ONCE — `btst #1,$4(a4)` skips a suppressed
+ * group, `bset #0,$4(a4)` at +0x00658A latches, `move.l $6(a4),d0 / jsr $6C10`
+ * at +0x006594 queues the event — then +0x0064AA sets bit 0 of every chained
+ * lamp's +$02 and posts a {#$10, record} cell to the display ring at $126A.
+ *
+ * WHAT LIGHTS A LAMP STEADILY (the only kind that completes a group):
+ *   - a type-0 DEVICE's first hit: the record's +$04 "flag byte" IS a lamp —
+ *     `bset.b d0,(a2)` at +0x0055F0 sets the player's bit at lamp +$00, and
+ *     the Z flag from that same bset is what picks first-hit against repeat;
+ *   - a TRIGGER ZONE's first pass: the zone object's +$0A flag pointer, same
+ *     shape, `bset.b d0,(a2)` at +0x00543A;
+ *   - an element AWARD: `or.b d7,$5(lamp)` on the element's +$08 lamp — the
+ *     always-on mask at +$05.
+ * An element START lights its +$04 lamp BLINKING instead (`or.b d7,(a2)` /
+ * `ori.b #$2,$2(a2)` / reload 8 at +0x006312..22, re-applied every frame by
+ * the active-element service $626E while the element stays armed), and every
+ * disarm — award, timeout, COMPLETE, LAMP_OFF — runs the force-off $6234,
+ * which `bclr`s the player's +$00 bit and stops the blink. So a group whose
+ * lamps double as some mission's START lamps cannot fire while that mission
+ * has them armed, and the mission wipes them on its way out. The same service
+ * also force-offs the START lamp of an armed element WITHOUT flags bit 4
+ * whenever a mission is running (+0x0062EC..F8), which is what flags bit 4
+ * ("the mode-lamp bank") gates.
+ *
+ * RESETS. `$3EA8` (hard: new game at +0x0045A6, game over at +0x005124)
+ * clears +$00 AND +$05 of every chained lamp and the record's fired latch;
+ * `$3F10` (soft: every ball start, +0x0050B6) clears +$00 and the latch but
+ * keeps +$05 where the group's flags carry bit 2. A device or zone flag byte
+ * that lives on this table therefore resets EVERY BALL — the port's per-game
+ * first-hit scoring flags diverge there, documented at `scoreSurfaces`'s
+ * caller — and the groups' own lamp state is per ball, which this export's
+ * consumer (`resetModesForNewBall`) now honours.
+ *
+ * THE JOINS exported per lamp are exactly the four writers above, found by
+ * inverting the relocations: which elements name this lamp at +$04 / +$08,
+ * which type-0 devices at device +$04, which trigger-zone objects at +$0A.
+ * On the shipped tables the five event-bearing groups are:
+ *   law-n-justice  group 12  script 237  two lamps    = targets 32+33 (the
+ *                  RICOCHET standups; both -> arm element 14, the X shot)
+ *   babewatch      group 19  script 255  three lamps  = lower zones 7/8/9
+ *                  (the top rollover lanes; all three -> element 0 -> ladder 0)
+ *   babewatch      group 25  script 270  nine lamps   = targets 32..40
+ *   extreme-sports group  7  script 217  three lamps  = targets 33/34/35
+ *   extreme-sports group 19  script 183  three lamps  = upper zones 7/8/9
+ *                  (the upper-deck lanes; all three -> element 91 -> ladder 7)
+ * BabeWatch's OTHER orphan, script 159, is not a lamp group: its one referrer
+ * (h4+0x6062) is an entry of the {flag.w, time.w, script.l} timeline at
+ * h4+0x605E — "THE CASINO IS OPEN / CLOSED", read through the descriptor's
+ * +$68 clock-record list by the BCD clock service at main.seg00 +0x006334 —
+ * a clock-scheduled award this export leaves unbound.
+ */
+const HEADER_LAMP_GROUPS = 0x38;
+/** Group record fields. Cited on `HEADER_LAMP_GROUPS`. */
+const GROUP_FIRST_LAMP = 0x00;
+const GROUP_FLAGS = 0x04;
+const GROUP_EVENT = 0x06;
+/** Lamp object: the +$10 chain link, as in `export-table-lamps.mjs`. */
+const LAMP_NEXT = 0x10;
+/** Longest lamp chain accepted; the longest shipped is 9 (BabeWatch group 25). */
+const GROUP_MAX_LAMPS = 32;
+/** A type-0 device's per-player flag byte at +$04 IS a lamp; `bset` at +0x0055F0. */
+const DEVICE_FLAG_POINTER = 0x04;
+/** A trigger-zone OBJECT's flag byte at +$0A, the same shape; `bset` at +0x00543A. */
+const ZONE_OBJECT_FLAG = 0x0a;
 
 /** Element record field offsets. Each is quoted to its instruction above. */
 const ELEMENT_FLAGS = 0x00;
@@ -778,6 +863,195 @@ function counterScriptOf(pkg, element) {
 }
 
 /**
+ * The lamp groups off the descriptor's +$38 table, with the event script and
+ * the physical joins of every chained lamp. See `HEADER_LAMP_GROUPS` for the
+ * whole decode; this function is mechanical once that comment is believed.
+ *
+ * The joins are REVERSE maps over structures this exporter already walks:
+ * element +$04/+$08, device +$04 (type-0 records only — types 1 and 2 have no
+ * flag byte at that offset), and trigger-zone object +$0A. Check: every lamp
+ * of an event-bearing, unsuppressed group must have at least one join, because
+ * a lamp nothing can light makes the event unreachable and would mean the join
+ * derivation has drifted from the chain walk.
+ */
+function lampGroups(pkg, scriptIndex, elementList, residue) {
+  const base = descriptorPointer(pkg, HEADER_LAMP_GROUPS);
+  if (base === null) return [];
+
+  const push = (map, k, value) => {
+    const list = map.get(k);
+    if (list === undefined) map.set(k, [value]);
+    else list.push(value);
+  };
+  const startOf = new Map();
+  const awardOf = new Map();
+  elementList.forEach((at, index) => {
+    const start = follow(pkg, at, ELEMENT_LAMP_START);
+    if (start !== null) push(startOf, key(start), index);
+    const award = follow(pkg, at, ELEMENT_LAMP_AWARD);
+    if (award !== null) push(awardOf, key(award), index);
+  });
+  const deviceOf = new Map();
+  for (const level of [0, 1]) {
+    const devices = descriptorPointer(pkg, level === 1 ? HEADER_UPPER_DEVICES : HEADER_LOWER_DEVICES);
+    if (devices === null) continue;
+    for (let index = 0; index < DEVICE_SLOTS; index += 1) {
+      const record = follow(pkg, devices, 4 * index);
+      if (record === null || residue.has(index)) continue;
+      if (readU16(pkg, record, 0) !== 0) continue;
+      const flag = follow(pkg, record, DEVICE_FLAG_POINTER);
+      if (flag !== null) push(deviceOf, key(flag), { level, surfaceId: index + DEVICE_ID_BASE });
+    }
+  }
+  const zoneOf = new Map();
+  for (const level of [0, 1]) {
+    const zones = descriptorPointer(pkg, level === 1 ? HEADER_UPPER_ZONES : HEADER_LOWER_ZONES);
+    if (zones === null) continue;
+    for (let index = 0; ; index += 1) {
+      const at = { hunk: zones.hunk, offset: zones.offset + ZONE_RECORD_BYTES * index };
+      if (!inBounds(pkg, at, ZONE_RECORD_BYTES) || readS16(pkg, at, 0) < 0) break;
+      const type = readU16(pkg, at, 8);
+      if (type !== 0 && type !== 1) continue;
+      const object = follow(pkg, at, 10);
+      if (object === null) continue;
+      const flag = follow(pkg, object, ZONE_OBJECT_FLAG);
+      if (flag !== null) push(zoneOf, key(flag), { level, index });
+    }
+  }
+
+  const groups = [];
+  for (let index = 0; ; index += 1) {
+    const record = follow(pkg, base, 4 * index);
+    if (record === null) break;
+    if (index > 64) throw new Error(`${pkg.stem}: the lamp-group table is not terminated`);
+    const flags = readU8(pkg, record, GROUP_FLAGS);
+    const event = follow(pkg, record, GROUP_EVENT);
+    let script = -1;
+    if (event !== null) {
+      const resolved = scriptIndex.get(key(event));
+      if (resolved === undefined) {
+        throw new Error(
+          `${pkg.stem}: lamp group ${index} at ${key(record)} fires ${key(event)}, ` +
+            `which is not a script that survived the prune`,
+        );
+      }
+      script = resolved;
+    }
+    const lamps = [];
+    const seen = new Set();
+    let lamp = follow(pkg, record, GROUP_FIRST_LAMP);
+    while (lamp !== null) {
+      const k = key(lamp);
+      if (seen.has(k) || lamps.length >= GROUP_MAX_LAMPS) {
+        throw new Error(`${pkg.stem}: lamp group ${index} chain at ${k} loops or runs away`);
+      }
+      seen.add(k);
+      lamps.push({
+        startElements: startOf.get(k) ?? [],
+        awardElements: awardOf.get(k) ?? [],
+        devices: deviceOf.get(k) ?? [],
+        zones: zoneOf.get(k) ?? [],
+      });
+      lamp = follow(pkg, lamp, LAMP_NEXT);
+    }
+    if (script >= 0 && (flags & 0x02) === 0) {
+      const dark = lamps.findIndex(
+        (one) =>
+          one.startElements.length === 0 &&
+          one.awardElements.length === 0 &&
+          one.devices.length === 0 &&
+          one.zones.length === 0,
+      );
+      if (dark >= 0) {
+        throw new Error(
+          `${pkg.stem}: lamp group ${index} fires script ${script} but nothing can light its ` +
+            `lamp ${dark}; the join derivation has drifted from the chain`,
+        );
+      }
+    }
+    groups.push({ index, flags, script, lamps });
+  }
+  return groups;
+}
+
+/**
+ * THE MULTIPLIER RESTORE — descriptor HOOK 2, decoded out of the descriptor's
+ * own tail rather than assumed.
+ *
+ * The 152-byte descriptor the engine copies to `$22EE(a5)` (+0x0032F2) is the
+ * fields at +$00..+$97 only. What follows in hunk 0 is TABLE-NATIVE CODE: the
+ * engine stores the descriptor's own address at `$94(a5)` (+0x0032EE) and
+ * calls three 6-byte `jmp` vectors through it —
+ *
+ *     +0x003300  jsr ([$94,a5],$98)   table load
+ *     +0x0045EA  jsr ([$94,a5],$9E)   new game
+ *     +0x005116  jsr ([$94,a5],$A4)   EVERY BALL START, after $427C has
+ *                                     cleared or held the player's multiplier
+ *
+ * On Law 'n Justice and BabeWatch hook 2 is the same routine (h0+$AE / h0+$B4):
+ * it reads the incoming player's multiplier word (`([$dc2,a5],$12)`), and when
+ * it is non-zero writes multiplier/2 into BOTH per-player words of the ladder's
+ * counter record (`move.w d1,$6(a1,d6.w*2)` — raw 3381 6206, the scale-dropped
+ * extension again) and walks multiplier/2 lamps of the X2..X10 insert chain
+ * setting the player's ALWAYS-ON bit (`or.b d7,$5(a1)` / `movea.l $10(a1),a1`).
+ * That is what makes a HELD multiplier (award effect 8) resume its ladder: the
+ * count comes back as multiplier/2, so the next driver award steps to the next
+ * rung instead of starting over. On Extreme Sports hook 2 is a plain `rts` and
+ * there is no restore — consistent with effect 8 having no user there.
+ *
+ * This function DECODES the hook rather than hard-coding the two tables: it
+ * follows the +$A4 vector's relocated operand, requires the target to open
+ * with the exact `move.w ([$dc2,a5],$12),d0` signature (bytes 3035 0162 0dc2
+ * 0012), and then reads the two relocated `lea` operands out of the body — one
+ * must be a record on the descriptor's counter list, the other a lamp on the
+ * group table, in either order. Anything else (Extreme Sports' `rts`) answers
+ * null. BabeWatch's tail also `jsr`s its own h4 native code (the backglass
+ * dancer template reset at h4+$85EC) — presentation, not modelled, and the
+ * scan skips relocated operands that are neither a counter nor a lamp.
+ */
+function multiplierRestoreOf(pkg, counterIndexOf) {
+  const vector = follow(pkg, { hunk: 0, offset: 0 }, 0xa6);
+  if (vector === null || vector.hunk !== 0) return null;
+  const body = bodyOf(pkg, 0);
+  if (vector.offset + 8 > body.length) return null;
+  if (body.readUInt32BE(vector.offset) !== 0x30350162) return null;
+  if (body.readUInt32BE(vector.offset + 4) !== 0x0dc20012) return null;
+
+  const lampIndexOf = new Map();
+  const bases = descriptorPointer(pkg, HEADER_LAMP_GROUPS);
+  for (let index = 0; ; index += 1) {
+    const record = follow(pkg, bases, 4 * index);
+    if (record === null) break;
+    let lamp = follow(pkg, record, GROUP_FIRST_LAMP);
+    let position = 0;
+    while (lamp !== null && position < GROUP_MAX_LAMPS) {
+      lampIndexOf.set(key(lamp), { group: index, position });
+      lamp = follow(pkg, lamp, LAMP_NEXT);
+      position += 1;
+    }
+  }
+
+  let counter = -1;
+  let group = -1;
+  for (let at = vector.offset; at + 4 <= body.length; at += 2) {
+    const target = follow(pkg, { hunk: 0, offset: at });
+    if (target === null) continue;
+    const asCounter = counterIndexOf(target);
+    if (asCounter >= 0) counter = asCounter;
+    const asLamp = lampIndexOf.get(key(target));
+    if (asLamp !== undefined && asLamp.position === 0) group = asLamp.group;
+    at += 2;
+  }
+  if (counter < 0 || group < 0) {
+    throw new Error(
+      `${pkg.stem}: descriptor hook 2 has the restore signature but its lea operands ` +
+        `resolve to counter ${counter} / group ${group}; the decode has drifted`,
+    );
+  }
+  return { counter, group };
+}
+
+/**
  * True when a record can be a playfield element at all.
  *
  * Not a decode, a REFUTATION: both packed-BCD fields must be packed BCD, the
@@ -1211,6 +1485,11 @@ function decode(pkg, table) {
   const elementCounter = elementList.map((at) => counterIndexOf(follow(pkg, at, ELEMENT_COUNTER)));
   const comboCounter = comboCounterOf(pkg, counterIndexOf);
 
+  // THE LAMP GROUPS off descriptor +$38, and the hook-2 multiplier restore
+  // decoded from the descriptor's own tail. See `HEADER_LAMP_GROUPS`.
+  const groups = lampGroups(pkg, scriptIndex, elementList, residue);
+  const multiplierRestore = multiplierRestoreOf(pkg, counterIndexOf);
+
   const elements = elementList.map((at, index) => ({
     index,
     flags: readU8(pkg, at, ELEMENT_FLAGS),
@@ -1350,6 +1629,14 @@ function decode(pkg, table) {
   for (const binding of [...devices, ...zones, ...locks]) {
     collectAwards(scriptDocs, elements, counters, binding.script, shootable, new Set());
   }
+  // A lamp group completes from shots, so its event script is shootable too —
+  // this is exactly the edge that was missing when the multiplier drivers were
+  // orphans (Law 'n Justice element 14, BabeWatch 0, Extreme Sports 91).
+  for (const group of groups) {
+    if (group.script >= 0 && (group.flags & 0x02) === 0) {
+      collectAwards(scriptDocs, elements, counters, group.script, shootable, new Set());
+    }
+  }
   const waited = new Set();
   const blind = [];
   for (const mission of missions) {
@@ -1372,6 +1659,8 @@ function decode(pkg, table) {
     ladders,
     counters,
     comboCounter,
+    lampGroups: groups,
+    multiplierRestore,
     triggers: { devices, zones, locks },
     selectors: selectors.map((entry, index) => ({
       index,
@@ -1438,6 +1727,8 @@ function buildDocument(table, decoded) {
     ladders: decoded.ladders,
     counters: decoded.counters,
     comboCounter: decoded.comboCounter,
+    lampGroups: decoded.lampGroups,
+    multiplierRestore: decoded.multiplierRestore,
     triggers: decoded.triggers,
   };
 }
@@ -1525,6 +1816,15 @@ function main(argv) {
       `  ${pad}  ${decoded.missions.length} modes (${selected} on ${decoded.selectors.length} ` +
         `selector table(s)), ${decoded.triggers.devices.length} device / ` +
         `${decoded.triggers.zones.length} zone / ${decoded.triggers.locks.length} lock bindings`,
+    );
+    const firing = decoded.lampGroups.filter((group) => group.script >= 0 && (group.flags & 0x02) === 0);
+    console.log(
+      `  ${pad}  ${decoded.lampGroups.length} lamp groups, ${firing.length} with a completion ` +
+        `script (${firing.map((group) => `${group.index}->s${group.script}`).join(", ") || "none"}); ` +
+        (decoded.multiplierRestore === null
+          ? "no hook-2 multiplier restore"
+          : `hook-2 restore: counter ${decoded.multiplierRestore.counter}, ` +
+            `group ${decoded.multiplierRestore.group}`),
     );
     console.log(
       `  ${pad}  ${decoded.stats.waited} elements waited on, ` +

@@ -182,6 +182,10 @@ export interface TableModesDocument {
   readonly counters?: readonly Readonly<Record<string, unknown>>[];
   /** Index into `counters` of the one the end-of-ball bonus pays combos for, or -1. */
   readonly comboCounter?: number;
+  /** The lamp groups off the descriptor's +$38 table. See `table-modes.ts`. */
+  readonly lampGroups?: readonly Readonly<Record<string, unknown>>[];
+  /** Descriptor hook 2's ball-start multiplier restore, or null. See `table-modes.ts`. */
+  readonly multiplierRestore?: Readonly<Record<string, unknown>> | null;
   readonly triggers: Readonly<Record<string, unknown>>;
 }
 

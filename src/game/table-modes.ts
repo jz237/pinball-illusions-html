@@ -241,6 +241,81 @@ export interface ModeLadder {
   readonly entries: readonly ModeLadderEntry[];
 }
 
+/**
+ * One lamp of a LAMP GROUP, as the set of things that can light it.
+ *
+ * The machine's lamp object carries two per-player masks — +$00, written by
+ * `bset` on a type-0 device's first hit (+0x0055F0) and on a trigger zone's
+ * first pass (+0x00543A), and +$05, the always-on mask an element AWARD or.bs
+ * (`or.b d7,$5(lamp)` on the element's +$08 lamp) — and a BLINK bit the
+ * active-element service re-applies every frame to the +$04 START lamp of an
+ * armed element (+0x006312..22). The group scan at +0x0064D0 counts the lamp
+ * lit when the player's bit is in `(+$00 | +$05)` AND the blink bit is off, so
+ * the joins here are exactly the writers of those three states:
+ *
+ *   `devices` / `zones`   light the lamp STEADILY (they are the first-hit flag
+ *                         bytes themselves; the id is the surface id / the
+ *                         zone's index in its level's list)
+ *   `awardElements`       set the always-on mask when AWARDed
+ *   `startElements`       BLINK the lamp while armed — which BLOCKS the group —
+ *                         and their disarm force-off ($6234) also `bclr`s the
+ *                         steady bit a device may have set
+ */
+export interface ModeGroupLamp {
+  readonly startElements: readonly number[];
+  readonly awardElements: readonly number[];
+  readonly devices: readonly { readonly level: PlayfieldLevel; readonly surfaceId: number }[];
+  readonly zones: readonly { readonly level: PlayfieldLevel; readonly index: number }[];
+}
+
+/**
+ * One LAMP GROUP off the descriptor's +$38 table: a chain of lamps and the
+ * script the machine queues (through $6C10, at main.seg00 +0x006594) the first
+ * time every lamp in the chain is lit for the current player.
+ *
+ * THIS IS THE STRUCTURE THAT MAKES THE BONUS MULTIPLIER REACHABLE. The three
+ * multiplier-arming scripts nothing else refers to are these groups' events:
+ * Law 'n Justice group 12 (both RICOCHET standups, ids 32+33) fires script 237
+ * = `START 14`; BabeWatch group 19 (the three top rollover lanes, lower zones
+ * 7/8/9) fires 255 = `AWARD 0`; Extreme Sports group 19 (the upper-deck lanes,
+ * upper zones 7/8/9) fires 183 = `AWARD 91` — and elements 14 / 0 / 91 are the
+ * award-effect-6 drivers of the X2..X10 ladders.
+ *
+ * `flags` is the byte at group record +$04: bit 0 is the runtime FIRED latch
+ * (`bset #0,$4(a4)` at +0x00658A — the event fires once), bit 1 SUPPRESSES the
+ * fire (`btst #1` at +0x006582), bit 2 keeps the lamps' always-on masks across
+ * a ball (the soft reset at +0x003F10 skips its `clr.b $5(a0)` for bit-2
+ * groups; the hard reset at +0x003EA8 — new game — never does).
+ */
+export interface ModeLampGroup {
+  readonly index: number;
+  readonly flags: number;
+  /** The event script, or -1: most groups are lamp-bookkeeping only. */
+  readonly script: number;
+  readonly lamps: readonly ModeGroupLamp[];
+}
+
+/** Group flags bit 1: the completion never fires. */
+export const GROUP_FLAG_SUPPRESS_FIRE = 0x02;
+/** Group flags bit 2: the lamps' always-on masks survive a ball. */
+export const GROUP_FLAG_KEEP_ALWAYS_ON = 0x04;
+
+/**
+ * Descriptor HOOK 2's ball-start multiplier restore, decoded from the
+ * descriptor's own embedded code (the exporter's `multiplierRestoreOf` has the
+ * whole listing). At EVERY ball start (+0x005116, after `$427C` has cleared or
+ * held the multiplier) the hook reads the incoming player's multiplier word
+ * and, when non-zero, writes multiplier/2 into both per-player words of
+ * `counter` and sets the always-on bit on the first multiplier/2 lamps of
+ * `group`'s chain — which is what lets a HELD multiplier (award effect 8)
+ * resume its ladder mid-run instead of starting over. Extreme Sports' hook is
+ * a plain `rts` and ships as null.
+ */
+export interface ModeMultiplierRestore {
+  readonly counter: number;
+  readonly group: number;
+}
+
 export interface ModeMessage {
   readonly index: number;
   readonly lines: readonly string[];
@@ -302,6 +377,18 @@ export interface TableModes {
   readonly ladders: readonly ModeLadder[];
   /** The progress-counter records, in the descriptor's own list order. */
   readonly counters: readonly ModeCounter[];
+  /** The lamp groups off descriptor +$38, in table order. See `ModeLampGroup`. */
+  readonly lampGroups: readonly ModeLampGroup[];
+  /** Hook 2's ball-start multiplier restore, or null. See `ModeMultiplierRestore`. */
+  readonly multiplierRestore: ModeMultiplierRestore | null;
+  /**
+   * DECODED: elements whose AWARD-relight latch survives a ball — the elements
+   * whose +$08 award lamp sits in a group whose flags carry bit 2, which is the
+   * set the soft reset at +0x003F10 skips its `clr.b $5(a0)` for. This closes
+   * the divergence `resetModesForNewBall` used to label: `awardLit` was cleared
+   * wholesale because the group table had not been exported yet.
+   */
+  readonly awardLitSurvivesBall: readonly number[];
   /**
    * DECODED: the counter the end-of-ball bonus pays a combo term for, or -1.
    *
@@ -631,6 +718,67 @@ export function parseTableModesDocument(doc: TableModesDocument): TableModes {
     counters.length - 1,
   );
 
+  // --- lamp groups ---------------------------------------------------------
+  const lampGroups: ModeLampGroup[] = [];
+  for (const [at, entry] of requireArray(raw["lampGroups"] ?? [], `${label} lampGroups`).entries()) {
+    const item = entry as Record<string, unknown>;
+    const where = `${label} lamp group ${at}`;
+    const lamps: ModeGroupLamp[] = [];
+    for (const [lampAt, rawLamp] of requireArray(item["lamps"], `${where} lamps`).entries()) {
+      const lamp = rawLamp as Record<string, unknown>;
+      const lampWhere = `${where} lamp ${lampAt}`;
+      const readElements = (which: string): number[] =>
+        requireArray(lamp[which] ?? [], `${lampWhere} ${which}`).map((value, i) =>
+          requireWholeNumber(value, `${lampWhere} ${which} ${i}`, 0, elements.length - 1),
+        );
+      const devices = requireArray(lamp["devices"] ?? [], `${lampWhere} devices`).map((value, i) => {
+        const join = value as Record<string, unknown>;
+        return Object.freeze({
+          level: (requireWholeNumber(join["level"], `${lampWhere} device ${i} level`, 0, 1) === 1
+            ? 1
+            : 0) as PlayfieldLevel,
+          surfaceId: requireWholeNumber(join["surfaceId"], `${lampWhere} device ${i} surfaceId`, 0, 255),
+        });
+      });
+      const zones = requireArray(lamp["zones"] ?? [], `${lampWhere} zones`).map((value, i) => {
+        const join = value as Record<string, unknown>;
+        return Object.freeze({
+          level: (requireWholeNumber(join["level"], `${lampWhere} zone ${i} level`, 0, 1) === 1
+            ? 1
+            : 0) as PlayfieldLevel,
+          index: requireWholeNumber(join["index"], `${lampWhere} zone ${i} index`, 0, 255),
+        });
+      });
+      lamps.push(
+        Object.freeze({
+          startElements: Object.freeze(readElements("startElements")),
+          awardElements: Object.freeze(readElements("awardElements")),
+          devices: Object.freeze(devices),
+          zones: Object.freeze(zones),
+        }),
+      );
+    }
+    lampGroups.push(
+      Object.freeze({
+        index: requireWholeNumber(item["index"], `${where} index`, at, at),
+        flags: requireWholeNumber(item["flags"], `${where} flags`, 0, 255),
+        script: requireWholeNumber(item["script"], `${where} script`, -1, scriptCount - 1),
+        lamps: Object.freeze(lamps),
+      }),
+    );
+  }
+
+  // Hook 2's restore, checked against the pools it indexes.
+  const rawRestore = raw["multiplierRestore"] ?? null;
+  let multiplierRestore: ModeMultiplierRestore | null = null;
+  if (rawRestore !== null) {
+    const item = rawRestore as Record<string, unknown>;
+    multiplierRestore = Object.freeze({
+      counter: requireWholeNumber(item["counter"], `${label} multiplierRestore counter`, 0, counters.length - 1),
+      group: requireWholeNumber(item["group"], `${label} multiplierRestore group`, 0, lampGroups.length - 1),
+    });
+  }
+
   // --- missions ------------------------------------------------------------
   const missions: ModeMission[] = [];
   for (const [at, entry] of requireArray(raw["missions"], `${label} missions`).entries()) {
@@ -757,6 +905,17 @@ export function parseTableModesDocument(doc: TableModesDocument): TableModes {
     .filter((element) => (element.flags & ELEMENT_FLAG_DONE_SURVIVES_BALL) !== 0)
     .map((element) => element.index);
 
+  // The elements whose award-relight latch survives a ball: those whose +$08
+  // award lamp chains under a bit-2 group. See `awardLitSurvivesBall` above.
+  const awardLitSurvivors = new Set<number>();
+  for (const group of lampGroups) {
+    if ((group.flags & GROUP_FLAG_KEEP_ALWAYS_ON) === 0) continue;
+    for (const lamp of group.lamps) {
+      for (const element of lamp.awardElements) awardLitSurvivors.add(element);
+    }
+  }
+  const awardLitSurvivesBall = [...awardLitSurvivors].sort((a, b) => a - b);
+
   return Object.freeze({
     tableId,
     displayName,
@@ -769,6 +928,9 @@ export function parseTableModesDocument(doc: TableModesDocument): TableModes {
     armElements: Object.freeze(armElements),
     ladders: Object.freeze(ladders),
     counters: Object.freeze(counters),
+    lampGroups: Object.freeze(lampGroups),
+    multiplierRestore,
+    awardLitSurvivesBall: Object.freeze(awardLitSurvivesBall),
     comboCounter,
     litAtGameStart: Object.freeze(litAtGameStart),
     keepArmedAcrossBall: Object.freeze(keepArmedAcrossBall),

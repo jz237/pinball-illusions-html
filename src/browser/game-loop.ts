@@ -227,10 +227,12 @@ import {
   EMPTY_MODE_TICK,
   comboCount,
   createModeState,
+  lightGroupLampsForTrigger,
   litElements,
   missionSecondsLeft,
   queueScript,
   resetModesForNewBall,
+  restoreMultiplierLamps,
   tickModes,
 } from "../game/mode-vm.js";
 import type { TableAcceleration } from "../game/table-accel.js";
@@ -1563,6 +1565,15 @@ function anyControlPressed(snapshot: ControlSnapshot): boolean {
  */
 function endBallAfterBonus(game: Game): boolean {
   clearBonusForNewBall(game.scoring);
+  // Descriptor HOOK 2, `jsr ([$94,a5],$A4)` at +0x005116, runs on the machine's
+  // every ball start AFTER `$427C` has settled the holds: it re-seeds the
+  // multiplier ladder's counter to multiplier/2 and relights that many X2..X10
+  // chain lamps for the incoming player. With no hold the multiplier is now
+  // zero and the hook's own `beq` makes this a no-op, exactly as here; Extreme
+  // Sports' hook is a plain `rts` and its document ships no restore at all.
+  if (game.modes !== null && game.modeState !== null) {
+    restoreMultiplierLamps(game.modes, game.modeState, game.scoring.multiplier);
+  }
   game.serveCountdown = game.options.serveDelayTicks;
   if (game.ballsServed >= game.options.ballsPerGame) {
     game.phase = "game-over";
@@ -1721,11 +1732,19 @@ function runModes(game: Game, awards: readonly Award[]): ModeTickReport {
     const trigger = awardTrigger(award);
     if (trigger === null) continue;
     if (trigger.kind === "device") {
+      // The device's +$04 "flag byte" is a lamp on the group table, and the
+      // same `bset` that picks first-hit from repeat lights it (+0x0055F0);
+      // completing a group of them queues the group's event. This is the join
+      // that arms the bonus multiplier — see `lampGroups` in table-modes.ts.
+      lightGroupLampsForTrigger(modes, state, "device", -1, trigger.id);
       const lower = modes.scriptForDevice(0, trigger.id);
       queueScript(state, lower >= 0 ? lower : modes.scriptForDevice(1, trigger.id));
       continue;
     }
     const level: PlayfieldLevel = trigger.level === 1 ? 1 : 0;
+    // A trigger zone's flag byte at object +$0A is the same shape (+0x00543A);
+    // BabeWatch's and Extreme Sports' rollover-lane groups light this way.
+    if (trigger.kind === "zone") lightGroupLampsForTrigger(modes, state, "zone", level, trigger.id);
     queueScript(
       state,
       trigger.kind === "lock"

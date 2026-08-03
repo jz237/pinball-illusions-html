@@ -20,11 +20,13 @@ import {
   comboCount,
   createModeState,
   endMission,
+  lightGroupLampsForTrigger,
   litElements,
   missionRunning,
   missionSecondsLeft,
   queueScript,
   resetModesForNewBall,
+  restoreMultiplierLamps,
   startSelectedMission,
   tickModes,
 } from "../src/game/mode-vm.js";
@@ -219,6 +221,64 @@ function counterFixture(): TableModes {
   return parseTableModesDocument(doc as unknown as TableModesDocument);
 }
 
+/**
+ * The same table with LAMP GROUPS bolted on, for the descriptor-+$38 decode.
+ *
+ *   group 0  event script 6 (`START 3`), two lamps: lamp 0 is device 32's flag
+ *            byte AND element 4's START lamp (the blink source), lamp 1 is
+ *            device 33's — the shape of Law 'n Justice's group 12
+ *   group 1  flags $02 (SUPPRESSED), one lamp on device 34
+ *   group 2  flags $04 (always-on survives a ball), no event, one lamp that is
+ *            zone 0:3's flag byte and element 5's AWARD lamp
+ *
+ * Scripts 8 and 9 are an `AWARD 4` (the disarm that runs the force-off $6234)
+ * and a `LAMP_OFF 5` (the only writer that clears an always-on mask).
+ */
+function lampGroupFixture(): TableModes {
+  const doc = fixtureDocument() as unknown as Record<string, unknown>;
+  doc["elements"] = [
+    ...(doc["elements"] as unknown[]),
+    element(3, 0),
+    element(4, 100),
+    element(5, 100),
+  ];
+  doc["scripts"] = [
+    ...(doc["scripts"] as unknown[]),
+    { index: 6, ops: [{ pc: 0, op: 1, args: [3] }, { pc: 6, op: 0, args: [] }] },
+    { index: 7, ops: [{ pc: 0, op: 5, args: [5] }, { pc: 6, op: 0, args: [] }] },
+    { index: 8, ops: [{ pc: 0, op: 5, args: [4] }, { pc: 6, op: 0, args: [] }] },
+    { index: 9, ops: [{ pc: 0, op: 14, args: [5] }, { pc: 6, op: 0, args: [] }] },
+  ];
+  doc["lampGroups"] = [
+    {
+      index: 0,
+      flags: 0,
+      script: 6,
+      lamps: [
+        { startElements: [4], awardElements: [], devices: [{ level: 0, surfaceId: 32 }], zones: [] },
+        { startElements: [], awardElements: [], devices: [{ level: 0, surfaceId: 33 }], zones: [] },
+      ],
+    },
+    {
+      index: 1,
+      flags: 0x02,
+      script: 7,
+      lamps: [{ startElements: [], awardElements: [], devices: [{ level: 0, surfaceId: 34 }], zones: [] }],
+    },
+    {
+      index: 2,
+      flags: 0x04,
+      script: -1,
+      lamps: [{ startElements: [], awardElements: [5], devices: [], zones: [{ level: 0, index: 3 }] }],
+    },
+  ];
+  doc["counters"] = [
+    { index: 0, flags: 0, reset: 0, cap: 0, step: 0, continuation: -1, ladder: -1, keepAcrossBall: false },
+  ];
+  doc["multiplierRestore"] = { counter: 0, group: 0 };
+  return parseTableModesDocument(doc as unknown as TableModesDocument);
+}
+
 /** Arms `element`, fires the one-op script that AWARDs it, and lets it run. */
 function fireShot(modes: TableModes, state: ModeState, element: number, script: number): void {
   state.armed[element] = 1;
@@ -251,6 +311,9 @@ function digest(state: ModeState): string {
     timers: [...state.timers],
     counterCounts: [...state.counterCounts],
     counterTotals: [...state.counterTotals],
+    groupLampLit: [...state.groupLampLit],
+    groupLampAlways: [...state.groupLampAlways],
+    groupFired: [...state.groupFired],
     queue: [...state.queue],
     queueRead: state.queueRead,
     queueWrite: state.queueWrite,
@@ -781,6 +844,124 @@ describe("the selector reconstruction", () => {
   });
 });
 
+describe("the lamp groups, decoded from descriptor +$38", () => {
+  it("fires its event once when the last lamp lights, and the latch holds", () => {
+    const modes = lampGroupFixture();
+    const state = createModeState(modes);
+    // One target hit: the group is one lamp short of firing.
+    lightGroupLampsForTrigger(modes, state, "device", -1, 32);
+    run(modes, state, 4);
+    expect(state.armed[3]).toBe(0);
+    expect(state.groupFired[0]).toBe(0);
+    // The second target: the scan (+0x0064D0) sees the chain complete, latches
+    // (`bset #0,$4(a4)`) and queues the event (`jsr $6C10` at +0x006594).
+    lightGroupLampsForTrigger(modes, state, "device", -1, 33);
+    run(modes, state, 4);
+    expect(state.armed[3]).toBe(1);
+    expect(state.groupFired[0]).toBe(1);
+    // More hits change nothing: the event fires once per latch.
+    state.armed[3] = 0;
+    lightGroupLampsForTrigger(modes, state, "device", -1, 32);
+    lightGroupLampsForTrigger(modes, state, "device", -1, 33);
+    run(modes, state, 4);
+    expect(state.armed[3]).toBe(0);
+  });
+
+  it("never fires a suppressed group — flags bit 1, btst #1 at +0x006582", () => {
+    const modes = lampGroupFixture();
+    const state = createModeState(modes);
+    lightGroupLampsForTrigger(modes, state, "device", -1, 34);
+    run(modes, state, 4);
+    expect(state.groupFired[1]).toBe(0);
+    expect(state.awardLit[5]).toBe(0);
+  });
+
+  it("is blocked by a blinking lamp, and the disarm wipes the steady bit", () => {
+    const modes = lampGroupFixture();
+    const state = createModeState(modes);
+    // Element 4 armed: the active-element service (+0x006312..22) keeps its
+    // START lamp — group 0's first — blinking, and the blink test at
+    // +0x006506 blocks the whole group.
+    state.armed[4] = 1;
+    lightGroupLampsForTrigger(modes, state, "device", -1, 32);
+    lightGroupLampsForTrigger(modes, state, "device", -1, 33);
+    run(modes, state, 4);
+    expect(state.groupFired[0]).toBe(0);
+    // The award disarms element 4 and its force-off ($6234) `bclr`s the lamp's
+    // steady bit — the device's earlier hit goes with it, so the group still
+    // cannot fire...
+    fireShot(modes, state, 4, 8);
+    run(modes, state, 4);
+    expect(state.groupFired[0]).toBe(0);
+    // ...until the target is hit again.
+    lightGroupLampsForTrigger(modes, state, "device", -1, 32);
+    run(modes, state, 4);
+    expect(state.groupFired[0]).toBe(1);
+    expect(state.armed[3]).toBe(1);
+  });
+
+  it("resets per ball: lamps dark, latch clear, always-on kept only for a bit-2 group", () => {
+    const modes = lampGroupFixture();
+    const state = createModeState(modes);
+    lightGroupLampsForTrigger(modes, state, "device", -1, 32);
+    lightGroupLampsForTrigger(modes, state, "device", -1, 33);
+    run(modes, state, 4);
+    expect(state.groupFired[0]).toBe(1);
+    // The zone pass and the element award light group 2's lamp both ways.
+    lightGroupLampsForTrigger(modes, state, "zone", 0, 3);
+    fireShot(modes, state, 5, 7);
+    expect(state.groupLampAlways[3]).toBe(1);
+    expect(state.awardLit[5]).toBe(1);
+
+    // The soft reset +0x003F10: steady bits and latches always clear; the
+    // always-on mask survives only under a bit-2 group (`btst #$2,$4(a1)`),
+    // and `awardLit` — the same +$05 seen per element — follows it.
+    resetModesForNewBall(modes, state);
+    expect(state.groupFired[0]).toBe(0);
+    expect([...state.groupLampLit]).toEqual([0, 0, 0, 0]);
+    expect(state.groupLampAlways[3]).toBe(1);
+    expect(state.awardLit[5]).toBe(1);
+
+    // And the group can fire again on the new ball.
+    state.armed[3] = 0;
+    state.done[3] = 0;
+    lightGroupLampsForTrigger(modes, state, "device", -1, 32);
+    lightGroupLampsForTrigger(modes, state, "device", -1, 33);
+    run(modes, state, 4);
+    expect(state.groupFired[0]).toBe(1);
+    expect(state.armed[3]).toBe(1);
+  });
+
+  it("LAMP_OFF is the one writer that clears an always-on mask", () => {
+    const modes = lampGroupFixture();
+    const state = createModeState(modes);
+    fireShot(modes, state, 5, 7);
+    expect(state.groupLampAlways[3]).toBe(1);
+    queueScript(state, 9);
+    run(modes, state, 4);
+    expect(state.groupLampAlways[3]).toBe(0);
+    expect(state.awardLit[5]).toBe(0);
+  });
+
+  it("restoreMultiplierLamps re-seeds the ladder counter and relights the chain", () => {
+    const modes = lampGroupFixture();
+    const state = createModeState(modes);
+    // Hook 2 with a held X6: multiplier/2 = 3 into both counter words, and the
+    // first three chain lamps always-on — the fixture's chain is two lamps, so
+    // both light and the count still carries the full three rungs.
+    restoreMultiplierLamps(modes, state, 6);
+    expect(state.counterCounts[0]).toBe(3);
+    expect(state.counterTotals[0]).toBe(3);
+    expect(state.groupLampAlways[0]).toBe(1);
+    expect(state.groupLampAlways[1]).toBe(1);
+    // A zero multiplier is the hook's own `beq`: nothing at all happens.
+    const fresh = createModeState(modes);
+    restoreMultiplierLamps(modes, fresh, 0);
+    expect(fresh.counterCounts[0]).toBe(0);
+    expect([...fresh.groupLampAlways]).toEqual([0, 0, 0, 0]);
+  });
+});
+
 describe("on the shipped Law 'n Justice data", () => {
   it("runs a real mission from its launcher and lights the shots it names", () => {
     const modes = modesFor("law-n-justice");
@@ -897,6 +1078,148 @@ describe("on the shipped Law 'n Justice data", () => {
 // ---------------------------------------------------------------------------
 // On the assembled machine
 // ---------------------------------------------------------------------------
+
+describe("the bonus multiplier, earned through the shipped lamp groups", () => {
+  /** Runs `ticks` frames and answers every effect-5 multiplier reported. */
+  function collectMultipliers(modes: TableModes, state: ModeState, ticks: number): number[] {
+    const seen: number[] = [];
+    for (let i = 0; i < ticks; i += 1) {
+      const report = tickModes(modes, state);
+      if (report.bonusMultiplier >= 0) seen.push(report.bonusMultiplier);
+    }
+    return seen;
+  }
+
+  it("law-n-justice: both RICOCHET targets arm element 14, and zone 13 lights X2", () => {
+    const modes = modesFor("law-n-justice");
+    // The decoded joins, pinned: group 12 fires script 237 from two lamps that
+    // are the +$04 flag bytes of lower devices 32 and 33 (h4+0x3E4E/0x3E62 ->
+    // h4+0x8436/0x844A) and the START lamps of elements 37 and 38.
+    const group = modes.lampGroups[12];
+    expect(group?.script).toBe(237);
+    expect(group?.lamps.map((lamp) => lamp.devices.map((d) => d.surfaceId))).toEqual([[32], [33]]);
+    expect(group?.lamps.map((lamp) => lamp.startElements)).toEqual([[37], [38]]);
+
+    const state = createModeState(modes);
+    expect(state.armed[14]).toBe(0);
+    // One target is not enough...
+    lightGroupLampsForTrigger(modes, state, "device", -1, 32);
+    collectMultipliers(modes, state, 6);
+    expect(state.armed[14]).toBe(0);
+    // ...both are: script 237 runs `START 14`. This is the arming the session-5
+    // rig watched the machine do by itself 5.17 s into a game, on the frame of
+    // a +50,000 score — the second target's own first-hit award.
+    lightGroupLampsForTrigger(modes, state, "device", -1, 33);
+    collectMultipliers(modes, state, 6);
+    expect(state.armed[14]).toBe(1);
+
+    // Now the shot: lower zone 13's script awards element 14, whose effect 6
+    // steps ladder 1 to id 1 -> script 29 -> `AWARD 15`, whose effect 5 is
+    // `move.w $34(a2),$12(a0)` with +$34 = 2. The exact chain of the RAM trace.
+    const zoneScript = modes.scriptForZone(0, 13);
+    expect(zoneScript).toBeGreaterThanOrEqual(0);
+    queueScript(state, zoneScript);
+    expect(collectMultipliers(modes, state, 60)).toEqual([2]);
+  });
+
+  it("law-n-justice: a held multiplier resumes its ladder through hook 2", () => {
+    const modes = modesFor("law-n-justice");
+    const state = createModeState(modes);
+    // Ball 2 of a game whose ball 1 banked X4 and held it: hook 2 re-seeds the
+    // ladder counter to 4/2 = 2, so the next driver award steps to id 3 — X6 —
+    // instead of starting the ladder over.
+    restoreMultiplierLamps(modes, state, 4);
+    lightGroupLampsForTrigger(modes, state, "device", -1, 32);
+    lightGroupLampsForTrigger(modes, state, "device", -1, 33);
+    collectMultipliers(modes, state, 6);
+    expect(state.armed[14]).toBe(1);
+    queueScript(state, modes.scriptForZone(0, 13));
+    expect(collectMultipliers(modes, state, 60)).toEqual([6]);
+  });
+
+  it("babewatch: the three top rollover lanes light X2", () => {
+    const modes = modesFor("babewatch");
+    const group = modes.lampGroups[19];
+    expect(group?.script).toBe(255);
+    expect(group?.lamps.map((lamp) => lamp.zones.map((z) => `${z.level}:${z.index}`))).toEqual([
+      ["0:7"],
+      ["0:8"],
+      ["0:9"],
+    ]);
+
+    const state = createModeState(modes);
+    lightGroupLampsForTrigger(modes, state, "zone", 0, 7);
+    lightGroupLampsForTrigger(modes, state, "zone", 0, 8);
+    expect(collectMultipliers(modes, state, 20)).toEqual([]);
+    // The third lane: script 255 is `AWARD 0`, element 0's effect 6 steps
+    // ladder 0 to id 1 -> `AWARD 1`, multiplier 2.
+    lightGroupLampsForTrigger(modes, state, "zone", 0, 9);
+    expect(collectMultipliers(modes, state, 60)).toEqual([2]);
+  });
+
+  it("extreme-sports: the three upper-deck lanes light X2", () => {
+    const modes = modesFor("extreme-sports");
+    const group = modes.lampGroups[19];
+    expect(group?.script).toBe(183);
+    expect(group?.lamps.map((lamp) => lamp.zones.map((z) => `${z.level}:${z.index}`))).toEqual([
+      ["1:7"],
+      ["1:8"],
+      ["1:9"],
+    ]);
+    // No hook 2 on this table: the descriptor's vector is a plain `rts`.
+    expect(modes.multiplierRestore).toBeNull();
+
+    const state = createModeState(modes);
+    lightGroupLampsForTrigger(modes, state, "zone", 1, 7);
+    lightGroupLampsForTrigger(modes, state, "zone", 1, 8);
+    lightGroupLampsForTrigger(modes, state, "zone", 1, 9);
+    // Script 183 is `AWARD 91`; ladder 7 id 1 -> script 185, `AWARD 92`, X2.
+    expect(collectMultipliers(modes, state, 60)).toEqual([2]);
+  });
+
+  it("every table can now EARN a multiplier from physical events alone", () => {
+    // The census-shaped statement of this round: on each table, a player who
+    // hits every bound device and rolls every bound zone — twice, because Law
+    // 'n Justice's group ARMS a shot the second lap then collects — reports an
+    // effect-5 multiplier. Nothing scripted, nothing poked into element state;
+    // each simulated hit does exactly what `runModes` does for a real one:
+    // light the flag lamp and queue the bound script.
+    for (const tableId of ["law-n-justice", "babewatch", "extreme-sports"] as const) {
+      const modes = modesFor(tableId);
+      const state = createModeState(modes);
+      const lap = (): void => {
+        // Every group-joined lamp lights on its hit whether or not the zone or
+        // device also carries an event binding — `runModes` lights from the
+        // AWARD, and a zone scores without needing a script. BabeWatch's three
+        // lanes are exactly that: flag lamps on zones with no event of their own.
+        for (const group of modes.lampGroups) {
+          for (const lamp of group.lamps) {
+            for (const device of lamp.devices) {
+              lightGroupLampsForTrigger(modes, state, "device", device.level, device.surfaceId);
+            }
+            for (const zone of lamp.zones) {
+              lightGroupLampsForTrigger(modes, state, "zone", zone.level, zone.index);
+            }
+          }
+        }
+        for (const level of [0, 1] as const) {
+          for (let id = 32; id < 192; id += 1) {
+            if (modes.scriptForDevice(level, id) >= 0) queueScript(state, modes.scriptForDevice(level, id));
+          }
+          for (let index = 0; index < 64; index += 1) {
+            if (modes.scriptForZone(level, index) >= 0) queueScript(state, modes.scriptForZone(level, index));
+          }
+        }
+      };
+      lap();
+      const first = collectMultipliers(modes, state, 800);
+      lap();
+      const seen = [...first, ...collectMultipliers(modes, state, 800)];
+      expect(seen.length, `${tableId} never set a multiplier`).toBeGreaterThan(0);
+      expect(Math.min(...seen)).toBeGreaterThanOrEqual(2);
+    }
+  });
+});
 
 describe("the missions, wired into a real game", () => {
   /**

@@ -90,7 +90,11 @@
  * counted.
  */
 
-import { ELEMENT_FLAG_LIT_AT_GAME_START } from "./table-modes.js";
+import {
+  ELEMENT_FLAG_LIT_AT_GAME_START,
+  GROUP_FLAG_KEEP_ALWAYS_ON,
+  GROUP_FLAG_SUPPRESS_FIRE,
+} from "./table-modes.js";
 import type { LockDevice, ModeElement, ModeScript, TableModes } from "./table-modes.js";
 
 // ---------------------------------------------------------------------------
@@ -303,6 +307,32 @@ export interface ModeState {
    */
   readonly counterTotals: Int32Array;
 
+  /**
+   * PER LAMP-GROUP LAMP (flattened over `TableModes.lampGroups` in group then
+   * chain order): the original's per-player STEADY bit at lamp +$00.
+   *
+   * Written by a type-0 device's hit (`bset.b d0,(a2)` at +0x0055F0 — the
+   * device's +$04 "flag byte" IS the lamp) and by a trigger zone's pass
+   * (+0x00543A), through `lightGroupLampsForTrigger`; cleared by the force-off
+   * $6234 whenever a start-element of the lamp is disarmed, and by both group
+   * resets. This is also why the steady bit resets EVERY BALL where the port's
+   * scoring `flags` set is per game — the lamp layer, not the scoring layer,
+   * owns re-arming a group on a later ball.
+   */
+  readonly groupLampLit: Uint8Array;
+  /**
+   * The same lamps' ALWAYS-ON mask, the original's +$05: `or.b d7,$5(lamp)` on
+   * an element AWARD's +$08 lamp, and hook 2's multiplier restore. Survives a
+   * ball only for groups whose flags carry bit 2 (`GROUP_FLAG_KEEP_ALWAYS_ON`).
+   */
+  readonly groupLampAlways: Uint8Array;
+  /**
+   * Per group, the FIRED latch — group record flags bit 0, `bset #0,$4(a4)` at
+   * +0x00658A. Cleared by both resets (`andi.b #$6,$4`), so a group can fire
+   * once per ball.
+   */
+  readonly groupFired: Uint8Array;
+
   /** The background ring at `$2396(a5)`; -1 is an empty slot. */
   readonly queue: Int32Array;
   queueWrite: number;
@@ -359,6 +389,10 @@ export function createModeState(modes: TableModes): ModeState {
   // three and Extreme Sports' counter 14 at five.
   const counterCounts = new Int32Array(modes.counters.length);
   for (const counter of modes.counters) counterCounts[counter.index] = counter.reset;
+  // The lamp groups start all-dark with the latch clear — the hard reset at
+  // +0x003EA8 (new game, +0x0045A6) clears both per-player masks of every
+  // chained lamp and `andi.b #$6,$4(record)` drops the fired latch.
+  const lampCount = modes.lampGroups.reduce((total, group) => total + group.lamps.length, 0);
   return {
     armed,
     done: new Uint8Array(count),
@@ -366,6 +400,9 @@ export function createModeState(modes: TableModes): ModeState {
     timers: new Int32Array(count),
     counterCounts,
     counterTotals: Int32Array.from(counterCounts),
+    groupLampLit: new Uint8Array(lampCount),
+    groupLampAlways: new Uint8Array(lampCount),
+    groupFired: new Uint8Array(modes.lampGroups.length),
     queue: new Int32Array(MODE_QUEUE_SLOTS).fill(-1),
     queueWrite: 0,
     queueRead: 0,
@@ -410,12 +447,14 @@ export function createModeState(modes: TableModes): ModeState {
  * resets them per ball" — was looking for a writer of the arrays and missing the
  * walk that owns them.
  *
- * DIVERGENCE, STATED: `awardLit` (the lamp's +$05 always-on mask) is cleared
- * wholesale here. `+0x003F10` preserves it for lamps in a GROUP whose flags
- * byte has bit 2 set — Law 'n Justice group 8; BabeWatch 7, 11, 15, 17, 25;
- * Extreme Sports 17, 20 — and the exporter does not ship the group table yet,
- * so there is nothing here to test the bit against. When
- * `*.lamps.json` grows its `groups[]` this becomes a filter like the two above.
+ * THE LAMP GROUPS RESET HERE TOO, and the old divergence note is closed: the
+ * soft reset at `+0x003F10` (one caller, the ball-start chain at +0x0050B6)
+ * clears every chained lamp's steady mask at +$00 and the group's fired latch
+ * (`andi.b #$6,$4`), and clears the always-on mask at +$05 UNLESS the group's
+ * flags carry bit 2 (`btst #$2,$4(a1)` at +0x003F2E skips the `clr.b $5(a0)`).
+ * `awardLit` — the port's per-element view of the same +$05 — now follows the
+ * identical rule through `TableModes.awardLitSurvivesBall` instead of being
+ * cleared wholesale.
  */
 export function resetModesForNewBall(modes: TableModes, state: ModeState): void {
   const keepArmed = new Set(modes.keepArmedAcrossBall);
@@ -431,7 +470,19 @@ export function resetModesForNewBall(modes: TableModes, state: ModeState): void 
     state.counterCounts[counter.index] = counter.reset;
     state.counterTotals[counter.index] = counter.reset;
   }
-  state.awardLit.fill(0);
+  state.groupLampLit.fill(0);
+  state.groupFired.fill(0);
+  let lampAt = 0;
+  for (const group of modes.lampGroups) {
+    const keep = (group.flags & GROUP_FLAG_KEEP_ALWAYS_ON) !== 0;
+    for (let i = 0; i < group.lamps.length; i += 1, lampAt += 1) {
+      if (!keep) state.groupLampAlways[lampAt] = 0;
+    }
+  }
+  const keepAwardLit = new Set(modes.awardLitSurvivesBall);
+  for (let index = 0; index < state.awardLit.length; index += 1) {
+    if (!keepAwardLit.has(index)) state.awardLit[index] = 0;
+  }
   // The original writes $FFFF — "no countdown" — into +$2E for everything the
   // reset arms; this state machine spells "not counting" as 0, and it clears
   // every element's timer rather than only the armed ones, which is the same
@@ -443,6 +494,177 @@ export function resetModesForNewBall(modes: TableModes, state: ModeState): void 
   state.background = -1;
   state.backgroundPc = 0;
   endMission(state);
+}
+
+// ---------------------------------------------------------------------------
+// The lamp groups
+// ---------------------------------------------------------------------------
+
+/**
+ * Derived joins over `TableModes.lampGroups`, built once per document: flat
+ * lamp index by device surface id, by zone, and by element (start and award
+ * paths), plus each flat lamp's group. Pure derivation, cached by identity.
+ */
+interface GroupJoinIndex {
+  readonly total: number;
+  /** Flat index of each group's first lamp. */
+  readonly groupBase: Int32Array;
+  readonly byDevice: ReadonlyMap<string, readonly number[]>;
+  readonly byZone: ReadonlyMap<string, readonly number[]>;
+  readonly startByElement: ReadonlyMap<number, readonly number[]>;
+  readonly awardByElement: ReadonlyMap<number, readonly number[]>;
+  /** Elements whose armed state blinks each flat lamp: the inverse of start. */
+  readonly startElementsOfLamp: readonly (readonly number[])[];
+}
+
+const JOIN_INDEX = new WeakMap<TableModes, GroupJoinIndex>();
+
+function groupJoins(modes: TableModes): GroupJoinIndex {
+  const cached = JOIN_INDEX.get(modes);
+  if (cached !== undefined) return cached;
+  const groupBase = new Int32Array(modes.lampGroups.length);
+  const byDevice = new Map<string, number[]>();
+  const byZone = new Map<string, number[]>();
+  const startByElement = new Map<number, number[]>();
+  const awardByElement = new Map<number, number[]>();
+  const startElementsOfLamp: (readonly number[])[] = [];
+  const push = <K,>(map: Map<K, number[]>, k: K, value: number): void => {
+    const list = map.get(k);
+    if (list === undefined) map.set(k, [value]);
+    else list.push(value);
+  };
+  let at = 0;
+  for (const group of modes.lampGroups) {
+    groupBase[group.index] = at;
+    for (const lamp of group.lamps) {
+      for (const device of lamp.devices) push(byDevice, `${device.level}:${device.surfaceId}`, at);
+      for (const zone of lamp.zones) push(byZone, `${zone.level}:${zone.index}`, at);
+      for (const element of lamp.startElements) push(startByElement, element, at);
+      for (const element of lamp.awardElements) push(awardByElement, element, at);
+      startElementsOfLamp.push(lamp.startElements);
+      at += 1;
+    }
+  }
+  const built: GroupJoinIndex = {
+    total: at,
+    groupBase,
+    byDevice,
+    byZone,
+    startByElement,
+    awardByElement,
+    startElementsOfLamp,
+  };
+  JOIN_INDEX.set(modes, built);
+  return built;
+}
+
+/**
+ * A device hit or a zone pass lights its flag lamp — `bset.b d0,(a2)` at
+ * +0x0055F0 (device +$04) and +0x00543A (zone object +$0A).
+ *
+ * Called for EVERY hit, not only the first: the machine's bset is idempotent
+ * and it is the bset itself that distinguishes first from repeat, so the lamp
+ * relights on the first hit of a NEW ball even though the port's per-game
+ * scoring flags still call that hit a repeat (divergence documented on
+ * `ModeState.groupLampLit`). A device award's trigger carries no level (`level`
+ * -1); a device surface id is filed on exactly one level, so matching both is
+ * the same join the engine makes through the level's own array.
+ */
+export function lightGroupLampsForTrigger(
+  modes: TableModes,
+  state: ModeState,
+  kind: "device" | "zone",
+  level: number,
+  id: number,
+): void {
+  const joins = groupJoins(modes);
+  const lamps =
+    kind === "device"
+      ? level < 0
+        ? [...(joins.byDevice.get(`0:${id}`) ?? []), ...(joins.byDevice.get(`1:${id}`) ?? [])]
+        : (joins.byDevice.get(`${level}:${id}`) ?? [])
+      : (joins.byZone.get(`${level}:${id}`) ?? []);
+  for (const lamp of lamps) state.groupLampLit[lamp] = 1;
+}
+
+/**
+ * The force-off $6234, run on every disarm the active-element service observes
+ * (+0x006296 after the armed test at +0x006284, and on the award, timeout,
+ * COMPLETE and LAMP_OFF paths that clear the bit): `bclr.b d6,(a1)` takes the
+ * player's STEADY bit off the element's +$04 start lamp and stops its blink.
+ * The always-on mask at +$05 is NOT touched — only LAMP_OFF's own handler
+ * reaches that.
+ */
+function forceStartLampsOff(modes: TableModes, state: ModeState, element: number): void {
+  for (const lamp of groupJoins(modes).startByElement.get(element) ?? []) {
+    state.groupLampLit[lamp] = 0;
+  }
+}
+
+/**
+ * THE GROUP SCAN, main.seg00 +0x0064D0, run once per tick.
+ *
+ * For each group: a lamp counts as LIT when the player's bit is in
+ * `(+$00 | +$05)` and the lamp is not blinking — and a lamp is blinking
+ * exactly while some element whose START lamp it is stays armed, because the
+ * active-element service re-applies the blink every frame (+0x006312..22) and
+ * the disarm force-off clears it. A blinking lamp sets the not-all-lit
+ * accumulator BEFORE the phase test (+0x006506), so it blocks its group even
+ * when a device has also set its steady bit. When every lamp is lit and the
+ * group is neither suppressed (`btst #1,$4(a4)`, +0x006582) nor already
+ * latched (`bset #0,$4(a4)`, +0x00658A), the event script at +$06 is queued
+ * through $6C10 (+0x006594).
+ *
+ * DIVERGENCE, STATED: the original's scan is budgeted — 32 lamps and 8 lamp
+ * changes per frame, cursor carried in `$10F4/$10F6(a5)` — so a completion can
+ * lag the lighting hit by a frame or two. This scan is complete every tick;
+ * the fire still reaches the queue, whose one-opcode-per-tick pace is the
+ * dominant delay either way.
+ */
+function scanLampGroups(modes: TableModes, state: ModeState): void {
+  if (modes.lampGroups.length === 0) return;
+  const joins = groupJoins(modes);
+  let at = 0;
+  for (const group of modes.lampGroups) {
+    let allLit = group.lamps.length > 0;
+    for (let i = 0; i < group.lamps.length; i += 1) {
+      const lamp = at + i;
+      const blinking = joins.startElementsOfLamp[lamp]?.some((element) => state.armed[element] === 1) ?? false;
+      if (blinking || (state.groupLampLit[lamp] !== 1 && state.groupLampAlways[lamp] !== 1)) {
+        allLit = false;
+        break;
+      }
+    }
+    at += group.lamps.length;
+    if (!allLit) continue;
+    if ((group.flags & GROUP_FLAG_SUPPRESS_FIRE) !== 0) continue;
+    if (state.groupFired[group.index] === 1) continue;
+    state.groupFired[group.index] = 1;
+    if (group.script >= 0) queueScript(state, group.script);
+  }
+}
+
+/**
+ * Descriptor HOOK 2's ball-start restore, `jsr ([$94,a5],$A4)` at +0x005116:
+ * for a non-zero incoming multiplier, both per-player words of the ladder's
+ * counter record take multiplier/2 and the first multiplier/2 lamps of the
+ * X2..X10 chain get their always-on bit set. Call it where the machine does —
+ * every ball start, AFTER the hold logic has settled the multiplier — with
+ * whatever `+$12` now holds. A table whose hook is `rts` ships `null` and
+ * this is a no-op, exactly as Extreme Sports' descriptor says.
+ */
+export function restoreMultiplierLamps(modes: TableModes, state: ModeState, multiplier: number): void {
+  const restore = modes.multiplierRestore;
+  if (restore === null || multiplier <= 0) return;
+  const rungs = Math.floor(multiplier / 2);
+  state.counterCounts[restore.counter] = rungs;
+  state.counterTotals[restore.counter] = rungs;
+  const joins = groupJoins(modes);
+  const base = joins.groupBase[restore.group] ?? 0;
+  const lamps = modes.lampGroups[restore.group]?.lamps.length ?? 0;
+  for (let i = 0; i < Math.min(rungs, lamps); i += 1) {
+    state.groupLampAlways[base + i] = 1;
+  }
 }
 
 /**
@@ -757,12 +979,20 @@ function awardElement(
   state.timers[index] = 0;
   // MEASURED: the award lamp handler or.b's the always-on byte of the
   // element's +$08 lamp, so the awarded shot's insert stays lit steady. The
-  // latch is presentation state; see its declaration.
+  // latch is presentation state; see its declaration. The GROUP view of the
+  // same +$05 byte is rules state — a group whose lamps are award lamps
+  // completes on it — so both are written here.
   state.awardLit[index] = 1;
+  for (const lamp of groupJoins(modes).awardByElement.get(index) ?? []) {
+    state.groupLampAlways[lamp] = 1;
+  }
   // MEASURED: the relight. 0x5CA8 sets the armed bit straight back when the
   // element's flags carry a bit of $A, so a lock-lit lamp survives its own
   // award and the next capture counts too. See `FLAGS_RELIGHT`.
   if ((element.flags & FLAGS_RELIGHT) !== 0) state.armed[index] = 1;
+  // A disarm the active-element service observes runs the force-off $6234 on
+  // the element's START lamp; a relit element never goes out, so never does.
+  if (state.armed[index] === 0) forceStartLampsOff(modes, state, index);
 
   out.awards.push({
     element: index,
@@ -995,6 +1225,7 @@ function step(
         if (!permanent && state.timers[index] !== 0) {
           state.armed[index] = 0;
           state.timers[index] = 0;
+          forceStartLampsOff(modes, state, index);
         }
       }
       return next;
@@ -1022,8 +1253,13 @@ function step(
         state.armed[index] = 0;
         state.timers[index] = 0;
         // The force-off at $6234 takes the whole lamp out, so the award
-        // relight latch goes with it.
+        // relight latch goes with it — on both its per-element view and the
+        // group's own always-on mask for the element's +$08 lamp.
         state.awardLit[index] = 0;
+        forceStartLampsOff(modes, state, index);
+        for (const lamp of groupJoins(modes).awardByElement.get(index) ?? []) {
+          state.groupLampAlways[lamp] = 0;
+        }
       }
       return next;
     }
@@ -1054,6 +1290,7 @@ function step(
         if (index >= 0) {
           state.armed[index] = 0;
           state.timers[index] = 0;
+          forceStartLampsOff(modes, state, index);
         }
         return next;
       }
@@ -1300,11 +1537,20 @@ export function tickModes(modes: TableModes, state: ModeState): ModeTickReport {
     const left = state.timers[index] ?? 0;
     if (left <= 0) continue;
     state.timers[index] = left - 1;
-    if (left - 1 === 0) state.armed[index] = 0;
+    if (left - 1 === 0) {
+      state.armed[index] = 0;
+      // The active-element service's own expiry path: `bclr.b d6,$1(a0)` at
+      // +0x006292 falls into the force-off at +0x006296.
+      forceStartLampsOff(modes, state, index);
+    }
   }
 
   stepMission(modes, state, out);
   stepBackground(modes, state, out);
+  // The lamp-group scan (+0x0064D0) runs as its own frame service in the
+  // original; here it runs after the interpreters so a lamp lit by this tick's
+  // physics is seen this tick, and the fired script queues for the next.
+  scanLampGroups(modes, state);
 
   if (
     out.awards.length === 0 &&
