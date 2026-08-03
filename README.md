@@ -6,9 +6,29 @@ Dreams / Fantasies / Illusions line, and the first with multiball.
 
 ## Status
 
-Early, but the geometry is no longer guesswork. Disk custody, volume layout, the
-table index and the per-table option defaults are established, and the per-pixel
-collision map for all three tables has been decoded and shipped:
+All three tables play, in HD, with sound, on a desktop or a phone. What is on
+screen and what comes out of the speakers is the disk's own data, and where the
+two disagree with a recording of the real machine, the recording wins.
+
+The instrument that made that possible is worth stating up front, because most
+of the interesting findings came from it rather than from reading code: the
+original runs under WinUAE beside this port, filmed at one frame per PAL frame
+with unresampled audio, and — when film is not sharp enough — its ball record is
+read live out of emulator memory, frame by frame. Several beliefs this project
+held with confidence were overturned that way. The credits roll is twelve pages,
+not nineteen. The flipper collision body was a third thinner than the bat drawn
+over it. The title music was the wrong module entirely. An untouched ball on Law
+'n Justice scores nothing on the real machine either, so the zero this port
+produces is correct and the round chasing it was chasing correct behaviour.
+
+Some numbers that are checkable rather than adjectival: the three playfields
+agree with filmed frames of the original at **98.45 / 99.86 / 99.13 percent** of
+pixels; the twelve credit pages match at **27,400 of 27,400** ink pixels; the
+front-end music correlates with the filmed audio at **0.72 waveform and 0.98
+envelope** and loops at exactly the machine's own 8077 PAL frames. 1465 tests,
+strict `tsc`, and a build that refuses to ship any asset nothing accounts for.
+
+The geometry everything else rests on:
 
 - Playfield is **336 x 600** on every table, stored as four stacked 1-bit layers of
   **620 / 620 / 600 / 600** rows at offsets **0 / 26040 / 52080 / 77280**.
@@ -316,14 +336,35 @@ button, iOS gates motion behind a permission prompt, a real shake is
 indistinguishable from walking, and this table's tilt is a measured mechanism
 that a noisy continuous signal would trip for players who did nothing.
 
-### Not started
+### Not started, and one thing deliberately not fitted
 
-The intro (`intro.bin` is a FreeAnim animation plus an SNT! tune, and its frame
-format is not decoded); the credits roll's own text and its tumbling-object
-backdrops; the bonus ladder; and MULTIPLE PLAYERS — the original scans F1..F8
-for one to eight and alternates them per ball, and this reconstruction is one
-player, because the simulation holds a single score, ball count and mission
-machine, and giving it eight is a change to the game rather than to the shell.
+MULTIPLE PLAYERS. The original scans F1..F8 for one to eight and alternates them
+per ball; this is one player, because the simulation holds a single score, ball
+count and mission machine, and giving it eight is a change to the game rather
+than to the shell.
+
+The INTRO ANIMATION. `intro.bin` is a FreeAnim animation whose frame format is
+still undecoded — though its SNT! tune is decoded and shipped, because it turned
+out to be the front-end music the menus play, which this project spent a round
+attributing to the wrong file entirely.
+
+The BONUS LADDER count-up.
+
+Six of Law 'n Justice's seventeen sound records, which are reachable only from
+table-native 68000 code this port does not run, or hang off a pointer ladder
+with no decoded consumer. Unbindable without new decode work, so unbound rather
+than guessed.
+
+And one thing that is measured, understood, and deliberately left alone. Coming
+down Law 'n Justice's left orbit the machine turns 14.13 degrees off vertical at
+the first arch contact and leaves the wall to coast; this port turns 7.58 and
+grinds along it, arriving about 1.5 px/tick slow. The wall there is a
+three-pixel staircase, and the machine's own cold launches take that same
+contact anywhere from 10.78 to 14.13 degrees depending on a quarter-pixel of
+launch timing. A response that swings 3.35 degrees per quarter pixel cannot be
+fitted; closing it would mean tuning to one draw. It needs a decoded rule for
+staircase normals, and until someone has one the honest state is a measurement,
+not a fix. See the session-4 trace under `research/view/reference/`.
 
 See [docs/DISK_ANALYSIS.md](docs/DISK_ANALYSIS.md) and
 [docs/GAMEPLAY_PARITY.md](docs/GAMEPLAY_PARITY.md).
