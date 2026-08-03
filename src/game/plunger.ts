@@ -60,12 +60,17 @@
  * so the next reader does not re-add it from the raw film numbers.
  */
 
-import type { BallState, TableId } from "./contracts.js";
+import type { BallState, PlayfieldLevel, TableId } from "./contracts.js";
 import type { BallSet } from "./ball-physics.js";
 import { spawnBall } from "./ball-physics.js";
+import { BALL_RADIUS_PIXELS } from "./collision-probe.js";
 import type { Q10 } from "../core/fixed-point.js";
-import { pixelsToQ10 } from "../core/fixed-point.js";
-import { VELOCITY_CLAMP_Q10, originalVelocityToQ10 } from "./timebase.js";
+import { pixelsToQ10, q10ToPixel } from "../core/fixed-point.js";
+import {
+  Q10_PER_ORIGINAL_VELOCITY_UNIT,
+  VELOCITY_CLAMP_Q10,
+  originalVelocityToQ10,
+} from "./timebase.js";
 
 /**
  * The shooter lane, as free ball-centre bounds measured against the collision
@@ -202,10 +207,12 @@ export const EXTREME_SPORTS_SHOOTER_LANE: ShooterLane = Object.freeze({
  * it. The inset is removed and the constant is kept at 0 so the derivation
  * stays visible rather than disappearing into `serveRow = lane.bottomY`.
  *
- * It is inert by design: the serve loop pins the lane ball to this row every
- * tick until the launch, so the ball never contacts anything from it. That was
- * CONFIRMED rather than assumed — `tests/plays.test.ts`'s per-table play hashes
- * and the census scores are unchanged by this edit.
+ * It describes the SEAT, which is where a ball rolled down the return chute
+ * comes to rest, and it is no longer where any ball is placed: the machine
+ * serves into the trough and the map holds the ball on the lane floor. Measured
+ * with the chute in: 1,782 of 2,000 sampled trough records settle at
+ * (321.0000, 552.9990) on BabeWatch, i.e. on this row, which is the film's
+ * resting silver to within the frame difference's own precision.
  */
 export const SERVE_INSET_PIXELS = 0;
 
@@ -252,10 +259,18 @@ export const LAUNCH_KICK: Q10 = originalVelocityToQ10(ORIGINAL_LAUNCH_KICK_UNITS
 export interface PlungerConfig {
   /** Q10 units per tick of upward kick, pre-clamp. The same for every ball. */
   readonly launchKick: number;
-  /** Where a new ball appears, in Q10 playfield coordinates. */
+  /**
+   * The SEAT, in Q10 playfield coordinates: the centre of the lane's free span
+   * on its bottommost free row.
+   *
+   * NOT where a ball is placed — nothing places a ball here any more; see the
+   * trough below. It is the lane's own geometry, and what still reads it is the
+   * camera framing, the tests that assert where a served ball ends up, and
+   * anything that wants to name the rod's nominal position.
+   */
   readonly serveX: Q10;
   readonly serveY: Q10;
-  /** Whether the serve point comes from a measured lane or an assumed one. */
+  /** Whether the seat comes from a measured lane or an assumed one. */
   readonly laneConfidence: ShooterLane["confidence"];
 }
 
@@ -366,7 +381,7 @@ export function autoLaunchOutcome(config: PlungerConfig = DEFAULT_PLUNGER_CONFIG
   return { fired: true, launchVelocityY: -config.launchKick };
 }
 
-/** Where a served ball appears, in Q10. */
+/** The lane seat, in Q10 — where a served ball comes to REST, not where it starts. */
 export function servePosition(config: PlungerConfig = DEFAULT_PLUNGER_CONFIG): {
   readonly x: Q10;
   readonly y: Q10;
@@ -374,24 +389,248 @@ export function servePosition(config: PlungerConfig = DEFAULT_PLUNGER_CONFIG): {
   return { x: config.serveX, y: config.serveY };
 }
 
+// ---------------------------------------------------------------------------
+// THE TROUGH: main.seg00 $3E36, and the entropy it carries
+// ---------------------------------------------------------------------------
+//
+// This is the routine that puts a ball back in the trough, and it is the only
+// place in the binary — apart from a saucer's authored eject at +0x0070FC and
+// the integrator itself at +0x00B728 — that ever writes a ball's position. It
+// runs on a drain (+0x00B424 falls into it when the y>600 test fires at
+// +0x00B29A), on a device that swallows a ball (+0x005B7C), and on every one of
+// the three ball records at the start of a game (+0x003550) and of a ball
+// (+0x003E84). Byte-verified against main.bin.seg00.bin — the shipped listing
+// is one word out of phase here, because $3E34 is a data counter sitting inside
+// the code and the disassembler kept going:
+//
+//   $3E36  02 6C 00 07 00 12   andi.w  #$0007,$12(a4)      x  &= 7
+//   $3E3C  06 6C 01 1C 00 12   addi.w  #$011C,$12(a4)      x  += 284
+//   $3E42  70 00               moveq   #0,d0
+//   $3E44  30 2C 00 12         move.w  $12(a4),d0
+//   $3E48  E1 88 E5 88         lsl.l   #8,d0 / lsl.l #2,d0     (<<10)
+//   $3E4C  29 40 00 1E         move.l  d0,$1e(a4)          xQ10 = x<<10
+//   $3E50  02 6C 00 07 00 14   andi.w  #$0007,$14(a4)      y  &= 7
+//   $3E56  06 6C 01 FE 00 14   addi.w  #$01FE,$14(a4)      y  += 510
+//   $3E5C  30 2C 00 14 ...     (same <<10)
+//   $3E64  29 40 00 22         move.l  d0,$22(a4)          yQ10 = y<<10
+//   $3E68  02 AC 00FF00FF 000E andi.l  #$00FF00FF,$e(a4)   vx &= 255, vy &= 255
+//   $3E70  06 AC 02000200 000E addi.l  #$02000200,$e(a4)   vx += 512, vy += 512
+//   $3E78  42 2C 00 01         clr.b   $1(a4)
+//   $3E7C  4E B9 000053F4      jsr     $53F4               level pointers := UPPER
+//   $3E82  4E 75               rts
+//
+// Four facts the numbers alone do not carry, all of them load-bearing:
+//
+//  1. IT MASKS IN PLACE. There is no "old position" variable — the routine ANDs
+//     the ball record's own fields, so the three bits it keeps are the bits of
+//     wherever that ball was standing when the machine took it away. A drain at
+//     x=185 serves the next ball one pixel right of a drain at x=184.
+//
+//  2. $12/$14 ARE WHOLE PIXELS, not sub-pixels. $1e/$22 are the Q10 masters and
+//     $12/$14 are `asr.l #10` of them (+0x00B722), and this routine rebuilds
+//     $1e/$22 by shifting $12/$14 back up. So `&7` is SEVEN WHOLE PIXELS. The
+//     round-6 sweep that treated it as 7/256 px and found the serve degenerate
+//     was measuring a 256th of the real thing.
+//
+//  3. $12/$14 ARE THE SPRITE'S TOP-LEFT, and this port's `BallState.x/y` is the
+//     CENTRE — the same +8 that `table-accel.ts` documents at +0x00B72E. So the
+//     placement in this port's frame is 284+8 = 292 and 510+8 = 518. (The mask
+//     is unaffected: the radius is 8, so (centre-8)&7 == centre&7.)
+//
+//  4. IT IS NOT THE LANE. (292..299, 518..525) is a mouth on the UPPER
+//     collision line — $53F4 is the "level 1" pointer set, the sibling of
+//     $53C6's level 0 — and it is the top of a 45-degree chute that is PIXEL
+//     IDENTICAL on all three shipped maps (as the lane floor at y=561 is), the
+//     ball-return running down to the shooter lane's foot at (317,562), where
+//     every table carries the same `to-lower` hand-off zone (317,545)-(337,565).
+//     The mouth is a FUNNEL, not a slot: measured with the engine's own probe
+//     ring, the free ball-centre run on rows 518..522 is 295..327, 294..327,
+//     293..327, 292..327, 291..327 — identical on all three maps to the pixel —
+//     so 45 of the 64 placements start clear and the other 19 start inside the
+//     upper-left wall's touch band and are pushed off it by the first collision
+//     pass. That is a machine dropping a ball into a funnel. The velocity is the
+//     reason it is a chute and not a drop: +512 in BOTH axes is 2 px/tick down
+//     and 2 px/tick right, i.e. straight down the 45-degree channel.
+//
+// So the serve is: place at the chute mouth with three bits of the last ball's
+// position, push off with the low byte of its velocity, and roll. Every draw
+// arrives on the rod (measured: all 64 mouth pixels at both ends of the velocity
+// carry, all three tables, 11..75 ticks), which is why nothing has to pin it.
+
+/** `addi.w #$011C` — the trough x, as the original's top-left sprite column. */
+export const TROUGH_ORIGIN_X = 284;
+/** `addi.w #$01FE` — the trough y, same frame. */
+export const TROUGH_ORIGIN_Y = 510;
+/** `andi.w #$0007` — three bits of the drained ball's position, both axes. */
+export const TROUGH_POSITION_MASK = 7;
+/** `andi.l #$00FF00FF` — the low byte of the drained ball's velocity, both axes. */
+export const TROUGH_VELOCITY_MASK = 0xff;
+/** `addi.l #$02000200` — the push-off, in the original's velocity units. */
+export const TROUGH_VELOCITY_UNITS = 512;
+/** `jsr $53F4`: the ball is placed on the UPPER collision line, in the chute. */
+export const TROUGH_LEVEL: PlayfieldLevel = 1;
+
+/** The chute mouth in this port's centre frame: 284+8 and 510+8. */
+export const TROUGH_CENTRE_X = TROUGH_ORIGIN_X + BALL_RADIUS_PIXELS;
+export const TROUGH_CENTRE_Y = TROUGH_ORIGIN_Y + BALL_RADIUS_PIXELS;
+
 /**
- * Puts a new, motionless ball at the bottom of the shooter lane.
+ * The four fields $3E36 reads out of the ball record before it overwrites them:
+ * the machine's carried serve entropy, already masked.
  *
- * It is served at rest rather than with a downward nudge: gravity settles it
- * onto the lane floor within a few ticks, and starting it moving would make the
- * launch depend on when the player pressed relative to the serve.
- *
- * DIVERGENCE, recorded: the original re-troughs a drained ball at
- * x=(oldx&7)+284, y=(oldy&7)+510 (main.seg00 $3E36) — three bits of carried
- * position entropy — and lets it ROLL down a serve chute into the lane, so no
- * two serves start from the identical pixel. This port serves at the fixed
- * seat. The chute physics needs the upper-line serve path verified before it
- * can be authentic rather than decorative, and the entropy without the chute
- * would just be noise injected at a place the original derives it; both wait
- * on their own round.
+ * Kept masked rather than raw so that the only place the masks are applied is
+ * `troughRecordOf`, and so a record can be compared and pinned.
  */
-export function serveBall(set: BallSet, config: PlungerConfig = DEFAULT_PLUNGER_CONFIG): BallState {
-  return spawnBall(set, config.serveX, config.serveY, 0, 0);
+export interface TroughRecord {
+  /** `x & 7` of the ball that was last put in the trough. */
+  readonly x: number;
+  /** `y & 7`. */
+  readonly y: number;
+  /** `vx & 255`, in the original's velocity units. */
+  readonly velocityX: number;
+  /** `vy & 255`. */
+  readonly velocityY: number;
+}
+
+/**
+ * The record a machine that has never had a ball taken off it serves from.
+ *
+ * WHAT THE ORIGINAL DOES HERE IS UNDEFINED, and this is the defensible reading.
+ * The three ball records live at $FAA(a5) in the workspace the loader allocates,
+ * and nothing ever initialises them: the game-start path at +0x003536 walks the
+ * three of them calling $3E36, which masks whatever is already there. On the
+ * first game after the machine is switched on that is cleared BSS — zeros — and
+ * on every later game it is the previous game's leftovers, which is real
+ * behaviour that no reconstruction can reproduce, because it depends on what
+ * else the Amiga happened to leave in that memory.
+ *
+ * So: a cold machine, zeros. `createGame` starts here, `startGame` deliberately
+ * does NOT reset it (the leftovers survive a new game on the original too, and
+ * that is exactly the carry this models), and the choice is stated rather than
+ * hidden because a reader comparing against a real machine will see the first
+ * ball of the first game agree and later games diverge.
+ */
+export const CLEARED_TROUGH_RECORD: TroughRecord = Object.freeze({
+  x: 0,
+  y: 0,
+  velocityX: 0,
+  velocityY: 0,
+});
+
+/**
+ * `andi.w #$0007` / `andi.l #$00FF00FF` applied to a ball this port is about to
+ * take off the table.
+ *
+ * The position mask is on the CENTRE rather than the top-left, and that is not
+ * an approximation: the radius is 8, so the two differ by a multiple of the
+ * mask. The velocity mask goes through the original's own word: this port's Q10
+ * velocity is `Q10_PER_ORIGINAL_VELOCITY_UNIT` times the original's, and `>>` is
+ * the `asr` the 68000 would have used, so a negative velocity masks to the same
+ * two's-complement byte the machine would have kept. A drain is nearly always
+ * moving down and left or down and right at speed, so this byte is the liveliest
+ * of the four fields — it is what makes two drains a pixel apart serve
+ * differently rather than identically.
+ */
+export function troughRecordOf(ball: {
+  readonly x: Q10;
+  readonly y: Q10;
+  readonly velocityX: Q10;
+  readonly velocityY: Q10;
+}): TroughRecord {
+  return {
+    x: q10ToPixel(ball.x) & TROUGH_POSITION_MASK,
+    y: q10ToPixel(ball.y) & TROUGH_POSITION_MASK,
+    velocityX: originalVelocityWord(ball.velocityX) & TROUGH_VELOCITY_MASK,
+    velocityY: originalVelocityWord(ball.velocityY) & TROUGH_VELOCITY_MASK,
+  };
+}
+
+/**
+ * This port's Q10 velocity as the original's velocity WORD, floored.
+ *
+ * Floor rather than truncate-toward-zero because every shift in the engine is an
+ * `asr`, and the mask that follows reads the two's-complement bit pattern: -1000
+ * units is $FC18 and $FC18 & $FF is 24, which is the number the machine carries.
+ * Rounding the other way for negatives would carry a different byte.
+ */
+function originalVelocityWord(velocityQ10: Q10): number {
+  return Math.floor(velocityQ10 / Q10_PER_ORIGINAL_VELOCITY_UNIT);
+}
+
+/** Where and how fast a ball leaves the trough, in Q10. */
+export interface TroughPlacement {
+  readonly x: Q10;
+  readonly y: Q10;
+  readonly velocityX: Q10;
+  readonly velocityY: Q10;
+  readonly level: PlayfieldLevel;
+}
+
+/** $3E36's arithmetic, in this port's units. */
+export function troughPlacement(record: TroughRecord = CLEARED_TROUGH_RECORD): TroughPlacement {
+  return {
+    x: pixelsToQ10(TROUGH_CENTRE_X + (record.x & TROUGH_POSITION_MASK)),
+    y: pixelsToQ10(TROUGH_CENTRE_Y + (record.y & TROUGH_POSITION_MASK)),
+    velocityX: originalVelocityToQ10(
+      TROUGH_VELOCITY_UNITS + (record.velocityX & TROUGH_VELOCITY_MASK),
+    ),
+    velocityY: originalVelocityToQ10(
+      TROUGH_VELOCITY_UNITS + (record.velocityY & TROUGH_VELOCITY_MASK),
+    ),
+    level: TROUGH_LEVEL,
+  };
+}
+
+/**
+ * Puts a ball in the trough, carrying the last one's low bits with it.
+ *
+ * `config` is no longer read — the trough is engine geometry, one place for all
+ * three tables, exactly as $3E36's two immediates are one pair of constants in
+ * the shared binary — but it stays in the signature because every caller has a
+ * config to hand and losing the parameter would hide the fact that the SEAT is
+ * still per-table even though the trough is not.
+ */
+export function serveBall(
+  set: BallSet,
+  _config: PlungerConfig = DEFAULT_PLUNGER_CONFIG,
+  record: TroughRecord = CLEARED_TROUGH_RECORD,
+): BallState {
+  const place = troughPlacement(record);
+  return spawnBall(set, place.x, place.y, place.velocityX, place.velocityY, place.level);
+}
+
+/**
+ * THE ROD SWITCH: the level-0 zone the machine reads to know a ball has arrived
+ * in the lane and may be kicked.
+ *
+ * The original's launcher does not kick "the ball that was served" — it kicks
+ * whatever ball index is standing in a byte a per-table pointer names
+ * ($234E(a5), read at +0x006628, `move.b (a0),d0 / beq` and no kick when it is
+ * zero). That byte is a zone's occupancy byte, and the zone is in the shipped
+ * data: every table carries exactly one level-0 `trigger-b` zone over the lane
+ * seat, scoring nothing, and all three are the SAME rectangle —
+ * (310,540)-(330,560) — as the lane floor at y=561 and the return chute are the
+ * same on all three. `tests/plunger.test.ts` re-derives it from the three
+ * shipped device documents rather than trusting this constant.
+ *
+ * It matters now in a way it never did before: a served ball spends 11 to 75
+ * ticks in the return chute, and a launch press that lands in that window must
+ * be consumed and do nothing (which is what the original's `beq` does) rather
+ * than fire a 6000-unit kick at a ball halfway down a habitrail.
+ */
+export const ROD_SWITCH: {
+  readonly minX: number;
+  readonly minY: number;
+  readonly maxX: number;
+  readonly maxY: number;
+} = Object.freeze({ minX: 310, minY: 540, maxX: 330, maxY: 560 });
+
+/** True when a ball is standing on the rod switch, i.e. is kickable. */
+export function ballIsOnTheRod(ball: BallState): boolean {
+  if (!ball.active || ball.level !== 0) return false;
+  const x = q10ToPixel(ball.x);
+  const y = q10ToPixel(ball.y);
+  return x >= ROD_SWITCH.minX && x <= ROD_SWITCH.maxX && y >= ROD_SWITCH.minY && y <= ROD_SWITCH.maxY;
 }
 
 /**

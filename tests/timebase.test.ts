@@ -325,21 +325,41 @@ class ScriptedInput implements InputSource {
 function plungeFlight(tableId: TableId): { ticks: number; topY: number } {
   const game = createGame(mapFor(tableId), { ballsPerGame: 1 });
   startGame(game);
-  const input = new ScriptedInput((t) => (t >= 40 && t < 90 ? ["plunger"] : []));
+  // Press once the served ball has finished the RETURN CHUTE and settled on the
+  // rod. It used to press at tick 40, which was 15 ticks after a serve that
+  // teleported the ball onto the seat; the serve now rolls it down the chute and
+  // reaches the rod at tick 36, so a press at 40 kicks a ball that is still
+  // rattling and this file's subject — how fast a SETTLED launch climbs — would
+  // be measuring the rattle instead.
+  const input = new ScriptedInput((t) => (t >= 80 && t < 130 ? ["plunger"] : []));
   let launchTick = -1;
   let topY = PLAYFIELD_HEIGHT;
   let topTick = -1;
+  let previous = PLAYFIELD_HEIGHT;
   for (let tick = 0; tick < 600; tick += 1) {
     const report = runTicks(game, input, 1)[0];
-    if (report?.launched === true) launchTick = tick;
+    if (report?.launched === true) {
+      launchTick = tick;
+      previous = PLAYFIELD_HEIGHT;
+    }
     if (launchTick < 0) continue;
+    let highest = PLAYFIELD_HEIGHT;
     for (const ball of debugSnapshot(game).balls) {
       if (!ball.active) continue;
-      if (ball.pixelY < topY) {
-        topY = ball.pixelY;
-        topTick = tick;
-      }
+      if (ball.pixelY < highest) highest = ball.pixelY;
     }
+    if (highest < topY) {
+      topY = highest;
+      topTick = tick;
+    }
+    // THE FIRST ASCENT, not the whole ball. This used to take the minimum over
+    // 600 ticks, which was the same thing while the launch was the only time the
+    // ball ever went up; a ball that survives long enough to be carried round a
+    // habitrail later can beat its own launch apex a hundred ticks afterwards
+    // and turn "how fast does the launch climb" into "how long did the ball
+    // live". Stop at the first tick the climb turns over.
+    if (highest > previous) break;
+    previous = highest;
   }
   return { ticks: topTick - launchTick, topY };
 }

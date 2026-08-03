@@ -388,6 +388,64 @@ clamp — and its spread lives in the STROKE: a ball met at rate 20 leaves at a 
 speed of one met at 120. `src/game/flippers.ts` implements it and
 `tests/timebase.test.ts` asserts the bound as arithmetic. **[disk]**
 
+## The serve — SETTLED, and it carries the machine's only entropy
+
+The machine does not put a ball on the plunger rod. It puts it in a **trough** and lets it
+roll, and the placement carries the low bits of the LAST ball it took off the table. That
+is the only non-determinism in the whole engine, and the reconstruction did not have it
+until 2026-08-03.
+
+- **`main.seg00 $3E36` is the routine, and it masks the ball record IN PLACE** — there is
+  no "old position" variable, so the bits it keeps are the bits of wherever the machine
+  took the last ball away from: `x &= 7; x += 284; y &= 7; y += 510; vx &= 255; vy &= 255;
+  vx += 512; vy += 512`, then the Q10 masters are rebuilt as `field << 10` and `jsr $53F4`
+  sets the **upper**-line pointer set. Byte-verified against `main.bin.seg00.bin`; the
+  shipped listing is one word out of phase across it because `$3E34` is a data counter
+  sitting inside the code. Called from the drain (+0x00B424, straight out of the `y > 600`
+  test at +0x00B29A), from a device that swallows a ball (+0x005B7C), and on all three ball
+  records at the start of a game (+0x003550) and of a ball (+0x003E84). **[disk]**
+- **`$12/$14` are WHOLE PIXELS and they are the sprite's TOP-LEFT.** `$1e/$22` are the Q10
+  masters and `$12/$14` are `asr.l #10` of them (+0x00B722); the accel lookup adds 8 before
+  its shift (+0x00B72E) because the ball is 17 px wide. So the mask is three whole pixels,
+  not three 256ths of one, and the placement in this port's centre frame is **(292, 518)**.
+  An earlier sweep read the mask as 7/256 px and reported the serve degenerate; it was
+  measuring a 256th of the real thing. **[disk]**
+- **The trough is the mouth of the ball return, not the lane.** Measured with the engine's
+  own ring, the free ball-centre run on the mouth's rows 518..522 is 295..327, 294..327,
+  293..327, 292..327, 291..327 — **identical on all three shipped maps to the pixel**, like
+  the lane floor at `y = 561`. It is a 45-degree funnel on the upper collision line running
+  down to the lane's foot at (317,562), where every table carries the same `to-lower`
+  hand-off zone (317,545)-(337,565). The `+512` in BOTH axes is 2 px/tick down and 2 px/tick
+  right: straight down the channel. 45 of the 64 placements start clear and 19 start inside
+  the funnel's upper-left wall and are pushed off it; all 64 arrive. **[disk]**
+- **The launcher kicks the ball standing on a SWITCH, not the ball it served.** +0x006628
+  reads a byte a per-table pointer names (`$234E(a5)`) and does nothing at all when it is
+  zero. That byte belongs to a zone, and the zone is in the shipped scoring layer: one
+  level-0 trigger over the lane seat, scoring nothing, **(310,540)-(330,560) on all three
+  tables**. A launch press while the ball is still in the chute is consumed and wasted.
+  `tests/plunger.test.ts` re-derives the rectangle from the three shipped documents. **[disk]**
+- **Nothing pins the lane ball.** The three writes to a ball's position in the entire
+  binary are this routine, a saucer's authored eject (+0x0070FC) and the integrator
+  (+0x00B728). The reconstruction used to teleport a served ball onto the seat and rewrite
+  it there every tick, on the belief that the collision layer has no floor under the lane;
+  row 561 is solid from `x = 310` rightward on all three maps and the ball settles on it
+  unaided. **[disk]**
+- **What it is worth, measured.** 2,000 random trough records per table, rolled down the
+  chute and then launched untouched: **71 / 75 / 1158 distinct rest states** on the rod
+  (LnJ / BW / ES) against **one** before, and **4 / 32 / 5 distinct launch scores** against
+  one. On BabeWatch **3 of the 75 rest states reach the +500,000 top-lane saucer**
+  (`zone-0-17`), paying 680,000–735,000 against the film's 790,000 — a shot that was
+  unreachable under every perturbation the round-6 sweep could try. Ninety-game census at
+  12,000 ticks: 90/90 complete and 270 real drains on both trees, every anomaly detector
+  zero on both, distinct scores 1 → 4, 1 → 22, 8 → 13.
+- **What is a reconstruction's choice, stated.** The original's three ball records are
+  never initialised — the game-start path masks whatever is in them, which is cleared BSS
+  on the first game after switch-on and the previous game's leftovers afterwards. This port
+  starts a machine cold (`createGame`) with a cleared record and does NOT reset it on
+  `startGame`, so the carry survives a new game as it does on the original; what it cannot
+  reproduce is the leftovers themselves. It also keeps ONE record where the original keeps
+  three, which is identical for single-ball play and differs during multiball. **[recon]**
+
 ## Physical layout
 
 - Three flippers per table, and all nine are **[disk]**: pivot, rest and flipped pose, sweep

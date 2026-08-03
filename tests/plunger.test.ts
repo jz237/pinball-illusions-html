@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 
 import type { SimulationForces, TableMap, TableMapDocument } from "../src/game/contracts.js";
 import { materialTableFor } from "../src/game/materials.js";
+import { accelFor, devicesFor } from "./table-fixtures.js";
 import { parseTableMapDocument } from "../src/game/table-map.js";
 import { q10ToPixel } from "../src/core/fixed-point.js";
 import {
@@ -14,14 +15,25 @@ import {
 } from "../src/game/ball-physics.js";
 import { channelRunAt, freeCentre, levelViewsOf } from "../src/game/level-scan.js";
 import {
+  CLEARED_TROUGH_RECORD,
   DEFAULT_PLUNGER_CONFIG,
   LAUNCH_KICK,
   LAW_N_JUSTICE_SHOOTER_LANE,
   ORIGINAL_LAUNCH_KICK_UNITS,
   PLUNGER_IDLE,
+  ROD_SWITCH,
   SERVE_INSET_PIXELS,
   SHOOTER_LANE_BY_TABLE,
+  TROUGH_CENTRE_X,
+  TROUGH_CENTRE_Y,
+  TROUGH_LEVEL,
+  TROUGH_ORIGIN_X,
+  TROUGH_ORIGIN_Y,
+  TROUGH_POSITION_MASK,
+  TROUGH_VELOCITY_MASK,
+  TROUGH_VELOCITY_UNITS,
   autoLaunchOutcome,
+  ballIsOnTheRod,
   launchBall,
   plungerConfigFor,
   plungerConfigForLane,
@@ -29,6 +41,8 @@ import {
   servePosition,
   shooterLaneFor,
   tickLauncher,
+  troughPlacement,
+  troughRecordOf,
   validatePlungerConfig,
 } from "../src/game/plunger.js";
 import {
@@ -40,6 +54,12 @@ import type { PlungerInput } from "../src/game/plunger.js";
 import { BUMPER_KICK } from "../src/game/surface-physics.js";
 
 const CONFIG = DEFAULT_PLUNGER_CONFIG;
+
+const GRAVITY: SimulationForces = {
+  gravityY: SIMULATION_GRAVITY,
+  nudgeX: 0,
+  nudgeY: 0,
+};
 
 const PRESS: PlungerInput = { pressed: true, released: false, held: true };
 const HOLD: PlungerInput = { pressed: false, released: false, held: true };
@@ -279,15 +299,59 @@ describe("the fixed kick", () => {
 });
 
 describe("serving and launching a ball", () => {
-  it("puts a motionless ball at the serve point", () => {
+  it("puts the ball in the trough, on the upper line, pushed off down the chute", () => {
+    // $3E36 on a cleared record: x = 284, y = 510, v = 512 in both axes, and
+    // $53F4's pointer set, i.e. level 1. In this port's centre frame that is
+    // 292/518, because the original's $12/$14 are the sprite's top-left.
     const set = createBallSet();
     const ball = serveBall(set, CONFIG);
-    expect(ball.x).toBe(CONFIG.serveX);
-    expect(ball.y).toBe(CONFIG.serveY);
-    expect(ball.velocityX).toBe(0);
-    expect(ball.velocityY).toBe(0);
+    expect(ball.x).toBe((TROUGH_ORIGIN_X + 8) * 1024);
+    expect(ball.y).toBe((TROUGH_ORIGIN_Y + 8) * 1024);
+    expect(ball.velocityX).toBe(originalVelocityToQ10(TROUGH_VELOCITY_UNITS));
+    expect(ball.velocityY).toBe(ball.velocityX);
+    expect(ball.level).toBe(TROUGH_LEVEL);
     expect(ball.active).toBe(true);
     expect(set.balls).toHaveLength(1);
+  });
+
+  it("carries three bits of the last ball's position and a byte of its velocity", () => {
+    // The routine masks the record IN PLACE, so what it keeps is the low bits of
+    // wherever the machine took the last ball away from and how fast it was
+    // going. Two drains one pixel apart therefore serve one pixel apart.
+    const drained = {
+      x: 185 * 1024 + 900,
+      y: 601 * 1024,
+      velocityX: originalVelocityToQ10(-1000),
+      velocityY: originalVelocityToQ10(2313),
+    };
+    const record = troughRecordOf(drained);
+    // 185 & 7 = 1, 601 & 7 = 1; -1000 is $FC18 and $FC18 & $FF = $18 = 24;
+    // 2313 is $0909 and $0909 & $FF = 9.
+    expect(record).toEqual({ x: 1, y: 1, velocityX: 24, velocityY: 9 });
+
+    const place = troughPlacement(record);
+    expect(place.x).toBe((TROUGH_CENTRE_X + 1) * 1024);
+    expect(place.y).toBe((TROUGH_CENTRE_Y + 1) * 1024);
+    expect(place.velocityX).toBe(originalVelocityToQ10(TROUGH_VELOCITY_UNITS + 24));
+    expect(place.velocityY).toBe(originalVelocityToQ10(TROUGH_VELOCITY_UNITS + 9));
+
+    // And the masks are the disassembly's, not a rounding of them.
+    expect(TROUGH_POSITION_MASK).toBe(7);
+    expect(TROUGH_VELOCITY_MASK).toBe(0xff);
+    expect(TROUGH_VELOCITY_UNITS).toBe(512);
+  });
+
+  it("masks the CENTRE and the top-left to the same three bits", () => {
+    // The port stores centres, the original stored top-lefts, and the radius is
+    // 8 - a whole multiple of the mask - so no correction is needed anywhere.
+    for (let centre = 0; centre < 64; centre += 1) {
+      expect(centre & TROUGH_POSITION_MASK).toBe((centre - 8) & TROUGH_POSITION_MASK);
+    }
+  });
+
+  it("serves a cold machine from the cleared record", () => {
+    expect(CLEARED_TROUGH_RECORD).toEqual({ x: 0, y: 0, velocityX: 0, velocityY: 0 });
+    expect(troughPlacement()).toEqual(troughPlacement(CLEARED_TROUGH_RECORD));
   });
 
   it("gives each served ball its own id, for multiball", () => {
@@ -313,7 +377,8 @@ describe("serving and launching a ball", () => {
     const ball = serveBall(set, CONFIG);
     const idle = tickLauncher(HOLD, CONFIG);
     expect(launchBall(ball, idle)).toBe(false);
-    expect(ball.velocityY).toBe(0);
+    // Untouched, which is now the trough's push-off rather than zero.
+    expect(ball.velocityY).toBe(troughPlacement().velocityY);
   });
 
   it("does nothing to a drained ball", () => {
@@ -321,7 +386,155 @@ describe("serving and launching a ball", () => {
     const ball = serveBall(set, CONFIG);
     ball.active = false;
     expect(launchBall(ball, tickLauncher(PRESS, CONFIG))).toBe(false);
-    expect(ball.velocityY).toBe(0);
+    expect(ball.velocityY).toBe(troughPlacement().velocityY);
+  });
+});
+
+/**
+ * THE TROUGH AND THE ROD SWITCH, re-derived from the shipped documents rather
+ * than trusted.
+ *
+ * Both are engine geometry - one set of constants in main.seg00 for all three
+ * tables - and the claim that they ARE shared is exactly the kind of thing that
+ * is true until a map is re-exported. So it is executed here.
+ */
+describe("the trough and the rod switch are the same cabinet part on every table", () => {
+  const TABLES = ["law-n-justice", "babewatch", "extreme-sports"] as const;
+
+  function mapDoc(tableId: string): TableMap {
+    const path = fileURLToPath(
+      new URL(`../public/generated/tables/${tableId}.map.json`, import.meta.url),
+    );
+    return parseTableMapDocument(JSON.parse(readFileSync(path, "utf8")) as TableMapDocument);
+  }
+
+  it("drops the trough into a funnel that is pixel-identical on all three maps", () => {
+    // The chute is engine furniture, like the lane floor at y=561: the free
+    // ball-centre run on every row of the trough's 8x8 mouth is the same on all
+    // three shipped maps, to the pixel. That is what makes ONE pair of
+    // immediates in main.seg00 a legal serve for three different tables.
+    const runs = TABLES.map((tableId) => {
+      const views = levelViewsOf(mapDoc(tableId), materialTableFor(tableId));
+      const rows: string[] = [];
+      for (let dy = 0; dy <= TROUGH_POSITION_MASK; dy += 1) {
+        let lo = -1;
+        let hi = -1;
+        for (let x = 270; x < 336; x += 1) {
+          if (!freeCentre(views, TROUGH_LEVEL, x, TROUGH_CENTRE_Y + dy)) continue;
+          if (lo < 0) lo = x;
+          hi = x;
+        }
+        rows.push(`${lo}..${hi}`);
+      }
+      return rows;
+    });
+    expect(runs[1]).toEqual(runs[0]);
+    expect(runs[2]).toEqual(runs[0]);
+    // And it really is a funnel closing to the left as it rises: the run's left
+    // edge walks 295, 294, 293, 292, 291 down rows 518..522.
+    expect(runs[0]?.slice(0, 5)).toEqual([
+      "295..327",
+      "294..327",
+      "293..327",
+      "292..327",
+      "291..327",
+    ]);
+  });
+
+  it("delivers every one of the 64 trough placements onto the rod", () => {
+    // The property that matters, and the one the pin used to make unnecessary.
+    // 45 of the 64 mouth pixels are free ball centres and the other 19 start
+    // inside the funnel's upper-left wall — the machine drops the ball into a
+    // funnel, it does not thread it — so the test is that the ball ARRIVES, not
+    // that it starts clear. Both ends of the velocity carry are run, because the
+    // carry is what turns the drop into a slide.
+    for (const tableId of TABLES) {
+      const map = mapDoc(tableId);
+      const materials = materialTableFor(tableId);
+      const drive = accelFor(tableId);
+      const surfaces = devicesFor(tableId);
+      for (let dx = 0; dx <= TROUGH_POSITION_MASK; dx += 1) {
+        for (let dy = 0; dy <= TROUGH_POSITION_MASK; dy += 1) {
+          for (const carry of [0, TROUGH_VELOCITY_MASK]) {
+            const set = createBallSet();
+            const ball = serveBall(set, plungerConfigFor(tableId), {
+              x: dx,
+              y: dy,
+              velocityX: carry,
+              velocityY: carry,
+            });
+            let arrived = -1;
+            for (let tick = 0; tick < 200 && arrived < 0; tick += 1) {
+              stepBalls(set, map, materials, GRAVITY, { rampDrive: drive, surfaces });
+              if (ballIsOnTheRod(ball) && ball.velocityX === 0 && ball.velocityY === 0) {
+                arrived = tick;
+              }
+            }
+            expect(arrived, `${tableId} trough (${dx},${dy}) carry ${carry}`).toBeGreaterThan(0);
+          }
+        }
+      }
+    }
+  });
+
+  it("reads the rod switch out of the shipped scoring layer", () => {
+    // The original's launcher kicks whatever ball index stands in the byte
+    // $234E(a5) names; that byte belongs to a zone, and the zone is here: one
+    // level-0 trigger over the lane seat, scoring nothing, identical on all
+    // three tables.
+    for (const tableId of TABLES) {
+      const path = fileURLToPath(
+        new URL(`../public/generated/tables/${tableId}.devices.json`, import.meta.url),
+      );
+      const doc = JSON.parse(readFileSync(path, "utf8")) as {
+        zones: readonly {
+          level: number;
+          minX: number;
+          minY: number;
+          maxX: number;
+          maxY: number;
+          score: number;
+        }[];
+      };
+      const seatX = q10ToPixel(plungerConfigFor(tableId).serveX);
+      const seatY = q10ToPixel(plungerConfigFor(tableId).serveY);
+      const over = doc.zones.filter(
+        (zone) =>
+          zone.level === 0 &&
+          seatX >= zone.minX &&
+          seatX <= zone.maxX &&
+          seatY >= zone.minY &&
+          seatY <= zone.maxY,
+      );
+      expect(over, `${tableId} rod switch`).toHaveLength(1);
+      const zone = over[0]!;
+      expect(zone.score).toBe(0);
+      expect({
+        minX: zone.minX,
+        minY: zone.minY,
+        maxX: zone.maxX,
+        maxY: zone.maxY,
+      }).toEqual({
+        minX: ROD_SWITCH.minX,
+        minY: ROD_SWITCH.minY,
+        maxX: ROD_SWITCH.maxX,
+        maxY: ROD_SWITCH.maxY,
+      });
+    }
+  });
+
+  it("says a ball is on the rod only when it is standing on that switch", () => {
+    const set = createBallSet();
+    const ball = serveBall(set, CONFIG);
+    // Fresh out of the trough it is on the upper line, at the head of the chute.
+    expect(ballIsOnTheRod(ball)).toBe(false);
+    ball.level = 0;
+    expect(ballIsOnTheRod(ball)).toBe(false);
+    ball.x = CONFIG.serveX;
+    ball.y = CONFIG.serveY;
+    expect(ballIsOnTheRod(ball)).toBe(true);
+    ball.active = false;
+    expect(ballIsOnTheRod(ball)).toBe(false);
   });
 });
 
@@ -339,13 +552,19 @@ describe("launching up the real Law 'n Justice lane", () => {
     JSON.parse(readFileSync(MAP_PATH, "utf8")) as TableMapDocument,
   );
   const MATERIALS = materialTableFor("law-n-justice");
-  const GRAVITY: SimulationForces = {
-    gravityY: SIMULATION_GRAVITY,
-    nudgeX: 0,
-    nudgeY: 0,
-  };
+  const DRIVE = accelFor("law-n-justice");
+  const SURFACES = devicesFor("law-n-justice");
 
-  /** Serves, lets the ball settle on the lane floor, launches, and follows it. */
+  /**
+   * Serves, ROLLS THE BALL DOWN THE RETURN CHUTE, waits for it to settle on the
+   * lane floor, launches, and follows it.
+   *
+   * The 30 bare ticks this used to run are gone with the pin: a serve now starts
+   * at the trough on the upper line, and getting from there to the rod needs the
+   * ramp drive and the scoring layer's hand-off zone, which the launch tests
+   * below never had to care about while the loop teleported the ball onto the
+   * seat.
+   */
   function launchAndTrack(ticks: number): {
     minY: number;
     restY: number;
@@ -353,8 +572,9 @@ describe("launching up the real Law 'n Justice lane", () => {
   } {
     const set = createBallSet();
     const ball = serveBall(set, CONFIG);
-    for (let tick = 0; tick < 30; tick += 1) {
-      stepBalls(set, MAP, MATERIALS, GRAVITY);
+    for (let tick = 0; tick < 200; tick += 1) {
+      stepBalls(set, MAP, MATERIALS, GRAVITY, { rampDrive: DRIVE, surfaces: SURFACES });
+      if (ballIsOnTheRod(ball) && ball.velocityX === 0 && ball.velocityY === 0) break;
     }
     const restY = q10ToPixel(ball.y);
     launchBall(ball, tickLauncher(PRESS, CONFIG));
@@ -400,12 +620,15 @@ describe("launching up the real Law 'n Justice lane", () => {
     // model, a wrong clamp or a wrong bridge all land far outside it.
     const set = createBallSet();
     const ball = serveBall(set, CONFIG);
-    for (let tick = 0; tick < 30; tick += 1) stepBalls(set, MAP, MATERIALS, GRAVITY);
+    for (let tick = 0; tick < 200; tick += 1) {
+      stepBalls(set, MAP, MATERIALS, GRAVITY, { rampDrive: DRIVE, surfaces: SURFACES });
+      if (ballIsOnTheRod(ball) && ball.velocityX === 0 && ball.velocityY === 0) break;
+    }
     launchBall(ball, tickLauncher(PRESS, CONFIG));
     let previous = ball.y;
     const speeds: number[] = [];
     for (let tick = 0; tick < 8; tick += 1) {
-      stepBalls(set, MAP, MATERIALS, GRAVITY);
+      stepBalls(set, MAP, MATERIALS, GRAVITY, { rampDrive: DRIVE, surfaces: SURFACES });
       speeds.push((previous - ball.y) / 1024);
       previous = ball.y;
     }
@@ -418,9 +641,13 @@ describe("launching up the real Law 'n Justice lane", () => {
   it("never drives a launched ball through a lane wall", () => {
     const set = createBallSet();
     const ball = serveBall(set, CONFIG);
+    for (let tick = 0; tick < 200; tick += 1) {
+      stepBalls(set, MAP, MATERIALS, GRAVITY, { rampDrive: DRIVE, surfaces: SURFACES });
+      if (ballIsOnTheRod(ball) && ball.velocityX === 0 && ball.velocityY === 0) break;
+    }
     launchBall(ball, tickLauncher(PRESS, CONFIG));
     for (let tick = 0; tick < 300; tick += 1) {
-      stepBalls(set, MAP, MATERIALS, GRAVITY);
+      stepBalls(set, MAP, MATERIALS, GRAVITY, { rampDrive: DRIVE, surfaces: SURFACES });
       if (!ball.active) break;
       expect(Number.isInteger(ball.x)).toBe(true);
       expect(Number.isInteger(ball.y)).toBe(true);

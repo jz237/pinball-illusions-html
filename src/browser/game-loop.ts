@@ -30,22 +30,33 @@
  * test can hand it a script instead of a keyboard.
  *
  * ---------------------------------------------------------------------------
- * WHY THE LANE BALL IS PINNED
+ * THE LANE BALL IS NOT PINNED, AND THE SERVE IS THE MACHINE'S
  * ---------------------------------------------------------------------------
- * The shipped collision layer has no floor under the shooter lane — column 322
- * of Law 'n Justice is free all the way to the last row — because on the real
- * machine the ball rests on the launcher rod, and the rod is no more present in
- * the playfield bitmap than the flippers are. A served ball therefore has to be
- * held in place by the ball lifecycle rather than by the map: while
- * `laneBallId` is set the loop restores that ball to the serve point after the
- * step, and the moment the launch fires the id is cleared and the ball becomes
- * an ordinary ball with an upward velocity.
+ * This file used to teleport a served ball onto the lane seat and write it back
+ * there, at rest, after every step, on the grounds that the collision layer has
+ * no floor under the shooter lane. It has one — row 561 is solid from x=310 to
+ * the right edge on all three shipped maps — and the belief predates the 32 px
+ * phase correction that moved the lane.
+ *
+ * So the serve is now the original's: `serveBall` puts the ball in the TROUGH at
+ * main.seg00 $3E36's own coordinates, carrying three bits of the last drained
+ * ball's position and the low byte of its velocity (`plunger.ts` has the decode
+ * and the evidence), and the ball ROLLS down the return chute on the upper
+ * collision line into the lane, taking 11 to 75 ticks about it depending on what
+ * it carried. Nothing writes its position on the way.
+ *
+ * `laneBallId` is the original's $D88: the lane is spoken for from the moment a
+ * ball is dropped into the trough, so the machine never feeds a second one, but
+ * the LAUNCH is gated on the rod switch — the level-0 zone at (310,540)-(330,560)
+ * that every table carries over the seat and that the original's launcher reads
+ * through $234E(a5) — so a press while the ball is still in the chute is
+ * consumed and does nothing, exactly as +0x006628's `beq` does.
  *
  * The launch itself is the ORIGINAL'S: a fixed kick on the launch key's press
  * edge (main.seg00 0x65EE / 0x663A — see `plunger.ts` for the whole story),
- * so there is no under-plunge any more. The rod re-pin (`ballBackOnTheRod`)
- * stays because the playfield can still feed a ball back into the lane from
- * above, and a ball resting in the lane must always be shootable again.
+ * so there is no under-plunge any more. `ballBackOnTheRod` stays because the
+ * playfield can still feed a ball back into the lane from above, and a ball
+ * resting in the lane must always be shootable again.
  *
  * ---------------------------------------------------------------------------
  * THE BALL SEARCH
@@ -213,14 +224,16 @@ import { tableAccelerationFor } from "../game/table-accel.js";
 import type { PlungerConfig } from "../game/plunger.js";
 import { SIMULATION_GRAVITY, SIMULATION_X_TILT } from "../game/timebase.js";
 import {
+  CLEARED_TROUGH_RECORD,
   autoLaunchOutcome,
+  ballIsOnTheRod,
   launchBall,
   plungerConfigFor,
   serveBall,
-  servePosition,
-  shooterLaneFor,
   tickLauncher,
+  troughRecordOf,
 } from "../game/plunger.js";
+import type { TroughRecord } from "../game/plunger.js";
 import { isPoweredSurfaceId } from "../game/scoring.js";
 import type { NudgeConfig, NudgeDirection, TiltState } from "../game/tilt.js";
 import {
@@ -606,6 +619,23 @@ export interface Game {
   /** The ball sitting on the plunger rod, or null once it has been launched. */
   laneBallId: number | null;
   serveCountdown: number;
+  /**
+   * The three bits of position and byte of velocity the last ball taken off the
+   * table left in the trough, which the NEXT serve carries out of it.
+   *
+   * The original's ball records at $FAA(a5), read and rewritten in place by
+   * $3E36 — see `plunger.ts`. It is deliberately not reset by `startGame`: the
+   * machine's memory of the last drain outlives a game, because nothing in the
+   * binary ever clears those records. `createGame` is the cold machine.
+   *
+   * ONE record, where the original has three (one per ball, each carrying its
+   * own last drain). With a single ball in play the two are identical, because
+   * only one record is ever in flight; during multiball the original would serve
+   * ball 2 from ball 2's own last drain and this serves it from whichever ball
+   * drained most recently. Stated rather than modelled: this port's balls are an
+   * open set with running ids and there is no honest mapping onto three slots.
+   */
+  troughRecord: TroughRecord;
   /** Consecutive ticks with every live ball inside its box and none on the rod. */
   stillTicks: number;
   /** Coil pulses left before the ball search writes the ball off. Per serve. */
@@ -794,6 +824,7 @@ export function createGame(map: TableMap, options?: Partial<GameOptions>): Game 
     modeMessages: [],
     laneBallId: null,
     serveCountdown: 0,
+    troughRecord: CLEARED_TROUGH_RECORD,
     stillTicks: 0,
     searchPulses: BALL_SEARCH_PULSES,
     stillAnchors: [],
@@ -1002,7 +1033,13 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
         // Still run the rest of the tick: the camera has to keep easing and the
         // flippers have to keep falling back to rest while the lane is empty.
       } else {
-        const ball = serveBall(game.balls, game.plungerConfig);
+        // The trough, with the last drain's low bits in it: the ball is placed
+        // at the chute mouth on the UPPER line and ROLLS down to the rod, which
+        // takes 11 to 75 ticks depending on the entropy. `laneBallId` is set now
+        // rather than on arrival because it is the original's $D88 — "the lane is
+        // spoken for" — and the machine will not feed a second ball while it is
+        // set, whether or not the first has reached the bottom yet.
+        const ball = serveBall(game.balls, game.plungerConfig, game.troughRecord);
         game.laneBallId = ball.id;
         if (owed) {
           // A ball the machine owes: a lock's replacement or a multiball ball.
@@ -1071,7 +1108,13 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
   let launched = false;
   if (plunge.fired && game.laneBallId !== null) {
     const ball = ballById(game.balls, game.laneBallId);
-    if (ball !== undefined && launchBall(ball, plunge)) {
+    // ON THE ROD, not merely owed to it. The original kicks the ball index
+    // standing in the rod switch's byte and does nothing at all when that byte
+    // is zero (+0x006628, `move.b (a0),d0 / beq`), and since the serve now rolls
+    // a ball down the return chute there is a real window in which the lane is
+    // spoken for and empty. A press in that window is consumed and wasted,
+    // exactly as the original consumes $ED6 before it looks.
+    if (ball !== undefined && ballIsOnTheRod(ball) && launchBall(ball, plunge)) {
       // Cleared BEFORE the step, so the pin below does not immediately drag the
       // ball it just fired back down onto the rod.
       game.laneBallId = null;
@@ -1085,13 +1128,18 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
   // registers in the lane, no key. It is disarmed the moment the lane
   // empties, so a player who shoots first keeps the shot.
   if (game.autoLaunchCountdown > 0) {
-    if (game.laneBallId === null) {
+    const waiting = game.laneBallId === null ? undefined : ballById(game.balls, game.laneBallId);
+    if (waiting === undefined) {
       game.autoLaunchCountdown = 0;
-    } else {
+    } else if (ballIsOnTheRod(waiting)) {
+      // The clock runs only while the ball is actually on the rod. It used to
+      // start at the serve, which was harmless when the serve WAS the rod; now
+      // the ball spends up to 75 ticks in the return chute and a countdown
+      // started at the serve would expire against an empty lane and silently
+      // throw the auto-launch away.
       game.autoLaunchCountdown -= 1;
       if (game.autoLaunchCountdown === 0) {
-        const ball = ballById(game.balls, game.laneBallId);
-        if (ball !== undefined && launchBall(ball, autoLaunchOutcome(game.plungerConfig))) {
+        if (launchBall(waiting, autoLaunchOutcome(game.plungerConfig))) {
           game.laneBallId = null;
           launched = true;
         }
@@ -1206,18 +1254,24 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     }
   }
 
-  // The plunger rod, which the collision layer does not contain. See the header.
-  if (game.laneBallId !== null) {
-    const ball = ballById(game.balls, game.laneBallId);
-    if (ball !== undefined && ball.active) {
-      const home = servePosition(game.plungerConfig);
-      ball.x = home.x;
-      ball.y = home.y;
-      ball.velocityX = 0;
-      ball.velocityY = 0;
-      ball.level = 0;
-    }
-  }
+  // THERE IS NO PIN ANY MORE, and the removal is the point of the serve round.
+  //
+  // The loop used to write the lane ball back to the seat, at rest, on level 0,
+  // after every step. Nothing in the original does that — the only three writes
+  // to a ball's position in the whole binary are the trough ($3E36), a saucer's
+  // authored eject (+0x0070FC) and the integrator (+0x00B728) — and the pin was
+  // here because the serve teleported a ball into a lane the header claimed had
+  // no floor under it. It does have one: row 561 is solid from x=310 to the
+  // right edge on all three shipped maps, and a ball rolled in off the return
+  // chute comes to rest against it on its own (measured over the trough's whole
+  // 64-pixel mouth: 256/256 draws settle at y=553, velocity exactly zero, and
+  // stay there).
+  //
+  // The pin also destroyed the thing this round exists to add. Where the ball
+  // stops in the lane is a function of how it came down the chute — 9 distinct
+  // rest states on Law 'n Justice and BabeWatch, 116 on Extreme Sports, over 256
+  // trough draws — and snapping it to one seat pixel with zero velocity threw
+  // every one of them away on the tick it arrived.
 
   // ---- scoring -----------------------------------------------------------
   //
@@ -1280,6 +1334,25 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
   }
   const search = runBallSearch(game, cradled);
   const lost = search.lost;
+
+  // ---- the trough ---------------------------------------------------------
+  //
+  // Every ball this port takes off the table goes through the original's $3E36,
+  // and $3E36's whole effect on the machine's future is the four masked fields
+  // it leaves behind. Read HERE, before either prune below drops the ball
+  // objects, and covering all three ways a ball leaves: the drain (the original
+  // calls $3E36 from the y>600 test itself, +0x00B424), a device that swallowed
+  // it (+0x005B7C), and this port's own ball-search write-off, which the
+  // original has no equivalent of but which puts a ball back in the trough all
+  // the same. Last one this tick wins, which for the single-record model below
+  // is the only ordering there is.
+  const troughed = [...step.drained, ...lost, ...search.swallowed];
+  if (troughed.length > 0) {
+    const last = troughed[troughed.length - 1] as number;
+    const ball = ballById(game.balls, last);
+    if (ball !== undefined) game.troughRecord = troughRecordOf(ball);
+  }
+
   // A swallowed ball is inactive but NOT drained: it is back in the trough and
   // the machine owes a serve for it, so it must not reach the end-of-ball path.
   if (search.swallowed.length > 0) pruneInactiveBalls(game.balls);
@@ -1841,21 +1914,17 @@ function isAtRest(ball: BallState, threshold: number): boolean {
  * the rod has one on it.
  */
 function ballBackOnTheRod(game: Game): BallState | null {
-  const lane = shooterLaneFor(game.map.tableId);
-  const footY = q10ToPixel(game.plungerConfig.serveY) - BALL_RADIUS_PIXELS;
   const threshold = restThresholdOf(game);
 
   let lowest: BallState | null = null;
   for (const ball of freeBalls(game.balls)) {
-    if (ball.level !== 0) continue;
+    // The machine's own rod switch — the level-0 zone at (310,540)-(330,560)
+    // that every table carries over the lane seat — rather than a hand-drawn box
+    // around the serve point. It is the same rectangle the launcher tests, so a
+    // ball the loop calls "on the rod" is exactly a ball the launcher will kick.
+    if (!ballIsOnTheRod(ball)) continue;
     if (!isAtRest(ball, threshold)) continue;
-    const x = q10ToPixel(ball.x);
-    const y = q10ToPixel(ball.y);
-    if (x < lane.minCentreX || x > lane.maxCentreX) continue;
-    // Below the serve point, i.e. settled at the foot of the lane rather than
-    // hung up somewhere in the middle of it.
-    if (y < footY) continue;
-    if (lowest === null || y > q10ToPixel(lowest.y)) lowest = ball;
+    if (lowest === null || q10ToPixel(ball.y) > q10ToPixel(lowest.y)) lowest = ball;
   }
   return lowest;
 }
@@ -2249,6 +2318,13 @@ export interface GameDebugState {
   readonly ballsPerGame: number;
   readonly laneBallId: number | null;
   readonly serveCountdown: number;
+  /**
+   * The masked record the next serve will carry out of the trough — the
+   * original's $3E36 entropy. In the snapshot so that the simulation pin covers
+   * it: a change that quietly stopped the machine carrying its drains forward
+   * would otherwise only show up as a trajectory difference much later.
+   */
+  readonly troughRecord: TroughRecord;
   /** Balls the machine owes the lane that cost the player nothing. */
   readonly pendingServes: number;
   readonly multiball: boolean;
@@ -2327,6 +2403,7 @@ export function debugSnapshot(game: Game): GameDebugState {
     ballsPerGame: game.options.ballsPerGame,
     laneBallId: game.laneBallId,
     serveCountdown: game.serveCountdown,
+    troughRecord: game.troughRecord,
     pendingServes: game.pendingServes,
     multiball: game.multiball,
     ballsLocked: game.ballsLocked,

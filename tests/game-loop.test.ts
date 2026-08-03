@@ -30,7 +30,12 @@ import type { Game, GameTickReport } from "../src/browser/game-loop.js";
 import type { TableMap } from "../src/game/contracts.js";
 import { mapFor } from "./table-fixtures.js";
 import { pixelsToQ10, q10ToPixel } from "../src/core/fixed-point.js";
-import { plungerConfigFor, servePosition } from "../src/game/plunger.js";
+import {
+  ballIsOnTheRod,
+  plungerConfigFor,
+  servePosition,
+  troughPlacement,
+} from "../src/game/plunger.js";
 import { FixedStepScheduler } from "../src/core/fixed-step-scheduler.js";
 
 /**
@@ -40,6 +45,12 @@ import { FixedStepScheduler } from "../src/core/fixed-step-scheduler.js";
 const MAP: TableMap = mapFor("law-n-justice");
 
 const SERVE = servePosition(plungerConfigFor("law-n-justice"));
+
+/** Where a serve on a cold machine puts the ball: the trough, $3E36. */
+const TROUGH = troughPlacement();
+
+/** Ticks a cold serve takes to roll down the return chute onto the rod. */
+const CHUTE_TICKS = 40;
 
 /**
  * An input source whose whole behaviour is a function of the tick index.
@@ -108,24 +119,41 @@ describe("the ball lifecycle", () => {
     expect(game.ballsServed).toBe(1);
     expect(game.laneBallId).toBe(0);
 
+    // NOT at the seat: the serve is the original's trough at $3E36, on the
+    // UPPER line at the mouth of the return chute, pushed off at 512 units in
+    // both axes. Read one step after the placement — the serve happens at the
+    // top of the tick and the ball has already been integrated once by the time
+    // the report comes back — so this pins the LINE and the direction, and
+    // `plunger.test.ts` pins the arithmetic to the Q10.
     const ball = game.balls.balls[0];
     expect(ball).toBeDefined();
-    expect(ball?.x).toBe(SERVE.x);
-    expect(ball?.y).toBe(SERVE.y);
+    expect(ball?.level).toBe(1);
     expect(ball?.active).toBe(true);
+    expect(ball?.x).toBeGreaterThanOrEqual(TROUGH.x);
+    expect(ball?.y).toBeGreaterThanOrEqual(TROUGH.y);
+    // Moving down and to the right, into the chute, at the 2 px/tick the
+    // trough's +512 in each axis is worth.
+    expect(ball?.velocityX).toBeGreaterThanOrEqual(TROUGH.velocityX);
+    expect(ball?.velocityY).toBeGreaterThanOrEqual(TROUGH.velocityY);
   });
 
-  it("holds the served ball on the plunger rod, which the map does not contain", () => {
-    // The shipped collision layer has no floor under the lane, so without the
-    // lifecycle pinning it there the ball would simply fall out and drain
-    // before the player could touch the plunger.
+  it("rolls the served ball down the return chute and lets the map hold it", () => {
+    // This used to assert the lifecycle PIN, on the belief that the collision
+    // layer has no floor under the lane. It has one — row 561 is solid from
+    // x=310 rightward on all three shipped maps — and the ball that rolls down
+    // the chute settles on it and stays, with nothing writing its position.
     const game = startedGame();
     runTicks(game, new ScriptedInput(), 300);
 
     expect(game.ballsServed).toBe(1);
     const ball = game.balls.balls[0];
-    expect(ball?.y).toBe(SERVE.y);
+    expect(ball).toBeDefined();
+    expect(ball?.level).toBe(0);
+    expect(ballIsOnTheRod(ball!)).toBe(true);
+    expect(ball?.velocityX).toBe(0);
     expect(ball?.velocityY).toBe(0);
+    // On the lane floor, within a pixel of the seat the lane bounds name.
+    expect(q10ToPixel(ball?.y ?? 0)).toBe(q10ToPixel(SERVE.y));
   });
 
   it("launches the served ball up the lane on the press edge, once per hold", () => {
@@ -133,17 +161,24 @@ describe("the ball lifecycle", () => {
     // frame the press is seen, and however long the key stays down there is no
     // second launch. This test used to pin release-fires, which was the
     // invented spring's behaviour.
+    //
+    // The press now has to land on a ball that has REACHED the rod: the serve
+    // rolls one down the return chute and the original's launcher kicks the ball
+    // index standing in the rod switch's byte, doing nothing at all when that
+    // byte is zero (+0x006628). A press at tick 4 used to fire because the serve
+    // teleported the ball onto the seat; it is consumed and wasted now, which is
+    // the machine's own behaviour.
     const game = startedGame();
     const input = new ScriptedInput((tick, router) => {
-      if (tick === 4) router.press("plunger");
-      if (tick === 36) router.release("plunger");
+      if (tick === CHUTE_TICKS) router.press("plunger");
+      if (tick === CHUTE_TICKS + 32) router.release("plunger");
     });
 
-    const reports = runTicks(game, input, 40);
+    const reports = runTicks(game, input, CHUTE_TICKS + 36);
     const launches = reports.filter((report) => report.launched);
 
     expect(launches, "the launcher never fired").toHaveLength(1);
-    expect(launches[0]?.tick).toBe(5);
+    expect(launches[0]?.tick).toBe(CHUTE_TICKS + 1);
     // The ball is off the rod, so nothing pins it any more.
     expect(game.laneBallId).toBeNull();
 
@@ -157,10 +192,10 @@ describe("the ball lifecycle", () => {
     // the loop aliases a `start` press to the launch while a game is running.
     const game = startedGame();
     const input = new ScriptedInput((tick, router) => {
-      if (tick === 4) router.tap("start");
+      if (tick === CHUTE_TICKS) router.tap("start");
     });
 
-    const reports = runTicks(game, input, 10);
+    const reports = runTicks(game, input, CHUTE_TICKS + 6);
     expect(reports.some((report) => report.launched)).toBe(true);
     expect(game.laneBallId).toBeNull();
     // And it did not restart the game: the same ball count is in progress.
@@ -285,8 +320,10 @@ describe("nudge and tilt", () => {
   });
 
   it("applies the nudge impulse to every live ball", () => {
-    // Two balls, one of them hand-placed in open playfield, so the nudge has
-    // something it can actually move: the lane ball is pinned to the rod.
+    // One ball, hand-placed in open playfield, so the nudge has something it can
+    // actually move: a served ball is either rolling down the return chute on
+    // the UPPER line, which the cabinet does not reach into, or standing on the
+    // rod, which the tilt bookkeeping exempts.
     const game = startedGame();
     runTicks(game, new ScriptedInput(), 3);
     const free = game.balls.balls[0];
@@ -296,6 +333,7 @@ describe("nudge and tilt", () => {
       free.x = pixelsToQ10(150);
       free.y = pixelsToQ10(120);
       free.velocityX = 0;
+      free.level = 0;
     }
 
     const input = new ScriptedInput((tick, router) => {
@@ -465,11 +503,13 @@ describe("GameLoop", () => {
 describe("the debug handle", () => {
   it("exposes the ball states, tick count, camera and table", () => {
     const game = startedGame();
-    runTicks(game, new ScriptedInput(), 5);
+    // Long enough for the served ball to finish the return chute, so the snapshot
+    // is read off a ball at rest on the rod rather than one still rolling.
+    runTicks(game, new ScriptedInput(), CHUTE_TICKS);
 
     const state = debugSnapshot(game);
     expect(state.tableId).toBe("law-n-justice");
-    expect(state.tick).toBe(5);
+    expect(state.tick).toBe(CHUTE_TICKS);
     expect(state.camera.mode).toBe("scrolling");
     expect(state.balls).toHaveLength(1);
     expect(state.balls[0]?.pixelY).toBe(q10ToPixel(SERVE.y));

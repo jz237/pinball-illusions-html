@@ -447,15 +447,17 @@ describe("initial state", () => {
     const second = trace();
     expect(second).toEqual(first);
     // And it really is the filmed run, from both games: the same geometric
-    // approach this file's other case pins from `updateCamera` directly, one
-    // row wider at each early step because the ball it is chasing now rests
-    // EIGHT PIXELS LOWER. The serve row used to be `bottomY - 8`, an invented
-    // inset; the film puts the resting silver on `bottomY` itself (see
-    // SERVE_INSET_PIXELS in plunger.ts) and the whole chase moves with it. The
-    // law is untouched — every step is still 0.85..0.96 of the one before, and
-    // it still ends on SERVE_FRAMING_SCROLL, asserted above.
+    // approach this file's other case pins from `updateCamera` directly.
+    //
+    // RE-MEASURED for the trough serve. The ladder used to start 48/43/39 and
+    // end 15/1; it starts 45/40/36 and ends 16/12 now, because the ball the
+    // chase is following no longer APPEARS on the seat — it is placed in the
+    // return chute 34 rows higher, rolls down it, and the follower is already
+    // part of the way through its approach by the time the ball reaches the rod.
+    // The law is untouched: every step is still 0.85..0.96 of the one before,
+    // and it still ends on SERVE_FRAMING_SCROLL, asserted above.
     const nonZeroSteps = (rows: readonly number[]): number[] =>
       rows.map((row, i) => row - (i === 0 ? 0 : (rows[i - 1] ?? 0))).filter((step) => step !== 0);
-    expect(nonZeroSteps(second)).toEqual([48, 43, 39, 35, 31, 28, 25, 23, 21, 18, 17, 15, 1]);
+    expect(nonZeroSteps(second)).toEqual([45, 40, 36, 33, 30, 27, 25, 23, 21, 19, 17, 16, 12]);
   });
 });

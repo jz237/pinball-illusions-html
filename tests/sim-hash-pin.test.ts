@@ -1,5 +1,5 @@
 /**
- * THE SIMULATION DOES NOT MOVE. This file is the proof.
+ * THE SIMULATION MOVES ONLY WHEN A ROUND MEANS IT TO. This file is the proof.
  *
  * The HD pass (see `docs/` and `src/browser/hd-scale.ts`) is presentation only:
  * 4x artwork, 4x sprites, finer sprite placement, a bigger canvas. None of that
@@ -74,11 +74,34 @@ const TICKS = 4000;
  * game-stalled 1 -> 0, search-pulse 1 -> 0, lock-runaway 0 -> 0); tip-flip
  * sweep pass-under 0/1122; film side-by-side byte-identical at
  * 98.4508/99.8645/99.1322.
+ *
+ * RE-PIN, THE SERVE ENTROPY (the trough round): the serve was a teleport onto
+ * the lane seat followed by a per-tick pin that held the ball there at rest.
+ * The machine has neither. main.seg00 $3E36 puts a ball back in the TROUGH at
+ * x=(oldx&7)+284, y=(oldy&7)+510, v=512+(oldv&255) in both axes, on the upper
+ * collision line, and the ball rolls down the return chute into the lane on its
+ * own; the low bits it carries are the last drained ball's. So every serve now
+ * starts from a different pixel, arrives 41 to 212 ticks later instead of on the
+ * tick it was served, and comes to rest wherever the lane leaves it — 75
+ * distinct rest states on BabeWatch over 2,000 sampled records, against ONE
+ * before. Every tick of every table moves; three hashes move with them.
+ *
+ * `troughRecord` is in the snapshot for this reason, so the pin covers the
+ * carried entropy itself and not merely its consequences.
+ *
+ * The gates that held, measured against fb15432 with one driver run on both
+ * trees: census 90 games x 3 tables at 12,000 ticks, 90/90 completed and 270
+ * real drains on every table on BOTH trees, and every anomaly detector zero on
+ * both (write-offs, swallowed, search pulses, teleport, over-clamp, penetration,
+ * wall-crawl, award-burst, lock-runaway, stalls). Distinct census scores widen
+ * 1 -> 4 (LnJ), 1 -> 22 (BW), 8 -> 13 (ES). Tip-flip sweep byte-identical to
+ * HEAD, pass-under 0/1122. Film side-by-side unchanged at
+ * 98.4508/99.8645/99.1322 with byte-identical rasters.
  */
 const PINNED: Record<TableId, string> = {
-  "law-n-justice": "284c980c86dd3d2dc8ec82842d47bd6ae5adf020f92f5e89822079d19f9f2576",
-  "babewatch": "e8e4afb0543081f6b57c6bb0e67c0fbb1f012ae57c04a650b99e256249645710",
-  "extreme-sports": "a74be0c098fa34bd36f2bb96fb5e41635b1d837f70f1926e420f836b63c224f5",
+  "law-n-justice": "b3b85bcc6ff8a5aec89669300baa8773a5735ca390c7cb82e6a971ebae5e1563",
+  "babewatch": "3dfe1fff6ed571a5011fb85231f89abbf5562d899e9916c47b77955dd4a5d855",
+  "extreme-sports": "00ab840e4a34ad584b1f3546b0e652de23a7ec4438a4b7f3adad229847adc4a5",
 };
 
 /** Same shape as the determinism harness's input: behaviour = f(tick index). */
