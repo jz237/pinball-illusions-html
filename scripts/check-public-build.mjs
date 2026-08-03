@@ -131,6 +131,10 @@ const DERIVED_MARKERS = [
   // instrument, each digest-claimed through the samples[] branch below — never
   // as a `.mod`, which FORBIDDEN_EXT still refuses and should go on refusing.
   { class: "disk-derived-shell-music", noun: "front-end music" },
+  // The in-game modules: each table's own two SNT! banks, decoded the same
+  // way and shipped the same way — a document per table plus digest-claimed
+  // instrument WAVs, and never a `.mod`.
+  { class: "disk-derived-table-music", noun: "in-game music" },
   // The HD (4x) presentation set. Every one of these is derived from assets
   // already in the classes above by a deterministic local upscale
   // (scripts/hd-pipeline.mjs), which changes NOTHING about custody: art
@@ -151,6 +155,7 @@ const MEDIA_MARKERS = new Map([
   ["disk-derived-audio", { noun: "sound effect", extensions: AUDIO_EXT }],
   ["disk-derived-shell-artwork", { noun: "shell artwork", extensions: IMAGE_EXT }],
   ["disk-derived-shell-music", { noun: "front-end music", extensions: AUDIO_EXT }],
+  ["disk-derived-table-music", { noun: "in-game music", extensions: AUDIO_EXT }],
   ["disk-derived-playfield-artwork-hd", { noun: "HD playfield artwork", extensions: IMAGE_EXT }],
   ["disk-derived-lamp-overlays-hd", { noun: "HD lamp patch atlas", extensions: IMAGE_EXT }],
   ["disk-derived-ball-sprite-hd", { noun: "HD ball sprite", extensions: IMAGE_EXT }],

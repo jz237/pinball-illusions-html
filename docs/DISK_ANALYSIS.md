@@ -752,10 +752,17 @@ Recorded so nobody spends effort re-opening them:
 2. Slot 1's encoding and role. Not a raster, so its earlier "collision map candidate"
    label is withdrawn; its small byte values are real and unexplained. It grows across
    the three tables in package order, consistent with per-table device or script data.
-3. Confirm the audio-sample reading of segments 7 and 8, and identify `flipdat1.bin`.
+3. ~~Confirm the audio-sample reading of segments 7 and 8~~ — **CLOSED, and they are
+   more than samples: the slot 7/8 banks are the tables' IN-GAME MUSIC**, full `SNT!`
+   modules the engine plays through the replayer's alternate entry `$7A24`
+   (`[$2378]/[$237C]` = descriptor `+$74/+$78`), driven by kind-4 cue records through
+   `$6868` and the mailbox at `$2412`. Every pattern of all six banks decodes bit-exactly
+   under the `$7F8A` cell encoding, tiling each bank's offset table with zero slack.
+   Decoded, shipped and film-verified by `scripts/export-table-music.mjs` and
+   `docs/RULES_SPEC.md` §13.3. Identify `flipdat1.bin` remains.
    (~~and `music001.bin`~~ — **CLOSED**: one `SNT!` tracker module, the shell's
-   front-end music; see the section above. Slots 7/8 are confirmed `SNT!` banks by
-   the same parser, `main.seg00` `$7BF8`.)
+   front-end music; see the section above. Correlated against the gameplay captures it
+   plays no part in play — waveform NCC +0.01..+0.02, noise, on all three tables.)
 4. Which of the two 620-row layers is the lower level. Inferred from stroke geometry,
    not read; closing it needs an emulator dump of `$22EE(a5)..$2302(a5)`.
 5. Which odd material index carries which wall behaviour (rubber / slingshot / plain

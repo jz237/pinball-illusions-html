@@ -193,6 +193,17 @@ export interface TrackerOutput {
   host: TrackerHost | null;
   /** Master gain every voice feeds; mute and master volume both live here. */
   master: GainNode | null;
+  /**
+   * One bus per channel between the voices and the master, so a channel can
+   * be ducked LIVE — scheduled volume commands write the per-voice gains and
+   * would overwrite a duck applied there. This is Paula's channel 3 rule:
+   * while a sound effect is sounding on AUD3 the module engine feeds channel
+   * 3's registers to a dummy sink ($800C/$8950 swap a3 to $79DA when the
+   * effect flag $2442 is up), and the effect ending gives the channel back.
+   */
+  readonly channelBuses: (GainNode | null)[];
+  /** The level each bus should sit at, applied when the bus is built. */
+  readonly channelLevels: number[];
   /** Instrument buffers, built once per host. */
   readonly buffers: Map<string, AudioBuffer>;
   /** The sounding voice per channel, so the next note can replace it. */
@@ -233,6 +244,8 @@ export function createTrackerOutput(
     bank,
     host: null,
     master: null,
+    channelBuses: Array.from({ length: TRACKER_CHANNELS }, () => null),
+    channelLevels: Array.from({ length: TRACKER_CHANNELS }, () => 1),
     buffers: new Map<string, AudioBuffer>(),
     channels: Array.from({ length: TRACKER_CHANNELS }, () => null),
     stream: null,
@@ -253,6 +266,12 @@ function ensureHost(output: TrackerOutput): TrackerHost | null {
       master.gain.value = output.muted ? 0 : output.masterVolume;
       master.connect(output.host.destination);
       output.master = master;
+      for (let channel = 0; channel < TRACKER_CHANNELS; channel += 1) {
+        const bus = output.host.createGain();
+        bus.gain.value = output.channelLevels[channel] ?? 1;
+        bus.connect(master);
+        output.channelBuses[channel] = bus;
+      }
     }
   }
   return output.host;
@@ -308,7 +327,8 @@ function scheduleNote(
   const gain = host.createGain();
   gain.gain.value = gainFor(command.volume);
   source.connect(gain);
-  if (output.master !== null) gain.connect(output.master);
+  const sink = output.channelBuses[command.channel] ?? output.master;
+  if (sink !== null) gain.connect(sink);
   // Effect 9 starts the note part-way into the PCM. The command carries BYTES
   // because that is what `9xx` means on Paula; the buffer is one sample a byte
   // for a disk instrument, so the two agree, and a synthesized instrument never
@@ -413,7 +433,11 @@ export function startTracker(
 ): boolean {
   const host = ensureHost(output);
   if (host === null) return false;
-  stopTracker(output);
+  // A start scheduled for the future stops the OLD stream's voices at that
+  // same moment, so a section handover — the in-game music switching at a
+  // loop boundary, exactly where the machine's queued command lands — is a
+  // splice rather than a gap.
+  stopTracker(output, atContextTime);
   output.stream = stream;
   output.startContextTime = atContextTime ?? host.currentTime;
   output.nextIndex = 0;
@@ -423,17 +447,37 @@ export function startTracker(
   return true;
 }
 
-/** Stops everything now. Safe to call twice, or before anything started. */
-export function stopTracker(output: TrackerOutput): void {
+/**
+ * Stops everything — now, or at `atContextTime` for a scheduled handover.
+ * Safe to call twice, or before anything started.
+ */
+export function stopTracker(output: TrackerOutput, atContextTime?: number): void {
   const now = output.host === null ? 0 : output.host.currentTime;
+  const when = atContextTime === undefined ? now : Math.max(atContextTime, now);
   for (let channel = 0; channel < output.channels.length; channel += 1) {
-    stopVoice(output.channels[channel] ?? null, now);
+    stopVoice(output.channels[channel] ?? null, when);
     output.channels[channel] = null;
   }
   output.playing = false;
   output.stream = null;
   output.nextIndex = 0;
   output.passOffsetMs = 0;
+}
+
+/**
+ * Sets a channel's live level, 0..1 — the in-game arbitration switch: the
+ * effects layer owns Paula channel 3, and while an effect is sounding the
+ * module's channel 3 is held at 0 exactly as the original's $800C/$8950
+ * redirect its register writes. Scheduling continues underneath, so the
+ * channel rejoins the song mid-phrase when the effect ends, which is what
+ * the hardware does when the DMA feed comes back.
+ */
+export function setTrackerChannelLevel(output: TrackerOutput, channel: number, level: number): void {
+  if (channel < 0 || channel >= TRACKER_CHANNELS) return;
+  const clamped = Math.min(Math.max(level, 0), 1);
+  output.channelLevels[channel] = clamped;
+  const bus = output.channelBuses[channel] ?? null;
+  if (bus !== null) bus.gain.value = clamped;
 }
 
 /**

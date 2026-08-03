@@ -1273,9 +1273,27 @@ inventory and evidence: `research/SOUND_CENSUS.md`. **[disk]**
   `"provenance": "decoded"`. The old corroboration (live-sample test, the bank-0
   discriminating case, the instrument-7 rollover scale A-1/C-2/D-2/E-2) stands as
   confirmation. **[disk]**
-- **The packed pattern format.** 366-518 bytes per pattern where ProTracker needs 1024,
-  so it is compressed and no music can be played back. Only instruments are extracted.
-  **[open]**
+- ~~The packed pattern format~~ **CRACKED (the front-end music round), and the in-game
+  music with it.** The cell encoding is the playback decoder's own ($7F8A-$7FE6; see
+  `scripts/export-shell-music.mjs`), and it decodes every pattern of all six in-table
+  banks bit-exactly — each bank's patterns tile their offset table with zero slack and
+  the last ends exactly on the PCM offset. The banks at descriptor `+$74/+$78` are the
+  tables' IN-GAME MUSIC: full modules the engine plays through the replayer's alternate
+  entry `$7A24`, driven by kind-4 cue records (`$6868` posts `{command +$2, position
+  +$4, bank +$6}` to the mailbox `$2412/$2416/$2418`; positive = override with
+  save/restore, `-1` = queue at the current section's `Bxx`, `-2` = set background).
+  The engine's registered cues live in the descriptor: `+$88` ball start (the serve
+  vamp at position 0), `+$8C` game over, `+$90` high score, `+$94` TILT (a jingle
+  ending in `F00`, the player stop — phase 8 is the tilted state), and the bonus
+  routine at `+$80` carries the queue-main (`-1`, position 1 — the launch/ball-end
+  return). In play the module's channel 3 is suppressed exactly while an effect sounds
+  (`$2442` = effect-block `+$1E`; `$800C/$8950` redirect the register writes). Decoded,
+  shipped (`scripts/export-table-music.mjs`, class `disk-derived-table-music`), wired
+  (`src/browser/table-music.ts`) and film-verified per table (serve vamp waveform NCC
+  +0.65..+0.90; the main tune entering exactly on vamp lap boundaries on six filmed
+  launches; the tilt jingle's length matching the filmed tilt-to-silence gap on all
+  three filmed tilts, envelope NCC +0.89..+0.98). Mode/jackpot background switches
+  (the tables' other kind-4 records) remain unwired. **[disk]**
 - ~~The drain has no sound~~ **WRONG, and withdrawn.** True of the table packages — no
   zone object carries a drain sound — but the drain sound is the ENGINE'S: `main.seg00`
   plays its own record (hunk 10 `+$34`, 336 ms, priority 45) from `$52B4` inside the

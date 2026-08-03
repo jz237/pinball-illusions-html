@@ -23,9 +23,10 @@
 // APPENDED AFTER THE LAST ONE. So the great majority of those bytes are music
 // instruments — 1,029,942 of them across the three tables against 150,006 bytes
 // of effects — and this exporter takes only the effects and the individual
-// instruments the effect records name. THE MUSIC IS NOT EXPORTED: the packed
-// pattern format is not decoded (366-518 bytes per pattern where ProTracker
-// needs 1024), so there is nothing here that could play a tune.
+// instruments the effect records name. THE MUSIC — the banks as MODULES,
+// order lists, packed patterns (the cell encoding the front-end round cracked
+// at $7F8A-$7FE6) and the engine's cue records — is exported separately by
+// scripts/export-table-music.mjs; this exporter stays effects-only.
 //
 // ---------------------------------------------------------------------------
 // THE SOUND RECORD, 26 BYTES
@@ -33,7 +34,9 @@
 // Reached by `jsr $6CD0`, which masks the first byte with 7 and indexes the word
 // table at $6CE4 SCALED BY TWO (extension word $0206; this is the 68020 AGA
 // build, so the scale bits are live). Kind 2 is a PCM sample, kind 5 a bank
-// instrument, kind 4 is not audio at all. The layout is proven by the per-frame
+// instrument, kind 4 is a MUSIC COMMAND — $6868 posts its +$2/+$4/+$6 words
+// to the module player's mailbox; export-table-music.mjs documents that whole
+// layer. The layout below is proven by the per-frame
 // DMA servicer at $7958, which is handed the record verbatim with a3 = $DFF0D0:
 //
 //     7962  move.l  a1,(a3)          ; AUD3LC   <- +$16
@@ -239,7 +242,7 @@ const PROVENANCE = {
   description:
     "Sound-effect samples decoded from the SNT! banks of the operator's own AGA " +
     "floppy set, at the Paula period each sound record names. Effects only: the " +
-    "music modules' pattern format is not decoded and no music is exported.",
+    "banks as music modules ship separately under disk-derived-table-music.",
   authorizationRequired: true,
 };
 

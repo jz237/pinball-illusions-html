@@ -97,6 +97,7 @@ import {
   MUSIC_TOGGLE_KEY,
   createShellMusic,
 } from "./browser/shell-music.js";
+import { createTableMusic } from "./browser/table-music.js";
 
 /** One table, assembled and ready to play. */
 interface LoadedTable {
@@ -390,6 +391,11 @@ async function boot(): Promise<void> {
   // The shell music: driven by `shell.phase` from the frame loop below, over
   // the deck's shared context. Never awaited, never read by the simulation.
   const music = createShellMusic(storage, () => sound.context());
+  // The table music — the in-game module, decoded from each table's own two
+  // SNT! banks — driven by the tick reports and the same phase. It borrows
+  // the deck's context too, and follows the shell music's persisted mute.
+  const tableMusic = createTableMusic(() => sound.context());
+  tableMusic.setMuted(music.muted());
   const opened = new Map<TableId, LoadedTable>();
 
   let scale = fitCanvas(canvas);
@@ -557,6 +563,9 @@ async function boot(): Promise<void> {
     const onTick = (report: GameTickReport): void => {
       const bank = sound.bank;
       if (bank !== null) playTick(bank, report);
+      // The music reads the same finished report: serve -> vamp, launch ->
+      // main queued at the lap boundary, tilt -> the stop section.
+      tableMusic.observe(report);
       // The panel consumes the same per-tick reports the audio does — the
       // debug handle's `tick` goes through this hook too, so a scripted game
       // queues exactly the animations a played one does.
@@ -598,6 +607,7 @@ async function boot(): Promise<void> {
     if (cached !== undefined) {
       table = cached;
       sound.select(tableId);
+      tableMusic.select(tableId);
       apply(shellTableLoaded(shell));
       return Promise.resolve();
     }
@@ -608,6 +618,7 @@ async function boot(): Promise<void> {
         opened.set(tableId, next);
         table = next;
         sound.select(tableId);
+        tableMusic.select(tableId);
         apply(shellTableLoaded(shell));
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -649,6 +660,7 @@ async function boot(): Promise<void> {
           // nothing is ticked or drawn until it is chosen again.
           table = null;
           sound.silence();
+          tableMusic.clear();
           break;
       }
     }
@@ -664,12 +676,15 @@ async function boot(): Promise<void> {
     // touched the page. A keypress is exactly that.
     sound.resume();
     music.resume();
+    tableMusic.resume();
 
     // The mute toggle, from any phase. The backquote is bound to no game
     // control, no shell navigation, no function-key table pick and no
     // initials character, so taking it here steals nothing from anyone.
+    // One toggle covers both modules — the shell's and the table's — with
+    // the shell's persisted state as the single source of truth.
     if (keyEvent.code === MUSIC_TOGGLE_CODE || keyEvent.key === MUSIC_TOGGLE_KEY) {
-      if (keyEvent.repeat !== true) music.toggleMuted();
+      if (keyEvent.repeat !== true) tableMusic.setMuted(music.toggleMuted());
       keyEvent.preventDefault?.();
       return;
     }
@@ -728,8 +743,10 @@ async function boot(): Promise<void> {
       router.releaseAll();
       // A hidden tab gets no frames, so the music's scheduler would run its
       // lookahead dry and leave the looped voices droning. Stop it; the first
-      // visible frame's `update` starts the song afresh.
+      // visible frame's `update` starts the song afresh. The table music
+      // stops for the same reason (its next serve brings it back).
       music.stop();
+      tableMusic.stop();
     } else {
       table?.loop.scheduler.resume();
     }
@@ -751,10 +768,13 @@ async function boot(): Promise<void> {
    */
   const frame = (timeMs: number): void => {
     pollGamepads(router);
-    // The music follows the shell's phase: on over every menu and card, off
-    // over the ball. One call a frame both handles the transitions and pumps
-    // the scheduler's lookahead window.
+    // The music follows the shell's phase: the front-end module over every
+    // menu and card, the table's own module over the ball. One call a frame
+    // each handles the transitions and pumps the scheduler's lookahead
+    // window; the table controller also gates the module's channel 3 while
+    // the effects channel is sounding, which is Paula's AUD3 rule.
     music.update(shell.phase);
+    tableMusic.update(shell.phase, sound.bank);
 
     if (shell.phase === "play" && table !== null) {
       // Only on the transition. `resume()` with no timestamp deliberately

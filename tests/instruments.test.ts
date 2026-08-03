@@ -346,10 +346,15 @@ describe("the tracker output layer", () => {
     expect(second.starts).toEqual([10.25]);
     expect(second.playbackRate.value).toBe(0.5);
     expect(second.gainNode?.gain.value).toBe(0.5);
-    // Every voice's gain feeds the master, which feeds the destination.
+    // Every voice's gain feeds its CHANNEL BUS — the per-channel gain the
+    // in-game arbitration ducks (channel 3 while an effect sounds) — and the
+    // buses feed the master, which feeds the destination. Gains are created
+    // master first, then the four buses in channel order.
     const master = host.gains[0] as FakeGain;
     expect(master.connected).toContain(host.destination);
-    expect(second.gainNode?.connected).toContain(master);
+    const channelOneBus = host.gains[2] as FakeGain;
+    expect(channelOneBus.connected).toContain(master);
+    expect(second.gainNode?.connected).toContain(channelOneBus);
   });
 
   it("wires the instrument's buffer and loop window into the source", () => {
