@@ -427,15 +427,30 @@ export function attachTouch(host: TouchHost): TouchHandle {
   const wakeLockApi = (view.navigator as Navigator & { wakeLock?: WakeLockLike }).wakeLock;
   let sentinel: WakeLockSentinelLike | null = null;
   let requesting = false;
+  /**
+   * Whether the lock is still WANTED, as opposed to already granted.
+   *
+   * The request is asynchronous and a ball can drain while it is in flight —
+   * or the whole chrome can be detached. Without this the lock arrives after
+   * the phase moved on, is stored, and nothing looks at it again until the next
+   * time play ENDS, so the screen stays awake through the entire front end.
+   */
+  let wantScreen = false;
 
   const holdScreen = (wanted: boolean): void => {
     if (wakeLockApi === undefined) return;
+    wantScreen = wanted;
     if (wanted) {
       if (sentinel !== null || requesting) return;
       requesting = true;
       void wakeLockApi
         .request("screen")
         .then((next) => {
+          // Granted late, for a ball that is already over.
+          if (!wantScreen) {
+            void next.release().catch(() => undefined);
+            return;
+          }
           sentinel = next;
         })
         .catch(() => {
@@ -500,6 +515,14 @@ export function attachTouch(host: TouchHost): TouchHandle {
       }
       globals.length = 0;
       mediaList?.removeEventListener("change", onMediaChange);
+      // A finger still down on a button asserts its control through the router,
+      // and every listener that could have released it has just been removed —
+      // so detaching mid-cradle would weld the bat up for good. Same eviction
+      // `applyPlan` does when a button changes meaning under a finger.
+      for (const pointerId of [...pointerSlots.keys()]) {
+        host.router.pointerUp(pointerId);
+      }
+      pointerSlots.clear();
       holdScreen(false);
     },
   };
