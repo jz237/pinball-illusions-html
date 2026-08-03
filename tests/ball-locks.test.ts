@@ -609,9 +609,30 @@ describe("a lock in a running game", () => {
     expect(runToMultiball(game, input, 900), "multiball never started").toBeGreaterThanOrEqual(0);
     expect(debugSnapshot(game).multiball).toBe(true);
 
+    // THE CLAIM WAS `peak === 3`, AND IT DEPENDED ON A COIN TOSS THIS TEST IS
+    // NOT ABOUT. Reaching three SIMULTANEOUSLY needs the feeder to deliver three
+    // — which is the contract — AND the first two to still be alive when the
+    // third arrives, which is a property of a blind 23-tick bat cadence and a
+    // six-hundred-tick uncontrolled preamble. When the contact angle became the
+    // machine's, that preamble diverged by four pixels, the ball ejected from
+    // the lock rolled eleven pixels further along the right inlane, missed the
+    // slingshot it used to catch at (161, 553) and drained down the middle at
+    // (156, 598) on tick 21 — eighty ticks before the third ball left the rod at
+    // tick 116. Three balls were still fed, one at a time, exactly as before.
+    //
+    // So the claim is restated as a CONSERVATION LAW, which is strictly stronger
+    // about the feeder and carries no dependence on the player: every ball the
+    // machine promised is accounted for on every tick, all three reach the
+    // playfield, and the peak plus the drains that beat the last delivery is
+    // exactly three. A feeder that stalled, double-served or lost a ball fails
+    // every one of these; the old assertion could only see the first.
     let peak = 0;
+    let drains = 0;
+    let drainsBeforeLastDelivery = 0;
+    const delivered = new Set<number>();
     for (let tick = 0; tick < 1500; tick += 1) {
-      runTicks(game, input, 1);
+      const report = runTicks(game, input, 1)[0];
+      drains += report?.drained.length ?? 0;
       const state = debugSnapshot(game);
       // Never two balls on the rod at once, whatever else happens: one lane, one
       // ball, exactly as the original's `$D88/$D89(a5)` interlock enforces.
@@ -619,10 +640,25 @@ describe("a lock in a running game", () => {
         (ball) => ball.active && ball.id === state.laneBallId,
       ).length;
       expect(onRod).toBeLessThanOrEqual(1);
+      for (const ball of state.balls) {
+        if (!ball.active || ball.id === state.laneBallId) continue;
+        if (delivered.size < MAX_SIMULTANEOUS_BALLS && !delivered.has(ball.id)) {
+          delivered.add(ball.id);
+          drainsBeforeLastDelivery = drains;
+        }
+      }
+      // Nothing is created and nothing vanishes: what is rolling, what is still
+      // owed and what has gone down the drain always adds to the three the mode
+      // promised.
+      expect(
+        freeBallCount(game.balls) + state.pendingServes + drains,
+        `balls accounted for at tick ${tick}`,
+      ).toBe(MAX_SIMULTANEOUS_BALLS);
       peak = Math.max(peak, freeBallCount(game.balls));
-      if (peak >= 3) break;
+      if (delivered.size >= MAX_SIMULTANEOUS_BALLS && peak + drainsBeforeLastDelivery >= 3) break;
     }
-    expect(peak, "balls simultaneously in play").toBe(3);
+    expect(delivered.size, "distinct balls fed onto the playfield").toBe(3);
+    expect(peak + drainsBeforeLastDelivery, "three rolling, drains included").toBe(3);
     expect(peak).toBeLessThanOrEqual(MAX_SIMULTANEOUS_BALLS);
   });
 

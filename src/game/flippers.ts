@@ -153,17 +153,33 @@
  */
 
 import { TABLE_IDS } from "./contracts.js";
-import type { BallState, MaterialBehaviour, PlayfieldLevel, TableId } from "./contracts.js";
+import type {
+  BallState,
+  ContactPoint,
+  MaterialBehaviour,
+  PlayfieldLevel,
+  TableId,
+} from "./contracts.js";
 import type { PushClamp } from "./ball-physics.js";
 import { DEFAULT_SIMULATION_OPTIONS, reflectVelocity } from "./ball-physics.js";
 import {
   ANGLE_UNITS_PER_TURN,
   DEFAULT_PROBE_RADIUS,
+  cosineUnits,
   integerSqrt,
+  meanContactAngle,
   normalizeAngle,
+  numberAt,
+  outwardNormalOf,
+  ringIndexForAngle,
+  ringOffsetsFor,
+  roundHalfAwayFromZero,
+  sineUnits,
 } from "./collision-probe.js";
+import type { BatPoseBody, BatStrokeShape } from "./flipper-bats.js";
+import { batBodySolid, batPoseBody, batPoseForStroke } from "./flipper-bats.js";
 import type { Q10 } from "../core/fixed-point.js";
-import { Q10_ONE, pixelsToQ10, q10Clamp, q10Multiply } from "../core/fixed-point.js";
+import { Q10_ONE, pixelsToQ10, q10Clamp, q10Multiply, q10ToPixel } from "../core/fixed-point.js";
 import {
   ORIGINAL_ANGLE_UNITS_PER_POSE,
   ORIGINAL_ANGLE_UNITS_PER_TURN,
@@ -176,72 +192,12 @@ import {
 // ---------------------------------------------------------------------------
 // Deterministic trigonometry
 // ---------------------------------------------------------------------------
-
-/** Angle units in a quarter turn: 512 on the 2048-unit scale. */
-export const QUARTER_TURN_UNITS = ANGLE_UNITS_PER_TURN / 4;
-
-const HALF_TURN_UNITS = ANGLE_UNITS_PER_TURN / 2;
-
-/** `Math.round` breaks ties toward +Infinity; this one is sign-symmetric. */
-function roundHalfAwayFromZero(value: number): number {
-  return value < 0 ? -Math.round(-value) : Math.round(value);
-}
-
-/**
- * sin over the first quadrant, Q10, one entry per angle unit plus the endpoint.
- *
- * The 11th-order Taylor series is accurate to about 2e-9 over 0..pi/2, four
- * orders of magnitude finer than the Q10 quantum, so the table is the correctly
- * rounded one and would not change if the polynomial were improved. `i / 512`
- * is exact (512 is a power of two) and everything after it is a correctly
- * rounded IEEE operation, so the table is identical on every engine.
- */
-function buildQuarterSineTable(): readonly number[] {
-  const table: number[] = [];
-  for (let i = 0; i <= QUARTER_TURN_UNITS; i += 1) {
-    const x = (i / QUARTER_TURN_UNITS) * (Math.PI / 2);
-    const xx = x * x;
-    let p = -1 / 39916800;
-    p = p * xx + 1 / 362880;
-    p = p * xx - 1 / 5040;
-    p = p * xx + 1 / 120;
-    p = p * xx - 1 / 6;
-    p = p * xx + 1;
-    table.push(roundHalfAwayFromZero(x * p * Q10_ONE));
-  }
-  return table;
-}
-
-const QUARTER_SINE = buildQuarterSineTable();
-
-function quarterSineAt(index: number): number {
-  const value = QUARTER_SINE[index];
-  if (value === undefined) {
-    throw new RangeError(`quarter-sine index out of range: ${index}`);
-  }
-  return value;
-}
-
-/**
- * sin of an angle in 2048-unit form, as Q10.
- *
- * Folded to the first quadrant and negated with integer arithmetic, so the four
- * quadrants are exact reflections. Zero is returned as +0: a negative zero here
- * would survive into a contact normal and fail identity comparisons.
- */
-export function sineUnits(angle: number): Q10 {
-  const wrapped = normalizeAngle(angle);
-  const withinHalf = wrapped % HALF_TURN_UNITS;
-  const folded = withinHalf <= QUARTER_TURN_UNITS ? withinHalf : HALF_TURN_UNITS - withinHalf;
-  const magnitude = quarterSineAt(folded);
-  if (magnitude === 0) return 0;
-  return wrapped < HALF_TURN_UNITS ? magnitude : -magnitude;
-}
-
-/** cos of an angle in 2048-unit form, as Q10. */
-export function cosineUnits(angle: number): Q10 {
-  return sineUnits(angle + QUARTER_TURN_UNITS);
-}
+//
+// `QUARTER_TURN_UNITS`, `sineUnits` and `cosineUnits` USED TO BE DEFINED HERE.
+// They moved to `collision-probe.ts` when the contact normal became `cos`/`sin`
+// of a mean bearing (the machine's +0x00B502), because a bat angle and a contact
+// bearing are the same 2048-unit scale and two tables would be two answers to
+// "which way is 738". This module imports them; nothing about the bats changed.
 
 /**
  * Radians per angle unit, scaled by 2^20.
@@ -353,9 +309,20 @@ export const FLIPPER_FIRST_BANK_FRAMES = 85;
  *
  * `tests/flippers.test.ts` derives all four numbers from the shipped pose bank
  * rather than restating them, so they cannot go stale again.
+ *
+ * ---------------------------------------------------------------------------
+ * THE CAPSULE IS NO LONGER THE COLLISION BODY, and everything above is now a
+ * MEASUREMENT of the drawn bat rather than a description of what a ball meets.
+ * `touchAt` collides against the pose's own pixels, exactly as the original does
+ * — see `batBodyOf`. These four constants stay because they are the best
+ * one-line summary of the shape the disk draws (a blade 15 px across at the boss
+ * and 8 at the tip, 46 long, hanging 1 px below its own axis), because `length`
+ * still bounds the reported `along` and sets the sub-stepping, and because the
+ * 99.24% and the one-pixel inlane note are the record of the model that was
+ * replaced. `batRadiusAt` is descriptive; nothing on the contact path reads it.
  */
 
-/** Length of the capsule's AXIS, in pixels; the round tip cap reaches 48. */
+/** Length of the capsule's AXIS, in pixels; its round tip cap reached 48. */
 export const FLIPPER_LENGTH_PIXELS = 44;
 
 /** Half-thickness at the boss, in pixels, measured from the pivot's axis. */
@@ -624,6 +591,17 @@ export interface FlipperConfig {
   /** Pivot in Q10 playfield coordinates. */
   readonly pivotX: Q10;
   readonly pivotY: Q10;
+  /**
+   * The DRAWN pose the bat rests at, 0..119, straight off the record.
+   *
+   * Carried on the configuration because the collision body is that pose's own
+   * silhouette: `batPoseBody` walks `restPose + ((direction * stroke) >> 6)`,
+   * the machine's own `asr.w #6` at +0xBDB8, so the shape the ball meets is
+   * indexed by exactly the arithmetic the renderer indexes the picture by.
+   * `restAngle` is this pose converted once and `validateFlipperConfig` refuses
+   * a configuration where the two disagree — there is one bearing, not two.
+   */
+  readonly restPose: number;
   /** Bearing at rest, 2048 units, y downward. */
   readonly restAngle: number;
   /**
@@ -1017,6 +995,7 @@ function flipperFromRecord(record: FlipperRecord): FlipperConfig {
     role: record.role,
     pivotX: pixelsToQ10(record.pivotXPixels),
     pivotY: pixelsToQ10(record.pivotYPixels),
+    restPose: record.restPose,
     restAngle: poseToAngleUnits(record.restPose),
     sweep: record.sweepPoses * BAT_ANGLE_UNITS_PER_POSE,
     // Flipping raises the tip, which on the left means a smaller bearing and on
@@ -1068,6 +1047,13 @@ export function validateFlipperConfig(config: FlipperConfig): FlipperConfig {
   if (config.sweep >= BAT_ANGLE_UNITS_PER_TURN) {
     throw new RangeError(`flipper sweep must be under one turn: ${config.sweep}`);
   }
+  // A whole number of DRAWN poses, because the collision body is one of them:
+  // a bat whose sweep ends between two poses has no shape at its own stop.
+  if (config.sweep % BAT_ANGLE_UNITS_PER_POSE !== 0) {
+    throw new RangeError(
+      `flipper sweep ${config.sweep} is not a whole number of ${BAT_ANGLE_UNITS_PER_POSE}-unit poses`,
+    );
+  }
   for (const [field, value] of [
     ["upAcceleration", config.upAcceleration],
     ["upMaxRate", config.upMaxRate],
@@ -1089,6 +1075,25 @@ export function validateFlipperConfig(config: FlipperConfig): FlipperConfig {
   }
   if (config.taperStart < 0 || config.taperStart > config.length) {
     throw new RangeError(`flipper taper start is outside the bat: ${config.taperStart}`);
+  }
+  // ONE BEARING, NOT TWO. The collision body is the drawn pose at
+  // `restPose + ((direction * stroke) >> 6)` and the geometry's axis is
+  // `restAngle + ...`; a configuration where those two describe different
+  // rotations is a bat whose picture and whose body point different ways, which
+  // is the defect `FLIPPER_PLACEMENT_NOTE` exists to record. Refused here rather
+  // than absorbed, because it is silent everywhere else.
+  if (
+    !Number.isInteger(config.restPose) ||
+    config.restPose < 0 ||
+    config.restPose >= ORIGINAL_POSES_PER_TURN
+  ) {
+    throw new RangeError(`flipper rest pose is not a drawn pose: ${config.restPose}`);
+  }
+  if (config.restAngle !== poseToAngleUnits(config.restPose)) {
+    throw new RangeError(
+      `flipper "${config.id}" rests at bearing ${config.restAngle} but draws pose ` +
+        `${config.restPose}, which is bearing ${poseToAngleUnits(config.restPose)}`,
+    );
   }
   return config;
 }
@@ -1264,19 +1269,90 @@ export function flipperEndpoints(
 }
 
 // ---------------------------------------------------------------------------
-// The bat as a swept, tapered capsule
+// The bat's body: the pose's own pixels
 // ---------------------------------------------------------------------------
 
 /**
- * Half-thickness of the bat `along` units from the pivot, Q10.
+ * THE BAT COLLIDES ON THE PIXELS IT DRAWS.
  *
- * The drawn silhouette is a constant 8 px from the axis out to along 6 and then
- * steps down to 4 px at along 44, which is what this reproduces — see
- * FLIPPER_BOSS_RADIUS_PIXELS for the profile and for the 99.24% of drawn pixels
- * this covers. Treating the bat as a capsule of varying radius rather than a
- * true cone overstates the surface by at most the taper's slope, about a tenth
- * of a pixel per pixel, which is inside the one-pixel quantisation the
- * silhouette is drawn at.
+ * `main.seg00 +0x00B2A2` walks the flipper records at `$2346(a5)` BEFORE it
+ * touches the map: the level word at record+$1C gates the bat out for a ball on
+ * the other collision plane, the per-pose box at record+$FA (four words, indexed
+ * `pose * 8`, and `$1FA + pose*8` for the mirrored bat's negative poses — one
+ * 32-entry table written without a mask) gates it out for a ball nowhere near,
+ * and what survives is blitted against the bat's own per-pose MASK BITMAP at
+ * record+$30 rather than against the playfield plane. `BLTCON0` is
+ * `shift<<12 | $0BA0` — `D = A AND C` — with C the ball's 17x2-word probe ring
+ * and A the mask, `BLTAMOD` 8 for the mask's 12-byte rows against the map path's
+ * $26 for its 42. The result buffer, the ring evaluator at +0x00A9C4 and the
+ * whole responder are then COMMON CODE with the map: a bat contact is an
+ * ordinary contact whose pixels happen to come from the bat.
+ *
+ * So this is what replaced the capsule, and the capsule is worth an obituary
+ * because it was measured and still wrong in a way no measurement of ITS OWN
+ * shape could show. Re-measured against the drawn poses it was 4% larger by
+ * area and differently shaped: 2.18 px too fat on the BACK face on average
+ * (max 4.00, and 8 px against a drawn 6 everywhere), while on a third of the
+ * STRIKING face — 2,375 of 6,996 (pose, along) cells — it was too THIN, by up
+ * to 1.46 px. Over 1,958,804 legal ball-centre positions across the 159
+ * (bat, stroke-pose) instances that is 18,055 contacts the capsule reported
+ * with no bat pixel anywhere on the ball's ring (6.3% of every contact it
+ * reported, 84% of them on the back face) and 4,156 the capsule missed while a
+ * bat pixel sat on the ring and the map was silent — 97.3% of those on the
+ * striking face, which is where balls actually meet bats.
+ *
+ * WHAT THIS DOES NOT DO. In the machine there is ONE probe and ONE normal for
+ * `map OR bat`: `+0x0039FA` ORs a window of the collision map INTO each pose's
+ * mask at table-load time, so the mask is a superset of the map and a ball
+ * touching both gets one answer. Here the map is still resolved inside
+ * `stepBalls` and the bat afterwards, so a ball touching both gets two. That is
+ * 61,280 of 270,683 bat contacts (22.6%) in the census above, it is unchanged
+ * from before this round, and closing it means giving the integrator's own
+ * level view a per-tick bat overlay. It is named here so this is not read as
+ * claiming the bat is now exact.
+ */
+function batStrokeShapeOf(config: FlipperConfig): BatStrokeShape {
+  return {
+    id: config.id,
+    restPose: config.restPose,
+    direction: config.direction,
+    // The configuration keeps the stroke in the original's own 7680-per-turn bat
+    // units; the pose bank counts poses. `validateFlipperConfig` refuses a sweep
+    // that is not a whole number of them.
+    sweepPoses: config.sweep / BAT_ANGLE_UNITS_PER_POSE,
+  };
+}
+
+/**
+ * The DRAWN pose this bat's body is at a stroke — the renderer's own index.
+ *
+ * Exported because a test asking "is the ball touching the bat" has to ask it of
+ * the same pose the physics is colliding on, and deriving that index a second
+ * time in the test is exactly how a picture and a body come apart.
+ */
+export function flipperPoseAt(config: FlipperConfig, stroke: number): number {
+  return batPoseForStroke(batStrokeShapeOf(config), stroke, config.sweep);
+}
+
+function batBodyOf(config: FlipperConfig, stroke: number): BatPoseBody {
+  return batPoseBody(
+    batStrokeShapeOf(config),
+    stroke,
+    config.sweep,
+    q10ToPixel(config.pivotX),
+    q10ToPixel(config.pivotY),
+  );
+}
+
+/**
+ * Half-thickness of the analytic capsule `along` units from the pivot, Q10.
+ *
+ * DESCRIPTIVE ONLY since the body became the drawn silhouette: nothing in the
+ * contact path reads it. It is kept because the four constants it interpolates
+ * — FLIPPER_BOSS_RADIUS_PIXELS and its neighbours — are a measurement of the
+ * drawn bat and the tests still state the profile they measured, and because a
+ * reader comparing this round with the last needs the old shape in front of
+ * them. It is not a fallback and there is no path that can reach it.
  */
 export function batRadiusAt(config: FlipperConfig, along: Q10): Q10 {
   if (along <= config.taperStart) return config.bossRadius;
@@ -1292,8 +1368,17 @@ interface BatTouch {
   /** Outward unit normal in Q10, pointing from the bat toward the ball. */
   readonly normalX: Q10;
   readonly normalY: Q10;
-  /** How far the ball has to move along the normal to just touch, Q10. */
-  readonly penetration: Q10;
+  /**
+   * WHOLE-PIXEL lift out of the bat, Q10, already resolved into components.
+   *
+   * A mask body has no analytic penetration to subtract: it answers only "does
+   * a drawn pixel lie on the ring", which is constant across a pixel cell. So
+   * the separation is searched rather than computed — see `separate` — and what
+   * is carried here is the displacement that search found, in whole pixels
+   * along the normal, so the mover and the searcher cannot round differently.
+   */
+  readonly pushX: Q10;
+  readonly pushY: Q10;
   /** Lever arm from the pivot to the touched point on the bat's surface, Q10. */
   readonly armX: Q10;
   readonly armY: Q10;
@@ -1302,26 +1387,54 @@ interface BatTouch {
 }
 
 /**
- * Tests one ball against one bat pose.
+ * Whole pixels a ball may be lifted out of a bat in one resolve.
+ *
+ * A bound rather than a tuning: `resolveOne` resolves at the CROSSING point, so
+ * the ball is never more than one collision pass into the body — at most 4 px of
+ * ball travel plus 4.4 px of tip travel, and the striking face is under 3 px
+ * deep at the deepest reachable point. Ten leaves the whole of that plus the
+ * margin, and a search that runs out is a ball the geometry has engulfed, which
+ * the guard in `touchAt` catches by a different route.
+ */
+const MAX_SEPARATION_PIXELS = 10;
+
+/**
+ * Tests one ball against one bat pose — against the pose's own drawn pixels.
+ *
+ * The ring is `collision-probe.ts`'s, at the ball's radius, and it is the SAME
+ * 44 offsets the machine's C-channel stencil holds; the mean and the outward
+ * normal are that module's own producers. There is deliberately no second ring,
+ * no second mean and no second normal rule here: in the machine `+0x00B35A`
+ * (bat) and `+0x00B4B0` (map) leave the same 68-byte buffer for the same
+ * evaluator, so whatever the map's contact normal becomes, the bat inherits it.
  *
  * `fromX`/`fromY` are the last position the ball was OUTSIDE the bat at — the
  * previous sample of the swept resolve — and they carry the one fact the
  * geometry alone cannot: which side the ball came from. When a fast ball's
- * sample lands past the bat's axis, the nearest-point normal reads off the far
- * face, and resolving with it is exactly the wrong-side ejection that B1
- * documented (161 bat-crossings-while-raised in 80 games, all through this
- * seam). If the geometric normal disagrees with the approach side, the normal
- * is overridden to the approach side's face and the penetration is measured
- * through the axis, so `separate` always pushes the ball back out the way it
+ * sample lands past the bat's axis the contact set is read off the FAR face, and
+ * resolving with it is exactly the wrong-side ejection that B1 documented (161
+ * bat-crossings-while-raised in 80 games, all through this seam). If the ring's
+ * normal disagrees with the approach side, the normal is overridden to the
+ * approach side's face, so `separate` always pushes the ball back out the way it
  * came in — never through.
  *
- * The degenerate case — a ball centre exactly on the bat's axis — has no normal
- * to read off the geometry either, and takes the approach side too; with no
- * approach side available it falls back to the face the bat sweeps toward, as
- * before.
+ * TWO DEGENERATE CASES A CAPSULE NEVER HAD, both guarded here:
+ *
+ *   - A ball far enough inside the body lights points all round the ring and
+ *     their mean is noise. Measured over the first-contact band (penetration
+ *     <= 1.5 px, 13,192 positions) the ring mean and the old nearest-point
+ *     normal agree to a median 5.00 degrees and never more than 21.84; over the
+ *     whole overlapping set the maximum is 180, and those are the deep centres.
+ *     A hit set spanning more than half the ring therefore takes the approach
+ *     side instead. The machine cannot reach this — a 15 px bat cannot engulf a
+ *     17 px ball — but `moveTo` and `separate` push against walls, and this port
+ *     can.
+ *   - No approach side and no usable mean at all falls back to the face the bat
+ *     sweeps toward, as the capsule did.
  */
 function touchAt(
   config: FlipperConfig,
+  stroke: number,
   angle: number,
   ballX: Q10,
   ballY: Q10,
@@ -1329,49 +1442,57 @@ function touchAt(
   fromX: Q10 = ballX,
   fromY: Q10 = ballY,
 ): BatTouch | null {
+  const body = batBodyOf(config, stroke);
+  const ring = ringOffsetsFor(ballRadius);
+  // Truncated to whole pixels exactly as `probeRing` does, so the bat and the
+  // map quantise a ball centre to the same pixel.
+  const centreX = q10ToPixel(ballX);
+  const centreY = q10ToPixel(ballY);
+
+  // THE BOX, +0x00B2C8..+0x00B2E4 — four words, all four comparisons inclusive.
+  // Built at +0x003A6C as `pivot - anchor - 16` on both axes, `pivot - anchor +
+  // h + 2` at the bottom and the record's own +$F8 on the right, and compared
+  // against the ball's TOP-LEFT (`$12/$14(a4)`), which is why the margin is a
+  // whole ball window rather than a radius. Read against the drawn block here:
+  // measured across the nine records, +$F8 is the bat's own rightmost drawn
+  // column on four of them and 1-3 px slack on the other five, never tighter,
+  // so a box derived from the silhouette is the shipped box or inside it. It is
+  // a gate and never a clip — nothing it admits is decided by it.
+  //
+  // The window is taken from the BALL'S OWN radius rather than the shipped 16,
+  // so that a simulation run at a different probe radius (the options carry one)
+  // cannot have the gate reject a position its ring could still reach. At the
+  // shipped radius of 8 the two are the same number.
+  const radiusPixels = q10ToPixel(ballRadius);
+  const boxLeft = body.originX - 2 * radiusPixels;
+  const boxTop = body.originY - 2 * radiusPixels;
+  const boxRight = body.originX + body.silhouette.right;
+  const boxBottom = body.originY + body.silhouette.height + 2;
+  const topLeftX = centreX - radiusPixels;
+  const topLeftY = centreY - radiusPixels;
+  if (topLeftX < boxLeft || topLeftX > boxRight) return null;
+  if (topLeftY < boxTop || topLeftY > boxBottom) return null;
+
+  // THE BLIT, `D = A AND C`: which of the ring's 44 points land on drawn pixels.
+  const contacts: ContactPoint[] = [];
+  for (let i = 0; i < ring.size; i += 1) {
+    const px = centreX + numberAt(ring.dx, i);
+    const py = centreY + numberAt(ring.dy, i);
+    if (!batBodySolid(body, px, py)) continue;
+    contacts.push({
+      ringIndex: i,
+      angle: numberAt(ring.angle, i),
+      material: config.surface.index,
+      x: px,
+      y: py,
+    });
+  }
+  if (contacts.length === 0) return null;
+
   const axisX = cosineUnits(angle);
   const axisY = sineUnits(angle);
-  const toBallX = ballX - config.pivotX;
-  const toBallY = ballY - config.pivotY;
-  const along = q10Clamp(
-    q10Multiply(toBallX, axisX) + q10Multiply(toBallY, axisY),
-    0,
-    config.length,
-  );
-  const nearestX = config.pivotX + q10Multiply(along, axisX);
-  const nearestY = config.pivotY + q10Multiply(along, axisY);
-  const offsetX = ballX - nearestX;
-  const offsetY = ballY - nearestY;
-  const distanceSquared = offsetX * offsetX + offsetY * offsetY;
-
-  const batRadius = batRadiusAt(config, along);
-  const touchDistance = batRadius + ballRadius;
-  // STRICTLY OUTSIDE is not touching; EXACTLY ON THE BOUNDARY IS.
-  //
-  // This used to be `>=`, and `separate()` below lifts a ball out by exactly its
-  // penetration — which lands it at distance == touchDistance, i.e. the one
-  // distance the old test called "not touching". A ball a bat had just pushed
-  // was therefore invisible to the bat on the NEXT tick, by construction. The
-  // lower bats hid it because gravity pulls a cradled ball back inside the
-  // capsule every tick; a raised upper bat, whose ball is held from below by the
-  // map, does not. Two measured consequences, both closed by the one character:
-  //
-  //   - Extreme Sports' upper bat at full stroke moved a ball at (184,181)L1 to
-  //     (184.124, 180.721) and then reported ZERO contacts there, so the ball
-  //     search saw a cradle as a strand and pulsed its coils at it.
-  //   - Law 'n Justice's upper bat sits 13 px from a notch at (25,307) between
-  //     the rubber post at (23-24,305-307) and the top of the level-0 boundary
-  //     wall at (25,308) — which was EXACTLY the touch distance while the boss
-  //     was 5 (5 + ball 8). A ball pressed into it was at distance exactly 13.0
-  //     and so could neither be seen as cradled NOR be struck by the bat
-  //     sweeping past it. Three of 270 census balls ended up there. The
-  //     re-measured boss of 8 puts the touch distance at 16 and the notch well
-  //     inside it, so the coincidence is gone; the `>` is kept because it is
-  //     `separate()`'s own arithmetic that creates the case, not that one notch.
-  if (distanceSquared > touchDistance * touchDistance) return null;
-
-  // The bat's perpendicular, unit length because the axis is: the reference
-  // both side tests below are signed against.
+  // The bat's perpendicular, unit length because the axis is: the reference the
+  // side tests are signed against.
   const perpX = -axisY | 0;
   const perpY = axisX;
   // Which side of the axis the ball approached from: the sign of the last
@@ -1380,42 +1501,66 @@ function touchAt(
   const fromPerp =
     q10Multiply(fromX - config.pivotX, perpX) + q10Multiply(fromY - config.pivotY, perpY);
   const fromSide = fromPerp > 0 ? 1 : fromPerp < 0 ? -1 : 0;
+  const approachX = (fromSide !== 0 ? fromSide * perpX : -config.direction * axisY) | 0;
+  const approachY = (fromSide !== 0 ? fromSide * perpY : config.direction * axisX) | 0;
 
-  const distance = integerSqrt(distanceSquared);
-  let normalX: number;
-  let normalY: number;
-  let penetration = touchDistance - distance;
-  if (distance === 0) {
-    if (fromSide !== 0) {
-      normalX = (fromSide * perpX) | 0;
-      normalY = (fromSide * perpY) | 0;
-    } else {
-      normalX = (-config.direction * axisY) | 0;
-      normalY = (config.direction * axisX) | 0;
+  const contactAngle = meanContactAngle(contacts);
+  const contactIndex = ringIndexForAngle(ring, contactAngle);
+  const mean = outwardNormalOf(contactAngle);
+  let normalX = mean.x;
+  let normalY = mean.y;
+  const normalPerp = q10Multiply(normalX, perpX) + q10Multiply(normalY, perpY);
+  const normalSide = normalPerp > 0 ? 1 : normalPerp < 0 ? -1 : 0;
+  const engulfed = 2 * contacts.length > ring.size;
+  const wrongSide = fromSide !== 0 && normalSide !== 0 && normalSide !== fromSide;
+  if (engulfed || wrongSide) {
+    normalX = approachX;
+    normalY = approachY;
+  }
+
+  // THE CONTACT POINT, +0x00AD9E: the ball centre plus the ring offset the mean
+  // landed on. The capsule never had one — its arm was the axis point plus a
+  // synthetic radius — and it is what makes the lever arm the real one.
+  const contactX = (ballX + pixelsToQ10(numberAt(ring.dx, contactIndex))) | 0;
+  const contactY = (ballY + pixelsToQ10(numberAt(ring.dy, contactIndex))) | 0;
+  const along = q10Clamp(
+    q10Multiply(contactX - config.pivotX, axisX) + q10Multiply(contactY - config.pivotY, axisY),
+    0,
+    config.length,
+  );
+
+  // THE SEPARATION, searched rather than computed. Whole pixels along the
+  // normal, out to the first position at which no drawn pixel is on the ring,
+  // then back one — so the ball is left on the LAST position that still touches
+  // and the bat can still see it next tick. That continuity is load-bearing:
+  // `game-loop.ts` exempts a ball the bats touched from the ball search (B2),
+  // and a cradle that reports no contact for one tick is a ball confiscated
+  // from a player who was legitimately holding it.
+  let pushX = 0;
+  let pushY = 0;
+  for (let step = 1; step <= MAX_SEPARATION_PIXELS; step += 1) {
+    const offsetX = Math.round((step * normalX) / Q10_ONE);
+    const offsetY = Math.round((step * normalY) / Q10_ONE);
+    let touching = false;
+    for (let i = 0; i < ring.size && !touching; i += 1) {
+      touching = batBodySolid(
+        body,
+        centreX + offsetX + numberAt(ring.dx, i),
+        centreY + offsetY + numberAt(ring.dy, i),
+      );
     }
-  } else {
-    normalX = roundHalfAwayFromZero((offsetX * Q10_ONE) / distance) | 0;
-    normalY = roundHalfAwayFromZero((offsetY * Q10_ONE) / distance) | 0;
-    if (fromSide !== 0) {
-      const normalPerp = q10Multiply(normalX, perpX) + q10Multiply(normalY, perpY);
-      const normalSide = normalPerp > 0 ? 1 : normalPerp < 0 ? -1 : 0;
-      if (normalSide !== 0 && normalSide !== fromSide) {
-        // The sample crossed the axis between two probes: resolve against the
-        // face the ball came from, and push it back through the axis.
-        const ballPerp = q10Multiply(offsetX, perpX) + q10Multiply(offsetY, perpY);
-        normalX = (fromSide * perpX) | 0;
-        normalY = (fromSide * perpY) | 0;
-        penetration = touchDistance - fromSide * ballPerp;
-      }
-    }
+    if (!touching) break;
+    pushX = pixelsToQ10(offsetX);
+    pushY = pixelsToQ10(offsetY);
   }
 
   return {
     normalX,
     normalY,
-    penetration,
-    armX: (nearestX + q10Multiply(batRadius, normalX) - config.pivotX) | 0,
-    armY: (nearestY + q10Multiply(batRadius, normalY) - config.pivotY) | 0,
+    pushX,
+    pushY,
+    armX: (contactX - config.pivotX) | 0,
+    armY: (contactY - config.pivotY) | 0,
     along,
   };
 }
@@ -1594,7 +1739,7 @@ function resolveOne(
       // bat's animation with the integrator's sub-steps.
       const sampleX = (startX + Math.trunc((deltaX * sampled) / total)) | 0;
       const sampleY = (startY + Math.trunc((deltaY * sampled) / total)) | 0;
-      const touch = touchAt(config, angle, sampleX, sampleY, ballRadius, freeX, freeY);
+      const touch = touchAt(config, stroke, angle, sampleX, sampleY, ballRadius, freeX, freeY);
       if (touch === null) {
         freeX = sampleX;
         freeY = sampleY;
@@ -1723,16 +1868,17 @@ function resolveOne(
  * Without this a ball resting on a raised flipper sinks a little further every
  * tick — the impulse cancels the approach but never undoes the overlap gravity
  * already produced — and eventually comes out of the other side.
+ *
+ * The displacement was SEARCHED in `touchAt` rather than computed here, and it
+ * is whole pixels. That is a property of the body and not a simplification: a
+ * mask reads whole pixels, so its answer is constant across a pixel cell and any
+ * sub-pixel lift is answer-preserving by construction. The search stops one
+ * pixel short of clear, so the ball is left touching and the bat still sees it
+ * next tick — which is what keeps a cradle a cradle.
  */
 function separate(ball: BallState, touch: BatTouch, clamp: PushClamp | null): void {
-  if (touch.penetration <= 0) return;
-  // Exactly the penetration, which lands the ball ON the capsule boundary. That
-  // is a TOUCH — see `touchAt`, whose test is strict — so the bat still sees the
-  // ball it has just separated on the next tick and can strike it.
-  const deltaX = q10Multiply(touch.penetration, touch.normalX);
-  const deltaY = q10Multiply(touch.penetration, touch.normalY);
-  if (deltaX === 0 && deltaY === 0) return;
-  moveBy(ball, deltaX, deltaY, clamp);
+  if (touch.pushX === 0 && touch.pushY === 0) return;
+  moveBy(ball, touch.pushX, touch.pushY, clamp);
 }
 
 /** Moves a ball by an offset, as far as the map allows. */

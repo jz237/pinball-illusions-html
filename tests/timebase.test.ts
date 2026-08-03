@@ -64,7 +64,6 @@ import {
   FLIPPER_LENGTH_PIXELS,
   ORIGINAL_IMPULSE_TANGENT,
   batRadiusAt,
-  cosineUnits,
   createFlipperBank,
   flipperAngle,
   flipperConfigsFor,
@@ -72,12 +71,11 @@ import {
   flipperInputFrom,
   flipperRateTaken,
   resolveFlipperContacts,
-  sineUnits,
   tickFlipper,
   tickFlipperBank,
 } from "../src/game/flippers.js";
 import type { FlipperConfig } from "../src/game/flippers.js";
-import { BALL_RADIUS_PIXELS } from "../src/game/collision-probe.js";
+import { BALL_RADIUS_PIXELS, cosineUnits, sineUnits } from "../src/game/collision-probe.js";
 import { q10Multiply } from "../src/core/fixed-point.js";
 import { BUMPER_KICK, SLINGSHOT_KICK } from "../src/game/surface-physics.js";
 import { LAUNCH_KICK } from "../src/game/plunger.js";

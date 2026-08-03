@@ -111,7 +111,7 @@ import {
   DEFAULT_PROBE_RADIUS,
   flagAt,
   integerSqrt,
-  meanContactIndex,
+  meanContactAngle,
   moreDeflecting,
   numberAt,
   passabilityOf,
@@ -1194,7 +1194,7 @@ function sweepToContact(
 
     const probe = probeRing(map, materials, passable, ring, point.x, point.y);
     if (probe.contactIndex < 0) return null;
-    if (record) logContacts(log, probe, ring, materials);
+    if (record) logContacts(log, probe, materials);
 
     // The un-snapped normal, which is also what the bounce is taken about; see
     // `outwardNormalOf`. Using the ring entry here and the exact vector there
@@ -1283,8 +1283,6 @@ function cancelMotionAlong(ball: BallState, deltaX: number, deltaY: number): boo
 interface ContactLog {
   readonly points: ContactPoint[];
   readonly seen: Set<number>;
-  sumX: number;
-  sumY: number;
   dominant: MaterialIndex | null;
   dominantBehaviour: MaterialBehaviour | null;
   /** Surface ids touched this tick, first-touch order, deduped. Empty with no map. */
@@ -1298,8 +1296,6 @@ function newContactLog(surfaceAt: ((x: number, y: number) => number) | null): Co
   return {
     points: [],
     seen: new Set<number>(),
-    sumX: 0,
-    sumY: 0,
     dominant: null,
     dominantBehaviour: null,
     surfaceIds: [],
@@ -1313,19 +1309,12 @@ function pixelKey(x: number, y: number): number {
   return (y + 0x8000) * 0x10000 + (x + 0x8000);
 }
 
-function logContacts(
-  log: ContactLog,
-  probe: RingProbe,
-  ring: RingOffsets,
-  materials: MaterialTable,
-): void {
+function logContacts(log: ContactLog, probe: RingProbe, materials: MaterialTable): void {
   for (const point of probe.contacts) {
     const key = pixelKey(point.x, point.y);
     if (log.seen.has(key)) continue;
     log.seen.add(key);
     log.points.push(point);
-    log.sumX += numberAt(ring.unitX, point.ringIndex);
-    log.sumY += numberAt(ring.unitY, point.ringIndex);
 
     const behaviour = materials.behaviourFor(point.material);
     if (log.dominantBehaviour === null || moreDeflecting(behaviour, log.dominantBehaviour)) {
@@ -1385,10 +1374,18 @@ interface IntegrationResult {
   readonly surfaceIds: readonly number[];
 }
 
-function closeContactLog(log: ContactLog, ring: RingOffsets): ContactResult | null {
+/**
+ * The tick's contact REPORT, which is not the tick's bounce.
+ *
+ * The bounce was taken about whichever probe stopped the sweep, from that
+ * position's own contact set. This runs the same producer over every distinct
+ * pixel the ring touched anywhere in the tick, which is the question the scoring
+ * and device layers ask: what did the ball touch. The two answers differ
+ * whenever a tick contains more than one contact, and they are meant to.
+ */
+function closeContactLog(log: ContactLog): ContactResult | null {
   if (log.points.length === 0) return null;
-  const index = meanContactIndex(ring, log.points, log.sumX, log.sumY);
-  return { contacts: log.points, normalAngle: numberAt(ring.angle, index), dominant: log.dominant };
+  return { contacts: log.points, normalAngle: meanContactAngle(log.points), dominant: log.dominant };
 }
 
 // ---------------------------------------------------------------------------
@@ -1661,7 +1658,7 @@ function recoverPenetration(
 
   const probe = probeRing(map, materials, passable, ring, ball.x, ball.y);
   if (probe.contactIndex >= 0) {
-    logContacts(log, probe, ring, materials);
+    logContacts(log, probe, materials);
     const normalX = probe.normalX;
     const normalY = probe.normalY;
     for (let step = 1; step <= maximum; step += 1) {
@@ -1822,7 +1819,7 @@ function integrateBall(
     }
   }
 
-  return { contact: closeContactLog(log, ring), surfaceIds: log.surfaceIds };
+  return { contact: closeContactLog(log), surfaceIds: log.surfaceIds };
 }
 
 // ---------------------------------------------------------------------------

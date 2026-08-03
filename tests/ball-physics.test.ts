@@ -1070,23 +1070,32 @@ describe("no tick is a no-op", () => {
     // 32 px frame. It is the same slot, 32 columns right; the ROW is untouched,
     // and so is every expectation below, because what this test is about was
     // never about where on the table the slot happens to be.
-    // WHAT THIS ASSERTS CHANGED WHEN GRAVITY WAS MEASURED, AND THE CHANGE IS
-    // WORTH READING BEFORE TRUSTING EITHER VERSION. At the port's old gravity of
-    // 24 the ball came to a dead halt here in ten ticks, velocity exactly zero,
-    // and that is what this test used to say. At the measured 128 it does not:
-    // it settles into a two-tick cycle, one Q10 unit — a thousandth of a pixel —
-    // of horizontal rattle, carrying vy = -2 for ever. A tick of gravity is now
-    // 128 units against a wedge that hands almost all of it straight back, and
-    // the residue no longer rounds to nothing.
+    // WHAT THIS ASSERTS CHANGED TWICE, AND BOTH CHANGES ARE WORTH READING.
     //
-    // That is not the defect this test exists for and the test now says so
-    // precisely. The defect was a FIXED POINT: position AND velocity both
-    // unchanged, with speed still on the books, which no tick may leave behind
-    // because every later tick then repeats it exactly. A two-tick cycle at a
-    // thousandth of a pixel is a ball at rest as far as anything downstream can
-    // tell — it never leaves its pixel, so the ball search's radius-8 box
-    // collects it — and the assertions below are over a thousand ticks rather
-    // than the old ten, which is a longer leash than the old version ever had.
+    // At the port's old gravity of 24 the ball came to a dead halt here in ten
+    // ticks, velocity exactly zero. At the measured gravity of 128 it stopped
+    // doing that and settled into a two-tick cycle instead: one Q10 unit — a
+    // thousandth of a pixel — of horizontal rattle, carrying vy = -2 for ever,
+    // because a tick of gravity is 128 units against a wedge that hands almost
+    // all of it straight back and the residue no longer rounds to nothing.
+    //
+    // IT IS A DEAD HALT AGAIN, and this site is exactly the shape the contact
+    // angle changed on. A ball wedged between two rails touches BOTH, which is a
+    // multi-arc contact: the vector mean cancelled to zero and fell back to
+    // `contacts[0]` — one wall, arbitrarily — so every tick shoved the ball off
+    // that one rail and gravity fed it back. The machine's arithmetic mean of
+    // the tabulated bearings has no cancellation and no fallback (see
+    // `meanContactAngle`); it answers to both walls at once and the reflection
+    // takes the residue out. Measured over the same thousand ticks: ONE distinct
+    // state, (88064, 159742) at velocity (0, 0), where the old rule cycled
+    // through two.
+    //
+    // The assertions below are therefore TIGHTENED TO ZERO rather than relaxed,
+    // and the defect the test exists for is unchanged: a FIXED POINT WITH SPEED
+    // STILL ON THE BOOKS, which no tick may leave behind because every later
+    // tick then repeats it exactly. A ball at rest at velocity exactly zero is
+    // not that — it is a ball at rest, and the ball search's radius-8 box
+    // collects it.
     const set = createBallSet();
     const ball = spawnBall(set, 88064, 159742, 0, -1);
     for (let tick = 0; tick < 10; tick += 1) stepBalls(set, LAW_MAP, LAW_MATERIALS, GRAVITY);
@@ -1094,15 +1103,15 @@ describe("no tick is a no-op", () => {
     const settledY = ball.y;
     for (let tick = 0; tick < 1000; tick += 1) {
       stepBalls(set, LAW_MAP, LAW_MATERIALS, GRAVITY);
-      // Confined to one Q10 unit in x and not moving at all in y.
-      expect(Math.abs(ball.x - settledX)).toBeLessThanOrEqual(1);
+      // WAS `<= 1`, `<= 1`, `<= 2`. Nothing moves at all now.
+      expect(ball.x).toBe(settledX);
       expect(ball.y).toBe(settledY);
-      expect(Math.abs(ball.velocityX)).toBeLessThanOrEqual(1);
-      expect(Math.abs(ball.velocityY)).toBeLessThanOrEqual(2);
+      expect(ball.velocityX).toBe(0);
+      expect(ball.velocityY).toBe(0);
     }
-    // Two Q10 units — two thousandths of a pixel — below the spawn row, on the
-    // pixel it started on, which is the row the ball search will find it on.
-    expect(settledY).toBe(159741);
+    // The pixel it started on, which is the row the ball search will find it on.
+    // WAS 159741: that one Q10 unit was the rattle's own drift, and it is gone.
+    expect(settledY).toBe(159742);
     expect(ball.y >> 10).toBe(155);
   });
 

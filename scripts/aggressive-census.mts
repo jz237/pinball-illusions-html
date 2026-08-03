@@ -39,7 +39,9 @@ import { TABLE_IDS } from "../src/game/contracts.js";
 import { parseTableAccelDocument, registerTableAcceleration } from "../src/game/table-accel.js";
 import { parseTableDevicesDocument, registerTableDevices } from "../src/game/table-devices.js";
 import { parseTableModesDocument, registerTableModes } from "../src/game/table-modes.js";
+import { parseFlipperBatsDocument, registerFlipperBats } from "../src/game/flipper-bats.js";
 import type {
+  FlipperBatsDocument,
   TableAccelDocument,
   TableDevicesDocument,
   TableId,
@@ -130,8 +132,17 @@ export function censusPlayer(index: number): {
  * run without it would be measuring a different machine. The mission layer is
  * loaded for the same reason: it fires the multiball opcode and takes balls off
  * the table, so a census without it is not measuring the shipped machine.
+ *
+ * AND THE FLIPPER BAT POSE BANK, which is the fourth registry and the newest
+ * requirement: the bats collide on the pixels those poses draw, so a game
+ * assembled without it has no bat shape at all and `createGame` refuses to
+ * build one. It is one document for all three tables.
  */
 function mapFor(tableId: TableId) {
+  const batsUrl = new URL(`../public/generated/flipper-bats.json`, import.meta.url);
+  registerFlipperBats(
+    parseFlipperBatsDocument(JSON.parse(readFileSync(batsUrl, "utf8")) as FlipperBatsDocument),
+  );
   const accelUrl = new URL(`../public/generated/tables/${tableId}.accel.json`, import.meta.url);
   registerTableAcceleration(
     parseTableAccelDocument(JSON.parse(readFileSync(accelUrl, "utf8")) as TableAccelDocument),

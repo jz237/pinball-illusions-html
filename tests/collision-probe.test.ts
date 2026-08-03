@@ -16,11 +16,18 @@ import {
   PROBE_RING_SIZE,
   angleDelta,
   angleUnitsFor,
+  cosineUnits,
+  meanContactAngle,
   normalizeAngle,
   numberAt,
+  outwardNormalOf,
   probeContacts,
+  ringIndexForAngle,
   ringOffsetsFor,
+  sineUnits,
 } from "../src/game/collision-probe.js";
+import type { ContactPoint } from "../src/game/contracts.js";
+import { Q10_ONE } from "../src/core/fixed-point.js";
 import type { RingOffsets } from "../src/game/collision-probe.js";
 
 /** Comfortably bigger than a ball, so the standard centre is clear of the edges. */
@@ -146,13 +153,7 @@ describe("the shared probe ring", () => {
   });
 
   it("keeps every parallel array the same length", () => {
-    for (const values of [
-      PROBE_RING.dx,
-      PROBE_RING.dy,
-      PROBE_RING.unitX,
-      PROBE_RING.unitY,
-      PROBE_RING.angle,
-    ]) {
+    for (const values of [PROBE_RING.dx, PROBE_RING.dy, PROBE_RING.angle]) {
       expect(values).toHaveLength(PROBE_RING_SIZE);
     }
   });
@@ -214,14 +215,34 @@ describe("the shared probe ring", () => {
     }
   });
 
-  it("keeps each offset pointing at its stated angle", () => {
+  it("keeps each offset pointing at its stated angle, to the unit", () => {
     for (const point of ringPoints()) {
       const measured = normalizeAngle(
         Math.round((Math.atan2(point.dy, point.dx) * ANGLE_UNITS_PER_TURN) / (2 * Math.PI)),
       );
-      // The polynomial atan is worth about a third of an angle unit; allow one.
-      expect(angleGap(measured, point.angle)).toBeLessThanOrEqual(1);
+      // WAS `<= 1`, because the three-term polynomial atan this ring used to be
+      // built from was worth about half a unit. It is an exact equality now: the
+      // angles are summed to make a contact normal, so a unit of slack in one of
+      // them is a unit of error in a bounce.
+      expect(point.angle, `entry (${point.dx}, ${point.dy})`).toBe(measured);
     }
+  });
+
+  it("IS THE MACHINE'S OWN ANGLE TABLE, entry for entry", () => {
+    // The 44 bearings the ring evaluator adds up, +0x00A9C4..+0x00ACD8. 36 are
+    // `addi.w` immediates in the instruction stream (0 at +0x00AB4E and $29,
+    // $50, $84, $a9, $e2, $11e, $157, $17c and their mirrors from +0x00AB72 to
+    // +0x00AC7A); the other 8 — entries 9-13 and 31-35 — come out of the two
+    // 32-entry pre-summed blocks at +0x00A804 and +0x00A8E4.
+    //
+    // This is the table the reconstruction now sums, so it is pinned literally
+    // rather than derived. Eight entries moved by one unit when the polynomial
+    // atan was replaced: 5, 6, 16, 17, 27, 28, 38, 39.
+    expect([...PROBE_RING.angle]).toEqual([
+      0, 41, 80, 132, 169, 226, 286, 343, 380, 432, 471, 512, 553, 592, 644, 681, 738, 798, 855,
+      892, 944, 983, 1024, 1065, 1104, 1156, 1193, 1250, 1310, 1367, 1404, 1456, 1495, 1536, 1577,
+      1616, 1668, 1705, 1762, 1822, 1879, 1916, 1968, 2007,
+    ]);
   });
 
   it("puts the axes exactly on the quarter turns", () => {
@@ -253,16 +274,58 @@ describe("the shared probe ring", () => {
     }
   });
 
-  it("carries unit vectors that are directions, not lengths", () => {
-    for (let i = 0; i < PROBE_RING_SIZE; i += 1) {
-      const ux = numberAt(PROBE_RING.unitX, i);
-      const uy = numberAt(PROBE_RING.unitY, i);
-      // 1024 is one in Q10; every entry must be a unit vector to within rounding
-      // or the mean of a fan would be pulled toward the longer offsets.
-      expect(Math.abs(Math.hypot(ux, uy) - 1024)).toBeLessThanOrEqual(1);
-      expect(Number.isInteger(ux)).toBe(true);
-      expect(Number.isInteger(uy)).toBe(true);
+});
+
+describe("the direction table the normal is read out of", () => {
+  // This replaces the ring's `unitX`/`unitY` arrays, which were deleted with the
+  // vector mean that summed them. The property they were asserting — "every
+  // entry is a direction, not a length" — is asserted here instead, over all
+  // 2048 bearings rather than the ring's 44, because the normal is now taken at
+  // the machine's full 1/2048-turn resolution.
+  it("is a unit circle at Q10, at every one of the 2048 bearings", () => {
+    let worst = 0;
+    for (let angle = 0; angle < ANGLE_UNITS_PER_TURN; angle += 1) {
+      const x = cosineUnits(angle);
+      const y = sineUnits(angle);
+      expect(Number.isInteger(x)).toBe(true);
+      expect(Number.isInteger(y)).toBe(true);
+      worst = Math.max(worst, Math.abs(Math.hypot(x, y) - Q10_ONE));
     }
+    // Measured 0.6384, which is the rounding of two Q10 components and nothing
+    // else. A whole unit would mean the table was built wrong.
+    expect(worst).toBeLessThan(0.7);
+  });
+
+  it("is the correctly rounded table, so no engine's Math.sin can move it", () => {
+    for (let angle = 0; angle < ANGLE_UNITS_PER_TURN; angle += 1) {
+      const radians = (2 * Math.PI * angle) / ANGLE_UNITS_PER_TURN;
+      // `+ 0` on the reference: Math.round produces -0 for a small negative
+      // argument and this table deliberately never does.
+      expect(sineUnits(angle), `sin ${angle}`).toBe(Math.round(Q10_ONE * Math.sin(radians)) + 0);
+      expect(cosineUnits(angle), `cos ${angle}`).toBe(Math.round(Q10_ONE * Math.cos(radians)) + 0);
+    }
+  });
+
+  it("is exactly mirror-symmetric, so a mirrored bounce is a mirrored bounce", () => {
+    for (let angle = 0; angle < ANGLE_UNITS_PER_TURN; angle += 1) {
+      expect(sineUnits(-angle)).toBe(-sineUnits(angle) + 0);
+      expect(cosineUnits(-angle)).toBe(cosineUnits(angle));
+      expect(sineUnits(angle + ANGLE_HALF_TURN)).toBe(-sineUnits(angle) + 0);
+      expect(cosineUnits(angle + ANGLE_HALF_TURN)).toBe(-cosineUnits(angle) + 0);
+    }
+  });
+
+  it("agrees with the disk's own 16384-amplitude table to a unit at Q10", () => {
+    // main.bin.seg01 file offset 0xBC is `round(16384 * sin(2*pi*i/2048))` with
+    // zero error, reached through the hunk-1 relocations at main.seg00 0xB4BC
+    // and 0xB4C2. This port carries the same table at Q10 because that is the
+    // scale its vectors are written at; the amplitude cancels out of a rotation.
+    let worst = 0;
+    for (let angle = 0; angle < ANGLE_UNITS_PER_TURN; angle += 1) {
+      const disk = Math.round(16384 * Math.sin((2 * Math.PI * angle) / ANGLE_UNITS_PER_TURN));
+      worst = Math.max(worst, Math.abs(sineUnits(angle) - disk / 16));
+    }
+    expect(worst).toBeLessThanOrEqual(0.5);
   });
 });
 
@@ -380,20 +443,32 @@ describe("probing a corner", () => {
     const result = probeAtCentre(corner);
     expect(result.contacts).toHaveLength(10);
     expect(result.contacts.map((c) => c.ringIndex)).toEqual([9, 10, 11, 12, 13, 20, 21, 22, 23, 24]);
-    // Down is 512, left is 1024, and the two arcs are equally strong, so the
-    // mean direction is 768. The answer is always a ring entry, and 768 falls
-    // exactly between two of them (739 and 797), so allow one ring step.
-    expect(angleGap(result.normalAngle ?? -1, 768)).toBeLessThanOrEqual(32);
-    expect(PROBE_RING.angle).toContain(result.normalAngle);
+    // RESTATED, AND TIGHTENED. This used to allow one ring step either side of
+    // 768 and then assert `PROBE_RING.angle` contained the answer — a property
+    // of the old rule, which snapped the mean onto a ring entry. The machine
+    // does not snap: 432+471+512+553+592 + 944+983+1024+1065+1104 = 7680 over
+    // ten hits, quadrant mask 0111 so no wrap correction, and 7680/10 is 768 on
+    // the nose. 768 is NOT a ring angle — the nearest are 738 and 798 — and that
+    // is the point. The exact bisector of a right-angled corner is now
+    // reachable, where the old rule had to answer 738 or 798.
+    expect(result.normalAngle).toBe(768);
+    expect(PROBE_RING.angle).not.toContain(768);
+    // ... and the reported contact POINT is still a ring entry, because that is
+    // what +0x00AD92 quantises for: round(768 * 44 / 2048) = 17.
+    expect(result.contactIndex).toBe(17);
   });
 });
 
 describe("probing across the 2047/0 wrap", () => {
   it("reports 0 for contacts either side of the seam, not the naive 1024", () => {
     // Ring point 43 is at angle 2007 and point 1 is at angle 41: a wall dead
-    // ahead of a ball moving right, split by the seam. Their arithmetic mean is
-    // 1024 — the exact opposite direction, which would fire the ball INTO the
-    // wall it just touched.
+    // ahead of a ball moving right, split by the seam. Their raw mean is 1024 —
+    // the exact opposite direction, which would fire the ball INTO the wall it
+    // just touched. THE MACHINE TAKES THAT RAW MEAN, and then fixes it with one
+    // rule: quadrant mask 1001 is one of the three at +0x00ACD8, so every hit
+    // below half a turn is re-read as angle + 2048 (`swap` + `ror.l #5` on the
+    // count at +0x00ACEA) before the divide. (41 + 2048 + 2007) / 2 = 2048,
+    // masked to 11 bits = 0.
     const seam = mapWithSolidPixels([pixelOf(43), pixelOf(1)]);
     const result = probeAtCentre(seam);
     expect(result.contacts.map((c) => c.angle)).toEqual([41, 2007]);
@@ -412,22 +487,40 @@ describe("probing across the 2047/0 wrap", () => {
     const seam = mapWithSolidPixels([pixelOf(41), pixelOf(42), pixelOf(43)]);
     const result = probeAtCentre(seam);
     expect(result.contacts.map((c) => c.angle)).toEqual([1916, 1968, 2007]);
-    // Centred on 1968; a naive mean of the three would say 1963-ish only by
-    // luck, and adding entry 0 would swing it to 1472.
-    expect(angleGap(result.normalAngle ?? -1, 1968)).toBeLessThanOrEqual(32);
+    // RESTATED FROM `<= 32` TO THE EXACT VALUE. All three lie in quadrant 3, so
+    // the mask is 1000, no correction fires, and the answer is the plain
+    // truncated mean: (1916 + 1968 + 2007) / 3 = 1963.67 -> 1963. Five units off
+    // the middle entry, and that IS the machine's answer, not slop in it.
+    expect(result.normalAngle).toBe(1963);
+    expect(angleGap(1963, 1968)).toBe(5);
   });
 
-  it("stays sane in a channel where both sides cancel", () => {
+  it("HAS NO BISECTOR IN A CHANNEL, and the machine does not pretend otherwise", () => {
     const channel = makeMap((x) =>
       x >= CENTRE + BALL_RADIUS_PIXELS || x <= CENTRE - BALL_RADIUS_PIXELS ? WALL : OPEN_INDEX,
     );
     const result = probeAtCentre(channel);
     expect(result.contacts).toHaveLength(10);
-    const normal = result.normalAngle;
-    expect(normal).not.toBeNull();
-    expect(Number.isNaN(normal)).toBe(false);
-    // Nothing sensible exists here; the first contact keeps it deterministic.
-    expect(normal).toBe(result.contacts[0]?.angle);
+    expect(result.contacts.map((c) => c.angle)).toEqual([
+      0, 41, 80, 944, 983, 1024, 1065, 1104, 1968, 2007,
+    ]);
+
+    // RESTATED. This used to assert the answer was `contacts[0].angle` — 0 —
+    // which was the old rule's arbitrary-but-deterministic fallback for a
+    // cancelling vector sum. The machine has no fallback and no cancellation: it
+    // sums, and the quadrant mask here is 1111. FIFTEEN IS THE ONE PATTERN THE
+    // WRAP CORRECTION AT +0x00ACD8 DELIBERATELY SKIPS — it tests 1011, 1001 and
+    // 1101 and nothing else — so the sum of 9216 is divided raw by 10 and the
+    // answer is 921. That is not a bisector of anything, and it is not meant to
+    // be; a contact arc round all four quadrants has no mean direction and the
+    // machine returns a defined number rather than a meaningful one.
+    expect(result.normalAngle).toBe(921);
+    expect(result.contacts.reduce((sum, c) => sum + c.angle, 0)).toBe(9216);
+
+    // What must hold is that it is DEFINED and STABLE, which is what the old
+    // fallback was there to guarantee.
+    expect(Number.isInteger(result.normalAngle)).toBe(true);
+    expect(probeAtCentre(channel).normalAngle).toBe(result.normalAngle);
   });
 });
 
@@ -564,6 +657,83 @@ describe("probing at a non-default radius", () => {
       expect(contact.ringIndex).toBeLessThan(ring.size);
       expect(contact.angle).toBe(numberAt(ring.angle, contact.ringIndex));
     }
+  });
+});
+
+describe("the contact-angle producer, +0x00A9C4..+0x00AD04", () => {
+  /** A contact set from bare bearings; only `angle` reaches the producer. */
+  function contactsAt(angles: readonly number[]): readonly ContactPoint[] {
+    return angles.map((angle) => ({
+      ringIndex: PROBE_RING.angle.indexOf(angle),
+      angle,
+      material: WALL,
+      x: 0,
+      y: 0,
+    }));
+  }
+
+  it("is a TRUNCATING mean of the tabulated bearings, +0x00ACFE divu.w", () => {
+    // Not rounded. `divu.w` keeps the quotient and throws the remainder into the
+    // high word, so 5891/3 = 1963.67 is 1963 and never 1964.
+    expect(meanContactAngle(contactsAt([1916, 1968, 2007]))).toBe(1963);
+    expect(meanContactAngle(contactsAt([0, 41]))).toBe(20);
+    expect(meanContactAngle(contactsAt([512]))).toBe(512);
+  });
+
+  it("corrects the wrap on masks 1001, 1011 and 1101 — and on nothing else", () => {
+    // 1001: quadrants 0 and 3 only.
+    expect(meanContactAngle(contactsAt([41, 2007]))).toBe(0);
+    // 1011: add a quadrant-1 hit. (41 + 2048 + 592 + 2048 + 2007)/3 = 2245 -> 197.
+    expect(meanContactAngle(contactsAt([41, 592, 2007]))).toBe(197);
+    // 1101: add a quadrant-2 hit instead. (41+2048 + 1456 + 2007)/3 = 1850.
+    expect(meanContactAngle(contactsAt([41, 1456, 2007]))).toBe(1850);
+    // 0101 contains quadrants 0 and 2 but not 3: no correction, raw mean.
+    expect(meanContactAngle(contactsAt([0, 1024]))).toBe(512);
+  });
+
+  it("LEAVES MASK 1111 UNCORRECTED, which is a limit of the rule and not a gap", () => {
+    // +0x00ACD8 tests three masks. Fifteen is not one of them, and reproducing
+    // that is the difference between porting the machine and improving it.
+    expect(meanContactAngle(contactsAt([0, 592, 1024, 1616]))).toBe(808);
+    // The whole ring solid: 44032/44 = 1000.7 -> 1000. The old vector mean said
+    // 0 here, because 44 symmetric unit vectors sum to nothing.
+    expect(meanContactAngle(contactsAt([...PROBE_RING.angle]))).toBe(1000);
+  });
+
+  it("has no degenerate case, because the hardware gate guarantees N >= 1", () => {
+    // +0x00A7F6 reads DMACONR's BZERO and only enters the evaluator when the
+    // AND was non-empty, so +0x00ACFE can never divide by zero. The port keeps
+    // the invariant as a throw rather than as a silent fallback.
+    expect(() => meanContactAngle([])).toThrow(RangeError);
+    // The three sets the old rule had to invent an answer for. All defined now.
+    expect(meanContactAngle(contactsAt([0, 1024]))).toBe(512);
+    expect(meanContactAngle(contactsAt([512, 1536]))).toBe(1024);
+  });
+
+  it("re-quantises onto the ring exactly on every tabulated bearing", () => {
+    // +0x00AD92 `mulu.w #$580 / addi.l #$8000 / swap` = round(angle * 44/2048),
+    // which assumes the 44 entries are evenly spaced. They are not, quite — so
+    // this is a check that the assumption still round-trips all 44 of them.
+    for (let i = 0; i < PROBE_RING_SIZE; i += 1) {
+      expect(ringIndexForAngle(PROBE_RING, numberAt(PROBE_RING.angle, i))).toBe(i);
+    }
+    // 2047 lands on 44, which is the machine's 45th table row = the first.
+    expect(Math.round((2047 * PROBE_RING_SIZE) / ANGLE_UNITS_PER_TURN)).toBe(44);
+    expect(ringIndexForAngle(PROBE_RING, 2047)).toBe(0);
+  });
+
+  it("turns a bearing into the OPPOSITE unit vector, at 1/2048-turn resolution", () => {
+    // The bearing points into the surface; the normal points out of it.
+    expect(outwardNormalOf(0)).toEqual({ x: -Q10_ONE, y: 0 });
+    expect(outwardNormalOf(512)).toEqual({ x: 0, y: -Q10_ONE });
+    expect(outwardNormalOf(1024)).toEqual({ x: Q10_ONE, y: 0 });
+    for (let angle = 0; angle < ANGLE_UNITS_PER_TURN; angle += 1) {
+      const normal = outwardNormalOf(angle);
+      expect(normal.x).toBe(-cosineUnits(angle) + 0);
+      expect(normal.y).toBe(-sineUnits(angle) + 0);
+    }
+    // 768, the corner bisector the ring cannot express, is expressible here.
+    expect(outwardNormalOf(768)).toEqual({ x: 724, y: -724 });
   });
 });
 

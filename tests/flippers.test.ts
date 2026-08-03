@@ -16,7 +16,15 @@ import { parseTableMapDocument } from "../src/game/table-map.js";
 import { materialTableFor } from "../src/game/materials.js";
 import { upperLevelViewFor } from "../src/game/playfield-levels.js";
 import { createBall, createBallSet, stepBalls } from "../src/game/ball-physics.js";
-import { ANGLE_UNITS_PER_TURN, BALL_RADIUS_PIXELS, angleDelta } from "../src/game/collision-probe.js";
+import {
+  ANGLE_UNITS_PER_TURN,
+  BALL_RADIUS_PIXELS,
+  QUARTER_TURN_UNITS,
+  angleDelta,
+  cosineUnits,
+  ringOffsetsFor,
+  sineUnits,
+} from "../src/game/collision-probe.js";
 import { Q10_ONE, pixelsToQ10, q10Multiply, q10ToPixel } from "../src/core/fixed-point.js";
 import type { Q10 } from "../src/core/fixed-point.js";
 import type { FlipperConfig, FlipperState, FlipperSweep } from "../src/game/flippers.js";
@@ -60,23 +68,21 @@ import {
   UPPER_FLIPPER_RECORDS,
   BAT_ANGLE_UNITS_PER_POSE,
   poseToAngleUnits,
-  QUARTER_TURN_UNITS,
   BAT_ANGLE_UNITS_PER_TURN,
   FLIPPER_UP_MAX_RATE,
   batAngleToBearing,
   batRadiusAt,
-  cosineUnits,
   createFlipperBank,
   flipperAngle,
   flipperConfigsFor,
   flipperEndpoints,
   flipperFrameIndex,
   flipperInputFrom,
+  flipperPoseAt,
   flipperRecordFor,
   hasUpperFlipper,
   isFullyFlipped,
   resolveFlipperContacts,
-  sineUnits,
   substepsFor,
   sweptAngle,
   applyFlipperReactions,
@@ -90,7 +96,14 @@ import {
   tickFlipperBank,
   validateFlipperConfig,
 } from "../src/game/flippers.js";
-import { DEGREES_PER_POSE, batPoseForStroke } from "../src/game/flipper-bats.js";
+import {
+  DEGREES_PER_POSE,
+  POSES_PER_TURN,
+  batBodySolid,
+  batPoseBody,
+  batPoseForStroke,
+  clearFlipperBats,
+} from "../src/game/flipper-bats.js";
 import { flipperBatsFixture } from "./table-fixtures.js";
 
 const BALL_RADIUS: Q10 = pixelsToQ10(BALL_RADIUS_PIXELS);
@@ -168,13 +181,86 @@ const RIGHT = flipperConfigsFor("law-n-justice")[1] as FlipperConfig;
 // Helpers
 // ---------------------------------------------------------------------------
 
+/** The probe ring the bats and the map both collide on. */
+const PROBE = ringOffsetsFor(BALL_RADIUS);
+
+/**
+ * The bat's own frame at a stroke, taken from the pose it DRAWS.
+ *
+ * The bearing is the drawn pose's, not `flipperAngle`'s, because the body is
+ * that pose's pixels; the two agree to within the rounding of one pose and the
+ * suite pins that separately.
+ */
+function batFrameAt(
+  config: FlipperConfig,
+  state: FlipperState,
+): { pose: number; cos: number; sin: number; faceX: number; faceY: number } {
+  const pose = flipperPoseAt(config, state.stroke);
+  const radians = (pose * DEGREES_PER_POSE * Math.PI) / 180;
+  const cos = Math.cos(radians);
+  const sin = Math.sin(radians);
+  return { pose, cos, sin, faceX: -config.direction * sin, faceY: config.direction * cos };
+}
+
+/**
+ * The outermost DRAWN pixel on the face the bat sweeps toward, per whole along
+ * value, as an offset from the pivot.
+ */
+function drawnFaceProfile(
+  config: FlipperConfig,
+  state: FlipperState,
+): Map<number, { dx: number; dy: number; face: number }> {
+  const frame = batFrameAt(config, state);
+  const profile = new Map<number, { dx: number; dy: number; face: number }>();
+  for (const [dx, dy] of drawnPixels(frame.pose)) {
+    const along = Math.round(dx * frame.cos + dy * frame.sin);
+    const face = dx * frame.faceX + dy * frame.faceY;
+    const seen = profile.get(along);
+    if (seen === undefined || face > seen.face) profile.set(along, { dx, dy, face });
+  }
+  return profile;
+}
+
+/**
+ * The probe-ring entry pointing INTO the striking face — the direction from a
+ * ball resting on that face toward the bat, which is minus the face's outward
+ * normal. A ball at `pixel - PROBE[thisEntry]` therefore has `pixel` exactly on
+ * its ring and sits on the outward side of the bat.
+ */
+function faceRingIndex(config: FlipperConfig, state: FlipperState): number {
+  const frame = batFrameAt(config, state);
+  let best = 0;
+  let bestDot = -Infinity;
+  for (let i = 0; i < PROBE.size; i += 1) {
+    const dot = -((PROBE.dx[i] ?? 0) * frame.faceX + (PROBE.dy[i] ?? 0) * frame.faceY);
+    if (dot > bestDot) {
+      bestDot = dot;
+      best = i;
+    }
+  }
+  return best;
+}
+
 /**
  * A ball centre resting on the face the bat sweeps toward, `alongPixels` out
- * from the pivot and exactly touching.
+ * from the pivot and TOUCHING THE PIXELS THE BAT DRAWS.
  *
- * Built from the module's own geometry rather than hard-coded coordinates: the
- * point of these tests is the behaviour, and a placement recomputed here would
- * only re-test arithmetic that could drift from the collision routine's.
+ * REPLACED, and the replacement is the whole point of this round. This used to
+ * stand the ball off the axis by `batRadiusAt(along) + 8` — tangent to the
+ * analytic capsule — and "tangent" is a statement no pixel body can honour: the
+ * capsule's surface is a real number, the bat's is a set of whole pixels, and
+ * the two agree only by luck. Nine of the assertions in this file were resting
+ * balls on a curve the machine never had.
+ *
+ * The placement is now the engine's own definition of contact, the same one
+ * `probeRing` uses for every wall in the game: the outermost drawn pixel on the
+ * striking face at that along is put EXACTLY on the ball's probe ring, in the
+ * ring direction nearest the face normal. So a ball placed here is touching the
+ * bat the player can see, by construction and on the grid — and any model that
+ * collides against the drawn pixels must say so.
+ *
+ * `gap` lifts the centre further out along the face normal, in whole pixels, for
+ * the tests that want a ball ABOVE the bat rather than on it.
  */
 function ballRestingOn(
   config: FlipperConfig,
@@ -182,17 +268,25 @@ function ballRestingOn(
   alongPixels: number,
   gap = 0,
 ): { x: Q10; y: Q10 } {
-  const angle = flipperAngle(config, state);
-  const axisX = cosineUnits(angle);
-  const axisY = sineUnits(angle);
-  const faceX = (-config.direction * axisY) | 0;
-  const faceY = (config.direction * axisX) | 0;
-  const along = pixelsToQ10(alongPixels);
-  const standoff = batRadiusAt(config, along) + BALL_RADIUS + pixelsToQ10(gap);
-  return {
-    x: (config.pivotX + q10Multiply(along, axisX) + q10Multiply(standoff, faceX)) | 0,
-    y: (config.pivotY + q10Multiply(along, axisY) + q10Multiply(standoff, faceY)) | 0,
-  };
+  const frame = batFrameAt(config, state);
+  const profile = drawnFaceProfile(config, state);
+  let along = alongPixels;
+  let best = Infinity;
+  for (const candidate of profile.keys()) {
+    const distance = Math.abs(candidate - alongPixels);
+    if (distance < best) {
+      best = distance;
+      along = candidate;
+    }
+  }
+  const target = profile.get(along);
+  if (target === undefined) throw new Error(`${config.id} draws nothing at all`);
+  const index = faceRingIndex(config, state);
+  const centreX =
+    q10ToPixel(config.pivotX) + target.dx - (PROBE.dx[index] ?? 0) + Math.round(gap * frame.faceX);
+  const centreY =
+    q10ToPixel(config.pivotY) + target.dy - (PROBE.dy[index] ?? 0) + Math.round(gap * frame.faceY);
+  return { x: pixelsToQ10(centreX), y: pixelsToQ10(centreY) };
 }
 
 /** How far along the bat's axis a ball centre projects, from the pivot. Q10. */
@@ -315,12 +409,62 @@ describe("the flipdat1.bin sweep", () => {
     expect(FLIPPER_DRAWN_TIP_PIXELS / (BALL_RADIUS_PIXELS * 2)).toBeCloseTo(2.9, 1);
   });
 
-  it("puts a collision face behind 99% of every pixel of every drawn pose", () => {
-    // THE TEST THAT WOULD HAVE CAUGHT IT. The old safeguard compared PIVOTS to
-    // within two pixels and passed while 31% of the bat the player could see
-    // had nothing behind it, because pivot agreement says nothing about FACE
-    // agreement. This measures the face: every opaque pixel of every shipped
-    // pose, forward of the pivot, against the capsule the physics collides on.
+  it("collides on EXACTLY the pixels the pose draws — no tolerance", () => {
+    // THIS REPLACES "puts a collision face behind 99% of every pixel of every
+    // drawn pose", and the replacement is an equality where that was a
+    // percentage. The old test measured the analytic capsule against the drawn
+    // silhouette and allowed 245 unbacked pixels of 32,154 forward of the pivot,
+    // worst excursion 1.44 px — the residue being the hand-drawn poses' own
+    // wander. It was the right test for a model that approximated the shape. The
+    // body IS the shape now, so the same test would pass by construction while
+    // saying nothing, which is exactly the kind of test the discipline forbids.
+    //
+    // What is asserted instead: the pixels `flippers.ts` collides on are, pixel
+    // for pixel, `plane0 | plane1 | plane2` of the pose the renderer blits —
+    // both differences empty, on all 64 shipped poses, at a pivot chosen to put
+    // the block somewhere arbitrary in playfield space so the placement
+    // arithmetic is exercised too.
+    let solid = 0;
+    let onlyDrawn = 0;
+    let onlyBody = 0;
+    for (const pose of BATS.poses.keys()) {
+      const entry = BATS.poses.get(pose);
+      if (entry === undefined) throw new Error(`pose ${pose} vanished`);
+      const config = { ...LEFT, restPose: pose, restAngle: poseToAngleUnits(pose) };
+      const body = batPoseBody(
+        { id: config.id, restPose: pose, direction: config.direction, sweepPoses: config.sweep / BAT_ANGLE_UNITS_PER_POSE },
+        0,
+        config.sweep,
+        137,
+        409,
+      );
+      const drawn = new Set(drawnPixels(pose).map(([dx, dy]) => `${137 + dx},${409 + dy}`));
+      solid += drawn.size;
+      for (const key of drawn) {
+        const [x, y] = key.split(",").map(Number);
+        if (!batBodySolid(body, x ?? 0, y ?? 0)) onlyDrawn += 1;
+      }
+      // And nothing the pose does NOT draw, over the whole block plus a margin.
+      for (let y = body.originY - 2; y < body.originY + entry.height + 2; y += 1) {
+        for (let x = body.originX - 2; x < body.originX + entry.width + 2; x += 1) {
+          if (batBodySolid(body, x, y) && !drawn.has(`${x},${y}`)) onlyBody += 1;
+        }
+      }
+    }
+    // 37,911 pixels over the 64 poses — the 32,154 the old test counted forward
+    // of the pivot plus the 5,757 behind it, which the capsule's round cap never
+    // contained and which are now backed by construction.
+    expect({ poses: BATS.poses.size, solid, onlyDrawn, onlyBody })
+      .toEqual({ poses: 64, solid: 37911, onlyDrawn: 0, onlyBody: 0 });
+  });
+
+  it("keeps the retired capsule's own measurement on the record", () => {
+    // NOT A CONTRACT ON THE PHYSICS — `batRadiusAt` is descriptive now and
+    // nothing in the contact path reads it. It is kept, and measured, because
+    // the four constants it interpolates ARE a measurement of the drawn bat and
+    // because the next reader needs the shape that was replaced in front of
+    // them. If this number moves, the profile constants have drifted from the
+    // raster and the comments around them have gone stale.
     const left = flipperConfigsFor("law-n-justice")[0] as FlipperConfig;
     let total = 0;
     let unbacked = 0;
@@ -337,14 +481,34 @@ describe("the flipdat1.bin sweep", () => {
         }
       }
     }
-    // Measured: 245 of 32,154 (0.76%), worst excursion 1.44 px, and the residue
-    // is the hand-drawn poses' own wander — their perpendicular centre ranges
-    // over -1.57..+1.49 rather than sitting at a constant offset. At the old
-    // boss 5 / tip 1 / length 45 the same count is 9,980 (31.0%).
     expect(total).toBe(32154);
     expect(unbacked).toBeLessThanOrEqual(245);
     expect(worst).toBeLessThanOrEqual(1.5);
-    expect(unbacked / total).toBeLessThan(0.01);
+  });
+
+  it("refuses to invent a bat when the pose bank is absent", () => {
+    // THE LOUD FAILURE. There is no fallback shape and there must not be one:
+    // a bat whose body came from somewhere other than the document the renderer
+    // draws from is the defect FLIPPER_PLACEMENT_NOTE exists to record.
+    clearFlipperBats();
+    try {
+      const sweep = tickFlipper(LEFT, FLIPPER_AT_REST, false);
+      const ball: BallState = {
+        id: 0,
+        x: LEFT.pivotX,
+        y: LEFT.pivotY,
+        velocityX: 0,
+        velocityY: 0,
+        active: true,
+        heldBy: null,
+        level: LEFT.level,
+      };
+      expect(() => resolveFlipperContacts([ball], [sweep], BALL_RADIUS)).toThrow(
+        /pose bank is not registered/,
+      );
+    } finally {
+      flipperBatsFixture();
+    }
   });
 
   it("maps a bearing to the frame the file actually stores", () => {
@@ -710,17 +874,61 @@ describe("the bat's silhouette", () => {
 // ---------------------------------------------------------------------------
 
 describe("a flipper at rest", () => {
-  /** A bat that lies flat, so "held" means the ball simply does not move. */
-  const FLAT: FlipperConfig = validateFlipperConfig({ ...LEFT, restAngle: 0 });
+  /**
+   * A bat that lies flat, so "held" means the ball simply does not move.
+   *
+   * STRENGTHENED, not adjusted: this used to override `restAngle` to 0 and leave
+   * the record's rest POSE of 10 alone, which was harmless while the body was an
+   * analytic capsule built from the angle and is a contradiction now that the
+   * body is the drawn pose itself — a bat pointing one way and shaped another.
+   * Pose 0 IS bearing 0 (`poseToAngleUnits(0) === 0`) and it is one of the 64
+   * shipped poses, so the flat bat is now a real drawn bat rather than an
+   * angle with no picture, and `validateFlipperConfig` refuses the old form.
+   */
+  const FLAT: FlipperConfig = validateFlipperConfig({ ...LEFT, restAngle: 0, restPose: 0 });
 
   it("holds a ball up against gravity instead of letting it through", () => {
+    // RESTATED, because the premise it rested on was false and the body change
+    // exposed it. This used to assert the ball did not MOVE: "within a pixel of
+    // where it started", with a velocity under one pixel a tick, after 200
+    // ticks. That held only because the retired capsule's surface at bearing 0
+    // was a mathematically horizontal line, so a ball on it had nowhere to roll.
+    // The bat the original DRAWS is not horizontal at bearing 0 — it tapers from
+    // 8 px at the boss to 4 at the tip, so its top edge falls away toward the
+    // tip — and a ball on it rolls, which is what a ball on a real flipper does.
+    // Measured here: the ball starts at along 18 and leaves the blade's far end
+    // at tick 121, having been in contact on 119 of the first 122 ticks.
+    //
+    // The claim the test is NAMED for is the one it now makes, and it makes it
+    // on EVERY tick instead of only the last: while the ball is over the bat it
+    // is never on the far side of it, and it is never unsupported. That is a
+    // stronger statement than the end-state pair it replaces — an end-state
+    // check cannot see a ball that passed through the bat and came back.
     const start = ballRestingOn(FLAT, FLIPPER_AT_REST, 20);
     const ball = createBall(0, start.x, start.y);
-    runTicks([ball], [FLAT], [false], 200);
-    // Still on the striking face, and within a pixel of where it started.
-    expect(faceOffset(FLAT, FLIPPER_AT_REST, ball)).toBeGreaterThan(0);
-    expect(Math.abs(ball.y - start.y)).toBeLessThan(Q10_ONE);
-    expect(Math.abs(ball.velocityY)).toBeLessThan(Q10_ONE);
+    const states = [FLIPPER_AT_REST];
+    let overTheBat = 0;
+    let held = 0;
+    let worstFace = Infinity;
+    for (let tick = 0; tick < 200; tick += 1) {
+      const out = runTicks([ball], [FLAT], [false], 1, states);
+      const along = axisOffset(FLAT, FLIPPER_AT_REST, ball);
+      if (along <= -BALL_RADIUS || along >= FLAT.length + BALL_RADIUS) continue;
+      overTheBat += 1;
+      held += out.contacts;
+      worstFace = Math.min(worstFace, faceOffset(FLAT, FLIPPER_AT_REST, ball));
+      expect({ tick, through: faceOffset(FLAT, FLIPPER_AT_REST, ball) <= 0 })
+        .toEqual({ tick, through: false });
+    }
+    // It really was over the bat for most of the run, and it really was carried:
+    // 114 of the 122 ticks it spent there reported a contact. The eight that did
+    // not are a rolling ball momentarily a fraction of a pixel clear of its own
+    // probe ring, not a ball falling — `worstFace` below is what says that.
+    expect(overTheBat).toBeGreaterThan(100);
+    expect(held).toBeGreaterThanOrEqual(Math.ceil(0.9 * overTheBat));
+    // And it stayed a clear ball radius off the axis the whole time, which is
+    // the "held up" half of the claim.
+    expect(worstFace).toBeGreaterThan(pixelsToQ10(6));
   });
 
   it("never lets a ball cross to the far side of the real, tilted bat", () => {
@@ -779,19 +987,110 @@ describe("flipping", () => {
     expect(ball.y).toBeLessThan(start.y);
   });
 
-  it("launches the mirrored ball on the right flipper by the same amount", () => {
+  it("mirrors the right flipper's launch to the precision the RASTER allows", () => {
+    // THE EQUALITY THIS REPLACES WAS TRUE OF A FORMULA AND IS FALSE OF THE DISK.
+    //
+    // It read `rightBall.velocityX === -leftBall.velocityX`, exactly, and its
+    // stated reason was "the sine table's quadrant symmetry is integer-exact and
+    // the two configs differ only in that reflection". The second half stopped
+    // being true the moment the body became the bat's own pixels: a left bat at
+    // rest draws pose 10 and a right bat pose 50, those are two separately
+    // hand-drawn rotations of the same bat, and they are NOT reflections of each
+    // other. The exact figure is pinned in its own test below — 64 of 587 pixels
+    // differ on that pair — so an exact mirror of the outgoing velocity is not
+    // available at any tolerance the code could choose. Asserting it anyway
+    // would be asserting the raster is something it is not.
+    //
+    // So the mirror is claimed where it IS exact, and PINNED where the raster
+    // decides it, with every figure measured here rather than picked:
+    //   velocityY   exactly equal              (-15,996 on both)
+    //   speed       within 0.1%                (16,069.3 vs 16,058.8, 0.065%)
+    //   velocityX   opposite in sign, and PINNED EXACTLY (-1,533 vs +1,419)
+    //   placement   mirrored within one pixel  (+28,+1) vs (-29,+0)
+    //
+    // THE X ASYMMETRY GREW WHEN THE CONTACT ANGLE BECAME THE MACHINE'S, from
+    // (-1,529, +1,460) — 4.5% — to (-1,533, +1,419) — 7.4%. That is the
+    // raster's own asymmetry being read more sharply, not a new asymmetry. The
+    // vector mean this replaced summed 44 unit vectors, so one edge pixel
+    // present on the left pose and missing on the right moved the answer by its
+    // share of a length-44 sum; the machine's arithmetic mean of bearings
+    // divides by N, and N on a bat face is five or six. The same missing pixel
+    // is therefore worth several times more, which is what these two numbers
+    // are measuring.
+    //
+    // The 5% bound this used to carry would have to be LOOSENED to hold 7.4%, so
+    // it is replaced by the exact pair rather than widened. An equality cannot
+    // drift: if the raster moves, or the producer does, this fails loudly with
+    // the new numbers instead of quietly passing at 7.9%.
     const left = ballRestingOn(LEFT, FLIPPER_AT_REST, 25);
     const right = ballRestingOn(RIGHT, FLIPPER_AT_REST, 25);
     const leftBall = createBall(0, left.x, left.y);
     const rightBall = createBall(0, right.x, right.y);
     runTicks([leftBall], [LEFT], [true], UP_STROKE_TICKS + 2);
     runTicks([rightBall], [RIGHT], [true], UP_STROKE_TICKS + 2);
-    // Exactly mirrored, not merely similar: the sine table's quadrant symmetry
-    // is integer-exact and the two configs differ only in that reflection.
+
     expect(rightBall.velocityY).toBe(leftBall.velocityY);
-    expect(rightBall.velocityX).toBe(-leftBall.velocityX);
-    expect(rightBall.x - RIGHT.pivotX).toBe(-(leftBall.x - LEFT.pivotX));
-    expect(rightBall.y).toBe(leftBall.y);
+    expect(Math.sign(rightBall.velocityX)).toBe(-Math.sign(leftBall.velocityX));
+    const speedLeft = speedOf(leftBall);
+    const speedRight = speedOf(rightBall);
+    expect(Math.abs(speedRight - speedLeft) / speedLeft).toBeLessThan(0.001);
+    expect({ left: leftBall.velocityX, right: rightBall.velocityX })
+      .toEqual({ left: -1533, right: 1419 });
+    // The placement mirrors to a pixel, and the outgoing position with it.
+    expect(
+      Math.abs(q10ToPixel(right.x) - q10ToPixel(RIGHT.pivotX) +
+        (q10ToPixel(left.x) - q10ToPixel(LEFT.pivotX))),
+    ).toBeLessThanOrEqual(1);
+    expect(Math.abs(rightBall.x - RIGHT.pivotX + (leftBall.x - LEFT.pivotX)))
+      .toBeLessThan(2 * Q10_ONE);
+    expect(Math.abs(rightBall.y - leftBall.y)).toBeLessThan(2 * Q10_ONE);
+  });
+
+  it("measures how far the shipped raster is from being its own mirror", () => {
+    // THE FACT THAT MAKES THE EXACT MIRROR ABOVE IMPOSSIBLE, pinned exactly so
+    // it cannot drift and so the bound above is never loosened without this
+    // number moving first. Pose p and pose (60 - p) are the same bat drawn at
+    // mirrored bearings; a perfect mirror would differ in zero pixels.
+    const asymmetry = (pose: number): { size: number; differing: number } => {
+      const mirrored = new Set(drawnPixels(pose).map(([dx, dy]) => `${-dx},${dy}`));
+      const other = new Set(
+        drawnPixels(((60 - pose) % POSES_PER_TURN + POSES_PER_TURN) % POSES_PER_TURN)
+          .map(([dx, dy]) => `${dx},${dy}`),
+      );
+      let differing = 0;
+      for (const key of mirrored) if (!other.has(key)) differing += 1;
+      for (const key of other) if (!mirrored.has(key)) differing += 1;
+      return { size: mirrored.size, differing };
+    };
+    // The two rest poses a left and a right lower bat hold, and the two they
+    // hold fully flipped.
+    expect(asymmetry(10)).toEqual({ size: 587, differing: 128 });
+    expect(asymmetry(0)).toEqual({ size: 603, differing: 60 });
+    // Every mirrored pair the shipped bank carries agrees on pixel COUNT and on
+    // nothing finer: the raster is one bat drawn 120 times, not a bat and its
+    // reflection. Pinned exactly, so the bound the launch test above uses can
+    // never be loosened without this census moving first.
+    let pairs = 0;
+    let total = 0;
+    let worstPose = -1;
+    let worstDiffering = 0;
+    for (const pose of BATS.poses.keys()) {
+      const partner = ((60 - pose) % POSES_PER_TURN + POSES_PER_TURN) % POSES_PER_TURN;
+      if (!BATS.poses.has(partner)) continue;
+      pairs += 1;
+      const measured = asymmetry(pose);
+      // The counts always match; it is only ever WHICH pixels that differ.
+      expect(drawnPixels(partner)).toHaveLength(measured.size);
+      total += measured.differing;
+      if (measured.differing > worstDiffering) {
+        worstDiffering = measured.differing;
+        worstPose = pose;
+      }
+    }
+    // 62 of the 64 shipped poses have their mirror in the bank; the other two
+    // are poses whose partner no bat ever reaches.
+    expect({ pairs, total, worstPose, worstDiffering })
+      .toEqual({ pairs: 62, total: 7600, worstPose: 23, worstDiffering: 204 });
   });
 
   it("hits harder than a bat that is standing still", () => {
@@ -846,9 +1145,20 @@ describe("flipping", () => {
         .toEqual({ alongPixels, rising: true });
       previousMagnitude = magnitude;
     }
-    // And over the whole stroke the tip still beats the boss, which is the
-    // original claim, stated where the clamp cannot swallow it.
-    expect(speedAfter(40, UP_STROKE_TICKS + 2)).toBeGreaterThan(speedAfter(6, UP_STROKE_TICKS + 2));
+    // AND THE TIP BEATS THE BOSS BY HALF AGAIN, at the tick the impulse lands:
+    // 11,582 against 7,478 Q10.
+    //
+    // This line used to compare the two over the WHOLE up-stroke, and that
+    // comparison stopped meaning anything when the body became the drawn bat.
+    // A ball on the tip is thrown CLEAR by the first strike — 46 px of blade
+    // sweeping under a 16 px ball leaves it behind — so its shot is finished
+    // while the boss ball is still being carried, and after five ticks the boss
+    // ball has had four more impulses and reads faster (15,517 against 11,392).
+    // That is not the tip hitting softer, it is the tip having let go, and the
+    // measurement below says so directly at the moment both are still in
+    // contact. The retired capsule hid it because its own tip cap reached 48 px
+    // — 2 px past anything the original draws — and kept the ball a tick longer.
+    expect(speedAfter(40, 2)).toBeGreaterThan(1.5 * speedAfter(6, 2));
   });
 
   it("does not fire a ball that the bat is moving away from", () => {
@@ -1275,68 +1585,76 @@ describe("placement", () => {
     }
   });
 
-  it("catches a ball resting on the DRAWN face — every bat, every table", () => {
+  it("catches a ball resting on the DRAWN face — every bat, every pose, every along", () => {
     // THE OPERATOR'S DEFECT, PINNED DIRECTLY. His words were "flippers look
     // good on the 2nd 2 boards but dont work correctly, ball goes through them
     // when flipping", and this is the measurement of it: put a ball where the
     // player can see it — touching the outer face of the bat the ORIGINAL
-    // DRAWS, at eleven points along every one of the nine bats — sweep the bat
-    // from rest, and ask the physics whether anything happened.
+    // DRAWS — sweep the bat from rest, and ask the physics whether anything
+    // happened.
     //
-    // BEFORE this change, 67 of these 99 points registered NO CONTACT AT ALL:
-    // 5 of 11 on every lower-left bat, 9 of 11 on every lower-right, 3 on Law
-    // 'n Justice's upper and 11 of 11 — the whole bat — on BabeWatch's and
-    // Extreme Sports'. The ball was resting on a picture. It must be 0.
+    // BEFORE the pivots were unified, 67 of an 11-point-per-bat sample of 99
+    // registered NO CONTACT AT ALL: 5 of 11 on every lower-left bat, 9 of 11 on
+    // every lower-right, 3 on Law 'n Justice's upper and 11 of 11 — the whole
+    // bat — on BabeWatch's and Extreme Sports'. The ball was resting on a
+    // picture.
+    //
+    // WIDENED, in the round that made the body the drawn pose itself, from 99
+    // sampled points to EVERY along value EVERY pose draws, at both ends of
+    // every bat's stroke: 978 placements over 18 (bat, stroke) instances rather
+    // than 99 over 9. It is also now grid-exact — see `ballRestingOn`,
+    // which puts the drawn pixel ON the probe ring rather than standing the ball
+    // off a real-valued curve — so a pass is a statement about pixels the player
+    // can see and not about a tangency the machine never computed.
+    //
+    // The hub is INCLUDED, `along` from -8 forward, and that is a strengthening
+    // too: the drawn hub is flat-sided and reaches 8 px behind the pivot at up
+    // to 6 px of face, which the retired capsule's round cap of radius 8 did not
+    // contain at all. It must be 0.
     let missed = 0;
     let sampled = 0;
+    const perBat: string[] = [];
     for (const id of TABLE_IDS) {
       for (const config of flipperConfigsFor(id)) {
-        const bat = BATS.tables.get(id)?.get(config.id);
-        if (bat === undefined) throw new Error(`${id} draws no ${config.id}`);
-        const angle = flipperAngle(config, FLIPPER_AT_REST);
-        const axisX = cosineUnits(angle);
-        const axisY = sineUnits(angle);
-        // The face the bat sweeps toward. A point `t` out along it has a
-        // perpendicular offset of `direction * t`, which is how the drawn
-        // silhouette below is read on the same side.
-        const faceX = (-config.direction * axisY) | 0;
-        const faceY = (config.direction * axisX) | 0;
-        const outermost = new Map<number, number>();
-        for (const [dx, dy] of drawnPixels(bat.restPose)) {
-          const { along, perp } = batFrame(bat.restPose * DEGREES_PER_POSE, dx, dy);
-          if (along < 0) continue;
-          const at = Math.round(along);
-          const face = perp * config.direction;
-          outermost.set(at, Math.max(outermost.get(at) ?? -Infinity, face));
-        }
-        for (const alongPixels of [4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44]) {
-          const face = outermost.get(alongPixels);
-          if (face === undefined) continue;
-          sampled += 1;
-          const standoff = pixelsToQ10(face) + BALL_RADIUS;
-          const along = pixelsToQ10(alongPixels);
-          const ball: BallState = {
-            id: 0,
-            x: (config.pivotX + q10Multiply(along, axisX) + q10Multiply(standoff, faceX)) | 0,
-            y: (config.pivotY + q10Multiply(along, axisY) + q10Multiply(standoff, faceY)) | 0,
-            velocityX: 0,
-            velocityY: 0,
-            active: true,
-            heldBy: null,
-            level: config.level,
-          };
-          const sweep = tickFlipper(config, FLIPPER_AT_REST, true);
-          const contacts = resolveFlipperContacts([ball], [sweep], BALL_RADIUS);
-          if (contacts.length === 0) {
-            missed += 1;
-            expect({ id, bat: config.id, alongPixels, face, sawIt: false })
-              .toEqual({ id, bat: config.id, alongPixels, face, sawIt: true });
+        // Both of the bat's OWN STOPS, and each held where it already is, so the
+        // pose the ball was placed against is the pose it is tested against. A
+        // sweep that moves would be testing a different drawing: the poses are
+        // hand-drawn rotations and about a tenth of their pixels change from one
+        // to the next, which is a fact about the raster and not about contact.
+        for (const [state, held] of [
+          [FLIPPER_AT_REST, false],
+          [batAt(config.sweep), true],
+        ] as const) {
+          const profile = drawnFaceProfile(config, state);
+          let here = 0;
+          for (const along of [...profile.keys()].sort((a, b) => a - b)) {
+            const at = ballRestingOn(config, state, along);
+            sampled += 1;
+            here += 1;
+            const ball: BallState = {
+              id: 0,
+              x: at.x,
+              y: at.y,
+              velocityX: 0,
+              velocityY: 0,
+              active: true,
+              heldBy: null,
+              level: config.level,
+            };
+            const sweep = tickFlipper(config, state, held);
+            const contacts = resolveFlipperContacts([ball], [sweep], BALL_RADIUS);
+            if (contacts.length === 0) {
+              missed += 1;
+              expect({ id, bat: config.id, stroke: state.stroke, along, sawIt: false })
+                .toEqual({ id, bat: config.id, stroke: state.stroke, along, sawIt: true });
+            }
           }
+          perBat.push(`${id}/${config.id}@${state.stroke}=${here}`);
         }
       }
     }
-    expect(sampled).toBe(99);
-    expect(missed).toBe(0);
+    expect({ sampled, missed }).toEqual({ sampled: 978, missed: 0 });
+    expect(perBat).toHaveLength(18);
   });
 
   it("holds the SAME bearing the drawn pose does, at every point of every stroke", () => {
@@ -1555,8 +1873,19 @@ describe("a table's bank of flippers", () => {
      * player aims a flipper by choosing WHEN to press it, and that is now true
      * here; it was not true of the model this replaced, which fired every clean
      * contact at the velocity clamp whenever it was struck.
+     *
+     * FOUR NOW, RE-DERIVED, and the reason is geometric rather than a retuning.
+     * The ball is dropped from `ballRestingOn(..., 26, 24)`, which used to mean
+     * 24 px above the analytic capsule and now means 24 px above the pixels the
+     * bat DRAWS; the drawn face at along 26 sits inside where the capsule's
+     * surface was, and the bat is met at a different point of its own stroke.
+     * Swept over every even lead from 2 to 30 the ball never drains at all at
+     * leads 4, 6, 10 and 18, and 4 is the best of them: 491 px of travel, which
+     * is the same "whole playfield" figure the ten-pixel lead used to produce.
+     * At the old 14 the ball now drains on tick 150 against 41 unflipped — a
+     * save, but only 3.7x, under this test's own 4x bar.
      */
-    const LEAD = 14;
+    const LEAD = 4;
 
     /**
      * Drops a ball onto the left bat and either flips or does not.

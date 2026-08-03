@@ -31,7 +31,10 @@ import {
   FLIPPER_BATS_SCHEMA,
   POSES_PER_TURN,
   batBlockOrigin,
+  batBodySolid,
+  batPoseBody,
   batPoseForStroke,
+  batSilhouetteSolid,
   clearFlipperBats,
   flipperBats,
   loadFlipperBats,
@@ -159,6 +162,118 @@ describe("the shipped pose bank", () => {
       }
     }
     expect([...bats.poses.keys()].sort((a, b) => a - b)).toEqual([...wanted].sort((a, b) => a - b));
+  });
+
+  it("carries a COLLISION SILHOUETTE that is the OR of the three drawn planes", () => {
+    // THE BODY THE BATS COLLIDE ON, pinned against the document it came from.
+    //
+    // The original builds each pose's collision mask with one blitter minterm —
+    // `+0x003948`, BLTCON0 $0FFE, minterm $FE = A OR B OR C — run over the
+    // plane-0/1 block and again over the plane-2 block, so the shape a ball
+    // meets is `plane0 | plane1 | plane2` and there is exactly one shape per
+    // pose in the machine. This asserts the loader produces that, bit for bit,
+    // recomputing it here from the raw planes rather than from the loader's own
+    // arithmetic.
+    //
+    // PLANE 2 MATTERS AND IS NOT REDUNDANT: over the 64 shipped poses it
+    // contributes 2,878 pixels that are in neither plane 0 nor plane 1, so a
+    // body built from the outline planes alone would be hollow in the middle of
+    // the blade — which is a failure mode a mask model has and a capsule does
+    // not.
+    let solid = 0;
+    let plane2Only = 0;
+    for (const pose of [...bats.poses.keys()].sort((a, b) => a - b)) {
+      const entry = poseAt(pose);
+      const rowBytes = Math.ceil(entry.width / 8);
+      const plane2Rows = entry.height - 2 * bats.plane2RowOffset;
+      const bit = (plane: Uint8Array, row: number, x: number): boolean =>
+        ((plane[row * rowBytes + (x >> 3)] ?? 0) & (0x80 >> (x & 7))) !== 0;
+      let left = entry.width;
+      let right = -1;
+      let top = entry.height;
+      let bottom = -1;
+      let count = 0;
+      for (let y = 0; y < entry.height; y += 1) {
+        for (let x = 0; x < entry.width; x += 1) {
+          const outline = bit(entry.plane0, y, x) || bit(entry.plane1, y, x);
+          const body = y - bats.plane2RowOffset;
+          const fill = body >= 0 && body < plane2Rows && bit(entry.plane2, body, x);
+          const wanted = outline || fill;
+          if (batSilhouetteSolid(entry.silhouette, x, y) !== wanted) {
+            expect({ pose, x, y, solid: !wanted }).toEqual({ pose, x, y, solid: wanted });
+          }
+          if (!wanted) continue;
+          if (fill && !outline) plane2Only += 1;
+          count += 1;
+          if (x < left) left = x;
+          if (x > right) right = x;
+          if (y < top) top = y;
+          if (y > bottom) bottom = y;
+        }
+      }
+      solid += count;
+      // The tight bounds the collision box is derived from and the geometry the
+      // renderer blits are the same numbers.
+      expect({
+        pose,
+        left: entry.silhouette.left,
+        right: entry.silhouette.right,
+        top: entry.silhouette.top,
+        bottom: entry.silhouette.bottom,
+        count: entry.silhouette.count,
+        width: entry.silhouette.width,
+        height: entry.silhouette.height,
+      }).toEqual({
+        pose,
+        left,
+        right,
+        top,
+        bottom,
+        count,
+        width: entry.width,
+        height: entry.height,
+      });
+      // Nothing outside the block is ever solid, whatever the row padding holds.
+      expect(batSilhouetteSolid(entry.silhouette, -1, 0)).toBe(false);
+      expect(batSilhouetteSolid(entry.silhouette, entry.width, 0)).toBe(false);
+      expect(batSilhouetteSolid(entry.silhouette, 0, entry.height)).toBe(false);
+    }
+    expect({ solid, plane2Only }).toEqual({ solid: 37911, plane2Only: 2878 });
+  });
+
+  it("places the body at the same origin the renderer blits the picture at", () => {
+    // ONE PLACEMENT, not two. `batPoseBody` is what the physics reads and
+    // `batBlockOrigin` is what `movingSpritePlacements` reads; they have to be
+    // the same corner or the bat that collides is not the bat that is drawn,
+    // which is the defect FLIPPER_PLACEMENT_NOTE records for the pivots.
+    for (const [tableId, records] of bats.tables) {
+      for (const bat of records.values()) {
+        for (let step = 0; step <= bat.sweepPoses; step += 1) {
+          const stroke = step * ANGLE_UNITS_PER_POSE;
+          const sweepUnits = bat.sweepPoses * ANGLE_UNITS_PER_POSE;
+          const pose = batPoseForStroke(bat, stroke, sweepUnits);
+          const entry = poseAt(pose);
+          const drawn = batBlockOrigin(bat, entry);
+          const body = batPoseBody(bat, stroke, sweepUnits, bat.pivotX, bat.pivotY);
+          expect({ tableId, bat: bat.id, step, pose: body.pose, x: body.originX, y: body.originY })
+            .toEqual({ tableId, bat: bat.id, step, pose, x: drawn.x, y: drawn.y });
+          // And the body answers in PLAYFIELD coordinates about the same pixels.
+          expect(batBodySolid(body, drawn.x + entry.silhouette.left, drawn.y + entry.silhouette.top))
+            .toBe(batSilhouetteSolid(entry.silhouette, entry.silhouette.left, entry.silhouette.top));
+        }
+      }
+    }
+  });
+
+  it("refuses to hand out a body when nothing is registered", () => {
+    clearFlipperBats();
+    try {
+      expect(() =>
+        batPoseBody({ id: "lower-left", restPose: 10, direction: -1, sweepPoses: 18 }, 0, 1152, 86, 556),
+      ).toThrow(/pose bank is not registered/);
+    } finally {
+      registerFlipperBats(bats);
+    }
   });
 
   it("does not ship the eleven poses the bank has no units for", () => {

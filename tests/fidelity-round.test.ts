@@ -29,15 +29,13 @@ import {
   stepBalls,
 } from "../src/game/ball-physics.js";
 import { BUMPER_KICK, SLINGSHOT_KICK, surfaceResponseFor } from "../src/game/surface-physics.js";
-import { BALL_RADIUS_PIXELS } from "../src/game/collision-probe.js";
+import { BALL_RADIUS_PIXELS, cosineUnits, sineUnits } from "../src/game/collision-probe.js";
 import type { FlipperConfig, FlipperState, BallStart } from "../src/game/flippers.js";
 import {
   FLIPPER_AT_REST,
-  cosineUnits,
   flipperAngle,
   flipperConfigsFor,
   resolveFlipperContacts,
-  sineUnits,
   tickFlipper,
   batRadiusAt,
 } from "../src/game/flippers.js";
@@ -54,9 +52,14 @@ import {
 import type { Game, InputSource } from "../src/browser/game-loop.js";
 import { CONTROLS, IDLE_SNAPSHOT } from "../src/browser/input.js";
 import type { Control, ControlEdges, ControlSnapshot } from "../src/browser/input.js";
-import { devicesFor, mapFor } from "./table-fixtures.js";
+import { devicesFor, flipperBatsFixture, mapFor } from "./table-fixtures.js";
 import { ballLocksFor } from "../src/game/ball-locks.js";
 import type { BallLock } from "../src/game/ball-locks.js";
+
+// The bats collide on the pixels their poses draw, so the pose bank has to be
+// registered before any of these harnesses runs — B1's drop matrix calls
+// `resolveFlipperContacts` straight, with no game to have loaded it for them.
+flipperBatsFixture();
 
 const BALL_RADIUS: Q10 = pixelsToQ10(BALL_RADIUS_PIXELS);
 const LEFT = flipperConfigsFor("law-n-justice")[0] as FlipperConfig;

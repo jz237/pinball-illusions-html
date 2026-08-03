@@ -99,9 +99,10 @@
  * Round 5 passed `null` here and argued the unclamped case was recoverable: a
  * bat can push a ball at most its own penetration, a few pixels, and `stepBalls`
  * runs `recoverPenetration` on the next tick. Both halves turned out to be
- * wrong on Law 'n Justice's upper-left bat, whose capsule OVERLAPS the level-0
+ * wrong on Law 'n Justice's upper-left bat, whose body OVERLAPS the level-0
  * boundary wall (pivot (37,302), wall 14 px away against a boss-plus-ball touch
- * distance of 13 at the time, and 16 since the silhouette was re-measured), and
+ * distance of 13 at the time, and 16 once the silhouette was re-measured; the
+ * drawn silhouette that has since replaced the capsule overlaps it too), and
  * whose recovery walk is 34 px wide on that table rather than 16 because the
  * budget was tied to the virtual top wall. `ball-physics.ts` now exports
  * `pushClampForMap`, so there is one clamp with one implementation and the bat
@@ -192,7 +193,7 @@ import { tableModesFor } from "../game/table-modes.js";
 import type { TableLamps } from "../game/table-lamps.js";
 import { tableLampsFor } from "../game/table-lamps.js";
 import { drawLampOverlays } from "./lamp-layer.js";
-import { flipperBats } from "../game/flipper-bats.js";
+import { FLIPPER_BATS_PATH, flipperBats } from "../game/flipper-bats.js";
 import { tableBallFor } from "../game/table-ball.js";
 import { drawMovingSprites } from "./sprite-layer.js";
 import type { BallFrameState, BatFrameState } from "../game/moving-sprites.js";
@@ -705,8 +706,24 @@ const NUDGE_CONTROLS: readonly (readonly [Control, NudgeDirection])[] = Object.f
  * missing it looks entirely normal until a ball reaches an arch and stops
  * forever. Better a boot failure that names the file to load. See
  * `table-accel.ts`.
+ *
+ * THE FLIPPER BAT POSE BANK IS NOW THE SAME KIND OF REQUIREMENT, and for a
+ * sharper reason: the bats collide on the pixels those poses draw, so a game
+ * assembled without it has no bat shape at all. It used to be presentation only
+ * — absent, the renderer drew a magenta marker and the ball still bounced off an
+ * analytic capsule — and that is precisely the arrangement in which a picture and
+ * a physics can disagree. There is no capsule left to fall back to and
+ * `batPoseBody` refuses to invent one, so this turns what would otherwise be a
+ * throw on the first tick a ball came near a bat into a boot failure that names
+ * the document.
  */
 export function createGame(map: TableMap, options?: Partial<GameOptions>): Game {
+  if (flipperBats() === null) {
+    throw new Error(
+      `${map.tableId}: the flipper bat pose bank is not registered, so the bats have no ` +
+        `collision body. Load ${FLIPPER_BATS_PATH} (loadFlipperBats) before createGame.`,
+    );
+  }
   const modes = tableModesFor(map.tableId);
   return {
     map,

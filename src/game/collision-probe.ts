@@ -24,13 +24,36 @@
  * ---------------------------------------------------------------------------
  * `materials.ts` establishes that the disk data carries a single solid/not-solid
  * bit per pixel and no surface normals at all. A normal therefore has to be
- * recovered from geometry, and the cheapest honest way is the original's own:
- * sample a ring of points around the ball centre and take the mean direction of
- * the ones that landed in solid material. That mean points at the obstruction,
- * so the surface normal is its opposite — which, because the ring is symmetric,
- * is exactly the ring entry half a revolution away and needs no extra
- * arithmetic. Reconstructing that shape rather than a modern swept-circle solver
- * is what keeps the bounces feeling like the 1995 game.
+ * recovered from geometry, and the original's way is to sample a ring of points
+ * around the ball centre and average the directions of the ones that landed in
+ * solid material. That mean points at the obstruction, so the surface normal is
+ * its opposite. Reconstructing that shape rather than a modern swept-circle
+ * solver is what keeps the bounces feeling like the 1995 game.
+ *
+ * THE MEAN IS AN ARITHMETIC MEAN OF TABULATED ANGLES, NOT A MEAN OF VECTORS.
+ * That distinction is the whole of `meanContactAngle`, and it is the machine's:
+ * the ring evaluator at +0x00A9C4..+0x00AD04 adds up the bearings of the set
+ * points as plain 16-bit numbers, applies ONE wrap correction on ONE of three
+ * quadrant patterns, and divides. This port summed unit vectors instead and
+ * snapped the result back onto a ring entry, which agrees with the machine on
+ * any ordinary single-face contact and disagrees — often wildly — the moment
+ * the ring straddles two surfaces.
+ *
+ * CENSUS: all three shipped maps, both level views, every ball centre standing
+ * in passable material whose ring touches something — 437,581 positions. The
+ * gap is measured against the vector mean's EXACT direction, which is what the
+ * responder was handed, not against its snapped report:
+ *
+ *     one contiguous arc, < 4 quadrants   179,001 positions   worst 4 units, NONE >= 8
+ *     two or more separate arcs           236,752             91,429 differ >= 8
+ *     an arc spanning all four quadrants   21,828             21,108 differ >= 8
+ *     the two agree within one unit       292,781 = 66.9%
+ *     vector sum cancelled exactly            676  (the old rule had no answer at all)
+ *
+ * FOR ANY ORDINARY SINGLE-FACE CONTACT THE TWO RULES ARE THE SAME RULE, to
+ * within 0.7 degrees. They part company only where the ring straddles two
+ * surfaces — a corridor, a corner, a wedge — which is exactly where a ball gets
+ * stuck, so that is where the difference was being paid.
  *
  * THE RING MUST BE GAPLESS. The bit-0 collision layer is a ONE PIXEL outline
  * (see materials.ts): Law 'n Justice alone has 41 horizontal and 11 vertical
@@ -76,7 +99,8 @@ export const ANGLE_UNITS_PER_TURN = 2048;
 /** Half a revolution: add this to a contact angle to get the outward normal. */
 export const ANGLE_HALF_TURN = ANGLE_UNITS_PER_TURN / 2;
 
-const QUARTER_TURN = ANGLE_UNITS_PER_TURN / 4;
+/** Angle units in a quarter turn: 512 on the 2048-unit scale. */
+export const QUARTER_TURN_UNITS = ANGLE_UNITS_PER_TURN / 4;
 
 const MATERIAL_INDEX_COUNT = 16;
 
@@ -127,7 +151,7 @@ export function integerSqrt(value: number): number {
 }
 
 /** `Math.round` breaks ties toward +Infinity; this one is sign-symmetric. */
-function roundHalfAwayFromZero(value: number): number {
+export function roundHalfAwayFromZero(value: number): number {
   return value < 0 ? -Math.round(-value) : Math.round(value);
 }
 
@@ -168,16 +192,21 @@ export function angleDelta(from: number, to: number): number {
 // The ring
 // ---------------------------------------------------------------------------
 
-/** The probe ring for one radius, as parallel arrays in ring order. */
+/**
+ * The probe ring for one radius, as parallel arrays in ring order.
+ *
+ * It used to carry a fifth array, `unitX`/`unitY`: the Q10 unit vector of each
+ * entry, which the vector mean summed. Nothing sums vectors any more — the
+ * machine adds `angle` values and takes `sineUnits`/`cosineUnits` of the result
+ * — so the arrays went with the rule that needed them rather than staying on as
+ * a second, slightly different answer to which way each entry points.
+ */
 export interface RingOffsets {
   /** Number of entries. Depends on the radius; it is not a fixed 32 or 24. */
   readonly size: number;
   /** Integer pixel offsets, ordered by angle from +x toward +y (screen down). */
   readonly dx: readonly number[];
   readonly dy: readonly number[];
-  /** The same directions as Q10 unit vectors, so the mean is not length-weighted. */
-  readonly unitX: readonly number[];
-  readonly unitY: readonly number[];
   /** Angle of each entry in the 2048-unit scale, derived from its actual offset. */
   readonly angle: readonly number[];
 }
@@ -235,15 +264,49 @@ function firstQuadrantArc(radius: number): readonly { readonly x: number; readon
 }
 
 /**
- * atan(ratio) in radians for ratio in [0, 1].
+ * atan(ratio) in radians for ratio in [0, 1], to the last bit of a double.
  *
- * A three-term polynomial, max error about 0.0015 rad — a third of one angle
- * unit at this scale. It uses only IEEE `+ - *`, every one of which is correctly
- * rounded and therefore identical on every engine; `Math.atan2` is not, and this
- * table is baked into replay-critical contact records.
+ * Euler's arctangent series,
+ *
+ *     atan(t) = t / (1 + t^2) * SUM c_n u^n,
+ *     u = t^2 / (1 + t^2),   c_0 = 1,   c_n = c_(n-1) * 2n / (2n + 1),
+ *
+ * which uses only IEEE `+ - * /` — every one correctly rounded, so the sum is
+ * bit-identical on every engine, where `Math.atan2` is not — and whose terms
+ * shrink by at least a half each step over the whole first octant (u <= 1/2).
+ * Measured against `Math.atan2` over every integer offset in a 41x41 block:
+ * worst disagreement 4.5e-13 angle units.
+ *
+ * IT REPLACED A THREE-TERM POLYNOMIAL, AND THAT WAS A CORRECTNESS FIX. The old
+ * approximation was worth about half an angle unit, which is exactly the size
+ * that decides a rounding, and it left EIGHT of the ring's FORTY-FOUR angles one
+ * unit away from the machine's own tabulated constants: entries 5, 6, 16, 17,
+ * 27, 28, 38, 39 — the (6,5)/(5,6) family — read 227, 285, 739, 797, 1251,
+ * 1309, 1763, 1821 where the disk holds 226, 286, 738, 798, 1250, 1310, 1762,
+ * 1822 (`addi.w` immediates at +0x00AB72..+0x00AC7A and the two 32-entry blocks
+ * at +0x00A804 / +0x00A8E4). Those constants are now SUMMED to make a contact
+ * normal — see `meanContactAngle` — so a one-unit error in a tabulated angle is
+ * a one-unit error in the answer, and it no longer averages out. All 44 now
+ * equal `round(atan2(dy, dx) * 2048 / 2pi)` exactly, and the whole table is
+ * pinned entry by entry in `collision-probe.test.ts`.
+ *
+ * The closest any of the 44 comes to a rounding tie is 0.033 units, twelve
+ * orders of magnitude above this series' error, so the table would not move if
+ * the series were improved again.
  */
 function atanRadians(ratio: number): number {
-  return (Math.PI / 4) * ratio - ratio * (ratio - 1) * (0.2447 + 0.0663 * ratio);
+  const denominator = 1 + ratio * ratio;
+  const u = (ratio * ratio) / denominator;
+  let term = 1;
+  let sum = 1;
+  // 80 terms is well past the point where `term` underflows the sum's last bit
+  // at u = 1/2; the loop is bounded rather than tolerance-driven so its length
+  // is a property of the code and not of the argument.
+  for (let n = 1; n <= 80; n += 1) {
+    term = (term * u * (2 * n)) / (2 * n + 1);
+    sum += term;
+  }
+  return (ratio / denominator) * sum;
 }
 
 const RADIANS_TO_ANGLE_UNITS = ANGLE_UNITS_PER_TURN / (2 * Math.PI);
@@ -263,7 +326,7 @@ export function angleUnitsFor(dx: number, dy: number): number {
   const octant =
     ax >= ay
       ? atanRadians(ay / ax) * RADIANS_TO_ANGLE_UNITS
-      : QUARTER_TURN - atanRadians(ax / ay) * RADIANS_TO_ANGLE_UNITS;
+      : QUARTER_TURN_UNITS - atanRadians(ax / ay) * RADIANS_TO_ANGLE_UNITS;
   const first = Math.round(octant);
 
   const angle =
@@ -277,17 +340,86 @@ export function angleUnitsFor(dx: number, dy: number): number {
   return normalizeAngle(angle);
 }
 
-/** One component of the Q10 unit vector along (dx, dy), rounded sign-symmetrically. */
-function unitComponent(component: number, lengthSquared: number): number {
-  if (component === 0) return 0;
-  const scaledLength = integerSqrt(lengthSquared * Q10_ONE * Q10_ONE);
-  return roundHalfAwayFromZero((component * Q10_ONE * Q10_ONE) / scaledLength);
+// ---------------------------------------------------------------------------
+// Directions
+// ---------------------------------------------------------------------------
+
+/**
+ * sin over the first quadrant, Q10, one entry per angle unit plus the endpoint.
+ *
+ * The 11th-order Taylor series is accurate to about 2e-9 over 0..pi/2, four
+ * orders of magnitude finer than the Q10 quantum and three below the closest
+ * approach any entry makes to a rounding tie (1.7e-4 at 1024 * sin), so the
+ * table is the correctly rounded one and would not change if the polynomial
+ * were improved. `i / 512` is exact (512 is a power of two) and everything after
+ * it is a correctly rounded IEEE operation, so the table is identical on every
+ * engine.
+ *
+ * THIS IS THE MACHINE'S OWN TABLE AT THIS PORT'S SCALE. The disk carries 2048
+ * words of `round(16384 * sin(2*pi*i/2048))` at main.bin.seg01 file offset 0xBC,
+ * reached through the two hunk-1 relocations at main.seg00 offsets 0xB4BC and
+ * 0xB4C2, and the responder rotates the ball's velocity into and out of the
+ * contact frame with it (+0x00B502, +0x00B666). The amplitude here is Q10
+ * because that is the scale every vector in this port is written at, and the
+ * amplitude cancels out of a rotation; `surface-physics.ts` carries the
+ * measurement of what does NOT cancel, which is the responder's own constants.
+ *
+ * It used to live in `flippers.ts`, where the bat angles needed it. It moved
+ * here when the contact normal became `cos`/`sin` of a mean bearing, because two
+ * copies of a trigonometric table is two answers to "which way is 738".
+ */
+function buildQuarterSineTable(): readonly number[] {
+  const table: number[] = [];
+  for (let i = 0; i <= QUARTER_TURN_UNITS; i += 1) {
+    const x = (i / QUARTER_TURN_UNITS) * (Math.PI / 2);
+    const xx = x * x;
+    let p = -1 / 39916800;
+    p = p * xx + 1 / 362880;
+    p = p * xx - 1 / 5040;
+    p = p * xx + 1 / 120;
+    p = p * xx - 1 / 6;
+    p = p * xx + 1;
+    table.push(roundHalfAwayFromZero(x * p * Q10_ONE));
+  }
+  return table;
+}
+
+const QUARTER_SINE = buildQuarterSineTable();
+
+function quarterSineAt(index: number): number {
+  const value = QUARTER_SINE[index];
+  if (value === undefined) {
+    throw new RangeError(`quarter-sine index out of range: ${index}`);
+  }
+  return value;
+}
+
+/**
+ * sin of an angle in 2048-unit form, as Q10.
+ *
+ * Folded to the first quadrant and negated with integer arithmetic, so the four
+ * quadrants are exact reflections and a mirrored trajectory reflects off a
+ * mirrored normal. Zero is returned as +0: a negative zero here would survive
+ * into a contact normal and fail identity comparisons.
+ */
+export function sineUnits(angle: number): Q10 {
+  const wrapped = normalizeAngle(angle);
+  const withinHalf = wrapped % ANGLE_HALF_TURN;
+  const folded = withinHalf <= QUARTER_TURN_UNITS ? withinHalf : ANGLE_HALF_TURN - withinHalf;
+  const magnitude = quarterSineAt(folded);
+  if (magnitude === 0) return 0;
+  return wrapped < ANGLE_HALF_TURN ? magnitude : -magnitude;
+}
+
+/** cos of an angle in 2048-unit form, as Q10. */
+export function cosineUnits(angle: number): Q10 {
+  return sineUnits(angle + QUARTER_TURN_UNITS);
 }
 
 /**
  * Builds the whole ring by rotating the quarter arc through 90 degrees four
- * times. Entry `i` and entry `i + size / 2` are therefore exact negations, which
- * is what makes the outward normal a table lookup rather than a negation.
+ * times. Entry `i` and entry `i + size / 2` are therefore exact negations, so
+ * the four quadrants report exactly mirrored bearings.
  */
 function buildRing(radius: Q10): RingOffsets {
   const pixels = Math.max(1, Math.round(radius / Q10_ONE));
@@ -312,24 +444,15 @@ function buildRing(radius: Q10): RingOffsets {
     }
   }
 
-  const unitX: number[] = [];
-  const unitY: number[] = [];
   const angle: number[] = [];
   for (let i = 0; i < dx.length; i += 1) {
-    const ox = numberAt(dx, i);
-    const oy = numberAt(dy, i);
-    const lengthSquared = ox * ox + oy * oy;
-    unitX.push(unitComponent(ox, lengthSquared));
-    unitY.push(unitComponent(oy, lengthSquared));
-    angle.push(angleUnitsFor(ox, oy));
+    angle.push(angleUnitsFor(numberAt(dx, i), numberAt(dy, i)));
   }
 
   return Object.freeze({
     size: dx.length,
     dx: Object.freeze(dx),
     dy: Object.freeze(dy),
-    unitX: Object.freeze(unitX),
-    unitY: Object.freeze(unitY),
     angle: Object.freeze(angle),
   });
 }
@@ -378,74 +501,149 @@ export function moreDeflecting(candidate: MaterialBehaviour, incumbent: Material
   return candidate.index < incumbent.index;
 }
 
-/** A probe result plus the ring entry the mean contact direction landed on. */
+/** A probe result plus the contact point the mean bearing re-quantises onto. */
 export interface RingProbe extends ContactResult {
-  /** Ring index of the mean contact direction, or -1 when nothing was touched. */
+  /**
+   * Ring index of the REPORTED CONTACT POINT, or -1 when nothing was touched.
+   *
+   * The machine's +0x00AD92, not the mean itself: `round(angle * 44 / 2048)`.
+   * See `ringIndexForAngle`. The physics never reads it; `normalX`/`normalY`
+   * carry the direction, and this is the point the device layer is told about.
+   */
   readonly contactIndex: number;
   /**
-   * Outward surface normal as a Q10 unit vector — the mean contact direction
-   * reversed, WITHOUT being snapped to the ring. Zero when nothing was touched.
-   *
-   * See `outwardNormalOf` for why the snapped version is not good enough to
-   * reflect with.
+   * Outward surface normal as a Q10 unit vector: `cos`/`sin` of the mean bearing
+   * plus half a turn, at the machine's own 1/2048-turn resolution. Zero when
+   * nothing was touched.
    */
   readonly normalX: number;
   readonly normalY: number;
 }
 
 /**
- * The outward surface normal, as an exact Q10 unit vector rather than a ring
- * entry.
+ * THE CONTACT ANGLE — the machine's `$28(a4)`, and the one number every bounce
+ * in the game turns on.
  *
  * ---------------------------------------------------------------------------
- * WHY THE SNAPPED NORMAL IS NOT GOOD ENOUGH TO REFLECT WITH
+ * WHAT THE DISK DOES, +0x00A9C4 .. +0x00AD04
  * ---------------------------------------------------------------------------
- * `meanContactIndex` rounds the mean contact direction onto one of the ring's
- * 44 entries, and those entries are not evenly spaced: near the axes they are
- * 7.1 degrees apart, because the closest neighbours of (0, 8) are (+-1, 8). So a
- * surface whose true normal is 10.6 degrees off vertical is reflected off as
- * though it were 7.1 — an error of up to about 4 degrees, which is HALF the
- * whole static-friction angle the contact model works with. `WALL_FRICTION` is
- * 154/1024, so a ball is held on anything shallower than atan(0.150) = 8.55
- * degrees; the rounding therefore decides, on its own, whether a ball on a
- * shallow ramp rolls or sticks.
+ * The ring evaluator walks the 68-byte `D = A AND C` buffer the collision blit
+ * leaves behind — 17 rows by 2 words, C being the ball's own 44-point probe ring
+ * — and for every set point adds that point's TABULATED BEARING to `d5` as a
+ * plain 16-bit number. It also keeps a four-bit quadrant mask in `d6` (bit j set
+ * when some hit has an angle in [512j, 512j + 512)) and, in `d3`, a count of the
+ * hits below half a turn. The tail is twelve instructions:
  *
- * Measured, on the shipped Law 'n Justice map: a ball coasting up the top orbit
- * comes to rest at (214.95, 20.93) on the upper collision line, touching the
- * inner arc at (212, 28) and (213, 28). The mean of those two ring directions is
- * 10.6 degrees off vertical, and the arc's own face there falls one row every
- * four columns — a 14 degree slope, which is what a ball actually rolls down.
- * Snapped, it reads 7.1 degrees, the friction budget of 3 Q10/tick exactly
- * cancels the 3 Q10/tick of gravity along the surface, and the ball stops dead
- * with velocity (0, 0) for the rest of the game. Fifteen of two hundred and
- * seventy balls in an aggressive-player census ended on that single pixel.
+ *     +0x00ACD8  cmpi.b #$b,d6 / #$9,d6 / #$d,d6   masks 1011, 1001, 1101 only
+ *     +0x00ACEA  move.l d3,d0 / swap / ror.l #5    d5 += 2048 * d3
+ *     +0x00ACF2  add.w d1,d2 / d2,d3 / d3,d4       fold the four counters
+ *     +0x00ACF8  lsr.w #1,d4                       d4 = N, each hit bumped two
+ *     +0x00ACFE  divu.w d4,d5                      TRUNCATING integer mean
+ *     +0x00AD00  andi.w #$7ff,d5
+ *     +0x00AD04  move.w d5,$28(a4)                 <- the answer
  *
- * The reported `normalAngle` is deliberately left snapped: it is a contact
- * RECORD for the scoring and device layers, it is one of the tabulated angles by
- * construction, and every test that reads it is asserting that property. This is
- * the vector the physics reflects about, and nothing about it is less
- * deterministic — one integer square root and two integer divides, no
- * trigonometry and no `Math.sqrt`.
+ * THE WRAP RULE IS THREE MASKS AND NOT FOUR. Only 9 (1001), 11 (1011) and 13
+ * (1101) get the correction; 15 (1111) contains quadrants 0 and 3 as well and is
+ * DELIBERATELY EXCLUDED. So a contact arc spanning all four quadrants — a ball
+ * wedged in a corridor, a ball buried in a corner — is averaged on the raw
+ * numbers and gets an answer that is not any kind of bisector. That is a real,
+ * deliberate limit of the machine's rule and it is reproduced rather than
+ * papered over: it is how the original behaves, and inventing a fourth mask
+ * would be inventing an engine rule.
  *
- * Falls back to the ring entry when the contacts cancel out exactly, which is
- * the same degenerate case `meanContactIndex` handles: a ball wedged in a
- * corridor touching both walls has no mean direction at all.
+ * There is no empty case to guard. The caller only reaches the evaluator when
+ * the hardware says the AND was non-empty (+0x00A7F6 `btst.b #$5,$2(a6)` reads
+ * DMACONR's BZERO), so N >= 1 always and +0x00ACFE can never divide by zero.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT THIS PORT DID BEFORE, AND WHAT IT COST
+ * ---------------------------------------------------------------------------
+ * It summed Q10 unit vectors and took the nearest ring entry, with a fallback to
+ * `contacts[0]` when the sum cancelled exactly. For a single contiguous arc the
+ * two rules agree to within 4.18 units over 114,345 measured positions and the
+ * substitution is invisible. Where they part company is where balls get stuck:
+ * 59,163 of 151,077 multi-arc positions and 12,571 of 13,078 four-quadrant
+ * positions differ by 8 units or more. Three concrete disagreements, all
+ * verifiable by hand:
+ *
+ *     contacts {right, left}   disk 512 (down)   old rule 0    (the first one)
+ *     contacts {up, down}      disk 1024 (left)  old rule 512
+ *     the whole ring solid     disk 1000         old rule 0
+ *
+ * `outwardNormalOf` turns the answer into a vector. Nothing snaps.
  */
-export function outwardNormalOf(
-  ring: RingOffsets,
-  contactIndex: number,
-  sumX: number,
-  sumY: number,
-): { readonly x: number; readonly y: number } {
-  const lengthSquared = sumX * sumX + sumY * sumY;
-  if (lengthSquared === 0) {
-    const fallback = outwardNormalIndex(ring, contactIndex);
-    return { x: numberAt(ring.unitX, fallback), y: numberAt(ring.unitY, fallback) };
+export function meanContactAngle(contacts: readonly ContactPoint[]): number {
+  let sum = 0;
+  let quadrants = 0;
+  let belowHalfTurn = 0;
+  for (const contact of contacts) {
+    const angle = contact.angle;
+    sum += angle;
+    quadrants |= 1 << (angle >> 9);
+    if (angle < ANGLE_HALF_TURN) belowHalfTurn += 1;
   }
-  return {
-    x: unitComponent(-sumX, lengthSquared),
-    y: unitComponent(-sumY, lengthSquared),
-  };
+  if (contacts.length === 0) {
+    throw new RangeError("mean contact angle of an empty contact set");
+  }
+  if (quadrants === 0b1001 || quadrants === 0b1011 || quadrants === 0b1101) {
+    sum += ANGLE_UNITS_PER_TURN * belowHalfTurn;
+  }
+  return Math.trunc(sum / contacts.length) & (ANGLE_UNITS_PER_TURN - 1);
+}
+
+/**
+ * The machine's re-quantisation of a bearing onto a ring index, +0x00AD92:
+ *
+ *     mulu.w #$580,d5 / addi.l #$8000,d5 / swap d5      = round(angle * 44 / 2048)
+ *
+ * `$580` is 1408 and 1408/65536 is exactly 44/2048, so this is a round-to-
+ * nearest onto 44 evenly spaced directions — which the ring is NOT, quite. The
+ * machine spends the result on `(a0, d5.w*4)`, a table of (dx, dy) offsets with
+ * a 45th entry equal to the first, and stores ball position plus that offset as
+ * the reported contact point `$2a/$2c(a4)`.
+ *
+ * It is exact on every one of the ring's own bearings — all 44 round-trip — and
+ * approximate in between, by up to half a ring step. That is fine, because it is
+ * a REPORTING step: the reflection is taken about the unquantised angle, and the
+ * decode confirms the only consumers are the reported contact point and the
+ * device/zone layer downstream of it.
+ *
+ * The angle 2047 lands on 44, which is the wrapped first entry; `% ring.size`
+ * is the machine's 45th table row.
+ */
+export function ringIndexForAngle(ring: RingOffsets, angle: number): number {
+  const scaled = Math.round((normalizeAngle(angle) * ring.size) / ANGLE_UNITS_PER_TURN);
+  return scaled % ring.size;
+}
+
+/**
+ * The outward surface normal for a contact bearing, as a Q10 unit vector.
+ *
+ * The bearing points from the ball centre INTO the surface, so the outward
+ * normal is half a turn away, and the machine's own sin/cos tables turn it into
+ * a vector at 1/2048-turn resolution — 0.176 degrees, which is finer than the
+ * ring's own 8.18-degree spacing by a factor of forty-six. The responder does
+ * exactly this at +0x00B502 (`#$800 - $28(a4)`, then `muls.w` against the two
+ * tables) and the port does it here so that everything downstream sees a plain
+ * vector.
+ *
+ * WHY NOT SNAP TO A RING ENTRY. Because a bounce taken about a ring entry is a
+ * bounce taken about a direction up to 3.5 degrees away from the surface, and
+ * the static-friction angle this contact model works with is atan(154/1024) =
+ * 8.55 degrees. Measured on the shipped Law 'n Justice map before the exact
+ * normal existed: a ball coasting up the top orbit came to rest at
+ * (214.95, 20.93), touching the inner arc at (212, 28) and (213, 28) on a face
+ * that falls one row every four columns — a 14 degree slope a ball rolls down.
+ * Snapped, it read 7.1, friction cancelled gravity exactly, and fifteen of two
+ * hundred and seventy census balls ended on that one pixel. The machine has no
+ * such failure because it never snaps either.
+ */
+export function outwardNormalOf(contactAngle: number): {
+  readonly x: number;
+  readonly y: number;
+} {
+  const outward = contactAngle + ANGLE_HALF_TURN;
+  return { x: cosineUnits(outward), y: sineUnits(outward) };
 }
 
 /**
@@ -475,8 +673,6 @@ export function probeRing(
   const centreY = q10ToPixel(y);
 
   const contacts: ContactPoint[] = [];
-  let sumX = 0;
-  let sumY = 0;
   let dominant: MaterialIndex | null = null;
   let dominantBehaviour: MaterialBehaviour | null = null;
 
@@ -489,8 +685,6 @@ export function probeRing(
     if (flagAt(passable, material)) continue;
 
     contacts.push({ ringIndex: i, angle: numberAt(ring.angle, i), material, x: px, y: py });
-    sumX += numberAt(ring.unitX, i);
-    sumY += numberAt(ring.unitY, i);
 
     const behaviour = materials.behaviourFor(material);
     if (dominantBehaviour === null || moreDeflecting(behaviour, dominantBehaviour)) {
@@ -503,13 +697,13 @@ export function probeRing(
     return { contacts, normalAngle: null, dominant: null, contactIndex: -1, normalX: 0, normalY: 0 };
   }
 
-  const contactIndex = meanContactIndex(ring, contacts, sumX, sumY);
-  const normal = outwardNormalOf(ring, contactIndex, sumX, sumY);
+  const contactAngle = meanContactAngle(contacts);
+  const normal = outwardNormalOf(contactAngle);
   return {
     contacts,
-    normalAngle: numberAt(ring.angle, contactIndex),
+    normalAngle: contactAngle,
     dominant,
-    contactIndex,
+    contactIndex: ringIndexForAngle(ring, contactAngle),
     normalX: normal.x,
     normalY: normal.y,
   };
@@ -533,50 +727,8 @@ export function probeContacts(
   x: Q10,
   y: Q10,
   radius: Q10 = DEFAULT_PROBE_RADIUS,
-): ContactResult {
+): RingProbe {
   return probeRing(map, materials, passabilityOf(materials), ringOffsetsFor(radius), x, y);
-}
-
-/**
- * Mean contact direction, snapped to the ring.
- *
- * An arithmetic mean of the angles is wrong here and wrong in a way that hides:
- * two contacts at 1963 and 85 are 170 units apart either side of zero, and
- * averaging the numbers gives 1024 — the exact opposite direction, which would
- * fire the ball INTO the wall it just touched. Summing unit vectors and taking
- * the nearest ring entry respects the wrap, avoids `atan2`, and as a side effect
- * guarantees the answer is one of the tabulated directions — so the outward
- * normal is an exact integer vector rather than a rounded one.
- *
- * When the contacts cancel out exactly (a ball wedged in a corridor, touching
- * both sides) there is no meaningful mean, and the first contact is used so the
- * ball still gets pushed somewhere instead of being trapped. That choice is
- * arbitrary but deterministic: it is whichever wall the ring reached first.
- */
-export function meanContactIndex(
-  ring: RingOffsets,
-  contacts: readonly ContactPoint[],
-  sumX: number,
-  sumY: number,
-): number {
-  if (sumX === 0 && sumY === 0) {
-    const first = contacts[0];
-    if (first === undefined) {
-      throw new RangeError("mean contact direction of an empty contact set");
-    }
-    return first.ringIndex;
-  }
-
-  let bestIndex = 0;
-  let bestDot = -Infinity;
-  for (let i = 0; i < ring.size; i += 1) {
-    const dot = sumX * numberAt(ring.unitX, i) + sumY * numberAt(ring.unitY, i);
-    if (dot > bestDot) {
-      bestDot = dot;
-      bestIndex = i;
-    }
-  }
-  return bestIndex;
 }
 
 /** The outward surface normal for a contact: the ring entry half a turn away. */

@@ -32,7 +32,7 @@ import { parseTableLampsDocument, registerTableLamps } from "../src/game/table-l
 import type { TableLamps } from "../src/game/table-lamps.js";
 import { parseTableBallDocument } from "../src/game/table-ball.js";
 import type { TableBall } from "../src/game/table-ball.js";
-import { parseFlipperBatsDocument } from "../src/game/flipper-bats.js";
+import { parseFlipperBatsDocument, registerFlipperBats } from "../src/game/flipper-bats.js";
 import type { FlipperBats } from "../src/game/flipper-bats.js";
 import type {
   FlipperBatsDocument,
@@ -88,24 +88,40 @@ export function ballFor(tableId: TableId): TableBall {
 }
 
 /**
- * The shipped flipper bat pose bank, parsed. ONE document for all three tables:
- * the raster is table-independent and only the palette differs.
+ * The shipped flipper bat pose bank, parsed AND REGISTERED. ONE document for all
+ * three tables: the raster is table-independent and only the palette differs.
+ *
+ * It registers because the bank stopped being decoration: the bats now collide
+ * on the pixels those poses draw, so a simulation without it has no bat body at
+ * all and `batPoseBody` refuses to invent one. Parsing is cached — the document
+ * is 57 KB and several suites want it per test — and registering is idempotent.
+ * `tests/flipper-bats.test.ts` still exercises the empty registry through
+ * `clearFlipperBats`, which vitest's per-file isolation keeps to itself.
  */
+let parsedBats: FlipperBats | null = null;
+
 export function flipperBatsFixture(): FlipperBats {
-  const url = new URL("../public/generated/flipper-bats.json", import.meta.url);
-  return parseFlipperBatsDocument(JSON.parse(readFileSync(url, "utf8")) as FlipperBatsDocument);
+  if (parsedBats === null) {
+    const url = new URL("../public/generated/flipper-bats.json", import.meta.url);
+    parsedBats = parseFlipperBatsDocument(
+      JSON.parse(readFileSync(url, "utf8")) as FlipperBatsDocument,
+    );
+  }
+  registerFlipperBats(parsedBats);
+  return parsedBats;
 }
 
 /**
- * The shipped map for one table, with its ramp drive, its scoring layer and its
- * mission layer registered as a side effect, so `createGame(mapFor(id))` always
- * gets a fully armed machine.
+ * The shipped map for one table, with its ramp drive, its scoring layer, its
+ * mission layer and the flipper bat BODIES registered as a side effect, so
+ * `createGame(mapFor(id))` always gets a fully armed machine.
  */
 export function mapFor(tableId: TableId): TableMap {
   accelFor(tableId);
   registerTableDevices(devicesFor(tableId));
   registerTableModes(modesFor(tableId));
   registerTableLamps(lampsFor(tableId));
+  flipperBatsFixture();
   const doc = JSON.parse(readFileSync(documentUrl(tableId, "map"), "utf8")) as TableMapDocument;
   return parseTableMapDocument(doc);
 }
