@@ -271,11 +271,84 @@ const TICKS = 4000;
  *
  * Nothing else about this pin moved: same 4,000 ticks, same three tables, same
  * scripted input, same `debugSnapshot` fields.
+ *
+ * RE-PIN, THE MACHINE'S OWN FRAME (the arch-normal round). All three hashes
+ * move, there is no unchanged control table this time, and the justification is
+ * therefore not a control but a MEASUREMENT AGAINST THE ORIGINAL'S OWN RAM.
+ *
+ * WHAT CHANGED. `integrateBall` is the original's frame instead of a swept path:
+ * eight substeps of `pos += v>>1` with a collision-and-respond pass in front of
+ * substeps 0, 2, 4 and 6, the 44-direction ring read WHERE THE BALL STANDS, and
+ * no walk of any kind. Two independent defects went with it — the integrator
+ * (`v += a; x += v` against eight `x += v>>3; v += a/8`, a systematic +76 Q10 of
+ * over-travel on every accelerating tick) and the round-8 overlap-depth rule
+ * (the `|v|/4` walk along the contact bearing, which turned out to be the single
+ * largest error source in the contact model). Decode, candidate sweep and
+ * instrument: `research/ARCH_NORMAL_DECODE.md`.
+ *
+ * THE EVIDENCE, and it is the strongest this pin has ever carried. Both rules
+ * were scored against the machine's own velocity words over the same corpus —
+ * 576 traced frames of four untouched Law 'n Justice launches, carrying 218
+ * contacts, each frame predicted from the machine's own exact start state so
+ * errors cannot accumulate (`research/arch/tools/port-corpus.mts`, which imports
+ * the SHIPPED `stepBalls`):
+ *
+ *                              exact  <=4 units   error sum   positions exact
+ *   HEAD (the swept path)        436        440       21089            0 / 576
+ *   this tree                    466        517        1790          464 / 576
+ *
+ * Eleven-point-eight times closer on velocity, and the per-tick POSITION goes
+ * from never right to right on 464 of 576 frames. On the arch entry the four
+ * traced launches now come out at 14.13 / 14.13 / 10.79 / 14.13 degrees against
+ * the machine's measured 14.13 / 14.13 / 10.78 / 14.13, where HEAD turned 7.58
+ * and ground. The decode's own unobserved forecast — an approach above cy
+ * 118.88525 misses and the NEXT frame turns 17.24 — is reproduced at 17.25
+ * (`tests/arch-normal.test.ts`).
+ *
+ * THE CENSUS, 90 games x 3 tables x 40,000 ticks, aggressive player, HEAD
+ * c9724a4 -> this tree, both measured this round. The four-passes-a-frame
+ * rolling friction this round adopts is FOUR TIMES what the port charged, and
+ * the shallow-slope traps it could have re-opened did not:
+ *
+ *   law-n-justice   completed 90/90 -> 90/90, ends 271 -> 274, drained 271 ->
+ *                   274, written off 0 -> 0; median 635,000 -> 695,000, min 0,
+ *                   max 8,945,000 -> 9,165,000, zeros 3/90 -> 2/90, distinct
+ *                   76 -> 81; BALL 1 median 100,000 -> 267,500, zeros 26/90 ->
+ *                   13/90.
+ *   babewatch       completed 90/90 -> 90/90, ends 270, drained 270, written
+ *                   off 0 -> 0; median 985,000 -> 1,386,170, min 770,000 ->
+ *                   350,000, max 3,840,000 -> 8,910,000, zeros 0/90, distinct
+ *                   71 -> 81; BALL 1 median 410,000 -> 320,000, zeros 0/90.
+ *   extreme-sports  completed 90/90 -> 90/90, ends 270, drained 268 -> 270,
+ *                   WRITTEN OFF 2 (0.7%) -> 0 (0.0%) — the (238,588)L0 spit,
+ *                   the only write-off site left on any table, is gone;
+ *                   median 425,000 -> 347,500, min 165,000 -> 150,000, max
+ *                   7,700,000 -> 9,280,000, zeros 0/90, distinct 69 -> 64;
+ *                   BALL 1 median 92,500 -> 65,000, zeros 0/90.
+ *   worst write-off rate 0.7% -> 0.0%, zero stalls everywhere.
+ *
+ * The other gates: full suite green, `npx tsc --noEmit` clean, public-build
+ * guard 286 gated; tip-flip sweep pass-under 0 of 882 (0 of 1044 at HEAD — the
+ * trial count is lower because the ball now rolls off the blade in 56 ticks
+ * instead of 65, so fewer press ticks land while it is still on the bat); film
+ * side-by-side BYTE-IDENTICAL at 98.4508/99.8645/99.1322 with every raster
+ * identical to its stored reference in 298224/298224 px, which is expected
+ * rather than surprising — that instrument renders a fresh `createGame` at tick
+ * 0 with the ball pinned at a fixed centre, so it measures artwork, lamps and
+ * sprites and no trajectory reaches it.
+ *
+ * The digests this entry replaced, recorded so the move is auditable:
+ *   law-n-justice   6eadefa2a35b3a57cfb5b470096dc237626c082f08f7df537985cfa1dc286955
+ *   babewatch       685756c8b1dffff7b177b7673574d39be6b04b346a16df66261691a1fc5829aa
+ *   extreme-sports  63896e08d578ebda9e141f78682f982353251ad9b65a8b248046156cc3a62b51
+ *
+ * Nothing else about this pin moved: same 4,000 ticks, same three tables, same
+ * scripted input, same `debugSnapshot` fields. Only the digests.
  */
 const PINNED: Record<TableId, string> = {
-  "law-n-justice": "6eadefa2a35b3a57cfb5b470096dc237626c082f08f7df537985cfa1dc286955",
-  "babewatch": "685756c8b1dffff7b177b7673574d39be6b04b346a16df66261691a1fc5829aa",
-  "extreme-sports": "63896e08d578ebda9e141f78682f982353251ad9b65a8b248046156cc3a62b51",
+  "law-n-justice": "29c573580c2edd9cec313ebfe6c0c827157d121d87ad099e14635a2141652b00",
+  "babewatch": "d1358da0fef0abb2038238f211281072b2e4ce850c074fa23eebfd0489a4c9dc",
+  "extreme-sports": "05cf9bbd1334ff9fac6d5e26aa69708765f364db9678ed2eb064a2f18cb3c823",
 };
 
 /** Same shape as the determinism harness's input: behaviour = f(tick index). */

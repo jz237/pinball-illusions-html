@@ -593,10 +593,17 @@ describe("launching up the real Law 'n Justice lane", () => {
   it("settles the served ball inside the lane instead of drifting out of it", () => {
     const { restY } = launchAndTrack(1);
     expect(restY).toBeGreaterThan(q10ToPixel(CONFIG.serveY) - 4);
-    // Inclusive, because `bottomY` is documented as "the bottommost FREE CENTRE
-    // row of the unbroken channel" — a ball centre on it is in the lane, not out
-    // of it.
-    expect(restY).toBeLessThanOrEqual(LAW_N_JUSTICE_SHOOTER_LANE.bottomY);
+    // `bottomY` is "the bottommost FREE CENTRE row of the unbroken channel" —
+    // the lowest row whose WHOLE probe ring clears the floor at 561 — and the
+    // ball now rests ONE ROW BELOW IT, because the decoded contact rule reads
+    // the ring where the substep grid puts the ball instead of backing it up to
+    // first touch, so a resting ball legitimately sits inside the touch band.
+    // That is the original's own seat: cy 553.53..553.91 on all four session-4
+    // cold launches (research/view/reference/session4/INDEX.txt) against this
+    // port's row 553, where HEAD sat at 552.999. Still deep inside the channel,
+    // whose walls run to 561, which is what this test is about.
+    expect(restY).toBeLessThanOrEqual(LAW_N_JUSTICE_SHOOTER_LANE.bottomY + 1);
+    expect(restY).toBe(553);
   });
 
   it("sends every launch all the way to the top of the channel", () => {

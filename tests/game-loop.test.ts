@@ -160,8 +160,16 @@ describe("the ball lifecycle", () => {
     expect(ballIsOnTheRod(ball!)).toBe(true);
     expect(ball?.velocityX).toBe(0);
     expect(ball?.velocityY).toBe(0);
-    // On the lane floor, within a pixel of the seat the lane bounds name.
-    expect(q10ToPixel(ball?.y ?? 0)).toBe(q10ToPixel(SERVE.y));
+    // On the lane floor, ONE ROW BELOW the seat the lane bounds name — which is
+    // the row the ORIGINAL parks it on. `LAW_N_JUSTICE_SHOOTER_LANE.bottomY` is
+    // 552 because a centre there keeps the whole probe ring clear of the floor
+    // at row 561, and the decoded contact rule does not stop a ball at first
+    // touch: it reads the ring where the substep grid puts the ball, which is
+    // inside the touch band. The machine's own resting lane ball sits at cy
+    // 553.53..553.91 on every cold launch in research/view/reference/session4,
+    // i.e. row 553; HEAD settled it at 552.999, 0.77 px high, and that 0.77 px
+    // is what put HEAD into the wrong column of the arch staircase.
+    expect(q10ToPixel(ball?.y ?? 0)).toBe(q10ToPixel(SERVE.y) + 1);
   });
 
   it("launches the served ball up the lane on the press edge, once per hold", () => {
@@ -531,7 +539,9 @@ describe("the debug handle", () => {
     expect(state.tick).toBe(CHUTE_TICKS);
     expect(state.camera.mode).toBe("scrolling");
     expect(state.balls).toHaveLength(1);
-    expect(state.balls[0]?.pixelY).toBe(q10ToPixel(SERVE.y));
+    // The machine's own lane seat row; see "rolls the served ball down the
+    // return chute" above for the session-4 measurement it comes from.
+    expect(state.balls[0]?.pixelY).toBe(q10ToPixel(SERVE.y) + 1);
     expect(state.ballsRemaining).toBe(DEFAULT_BALLS_PER_GAME - 1);
   });
 

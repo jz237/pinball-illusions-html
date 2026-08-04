@@ -66,23 +66,33 @@
  * ---------------------------------------------------------------------------
  * WHY A TICK ALWAYS MAKES PROGRESS
  * ---------------------------------------------------------------------------
- * Contact is evaluated at a position the ball can actually reach, never at a
- * candidate that may lie inside the wall: from inside, the mean contact
- * direction inverts, the reflection reads as "already leaving", and the move is
- * then refused — leaving position AND velocity untouched, so every later tick is
- * bit-identical and the ball is stuck forever with speed. Instead the sweep
- * CLAMPS the move to the last free sample, the surface it stopped against
- * supplies the normal, and a pass that still cannot move kills the velocity
- * component along the refused direction. Some state changes on every tick, so no
- * configuration can repeat.
+ * The ball CENTRE is never allowed inside solid material — `advanceCentre`
+ * clamps every substep to the last free sample — so a move can be refused
+ * outright, and a refused move that changed no velocity either would leave the
+ * tick bit-identical to its predecessor and the ball stuck forever with speed on
+ * the books. A substep that cannot move therefore kills the velocity component
+ * along the refused direction, and a whole tick that moved nowhere at all is put
+ * to rest. Some state changes on every tick, so no configuration can repeat.
  *
  * ---------------------------------------------------------------------------
- * WHY THE TICK IS SPENT AS A FRACTION
+ * THE TICK IS THE MACHINE'S FRAME: EIGHT SUBSTEPS, FOUR COLLISION PASSES
  * ---------------------------------------------------------------------------
- * A bounce must land in the same place however finely the tick is cut, so the
- * integrator sweeps the whole remaining tick at one-pixel resolution and spends
- * only the unconsumed fraction on the reflected velocity. See `integrateBall`
- * and `sweepToContact` for what the fixed-substep version got wrong.
+ * Not a swept path cut at contacts, and not a tunable substep count. The
+ * original's unrolled tick at main.seg00 +0x00A618 is four groups of [call the
+ * responder at $b4ba, then two `pos += v >> 1` integrations at $b6e8], the
+ * acceleration re-read and added after every one of the eight moves. This
+ * integrator IS that frame: `integrateBall` runs eight substeps of
+ * `pos += v >> 3` (the same thing at this port's velocity scale) with a contact
+ * pass in front of substeps 0, 2, 4 and 6, reads the 44-point ring WHERE THE
+ * BALL STANDS at each pass, and never walks the probe anywhere.
+ *
+ * It is decoded and then FITTED against the original's own RAM: over a corpus of
+ * 576 traced frames carrying 218 contacts the rule reproduces the machine's next
+ * velocity word 11.8x more closely than the swept-path-plus-bearing-walk rule it
+ * replaces (summed error 1790 against 21089), and its per-tick POSITION exactly
+ * on 464 of 576 frames where every variant of the old structure managed none.
+ * `research/ARCH_NORMAL_DECODE.md` has the decode, the candidate sweep and the
+ * acceptance instrument.
  */
 
 import type {
@@ -119,7 +129,12 @@ import {
   ringOffsetsFor,
 } from "./collision-probe.js";
 import { SOLID_BORDER_INDEX } from "./materials.js";
-import { SIMULATION_GRAVITY, VELOCITY_CLAMP_Q10 } from "./timebase.js";
+import {
+  ORIGINAL_COLLISION_PASSES_PER_FRAME,
+  ORIGINAL_SUBSTEPS_PER_FRAME,
+  SIMULATION_GRAVITY,
+  VELOCITY_CLAMP_Q10,
+} from "./timebase.js";
 import type { SurfaceResponse } from "./surface-physics.js";
 import {
   LEVEL_TO_LOWER_ID,
@@ -362,10 +377,13 @@ export interface SimulationOptions {
    * radius, so a ball cannot skip past a wall thinner than the probe ring can
    * see.
    *
-   * It is a declared upper bound, not a step size: `sweepToContact` probes every
-   * pixel of the path, which is finer than any value this may sensibly hold, so
-   * the bound is satisfied with room to spare and the trajectory does not depend
-   * on it. It used to BE the step size, and that is exactly what made a bounce
+   * IT IS A DECLARED BOUND AND NOTHING READS IT. The substep count is eight
+   * because the machine's is eight (see `integrateBall`), and at the original's
+   * own velocity clamp one substep moves at most `4095 >> 1` = 2047 Q10 — one
+   * unit under two pixels, which is a quarter of the probe radius. The bound is
+   * therefore satisfied by the frame structure itself rather than enforced by
+   * cutting the tick, and the trajectory is completely independent of this
+   * value. It used to BE the step size, and that is exactly what made a bounce
    * land in a different place depending on how the tick happened to divide.
    */
   readonly maxSubstepDistance: Q10;
@@ -738,6 +756,13 @@ function clampVelocity(value: number): number {
  *
  * Integer and deterministic throughout: `integerSqrt` for the tangential
  * magnitude, one Q10 divide for the scale.
+ *
+ * RETURNS whether this was a RESTING contact — an approach too gentle to bounce
+ * at all, which is what `restThreshold` names. The caller needs it because a
+ * ball at rest is being HELD by the surface, and the surface's reaction is a
+ * force the integrator has to know about between contact passes: see
+ * `integrateBall`. It is a report about the contact, not a change to it; the
+ * arithmetic below is untouched.
  */
 export function reflectVelocity(
   ball: BallState,
@@ -746,9 +771,9 @@ export function reflectVelocity(
   normalY: number,
   restThreshold: number,
   surface: SurfaceResponse | null = null,
-): void {
+): boolean {
   const normalSpeedIn = q10Multiply(ball.velocityX, normalX) + q10Multiply(ball.velocityY, normalY);
-  if (normalSpeedIn >= 0) return;
+  if (normalSpeedIn >= 0) return false;
 
   const tangentX = ball.velocityX - q10Multiply(normalSpeedIn, normalX);
   const tangentY = ball.velocityY - q10Multiply(normalSpeedIn, normalY);
@@ -1045,6 +1070,9 @@ export function reflectVelocity(
   ball.velocityY = clampVelocity(
     q10Multiply(kickedTangentY, keep) + q10Multiply(normalSpeedOut, normalY),
   );
+  // Too soft to bounce, measured on the UNPOWERED reflection so a coil that
+  // fired cannot make a resting contact look like an impact.
+  return passiveDeflected === 0;
 }
 
 /** True when a ball centre may legally sit at this Q10 position. */
@@ -1074,11 +1102,19 @@ interface SweepLimit {
  * The furthest point on the straight path of the ball *centre* whose centre
  * pixel is free.
  *
- * This is the anti-tunnelling backstop. The probe ring already sees a wall a
- * full radius before the centre reaches it, but the ring is a finite set of
- * points and a pathological one-pixel diagonal could slip between two of them;
- * the centre sweep cannot, because it samples at one-pixel intervals. It never
- * fires for a ball rolling on a floor, since the centre stays a radius clear.
+ * This is the anti-tunnelling backstop, and it is NOT FOR SALE. The probe ring
+ * already sees a wall a full radius before the centre reaches it, but the ring
+ * is a finite set of points and a pathological one-pixel diagonal could slip
+ * between two of them; the centre sweep cannot, because it samples at one-pixel
+ * intervals. It never fires for a ball rolling on a floor, since the centre
+ * stays a radius clear.
+ *
+ * The machine has no such backstop — its responder cannot move a ball at all, so
+ * it resolves penetration by motion and will happily tunnel — and the decoded
+ * contact rule this port now runs deliberately lets the RING sit fully inside a
+ * wall, which is the machine's own behaviour and the whole point of reading the
+ * probe where the ball stands. The CENTRE is the line that is still held: the
+ * ring may be buried, the centre may not.
  *
  * It CLAMPS rather than rejecting. Rejecting the whole substep was how a ball
  * could spend a tick changing nothing at all, which — the velocity being
@@ -1113,242 +1149,124 @@ function sweepLimit(
   return { x: lastX, y: lastY, clamped: false };
 }
 
-/** Where a contact-aware sweep had to stop, and what stopped it. */
-interface SweepStop {
-  readonly x: Q10;
-  readonly y: Q10;
-  /**
-   * Fraction of the requested path actually covered, Q10, so the caller can
-   * spend the rest of the tick on whatever velocity the bounce leaves. It is the
-   * exact sample ratio `stopped / samples`, not a re-measured distance.
-   */
-  readonly covered: number;
-  /**
-   * The probe at the first sample the ball may not occupy — the surface it is
-   * about to hit, and the only place a normal can honestly come from, since by
-   * construction the ring sees nothing at the position the ball stopped in.
-   * Null when nothing was hit, whether the path completed or the centre sweep
-   * refused it.
-   */
-  readonly blocker: RingProbe | null;
-  /** True when solid material stopped the sweep short of its target. */
-  readonly clamped: boolean;
+/**
+ * Moves the ball centre by one substep, stopping at the last position whose
+ * centre pixel is free.
+ *
+ * THE MACHINE'S SUBSTEP IS `pos += v >> 1` AND NOTHING ELSE — no contact test,
+ * no back-up to first touch, no fractional bookkeeping. `$b6e8` reads the
+ * velocity, shifts it and adds it to the position; the responder at `$b4ba`
+ * never writes a position at all. This is that move, plus the port's own
+ * anti-tunnelling clamp (see `sweepLimit`), which the machine has no equivalent
+ * of and which is kept because a centre inside solid material has no honest
+ * normal to bounce about.
+ *
+ * At the original's own velocity clamp a substep is at most 2047 Q10, so the
+ * clamp samples two points rather than the sixteen the old whole-tick sweep did.
+ *
+ * Returns whether the ball actually moved, which is what the caller's
+ * no-progress guard turns on.
+ */
+function advanceCentre(
+  ball: BallState,
+  map: TableMap,
+  passable: readonly boolean[],
+  deltaX: Q10,
+  deltaY: Q10,
+): boolean {
+  if (deltaX === 0 && deltaY === 0) return false;
+  const limit = sweepLimit(
+    map,
+    passable,
+    ball.x,
+    ball.y,
+    q10IntegrateSigned16Velocity(ball.x, deltaX),
+    q10IntegrateSigned16Velocity(ball.y, deltaY),
+  );
+  const moved = limit.x !== ball.x || limit.y !== ball.y;
+  ball.x = limit.x;
+  ball.y = limit.y;
+  return moved;
 }
 
 /**
- * Sweeps the ball centre along a straight path and stops it where it first runs
- * into something, at one-pixel resolution.
+ * ONE COLLISION PASS: the whole of the machine's contact model, and it is short.
  *
- * This is where the tick is cut up, and it is cut at a resolution that is a
- * property of the PATH rather than of any tunable. A previous version advanced
- * the ball in `ceil(speed / maxSubstepDistance)` equal substeps and probed only
- * at the end of each, which made the bounce position depend on the substep
- * count: the substep that found contact was re-run from its own start, so the
- * approach it had already covered was thrown away, and the discarded distance
- * was one substep's worth. Starting at y = 388 px with vy = 8191 against a floor
- * at y = 400, one substep ended 6.5 px from where two did — a visible kink in the
- * trajectory at every velocity that happened to be a multiple of the substep
- * distance. Sampling every pixel of the actual path removes the tunable from the
- * answer entirely, and is strictly finer than any substep the old cap allowed.
+ * ---------------------------------------------------------------------------
+ * THE RING IS READ WHERE THE BALL STANDS. NOTHING IS MOVED, NOTHING IS WALKED.
+ * ---------------------------------------------------------------------------
+ * The original's collision entry at +0x00A7E0 blits the ball's 44-point ring
+ * against the collision line at the ball's CURRENT position, four times a frame,
+ * two `pos += v>>1` substeps apart. Whatever the AND buffer holds is the contact
+ * set; the evaluator at +0x00A9C4 averages the tabulated bearings of the set
+ * (three wrap masks, truncating divide) and `$28(a4)` is the answer. The
+ * responder at +0x00B4BA then gates on approach (+0x00B54E) and returns without
+ * ever writing `$1e`/`$22`. So the evaluation position is on the substep GRID,
+ * anywhere from zero to a quarter frame of path past first touch, and the
+ * penetration it reads is along the PATH.
  *
- * A contact only stops the sweep when the ball is APPROACHING it. A ball
- * rolling along a floor touches that floor at every sample without ever hitting
- * it, and stopping there would freeze it against a surface it is sliding on.
- * Every touched pixel is logged either way: the tick's contact report is "every
- * solid pixel the ring touched", which the scoring layer needs, and that is not
- * the same question as "what turned the ball around".
+ * This port used to do neither. It swept to exact first touch and then walked
+ * the probe `|v|/4` whole pixels ALONG THE CONTACT BEARING before reading it —
+ * the round-8 overlap-depth fix, kept in `research/rejected-overlap-depth-contact.md`
+ * with the measurements that motivated it. Scored against the original's own RAM
+ * it turned out to be the single largest error source in the contact model: a
+ * bearing-directed walk drags the read into the material where the ring
+ * straddles a large chunk of the face on BOTH sides, which is approach-blind, so
+ * the port answered a flat 15.98 degrees across the whole 1.7 px of approach
+ * phase at Law 'n Justice's top arch where the machine steps 14.12 / 10.79 /
+ * 17.24 degrees by pixel row. On the 576-frame corpus the walk costs 8.4x on top
+ * of the correct frame structure, and no depth of it is better than none.
+ *
+ * The gate on step 4 is +0x00B54E and it is what lets a ball slide along a wall
+ * it is pressed against: most of the positions a penetrating sampler visits read
+ * "not approaching" and are dropped without a response. Contacts are LOGGED
+ * either way, because the machine's id dispatch at +0x00AD42 runs off the
+ * overlap before the responder decides anything, and "what did the ball touch"
+ * is the scoring layer's question rather than "what turned it around".
+ *
+ * Full derivation, the candidate sweep and the per-frame scores:
+ * `research/ARCH_NORMAL_DECODE.md`.
  */
-function sweepToContact(
+function respondAt(
+  ball: BallState,
   map: TableMap,
   materials: MaterialTable,
   passable: readonly boolean[],
   ring: RingOffsets,
   log: ContactLog,
-  ball: BallState,
-  toX: Q10,
-  toY: Q10,
-): SweepStop {
-  const deltaX = toX - ball.x;
-  const deltaY = toY - ball.y;
-  // The path is parameterised by its longest component, so one unit of `t` moves
-  // the ball by at most one Q10 unit and the parameter is a property of the ray.
-  const span = Math.max(Math.abs(deltaX), Math.abs(deltaY));
-  if (span === 0) {
-    return { x: ball.x, y: ball.y, covered: Q10_ONE, blocker: null, clamped: false };
-  }
+  options: ResolvedOptions,
+  surfaceAt: ((x: number, y: number) => number) | null,
+): RingProbe | null {
+  const probe = probeRing(map, materials, passable, ring, ball.x, ball.y);
+  if (probe.contactIndex < 0) return null;
+  logContacts(log, probe, materials);
+  if (probe.dominant === null) return null;
 
-  const pointAt = (t: number): { readonly x: Q10; readonly y: Q10 } => ({
-    x: (ball.x + Math.trunc((deltaX * t) / span)) | 0,
-    y: (ball.y + Math.trunc((deltaY * t) / span)) | 0,
-  });
+  // +0x00B54E, the leaving gate. Taken about the exact normal rather than the
+  // ring entry, for the reason `outwardNormalOf` gives.
+  const into =
+    q10Multiply(ball.velocityX, probe.normalX) + q10Multiply(ball.velocityY, probe.normalY);
+  // Not approaching at all, but touching: the ball is LYING on the surface with
+  // no normal motion whatever, which is the rest contact in its purest form. The
+  // machine's gate returns here and so does this — nothing is reflected, nothing
+  // is scrubbed — but the surface is still holding the ball up, so the hold is
+  // reported. Without this the ball spends the two substeps to the next pass
+  // falling into the surface, and the pass after that throws the velocity away
+  // without giving the position back: a permanent 1 Q10 a tick of sink.
+  if (into > 0) return null;
+  if (into === 0) return probe;
 
-  /**
-   * What stops the ball at `t`, or null when the ball may stand there. A probe
-   * of null means the centre sweep refused the point and there is no surface to
-   * bounce off — the anti-tunnelling backstop, which only fires for geometry the
-   * ring is blind to, since the ring sees a wall a full radius earlier.
-   *
-   * ---------------------------------------------------------------------------
-   * THE CONTACT IS JUDGED, AND THE BOUNCE TAKEN, ONE PIXEL INTO THE SURFACE
-   * ---------------------------------------------------------------------------
-   * The original never evaluates a contact at tangency. Its frame (main.seg00
-   * +0x00A618) is four groups of [test-and-respond at the CURRENT position,
-   * then two free `pos += v>>1` substeps at +0x00B6E8]; the responder at
-   * +0x00B4BA never writes position, and the test only fires when the blit
-   * finds ring pixels overlapping the outline — so every contact the machine
-   * resolves is read from a ball that has already penetrated the touch band,
-   * by anything up to a quarter frame of path. From inside the band the ring
-   * STRADDLES the surface and the mean of the touched bearings is the face
-   * normal; the machine's +0x00B54E gate then drops the many overlapped
-   * positions that read "not approaching", which is how a ball slides along a
-   * wall it is pressed against.
-   *
-   * This sweep finds contact at exact first touch, where the hit set is only
-   * the one or two LEADING edge pixels and their mean tilts toward the
-   * direction of travel by up to half a ring step — 80/2048 of a turn against
-   * a one-pixel wall stair. The tilt manufactures approach speed out of what
-   * is really tangential motion, and the responder then kills or bounces
-   * speed the machine never loses; and because first touch is one exact
-   * alignment, the port deterministically picked the single worst sample on
-   * every face. Measured on BabeWatch's untouched launch (the round-8 RAM
-   * telemetry in research/PARITY_DELTAS.md): the launch-guide's mouth face at
-   * (291..295, 209..218) read at tangency as the two-pixel edge {1104,1193},
-   * whose 22-degree-tilted mean turned a 0.35 px/f wall-slide into a full
-   * bounce — the ball crossed the table top 1.3 px/f slow, sagged to y47
-   * instead of apexing at y32, and missed the top-lane saucer and its
-   * +500,000. One pixel inside the band the same face reads {1024,1065,1156,
-   * 1193}, and the same responder answers the graze the original's live RAM
-   * shows: vx +2.75 -> kept vy, 0.35 px/f lost.
-   *
-   * So the verdict and the bounce are taken from the ring INSIDE the band, at
-   * the machine's own evaluation depth — one collision-pass spacing, |v|/4 of
-   * path, walked in whole pixels along the contact bearing and clamped to the
-   * deepest position whose centre is still free:
-   *
-   *   - along the BEARING, not the path: penetration deepens the overlap
-   *     toward the surface whatever direction the ball crosses it, where a
-   *     path-directed step walks ALONG a face met obliquely and reads the
-   *     same tilted edge one pixel over;
-   *   - |v|/4 because that is the machine's spacing between evaluations
-   *     (four responder calls a frame, two `pos += v>>1` substeps apart): a
-   *     contact that matters persists across its passes, and the passes
-   *     after discovery read it from about that depth. Floored at one pixel
-   *     so a slow ball still evaluates from inside the band, and capped by
-   *     the free-centre clamp;
-   *   - at depth the read is honest in a way tangency can never be: a
-   *     one-pixel line crosses the ring as a symmetric chord and reads its
-   *     TRUE normal, a thick wall reads its interior straddle, and the
-   *     leading-edge tilt exists only at the tangent alignment. Measured on
-   *     the launch corridor: the guide step at (330,396) reads mean 0 — not
-   *     approaching, ball runs on — and the left-wall read turns the
-   *     tangency set's spurious 22-degree tilt into the face's own normal,
-   *     which is the difference between this port killing 4.9 px/f at the
-   *     wall-join and the RAM-measured original losing 0.35;
-   *   - the BALL still stops at the last free sample, exactly as before: the
-   *     machine resolves penetration by motion because its responder cannot
-   *     move a ball, and this port resolves it by never entering — what must
-   *     agree is the CONTACT SET THE RESPONSE IS COMPUTED FROM, not where
-   *     the ball sits for one frame;
-   *   - an overlapped probe that touches NOTHING is a lone pixel fallen
-   *     inside the hollow ring — invisible to the machine's stencil at
-   *     overlap too — and an overlapped probe the ball is LEAVING is the
-   *     machine's +0x00B54E gate; both let the sweep run on, with the
-   *     touched pixels still logged, since the machine's id dispatch
-   *     (+0x00AD42) runs off the overlap before its responder decides
-   *     anything;
-   *   - when even the first inward pixel's CENTRE is inside solid the wall
-   *     is thinner than any overlap this can take and the tangent set
-   *     stands — the machine would tunnel here, and the port's
-   *     anti-tunnelling guarantee is not for sale.
-   */
-  const stopperAt = (t: number, record: boolean): { readonly probe: RingProbe | null } | null => {
-    const point = pointAt(t);
-    if (!centreIsFree(map, passable, point.x, point.y)) return { probe: null };
-
-    const probe = probeRing(map, materials, passable, ring, point.x, point.y);
-    if (probe.contactIndex < 0 || probe.normalAngle === null) return null;
-    if (record) logContacts(log, probe, materials);
-
-    // The machine's evaluation depth: one collision-pass spacing of path,
-    // |v|/4, in whole pixels. NOT floored — a ball slower than a pixel per
-    // quarter tick penetrates nothing between the machine's passes, so its
-    // evaluation position IS the tangent one; that is what parks a ball
-    // resting in a slot narrower than itself (the mean of both rails is a
-    // phantom floor), and a floor of one pixel here let exactly that ball
-    // ratchet out through a gap it cannot fit. The bearing unit vector is
-    // the outward normal negated, which cosineUnits/sineUnits deliver as
-    // exact Q10 components of a unit pixel step.
-    const speed = integerSqrt(
-      ball.velocityX * ball.velocityX + ball.velocityY * ball.velocityY,
-    );
-    const depth = speed >> 12;
-    let overlapX = point.x;
-    let overlapY = point.y;
-    let inside = false;
-    for (let step = 1; step <= depth; step += 1) {
-      const x = (point.x - step * probe.normalX) | 0;
-      const y = (point.y - step * probe.normalY) | 0;
-      if (!centreIsFree(map, passable, x, y)) break;
-      overlapX = x;
-      overlapY = y;
-      inside = true;
-    }
-    if (inside) {
-      const overlapped = probeRing(map, materials, passable, ring, overlapX, overlapY);
-      if (overlapped.contactIndex < 0) return null;
-      if (record) logContacts(log, overlapped, materials);
-      const intoOverlap =
-        q10Multiply(ball.velocityX, overlapped.normalX) +
-        q10Multiply(ball.velocityY, overlapped.normalY);
-      return intoOverlap < 0 ? { probe: overlapped } : null;
-    }
-
-    // The un-snapped normal, which is also what the bounce is taken about; see
-    // `outwardNormalOf`. Using the ring entry here and the exact vector there
-    // would let a sweep stop against a surface it then reads as leaving.
-    const into =
-      q10Multiply(ball.velocityX, probe.normalX) + q10Multiply(ball.velocityY, probe.normalY);
-    return into < 0 ? { probe } : null;
-  };
-
-  let low = 0;
-  let high = span;
-  let stopper: { readonly probe: RingProbe | null } | null = null;
-  for (let t = Math.min(Q10_ONE, span); ; t = Math.min(t + Q10_ONE, span)) {
-    const found = stopperAt(t, true);
-    if (found !== null) {
-      stopper = found;
-      high = t;
-      break;
-    }
-    low = t;
-    if (t === span) break;
-  }
-
-  // Back the ball up to within one Q10 unit of where it actually met the
-  // surface. Leaving it at the last whole-pixel sample made the bounce position
-  // jump by up to a pixel whenever the velocity crossed a sample-count boundary
-  // — the same class of artefact as the substep dependence, one order smaller.
-  while (stopper !== null && high - low > 1) {
-    const middle = low + Math.trunc((high - low) / 2);
-    const found = stopperAt(middle, false);
-    if (found === null) {
-      low = middle;
-    } else {
-      stopper = found;
-      high = middle;
-    }
-  }
-
-  const stopped = pointAt(low);
-  return {
-    x: stopped.x,
-    y: stopped.y,
-    covered: Math.trunc((low * Q10_ONE) / span),
-    blocker: stopper === null ? null : stopper.probe,
-    clamped: stopper !== null,
-  };
+  const resting = reflectVelocity(
+    ball,
+    materials.behaviourFor(probe.dominant),
+    probe.normalX,
+    probe.normalY,
+    options.restThreshold,
+    surfaceResponseOf(probe, surfaceAt, options.poweredKicksLive),
+  );
+  return resting ? probe : null;
 }
+
 
 /**
  * Removes the part of the velocity pointing along a direction the ball was
@@ -1541,33 +1459,28 @@ export function stepBalls(
     // still applies on every level — a ball rolls down a ramp.
     const shoved = nudgeReachesLevel(ball.level);
 
-    // The RAMP DRIVE, read at the position the ball starts the tick in and added
-    // beside gravity — the same two additions the original makes, in the same
-    // order, at main.seg00 +0x00B754/+0x00B758. It applies on both levels and
-    // whether or not the ball is in contact with anything: the original does not
-    // test either, and a ball flying through a habitrail's mouth really is being
-    // pushed along it. `table-accel.ts` has the derivation of the Q10 scale and
-    // the measurements of the shallow-slope equilibria this exists to clear.
+    // ONLY THE IMPULSE IS SPENT HERE. The NUDGE is a one-shot add — the cabinet
+    // is shoved once, not accelerated — so it goes on the velocity before the
+    // frame starts, which is where the original puts it too.
     //
-    // No `nudgeReachesLevel` equivalent guards it, and there is nothing to guard
-    // against: it is a property of the place, not an impulse from the cabinet.
-    const drive =
-      resolved.rampDrive === null
-        ? null
-        : resolved.rampDrive.driveAt(ball.level, q10ToPixel(ball.x), q10ToPixel(ball.y));
-
-    ball.velocityX = clampVelocity(
-      ball.velocityX +
-        (forces.tiltX ?? 0) +
-        (shoved ? forces.nudgeX : 0) +
-        (drive === null ? 0 : drive.x),
-    );
-    ball.velocityY = clampVelocity(
-      ball.velocityY +
-        forces.gravityY +
-        (shoved ? forces.nudgeY : 0) +
-        (drive === null ? 0 : drive.y),
-    );
+    // GRAVITY, THE TABLE X-TILT AND THE RAMP DRIVE DO NOT. They are
+    // accelerations, and the original adds all three in one instruction pair
+    // (`add.w $e8c(a5),d0 / add.w $e86(a5),d1` at +0x00B758, on top of the
+    // block's drive vector) inside the routine each of its eight substeps calls.
+    // Charging a whole tick of them here and then moving by the result is the
+    // `v += a; x += v` over-travel this round removed: see `integrateBall`,
+    // which now receives them and spends them per substep, the drive re-read at
+    // each substep's own pixel.
+    //
+    // The drive applies on both levels and whether or not the ball is in contact
+    // with anything: the original does not test either, and a ball flying
+    // through a habitrail's mouth really is being pushed along it.
+    // `table-accel.ts` has the derivation of the Q10 scale and the measurements
+    // of the shallow-slope equilibria it exists to clear. No `nudgeReachesLevel`
+    // equivalent guards it, and there is nothing to guard against: it is a
+    // property of the place, not an impulse from the cabinet.
+    ball.velocityX = clampVelocity(ball.velocityX + (shoved ? forces.nudgeX : 0));
+    ball.velocityY = clampVelocity(ball.velocityY + (shoved ? forces.nudgeY : 0));
 
     // Captured before the move, because a level change is a CROSSING: the ball
     // has to have been on the other side of the hand-off line at the start of
@@ -1581,6 +1494,8 @@ export function stepBalls(
       passable,
       ring,
       resolved,
+      forces.gravityY,
+      forces.tiltX ?? 0,
     );
     if (integrated.contact !== null) {
       contacts.set(ball.id, integrated.contact);
@@ -1798,33 +1713,174 @@ function recoverPenetration(
 }
 
 /**
- * How many times one ball may be turned around inside a single tick.
+ * The integration substeps in one tick, and the substeps a collision pass sits
+ * in front of. BOTH ARE THE MACHINE'S, not tunables.
  *
- * A tick is 20 ms; a ball that reverses more than a handful of times in one is
- * wedged in geometry, not playing pinball. The cap exists to bound the work and
- * to guarantee the loop terminates whatever the map does — it is not a physical
- * quantity, and nothing about a normal trajectory comes near it.
+ * The unrolled tick at main.seg00 +0x00A618 is four groups of [call the
+ * responder at $b4ba, then two `pos += v>>1` integrations at $b6e8]: the
+ * responder calls are at +0x00A64C, +0x00A696, +0x00A6E0 and +0x00A728 and the
+ * eight moves at +0x00A660/666, +0x00A6AA/6B0, +0x00A6F4/6FA and +0x00A73C/742.
+ * So a pass runs in front of substeps 0, 2, 4 and 6 and nowhere else.
+ *
+ * FITTED AS WELL AS COUNTED. Over the 576-frame / 218-contact corpus of session
+ * 4's RAM traces this schedule scores 1850 against 4672 for passes at 2/4/6,
+ * 7976 for a pass at every substep, 12664 for 1/3/5/7 and 17576 for 0/4 — 2.5x
+ * clear of its nearest rival, on frames none of it was fitted to. The eight
+ * substeps are independently confirmed by the integrator fit: 693 of 703
+ * uniform-acceleration RAM frames reproduce exactly under `pos += v>>1` eight
+ * times with the acceleration re-added after every one.
  */
-const MAX_CONTACTS_PER_TICK = 8;
+const SUBSTEPS_PER_TICK = ORIGINAL_SUBSTEPS_PER_FRAME;
+const RESPOND_EVERY = ORIGINAL_SUBSTEPS_PER_FRAME / ORIGINAL_COLLISION_PASSES_PER_FRAME;
 
 /**
- * Integrates one ball as a swept path with bounce events.
+ * THE NORMAL REACTION OF A RESTING CONTACT — the one thing the machine's frame
+ * needs that the machine itself does not have, and the reason is measurable.
  *
- * The tick is spent as a FRACTION, not as a fixed number of equal substeps.
- * `remaining` is how much of the tick is still unspent, in Q10; each pass sweeps
- * the ball along `velocity * remaining`, and a contact consumes only the part of
- * that path the ball actually covered before hitting, leaving the rest to be
- * spent on the reflected velocity. That is what makes the bounce POSITION
- * independent of how finely the tick is cut: the approach displacement is kept
- * rather than discarded, and no per-substep rounding ever enters the answer.
+ * Between two collision passes the ball is in free flight for two substeps, so a
+ * ball LYING ON A SURFACE gains a quarter of a tick of gravity and moves into
+ * that surface by `(g/8 >> 3) + (2g/8 >> 3)` = 2 Q10, four times a tick: a
+ * steady 8 Q10 (1/128 px) of penetration per tick that the pass then throws away
+ * as velocity without giving back as position.
  *
- * Contact is evaluated only at positions the ball can actually reach, never at a
- * candidate that may lie inside the wall: from inside, the mean contact
- * direction inverts, the reflection reads as "already leaving", and the move is
- * then refused — leaving position AND velocity untouched, so every later tick is
- * bit-identical and the ball is stuck forever with speed. When geometry still
- * refuses a move, the velocity component along the refused direction is killed,
- * so some state changes on every tick and no configuration can repeat.
+ * THE ORIGINAL DOES EXACTLY THIS, and session 4 measured it: its resting lane
+ * ball descends 0.1328 px over the 16 frames between the +6.00 s and +6.32 s
+ * cold launches, which is 8.5 Q10 a frame — this integrator's 8, to the
+ * measurement's resolution. What the original then does, and what no part of the
+ * decoded frame explains, is EJECT the ball back up about 0.4 px every ~40
+ * frames, which is why its seat only ever bobs over cy 553.53..553.91 instead of
+ * burying itself. That ejector is not in the responder (which never writes a
+ * position), not in the integrator (fitted exactly on 693 of 703 free frames)
+ * and not in the ring, so it is not decoded, and a port without it does not get
+ * a bob: it gets an unbounded sink. Measured on this tree before this function
+ * existed, a ball released at the machine's own lane seat descended 3.125 px in
+ * 400 ticks with zero turning points and came to rest with its CENTRE against
+ * the lane floor — cradles, saucer holds and the trough all go with it.
+ *
+ * So the port supplies the piece of physics the machine gets away without: a
+ * surface a ball is RESTING on does not let it through. `restThreshold` already
+ * names exactly that state — "a bounce smaller than this is no bounce" — and
+ * `reflectVelocity` now reports it, so while a rest contact stands, the part of
+ * a substep's MOVE that points INTO that surface is dropped and only the part
+ * along it is taken.
+ *
+ * IT IS A POSITION CONSTRAINT AND NOT A FORCE, which matters twice over. The
+ * velocity bookkeeping is untouched, so the ball still arrives at the next pass
+ * with the approach the acceleration gave it, the responder still runs, and the
+ * per-contact slip and decay are still charged FOUR TIMES A FRAME — the
+ * machine's own rolling friction, which is the whole point of the four passes
+ * and which cancelling the acceleration instead would have silently removed.
+ * And it is the same family of rule as `advanceCentre`'s own clamp: the port
+ * declines to put a ball somewhere, rather than inventing a force.
+ *
+ * It is confined to contacts too gentle to bounce: at any real impact
+ * `passiveDeflected` is non-zero, no hold is taken, and the decoded response
+ * runs untouched. For a ball that IS moving the constraint removes only what the
+ * two substeps since the last pass added, which at this scale is nothing — the
+ * whole 218-contact RAM corpus scores the same with it and without it.
+ *
+ * A ball on a SLOPE still accelerates down it: only the into-surface component
+ * goes, and the along-surface component is what a slope is for.
+ */
+function holdAgainst(
+  resting: RingProbe | null,
+  deltaX: Q10,
+  deltaY: Q10,
+): { readonly x: Q10; readonly y: Q10 } {
+  if (resting === null) return { x: deltaX, y: deltaY };
+  const along = q10Multiply(deltaX, resting.normalX) + q10Multiply(deltaY, resting.normalY);
+  // Only a move INTO the surface is held; one away from it is the ball leaving,
+  // which no surface resists.
+  if (along >= 0) return { x: deltaX, y: deltaY };
+  return {
+    x: deltaX - q10Multiply(along, resting.normalX),
+    y: deltaY - q10Multiply(along, resting.normalY),
+  };
+}
+
+/**
+ * Gravity per substep at the measured tick gravity: SIXTEEN Q10, exactly.
+ *
+ * The original adds its whole gravity WORD once per substep — `add.w $e86(a5),d1`
+ * at +0x00B758, inside the routine each of the eight moves calls — so the tick's
+ * 128 Q10 is eight adds of 16 and never one add of 128. The difference is not
+ * cosmetic: over eight substeps `x += v>>3; v += a/8` advances the ball by
+ * `v + 0.4375a` where the old `v += a; x += v` advanced it by `v + a`, a
+ * systematic +56 Q10 per accelerating tick. Measured against the machine's own
+ * RAM over 474 contact-free frames the old integrator's position error was a
+ * median of exactly +76 Q10 on y and 0 on x, which is 2.3 px over the shooter
+ * lane's 31-frame ascent — enough to land the ball a whole pixel row further up
+ * the arch than the machine, and therefore on a different step of its
+ * three-valued contact staircase.
+ *
+ * The division is EXACT at the measured gravity and `substepAcceleration` below
+ * keeps the tick total exact for every other value as well, so no future
+ * re-measurement can start truncating quietly.
+ */
+export const SUBSTEP_GRAVITY: Q10 = SIMULATION_GRAVITY / SUBSTEPS_PER_TICK;
+
+/**
+ * Splits a whole-tick acceleration into its eight per-substep adds.
+ *
+ * `whole / 8` when that divides — which it does for every acceleration the
+ * original can produce, since one of its per-substep units is 32 Q10 — and
+ * otherwise the truncated share with the remainder spent on the last substep, so
+ * the TICK's total is exactly `whole` whatever a caller passes. Tests that count
+ * ticks of gravity therefore keep counting the same thing.
+ */
+function substepAcceleration(whole: Q10): { readonly each: Q10; readonly last: Q10 } {
+  const each = Math.trunc(whole / SUBSTEPS_PER_TICK);
+  return { each, last: whole - each * (SUBSTEPS_PER_TICK - 1) };
+}
+
+/**
+ * Integrates one ball through ONE FRAME OF THE MACHINE.
+ *
+ * ---------------------------------------------------------------------------
+ * THE FRAME
+ * ---------------------------------------------------------------------------
+ *     for substep in 0..7:
+ *         if substep is even:  probe the ring WHERE THE BALL STANDS and respond
+ *         pos += v >> 3                       ; the machine's `pos += v>>1`
+ *         v   += gravity/8 + rampDrive(pos)/8 ; re-read at the substep's pixel
+ *
+ * `v >> 3` is `pos += v >> 1` at this port's velocity scale: one of the
+ * original's velocity units is four Q10, so `(v/4) >> 1` is `v >> 3`, and the
+ * port simply keeps two more bits of resolution than the machine's 16-bit word.
+ * It is an arithmetic shift, so it floors for negatives exactly as `asr` does.
+ *
+ * The ramp drive is re-read at EVERY substep, at that substep's own pixel, not
+ * once at the tick start: reading it once costs 9% of the corpus score.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT THIS REPLACED, AND WHY
+ * ---------------------------------------------------------------------------
+ * The tick used to be spent as a FRACTION: sweep the whole remaining tick at
+ * one-pixel resolution, stop at first touch, bounce, spend the unconsumed
+ * fraction on the reflected velocity, up to `MAX_CONTACTS_PER_TICK` times. That
+ * design was chosen so the bounce POSITION would not depend on how finely the
+ * tick was cut — a real defect of the fixed-substep version before it — and it
+ * achieved that. What it could not do is be the machine: the machine's bounce
+ * position DOES depend on its substep grid, because the grid is where it looks,
+ * and reproducing the machine's answers means reproducing its grid.
+ *
+ * Both halves were measured against the original's own RAM (research/
+ * ARCH_NORMAL_DECODE.md, and `research/arch/tools/port-corpus.mts` drives this
+ * exact code): summed per-frame velocity error 21089 for the old rule against
+ * 1790 for this one on the same 576 frames, exact on 436 against 466, and
+ * per-tick POSITION exact on 464 of the 576 against 0 for every variant of the
+ * old structure. The decode's own Python model of this rule scores 1850 with the
+ * machine's 16-bit re-quantise and 1779 without it; this port carries Q10
+ * throughout, which is the second of those and is a strict refinement.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY A TICK STILL ALWAYS MAKES PROGRESS
+ * ---------------------------------------------------------------------------
+ * `advanceCentre` may refuse a substep outright. A refused substep whose contact
+ * pass also changed nothing would repeat for ever, so the velocity component
+ * along the refused direction is killed there and then; and a tick that moved
+ * nowhere at all is put to rest, which is the same rule the fractional version
+ * ended on and is what empties the sub-ball-width channels Law 'n Justice has.
  */
 function integrateBall(
   ball: BallState,
@@ -1833,6 +1889,8 @@ function integrateBall(
   passable: readonly boolean[],
   ring: RingOffsets,
   options: ResolvedOptions,
+  gravityY: Q10,
+  tiltX: Q10,
 ): IntegrationResult {
   // Bound to the level the ball is riding at the start of the tick, matching the
   // per-level view it is about to be collided against. A ball changes level only
@@ -1844,71 +1902,64 @@ function integrateBall(
   const log = newContactLog(surfaceAt);
   recoverPenetration(ball, map, materials, passable, ring, options, log);
 
+  // Gravity and the table's x-tilt are ACCELERATIONS and the original adds both
+  // in one instruction pair at +0x00B758, once per substep. The nudge is not:
+  // it is a one-shot impulse and `stepBalls` has already spent it.
+  const gravity = substepAcceleration(gravityY);
+  const tilt = substepAcceleration(tiltX);
+  const drive = options.rampDrive;
+
   const startX = ball.x;
   const startY = ball.y;
-  let remaining = Q10_ONE;
   let advanced = false;
-  for (let pass = 0; pass < MAX_CONTACTS_PER_TICK && remaining > 0; pass += 1) {
-    const stepX = q10Multiply(ball.velocityX, remaining);
-    const stepY = q10Multiply(ball.velocityY, remaining);
-    if (stepX === 0 && stepY === 0) break;
+  // The surface a RESTING contact is holding the ball against, kept between one
+  // pass and the next; null while nothing is holding it. See `holdAgainst`.
+  let resting: RingProbe | null = null;
 
-    const stop = sweepToContact(
-      map,
-      materials,
-      passable,
-      ring,
-      log,
-      ball,
-      q10IntegrateSigned16Velocity(ball.x, stepX),
-      q10IntegrateSigned16Velocity(ball.y, stepY),
-    );
-
-    const moved = stop.x !== ball.x || stop.y !== ball.y;
-    advanced = advanced || moved;
-    ball.x = stop.x;
-    ball.y = stop.y;
-    // Whatever share of the path the approach used up is gone; the bounce below
-    // gets only what is left.
-    remaining = q10Multiply(remaining, Q10_ONE - stop.covered);
-
-    // Past the bottom row there is no more table to collide with.
-    if (ball.y >= options.drainY) break;
-
+  for (let substep = 0; substep < SUBSTEPS_PER_TICK; substep += 1) {
     const velocityX = ball.velocityX;
     const velocityY = ball.velocityY;
-    if (stop.blocker !== null && stop.blocker.dominant !== null) {
-      reflectVelocity(
-        ball,
-        materials.behaviourFor(stop.blocker.dominant),
-        stop.blocker.normalX,
-        stop.blocker.normalY,
-        options.restThreshold,
-        surfaceResponseOf(stop.blocker, surfaceAt, options.poweredKicksLive),
-      );
-    } else if (!stop.clamped) {
-      // The path ran out with nothing in the way; `remaining` is zero and the
-      // loop is about to end anyway.
-      break;
+    if (substep % RESPOND_EVERY === 0) {
+      resting = respondAt(ball, map, materials, passable, ring, log, options, surfaceAt);
     }
+
+    const step = holdAgainst(resting, ball.velocityX >> 3, ball.velocityY >> 3);
+    const stepX = step.x;
+    const stepY = step.y;
+    const moved = advanceCentre(ball, map, passable, stepX, stepY);
+    advanced = advanced || moved;
 
     if (!moved && ball.velocityX === velocityX && ball.velocityY === velocityY) {
-      // Geometry refused the move and the reflection did not turn the ball
+      // Geometry refused the whole substep and no contact turned the ball
       // around. Take the refused direction out of the velocity so the next
-      // attempt differs; if even that changes nothing, stop the ball dead. A
-      // tick must never leave both position and velocity exactly as it found
-      // them, or the simulation has reached a fixed point it cannot leave.
-      if (!cancelMotionAlong(ball, stepX, stepY)) {
-        ball.velocityX = 0;
-        ball.velocityY = 0;
-        break;
-      }
+      // substep differs; the tick-level clamp below catches the ball that has
+      // no direction left to be refused in.
+      cancelMotionAlong(ball, stepX, stepY);
     }
+
+    // THE FRAME IS NOT CUT SHORT AT THE DRAIN. The old fractional loop broke out
+    // of the tick as soon as the ball passed `drainY`, on the grounds that there
+    // was no table left to collide with; the machine has no such concept inside
+    // its frame and neither does this one now. It costs nothing — `probeRing`
+    // ignores ring points past the bottom row and `centreIsFree` calls
+    // everything below it free, so the passes are free of their own accord — and
+    // the break was measurably wrong: on the traced frames that cross y=600 it
+    // withheld the whole tick's gravity, leaving the machine's own next velocity
+    // word 32 raw units short on four frames of the corpus.
+    const last = substep === SUBSTEPS_PER_TICK - 1;
+    const push =
+      drive === null ? null : drive.driveAt(level, q10ToPixel(ball.x), q10ToPixel(ball.y));
+    ball.velocityX = clampVelocity(
+      ball.velocityX + (last ? tilt.last : tilt.each) + (push === null ? 0 : push.x >> 3),
+    );
+    ball.velocityY = clampVelocity(
+      ball.velocityY + (last ? gravity.last : gravity.each) + (push === null ? 0 : push.y >> 3),
+    );
   }
 
-  // The tick as a whole gets the same rule the individual passes do, because a
-  // tick can go nowhere without any single pass going nowhere. Law 'n Justice
-  // has channels narrower than the ball, and one at (86, 156) held a ball that
+  // The tick as a whole gets the same rule the individual substeps do, because a
+  // tick can go nowhere without every substep going nowhere. Law 'n Justice has
+  // channels narrower than the ball, and one at (86, 156) held a ball that
   // drifted one Q10 unit down, bounced, drifted back up and ended every tick on
   // the pixel it started on with the velocity it started with — position and
   // velocity both unchanged with speed still on the books, which is precisely the

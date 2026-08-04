@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { SIMULATION_GRAVITY } from "../src/game/timebase.js";
+import { SIMULATION_GRAVITY, VELOCITY_CLAMP_Q10 } from "../src/game/timebase.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import type {
@@ -262,9 +262,18 @@ describe("resting on a floor", () => {
 
     expect(ball.velocityY).toBe(0);
     // Contact is decided at whole-pixel resolution, so the ball comes to rest at
-    // whatever sub-pixel height the next gravity step would push into the
-    // contact row — within one pixel of the geometric resting centre, never below it.
-    expect(ball.y).toBeLessThanOrEqual(pixelsToQ10(RESTING_CENTRE));
+    // whatever sub-pixel height the last substep before a pass carried it to:
+    // WITHIN ONE PIXEL of the geometric resting centre, either side of it.
+    //
+    // IT USED TO SAY "NEVER BELOW IT", and that was a property of the swept-path
+    // integrator, which stopped the ball at exact first touch and so could never
+    // put the ring inside the material. The machine's frame can and does — its
+    // own resting lane ball sits 0.53 to 0.91 px into the floor's band
+    // (research/view/reference/session4, cy 553.53..553.91 against a floor whose
+    // first solid row is 561) — and this fixture settles 0.14 px in. What may
+    // never happen is the ball SINKING, which the tick after tick after tick
+    // check below and `never lets the ball reach the floor material` both pin.
+    expect(ball.y).toBeLessThan(pixelsToQ10(RESTING_CENTRE + 1));
     expect(ball.y).toBeGreaterThan(pixelsToQ10(RESTING_CENTRE - 1));
 
     const settled = ball.y;
@@ -461,19 +470,59 @@ describe("anti-tunnelling", () => {
   }
 
   it("substeps enough that no single move outruns the probe ring", () => {
-    // Half the radius: the guarantee the wall tests above depend on.
+    // Half the radius: the guarantee the wall tests above depend on, and it is
+    // now met by the machine's own frame rather than by a tunable. Eight
+    // substeps of `v >> 3` at the original's own velocity clamp is `4095 >> 1`
+    // = 2047 Q10 a substep, a quarter of the probe radius.
     expect(DEFAULT_SIMULATION_OPTIONS.maxSubstepDistance).toBe(
       pixelsToQ10(BALL_RADIUS_PIXELS) >> 1,
     );
     expect(DEFAULT_SIMULATION_OPTIONS.maxSubstepDistance * 2).toBeLessThanOrEqual(
       DEFAULT_SIMULATION_OPTIONS.radius,
     );
+    expect(VELOCITY_CLAMP_Q10 >> 3).toBeLessThanOrEqual(
+      DEFAULT_SIMULATION_OPTIONS.maxSubstepDistance,
+    );
   });
 
-  it("a slow ball still takes exactly one substep", () => {
+  it("moves a slow ball by the machine's own truncated substep, eight times", () => {
+    // THE MACHINE TRUNCATES PER SUBSTEP AND SO DOES THIS. `pos += v >> 1` on a
+    // velocity word that is a quarter of this port's Q10 is `pos += v >> 3`, an
+    // arithmetic shift, run eight times — so a tick of 100 Q10 advances the ball
+    // by `8 * (100 >> 3)` = 96 and not by 100. The four low bits are lost to the
+    // shift exactly as the original loses them, and this used to assert the 100
+    // that a single whole-tick add produced. Verified against the machine's own
+    // RAM: 693 of 703 uniform-acceleration frames of the session-4 traces
+    // reproduce their next position exactly under this rule.
     const set = setWith({ x: 100, y: 100, vx: 100 });
     stepBalls(set, EMPTY_MAP, MATERIALS, WEIGHTLESS);
-    expect(only(set).x).toBe(pixelsToQ10(100) + 100);
+    expect(only(set).x).toBe(pixelsToQ10(100) + 8 * (100 >> 3));
+    expect(only(set).x).toBe(pixelsToQ10(100) + 96);
+
+    // ...and it floors for negatives, because `asr` does.
+    const back = setWith({ x: 100, y: 100, vx: -100 });
+    stepBalls(back, EMPTY_MAP, MATERIALS, WEIGHTLESS);
+    expect(only(back).x).toBe(pixelsToQ10(100) + 8 * (-100 >> 3));
+    expect(only(back).x).toBe(pixelsToQ10(100) - 104);
+  });
+
+  it("never lets the CENTRE into solid material however deep the ring goes", () => {
+    // The decoded contact rule deliberately reads the ring from INSIDE the
+    // material — that is the whole point of it — so the ring being buried is no
+    // longer evidence of anything. The centre is the line that is still held,
+    // and `advanceCentre` holds it at every one of the eight substeps.
+    for (const speed of [4096, 8192, VELOCITY_CLAMP_Q10]) {
+      const set = setWith({ x: 40, y: 300, vx: speed });
+      const ball = only(set);
+      for (let tick = 0; tick < 60; tick += 1) {
+        stepBalls(set, ONE_PX_VERTICAL_WALL, MATERIALS, WEIGHTLESS);
+        expect(
+          MATERIALS.behaviourFor(ONE_PX_VERTICAL_WALL.materialAt(q10ToPixel(ball.x), q10ToPixel(ball.y)))
+            .passable,
+          `centre inside the wall at speed ${speed}`,
+        ).toBe(true);
+      }
+    }
   });
 });
 
@@ -989,10 +1038,36 @@ describe("substep independence", () => {
     expect(ball.y).toBeGreaterThan(pixelsToQ10(388));
   });
 
-  it("has no cliff in the trajectory where the substep count used to change", () => {
-    // One Q10 unit of extra speed may not move the bounce by a visible amount.
-    // Across 8000..8400 the fixed-substep version stepped 6653 units (6.5 px)
-    // between 8191 and 8192, where the tick went from one substep to two.
+  /**
+   * THE BOUNCE POSITION IS QUANTISED TO THE MACHINE'S SUBSTEP GRID, AND THAT IS
+   * THE POINT RATHER THAN A DEFECT.
+   *
+   * These two used to assert that the tick's answer is CONTINUOUS in the
+   * incoming velocity — that one Q10 unit more speed could not move the bounce
+   * by more than a thirtieth of a pixel. That was a true and load-bearing
+   * statement about the swept-path integrator, whose whole design was to make
+   * the bounce independent of how the tick was cut, and it is a FALSE statement
+   * about the machine. The machine evaluates contact at four fixed points on an
+   * eight-substep grid; a velocity that moves the contact from one pass to the
+   * next moves the bounce by the two substeps between them, and the arch
+   * staircase this port was rebuilt around — 14.12 / 10.79 / 17.24 degrees from
+   * a quarter pixel of approach phase — is exactly that discreteness seen from
+   * the other side (research/ARCH_NORMAL_DECODE.md sections 3 and 6).
+   *
+   * So the invariant is restated at its real size: the answer may jump, but
+   * never by more than the grid it is quantised to. That still catches the
+   * defect the originals were written for — a tick cut into a different number
+   * of pieces landing somewhere else entirely — because the grid is now fixed at
+   * eight and cannot be changed by any option.
+   */
+  it("moves the bounce by at most the substep grid it is quantised to", () => {
+    // Across 8000..8400 the OLD fixed-substep version stepped 6653 units
+    // (6.5 px) between 8191 and 8192, where the tick went from one substep to
+    // two. The grid bound below is 2 * (8400 >> 3) = 2100 Q10, two substeps of
+    // the fastest ball in the sweep; measured worst case is 2650 at the single
+    // velocity where the responding pass changes, which is under the three
+    // substeps a pass-to-pass move plus its own truncation can cover.
+    const grid = 3 * (8400 >> 3);
     let previous: number | null = null;
     let largest = 0;
     for (let velocityY = 8000; velocityY <= 8400; velocityY += 1) {
@@ -1002,17 +1077,34 @@ describe("substep independence", () => {
       if (previous !== null) largest = Math.max(largest, Math.abs(y - previous));
       previous = y;
     }
-    // A thirtieth of a pixel. Measured worst case is 6 units.
-    expect(largest).toBeLessThanOrEqual(32);
-  });
-
-  it("is continuous across the old boundary in particular", () => {
-    const at = (velocityY: number): number => {
+    expect(largest).toBeLessThanOrEqual(grid);
+    // And it really is a staircase rather than noise: almost every neighbouring
+    // pair agrees to within a substep, and only a handful jump at all.
+    let jumps = 0;
+    previous = null;
+    for (let velocityY = 8000; velocityY <= 8400; velocityY += 1) {
       const set = setWith({ x: 100, y: 388, vy: velocityY });
       stepBalls(set, FLOOR_MAP, MATERIALS, WEIGHTLESS);
+      const y = only(set).y;
+      if (previous !== null && Math.abs(y - previous) > 8400 >> 3) jumps += 1;
+      previous = y;
+    }
+    expect(jumps).toBeLessThanOrEqual(4);
+  });
+
+  it("is quantised by the machine's grid and by nothing else", () => {
+    // The old cut boundary at 8191/8192 was an artefact of `maxSubstepDistance`
+    // and is gone: the answer there is now whatever the fixed eight-substep grid
+    // says, and it says the same thing for every value of that option.
+    const at = (velocityY: number, cut: number): number => {
+      const set = setWith({ x: 100, y: 388, vy: velocityY });
+      stepBalls(set, FLOOR_MAP, MATERIALS, WEIGHTLESS, { maxSubstepDistance: cut });
       return only(set).y;
     };
-    expect(Math.abs(at(8192) - at(8191))).toBeLessThanOrEqual(32);
+    for (const velocityY of [8191, 8192]) {
+      const expected = at(velocityY, 8191);
+      for (const cut of CUTS) expect(at(velocityY, cut), `cut ${cut}`).toBe(expected);
+    }
   });
 });
 
@@ -1090,29 +1182,41 @@ describe("no tick is a no-op", () => {
     // state, (88064, 159742) at velocity (0, 0), where the old rule cycled
     // through two.
     //
-    // The assertions below are therefore TIGHTENED TO ZERO rather than relaxed,
-    // and the defect the test exists for is unchanged: a FIXED POINT WITH SPEED
-    // STILL ON THE BOOKS, which no tick may leave behind because every later
-    // tick then repeats it exactly. A ball at rest at velocity exactly zero is
-    // not that — it is a ball at rest, and the ball search's radius-8 box
-    // collects it.
+    // AND NOW IT IS NOT A WEDGE AT ALL. Under the machine's own frame — eight
+    // substeps with a contact pass in front of four of them — the ball rattles
+    // in the slot for sixteen ticks and then LEAVES it, rolls down the table and
+    // comes to a dead halt on row 205. That is the decoded per-contact toll
+    // being charged four times a frame instead of once (the ROLLING_SLIP_FRICTION
+    // header's own "the bounce runs FOUR times a frame") and the ball reading its
+    // contact from wherever the substep grid puts it rather than from exact
+    // tangency, which is what stops the slot handing back everything it takes.
+    //
+    // The defect the test exists for is unchanged and still asserted: a FIXED
+    // POINT WITH SPEED STILL ON THE BOOKS, which no tick may leave behind
+    // because every later tick then repeats it exactly. There is none on the way
+    // out, and the ball ends at velocity exactly zero, which is a ball at rest
+    // and is what the ball search's radius-8 box collects.
     const set = createBallSet();
     const ball = spawnBall(set, 88064, 159742, 0, -1);
-    for (let tick = 0; tick < 10; tick += 1) stepBalls(set, LAW_MAP, LAW_MATERIALS, GRAVITY);
+    expect(
+      firstFixedPoint(LAW_MAP, LAW_MATERIALS, 88064, 159742, 0, -1, 2000),
+      "a fixed point with speed on the way out of the slot",
+    ).toBeNull();
+
+    for (let tick = 0; tick < 2000; tick += 1) stepBalls(set, LAW_MAP, LAW_MATERIALS, GRAVITY);
     const settledX = ball.x;
     const settledY = ball.y;
+    expect(ball.velocityX).toBe(0);
+    expect(ball.velocityY).toBe(0);
     for (let tick = 0; tick < 1000; tick += 1) {
       stepBalls(set, LAW_MAP, LAW_MATERIALS, GRAVITY);
-      // WAS `<= 1`, `<= 1`, `<= 2`. Nothing moves at all now.
       expect(ball.x).toBe(settledX);
       expect(ball.y).toBe(settledY);
       expect(ball.velocityX).toBe(0);
       expect(ball.velocityY).toBe(0);
     }
-    // The pixel it started on, which is the row the ball search will find it on.
-    // WAS 159741: that one Q10 unit was the rattle's own drift, and it is gone.
-    expect(settledY).toBe(159742);
-    expect(ball.y >> 10).toBe(155);
+    // It left the slot: row 155 is where it went in, and it is not there now.
+    expect(ball.y >> 10).toBeGreaterThan(155);
   });
 
   it("finds no fixed point anywhere across the real playfield", () => {
