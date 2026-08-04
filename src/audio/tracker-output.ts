@@ -183,6 +183,16 @@ interface ChannelVoice {
   source: AudioBufferSourceNode;
   gain: GainNode;
   instrument: ChipInstrument;
+  /**
+   * The context time this voice has been told to stop at, `Infinity` until
+   * something tells it.
+   *
+   * Kept for two reasons. `AudioBufferSourceNode.stop` takes the LAST call and
+   * not the earliest, so telling a voice that already stops at T to stop at a
+   * later time would EXTEND it — every stop below is guarded on this. And a
+   * voice whose stop has passed is finished, which is how `live` stays short.
+   */
+  stopAt: number;
 }
 
 export interface TrackerOutput {
@@ -206,8 +216,34 @@ export interface TrackerOutput {
   readonly channelLevels: number[];
   /** Instrument buffers, built once per host. */
   readonly buffers: Map<string, AudioBuffer>;
-  /** The sounding voice per channel, so the next note can replace it. */
+  /**
+   * The LAST-SCHEDULED voice per channel, so the next note can replace it and
+   * a pitch or volume command can reach it.
+   *
+   * It is not "the sounding voice", which is what this used to say and what
+   * `stopTracker` used to assume. The pump runs half a second AHEAD of the
+   * clock, so at any moment a channel has one voice actually sounding and
+   * several more already committed with `start(when)` in the future — and this
+   * slot holds the furthest-future one, not the near one. See `live`.
+   */
   readonly channels: (ChannelVoice | null)[];
+  /**
+   * EVERY VOICE STILL OWED A STOP — the ones the lookahead has committed and
+   * the clock has not reached yet.
+   *
+   * `stopTracker` walked `channels` alone and so stopped one voice per channel
+   * out of the several the pump had already scheduled. The rest kept their
+   * committed `start(when)` and sounded, which is a real browser behaviour and
+   * not a modelling artefact: a source that has been started cannot be
+   * un-started, only stopped. Measured on the mixer model, the front-end tune
+   * went on at FULL LEVEL for 23 ticks — 0.46 s, the lookahead — after the
+   * shell handed over to a ball, and every immediate background set (a tilt,
+   * the end-of-ball stop, a mode cue) laid the outgoing section under the new
+   * one for the same window.
+   *
+   * Pruned as it is appended to, so it never grows past the voices in flight.
+   */
+  live: ChannelVoice[];
   stream: TrackerCommandStream | null;
   /** Context time at which the song's millisecond 0 sounds. */
   startContextTime: number;
@@ -248,6 +284,7 @@ export function createTrackerOutput(
     channelLevels: Array.from({ length: TRACKER_CHANNELS }, () => 1),
     buffers: new Map<string, AudioBuffer>(),
     channels: Array.from({ length: TRACKER_CHANNELS }, () => null),
+    live: [],
     stream: null,
     startContextTime: 0,
     nextIndex: 0,
@@ -294,6 +331,10 @@ function bufferFor(
 /** Stops a voice at `when`, tolerant of nodes that have already ended. */
 function stopVoice(voice: ChannelVoice | null, when: number): void {
   if (voice === null) return;
+  // `stop` takes the LAST call, so a later time would extend a voice that is
+  // already ending. Only ever bring a stop forward.
+  if (when >= voice.stopAt) return;
+  voice.stopAt = when;
   try {
     voice.source.stop(when);
   } catch {
@@ -340,7 +381,15 @@ function scheduleNote(
     source.start(when);
   }
 
-  output.channels[command.channel] = { source, gain, instrument };
+  const voice: ChannelVoice = { source, gain, instrument, stopAt: Infinity };
+  output.channels[command.channel] = voice;
+  // Everything the lookahead has committed, so a stop can reach all of it.
+  // Pruned here rather than on a timer: a voice whose stop has passed is done.
+  const settled = host.currentTime;
+  if (output.live.length > 0) {
+    output.live = output.live.filter((one) => one.stopAt > settled);
+  }
+  output.live.push(voice);
 }
 
 function scheduleCommand(output: TrackerOutput, host: TrackerHost, command: TrackerCommand): void {
@@ -462,12 +511,21 @@ export function startTracker(
 /**
  * Stops everything — now, or at `atContextTime` for a scheduled handover.
  * Safe to call twice, or before anything started.
+ *
+ * EVERY VOICE, not one per channel. The pump commits up to half a second of
+ * notes ahead of the clock and a started source cannot be un-started, so a
+ * stop that only reached `channels` left the rest of the lookahead to play
+ * out: the shell's tune ran on over the first 0.46 s of every ball, and every
+ * immediate background set laid the outgoing section under the incoming one
+ * for the same window. Voices already ending sooner than `when` keep their own
+ * ending — `stopVoice` only ever brings a stop forward.
  */
 export function stopTracker(output: TrackerOutput, atContextTime?: number): void {
   const now = output.host === null ? 0 : output.host.currentTime;
   const when = atContextTime === undefined ? now : Math.max(atContextTime, now);
+  for (const voice of output.live) stopVoice(voice, when);
+  output.live = output.live.filter((one) => one.stopAt > now);
   for (let channel = 0; channel < output.channels.length; channel += 1) {
-    stopVoice(output.channels[channel] ?? null, when);
     output.channels[channel] = null;
   }
   output.playing = false;

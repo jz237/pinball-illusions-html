@@ -86,6 +86,12 @@ export interface Voice {
   readonly loop: boolean;
   /** Seconds of PCM, at the rate it is played back at. Infinite when looping. */
   readonly seconds: number;
+  /**
+   * The buffer this voice is playing, so a caller can say WHICH sound it is.
+   * The tracker's voices carry its synthesised instrument buffers; an effect's
+   * carries the decoded WAV, and `AudioBank.buffers` maps those back to files.
+   */
+  readonly buffer: unknown;
 }
 
 class FakeSource {
@@ -116,6 +122,7 @@ class FakeSource {
       gain: this.target,
       loop: this.loop,
       seconds,
+      buffer: this.buffer,
     };
     this.voice = voice;
     this.host.voices.push(voice);
@@ -157,6 +164,28 @@ export class RecordingMusicHost implements TrackerHost {
     const gain = new FakeGain();
     this.gains.push(gain);
     return gain as unknown as GainNode;
+  }
+
+  /**
+   * THE SAME HOST SERVES THE EFFECTS, because in a browser it is the same
+   * `AudioContext`: `main.ts` hands `sound.context()` to `createTableMusic`,
+   * to `createShellMusic` and to every `AudioBank`. `src/browser/audio.ts`
+   * wants a `decodeAudioData`, and giving it one here is what lets an effect
+   * and the music be weighed on ONE graph — which is the only way the
+   * channel-3 duck can be measured against a real sounding effect rather than
+   * against a hand-written `until`.
+   *
+   * The length and rate are read out of the real RIFF header the exporter
+   * writes (44-byte canonical header, rate at +24, data size at +40), so a
+   * voice's `seconds` is the sound's own length and not a guess.
+   */
+  async decodeAudioData(data: ArrayBuffer): Promise<AudioBuffer> {
+    const view = new DataView(data);
+    return {
+      length: view.getUint32(40, true),
+      sampleRate: view.getUint32(24, true),
+      getChannelData: () => new Float32Array(0),
+    } as unknown as AudioBuffer;
   }
 
   async resume(): Promise<void> {
@@ -201,6 +230,29 @@ export class RecordingMusicHost implements TrackerHost {
       level += this.levelOf(voice, t);
     }
     return level;
+  }
+
+  /**
+   * EVERY VOICE THAT ACTUALLY MADE A SOUND, with the context time it was
+   * weighed at — the midpoint of its own window, which is inside it by
+   * construction. A voice that was started and then displaced on the same tick
+   * (the effect channel's `stop()` before the next `start()`) has an empty
+   * window and is not here; nor is one whose chain never reached the
+   * destination, nor one held at zero by a duck for its whole life.
+   *
+   * This is what turns `audibleAt` from a scalar into a CENSUS: the caller
+   * maps `voice.buffer` back to the file it decoded and so can say WHICH
+   * records a played game was heard to play.
+   */
+  soundedVoices(): { readonly voice: Voice; readonly at: number }[] {
+    const sounded: { voice: Voice; at: number }[] = [];
+    for (const voice of this.voices) {
+      const end = Math.min(voice.stop, voice.start + voice.seconds);
+      if (!(end > voice.start)) continue;
+      const at = Number.isFinite(end) ? (voice.start + end) / 2 : voice.start;
+      if (this.levelOf(voice, at) > 0) sounded.push({ voice, at });
+    }
+    return sounded;
   }
 
   /** How many voices are sounding at `t`, ignoring their level. */
