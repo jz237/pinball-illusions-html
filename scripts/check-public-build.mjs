@@ -63,6 +63,12 @@ const IMAGE_EXT = new Set([
 // picture: these are the machine's own speech callouts. Same rule, same digests.
 const AUDIO_EXT = new Set([".wav", ".ogg", ".mp3", ".flac", ".m4a", ".aac", ".opus"]);
 
+// Nor a raw binary block. The intro ships its packed image streams and copper
+// lists as `.bin` files — disk bytes verbatim, the heaviest custody of all —
+// so `.bin` is scanned under exactly the image/audio rule: every one must be
+// claimed by a manifest and match its recorded digest, or the build refuses.
+const DATA_EXT = new Set([".bin"]);
+
 async function* walk(dir) {
   for (const entry of await readdir(dir, { withFileTypes: true })) {
     const full = join(dir, entry.name);
@@ -166,6 +172,12 @@ const DERIVED_MARKERS = [
   // disk-derived, so each ships as one WebP claimed by its own manifest
   // through the single-image branch, behind the same gate as everything else.
   { class: "disk-derived-table-thumbnail", noun: "table thumbnail" },
+  // The boot intro (scripts/export-intro.mjs): intro.bin's data and copper
+  // segments verbatim as two `.bin` blocks, plus the timed script and fade
+  // tables as manifest numbers. No raster ships — the player rasterises at
+  // runtime — so its media are the binaries themselves, claimed through the
+  // data[] branch below and digest-checked like any picture.
+  { class: "disk-derived-intro", noun: "intro animation" },
 ];
 
 /** Manifest classes that must account for the binary files they ship beside. */
@@ -181,6 +193,7 @@ const MEDIA_MARKERS = new Map([
   ["disk-derived-ball-sprite-hd", { noun: "HD ball sprite", extensions: IMAGE_EXT }],
   ["disk-derived-flipper-sprites-hd", { noun: "HD flipper bat atlas", extensions: IMAGE_EXT }],
   ["disk-derived-table-thumbnail", { noun: "table thumbnail", extensions: IMAGE_EXT }],
+  ["disk-derived-intro", { noun: "intro animation", extensions: DATA_EXT }],
 ]);
 
 /** Classes whose manifest claims exactly one raster through an `image` field. */
@@ -226,7 +239,7 @@ for await (const file of walk(root)) {
   const rel = relative(root, file);
   const ext = extname(file).toLowerCase();
 
-  if (IMAGE_EXT.has(ext) || AUDIO_EXT.has(ext)) media.push({ rel, file, ext });
+  if (IMAGE_EXT.has(ext) || AUDIO_EXT.has(ext) || DATA_EXT.has(ext)) media.push({ rel, file, ext });
   if (ext !== ".json") continue;
 
   const text = await readFile(file, "utf8");
@@ -256,6 +269,21 @@ for await (const file of walk(root)) {
     }
     for (const image of shellImages) {
       claim(rel, image?.file, image?.sha256, media_marker.noun, "shell artwork manifest");
+    }
+    continue;
+  }
+  if (marker.class === "disk-derived-intro") {
+    // The intro's media are binary blocks, not rasters: a `data` array of
+    // {file, sha256}, claimed exactly as an images[] would be. `.bin` is in
+    // the scan set above, so an unclaimed or tampered block refuses the
+    // build the same way an unclaimed picture does.
+    const dataFiles = Array.isArray(doc?.data) ? doc.data : null;
+    if (dataFiles === null) {
+      violations.push(`${rel}: intro manifest carries no data array`);
+      continue;
+    }
+    for (const entry of dataFiles) {
+      claim(rel, entry?.file, entry?.sha256, media_marker.noun, "intro manifest");
     }
     continue;
   }

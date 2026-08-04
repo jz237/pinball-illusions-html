@@ -51,6 +51,8 @@ import type { Game, GameDebugState, GameTickReport, RenderFraming } from "./brow
 import { VIEWPORT_HEIGHT } from "./browser/camera.js";
 import { attachFrontDoor } from "./browser/front-door.js";
 import type { FrontDoor } from "./browser/front-door.js";
+import { attachIntro, introFireKey, loadIntroAssets } from "./browser/intro.js";
+import type { IntroHandle } from "./browser/intro.js";
 import { setPlayfieldArtwork, setPlayfieldArtworkHd } from "./browser/playfield-renderer.js";
 import { canvasFitFor } from "./browser/canvas-fit.js";
 import { COARSE_POINTER_QUERY, attachTouch } from "./browser/touch.js";
@@ -531,6 +533,20 @@ async function boot(): Promise<void> {
   let door: FrontDoor | null = null;
 
   /**
+   * THE INTRO — `intro.bin`'s cold-boot cinematic, attached at the bottom of
+   * this function and non-null only while it owns the screen. The original
+   * plays it on every boot before its shell ever appears, so this build plays
+   * it once per page load before the front door; any fire input skips it
+   * (`introFireKey` + the pointer and gamepad paths below), and `onDone`
+   * simply nulls this out — the next animation frame takes the normal path
+   * and lands on the front door exactly as a build without the intro does.
+   * While it is non-null the shell clock is held paused, so the attract roll
+   * and the credits cycle behind the door start from zero afterwards, which
+   * is what the machine's own boot does.
+   */
+  let intro: IntroHandle | null = null;
+
+  /**
    * THE FRAMING (§2 of the parity brief): full table by default, the Amiga
    * window as the live toggle. Presentation only — the simulation's own
    * `forceFullTable` field stays untouched and hashed, and no input path
@@ -925,6 +941,17 @@ async function boot(): Promise<void> {
       return;
     }
 
+    // THE INTRO'S FIRE SKIP. The original polls fire on both joystick ports
+    // and exits the whole show; here any fire input — flipper keys, launch,
+    // Enter — does the same, and every other key is swallowed so nothing
+    // leaks into the shell behind a screen it is not drawing. (The mute
+    // above deliberately stays reachable: it is not a fire input.)
+    if (intro !== null) {
+      if (introFireKey(keyEvent) && keyEvent.repeat !== true) intro.skip();
+      keyEvent.preventDefault?.();
+      return;
+    }
+
     // THE FRAMING TOGGLE, intercepted before the input router exactly as the
     // mute is: F9/F10 flip the render-layer framing (§2 of the parity brief)
     // and are no longer bound to any control, so the simulation never hears
@@ -1047,6 +1074,14 @@ async function boot(): Promise<void> {
     "pointerdown",
     (event) => {
       unlockAudio();
+      // A click or a tap is the intro's fire too — the original's mouse
+      // button is wired to the same exit. Swallowed before anything else can
+      // read it, exactly as the idle-attract wake below is.
+      if (intro !== null) {
+        intro.skip();
+        event.stopPropagation();
+        return;
+      }
       const now = performance.now();
       if (door !== null && door.idling() && shell.phase === "attract") {
         door.noteActivity(now);
@@ -1097,6 +1132,9 @@ async function boot(): Promise<void> {
     // pages. The catch-up clamp would bound it at eight ticks anyway; pausing
     // means those eight are not run either.
     shellClock.pause();
+    // And the intro clock, or a backgrounded boot would come back mid-show
+    // with the whole absence banked (clamped, but eight frames nobody saw).
+    intro?.pause();
     router.releaseAll();
     music.stop();
     tableMusic.stop();
@@ -1105,6 +1143,7 @@ async function boot(): Promise<void> {
     router.releaseAll();
     table?.loop.scheduler.resume();
     shellClock.resume();
+    intro?.resume();
   };
   window.addEventListener("pagehide", suspendPage);
   window.addEventListener("pageshow", resumePage);
@@ -1113,6 +1152,7 @@ async function boot(): Promise<void> {
     if (document.hidden) {
       table?.loop.scheduler.pause();
       shellClock.pause();
+      intro?.pause();
       router.releaseAll();
       // A hidden tab gets no frames, so the music's scheduler would run its
       // lookahead dry and leave the looped voices droning. Stop it; the first
@@ -1123,6 +1163,7 @@ async function boot(): Promise<void> {
     } else {
       table?.loop.scheduler.resume();
       shellClock.resume();
+      intro?.resume();
     }
   });
 
@@ -1146,9 +1187,12 @@ async function boot(): Promise<void> {
   const frame = (timeMs: number): void => {
     pollGamepads(router, toggleFraming);
     // The front door follows the shell's phase and the idle clock; it owns
-    // the `data-door-mode` attribute the stylesheet reads.
-    door?.refresh(shell.phase, shell.tableId, timeMs);
-    const covered = door?.showing() === true;
+    // the `data-door-mode` attribute the stylesheet reads. While the intro
+    // holds the screen the door is not consulted at all — it stays exactly
+    // as the markup ships it, hidden — so the first thing it ever paints is
+    // the post-intro boot state.
+    if (intro === null) door?.refresh(shell.phase, shell.tableId, timeMs);
+    const covered = intro === null && door?.showing() === true;
     // Read the layout BEFORE the deck writes to it, so a relabel never forces a
     // synchronous reflow. Two integers compared per frame is nothing, and it
     // makes the fit self-healing: the `ResizeObserver` above reacts sooner, but
@@ -1178,6 +1222,29 @@ async function boot(): Promise<void> {
     // the effects channel is sounding, which is Paula's AUD3 rule.
     music.update(shell.phase);
     tableMusic.update(shell.phase, sound.bank);
+
+    // THE INTRO OWNS THE FRAME. The shell's clock is held paused so the
+    // attract roll starts from zero when the door appears; the front-end
+    // music above keeps being pumped — the original starts the tune WITH the
+    // intro, and the browser's autoplay gate means it actually sounds from
+    // the first gesture, mid-show or later, which is the shipped unlock path
+    // and no new audio code. Any pressed gamepad button is the original's
+    // joystick fire and skips, same as the key and pointer routes.
+    if (intro !== null) {
+      if (!shellClock.paused) shellClock.pause();
+      if (typeof navigator.getGamepads === "function") {
+        for (const pad of navigator.getGamepads()) {
+          if (pad === null || pad === undefined) continue;
+          if (pad.buttons.some((button) => button?.pressed === true)) {
+            intro.skip();
+            break;
+          }
+        }
+      }
+      intro?.frame(timeMs);
+      window.requestAnimationFrame(frame);
+      return;
+    }
 
     if (shell.phase === "play" && table !== null) {
       // Only on the transition. `resume()` with no timestamp deliberately
@@ -1266,13 +1333,49 @@ async function boot(): Promise<void> {
   // `?table=<id>` boots straight into a game — the front door's card hrefs
   // and Fantasies' own URL contract. Through the same decoded F-key path a
   // click takes, so a shared link and a keypress are the same state.
+  let bootTable: TableId | null = null;
   try {
-    const bootTable = new URLSearchParams(window.location.search).get("table");
-    if (bootTable !== null && isTableId(bootTable)) {
-      apply(shellPlayTable(shell, store, bootTable));
-    }
+    const requested = new URLSearchParams(window.location.search).get("table");
+    if (requested !== null && isTableId(requested)) bootTable = requested;
   } catch {
     // An unparsable query string boots the front door, which is the default.
+  }
+  if (bootTable !== null) apply(shellPlayTable(shell, store, bootTable));
+
+  // THE INTRO, attached last and awaited before the first frame: a cold load
+  // plays `intro.bin`'s cinematic before the front door, once per load, the
+  // way the original plays it before its shell on every boot. AWAITED because
+  // the alternative is the door flashing up and then being replaced, which no
+  // boot of the machine ever showed; the fetch is ~500 KB against assets the
+  // page was about to fetch anyway, and the "Loading…" notice covers it. A
+  // build without the gated intro assets rejects on the first fetch and boots
+  // straight to the door, unchanged — and a `?table=` deep link skips the
+  // show entirely, because a shared link into a game is not a cold boot of
+  // the machine, and 82 seconds of history lesson before someone's champion
+  // run would be hostile.
+  if (bootTable === null) {
+    try {
+      const assets = await loadIntroAssets();
+      intro = attachIntro(assets, {
+        context,
+        canvas,
+        surface: (width, height) => {
+          const surface = document.createElement("canvas");
+          surface.width = width;
+          surface.height = height;
+          return surface;
+        },
+        onDone: () => {
+          // The next animation frame takes the normal path: the shell clock
+          // resumes itself and the front door paints — the same first frame
+          // a build without the intro shows.
+          intro = null;
+        },
+      });
+      shellClock.pause();
+    } catch (error) {
+      console.warn("pinball-illusions: intro unavailable, booting to the front door", error);
+    }
   }
 
   window.requestAnimationFrame(frame);
