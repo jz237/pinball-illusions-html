@@ -84,6 +84,7 @@ function reportAt(tick: number, over: Partial<GameTickReport> = {}): GameTickRep
     missionStarted: -1,
     missionEnded: false,
     awards: [],
+    comboPaid: 0,
     elementStarts: [],
     elementAwards: [],
     messagesShown: [],

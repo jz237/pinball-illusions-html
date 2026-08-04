@@ -1473,6 +1473,20 @@ interface BatTouch {
 const MAX_SEPARATION_PIXELS = 10;
 
 /**
+ * Which side of a bat's axis a point lies on at one pose: +1 for the side the
+ * bat's own perpendicular `(-sin, cos)` points at, -1 for the other, 0 on it.
+ *
+ * The single place the side convention is written down, so `resolveOne`'s
+ * reading and `touchAt`'s override cannot drift apart.
+ */
+function sideOf(config: FlipperConfig, angle: number, x: Q10, y: Q10): number {
+  const perpX = -sineUnits(angle) | 0;
+  const perpY = cosineUnits(angle);
+  const perp = q10Multiply(x - config.pivotX, perpX) + q10Multiply(y - config.pivotY, perpY);
+  return perp > 0 ? 1 : perp < 0 ? -1 : 0;
+}
+
+/**
  * Tests one ball against one bat pose — against the pose's own drawn pixels.
  *
  * The ring is `collision-probe.ts`'s, at the ball's radius, and it is the SAME
@@ -1482,15 +1496,29 @@ const MAX_SEPARATION_PIXELS = 10;
  * (bat) and `+0x00B4B0` (map) leave the same 68-byte buffer for the same
  * evaluator, so whatever the map's contact normal becomes, the bat inherits it.
  *
- * `fromX`/`fromY` are the last position the ball was OUTSIDE the bat at — the
- * previous sample of the swept resolve — and they carry the one fact the
- * geometry alone cannot: which side the ball came from. When a fast ball's
- * sample lands past the bat's axis the contact set is read off the FAR face, and
+ * `fromSide` is WHICH SIDE OF THE BLADE the ball came from, +1 for the face the
+ * bat's own perpendicular points at and -1 for the other, 0 when unknown. It
+ * carries the one fact the geometry alone cannot. When a fast ball's sample
+ * lands past the bat's axis the contact set is read off the FAR face, and
  * resolving with it is exactly the wrong-side ejection that B1 documented (161
  * bat-crossings-while-raised in 80 games, all through this seam). If the ring's
  * normal disagrees with the approach side, the normal is overridden to the
  * approach side's face, so `separate` always pushes the ball back out the way it
  * came in — never through.
+ *
+ * A SIGN AND NOT A POSITION, and that distinction was worth 144 pass-unders.
+ * This used to take the last outside POSITION and re-derive the side from it
+ * against the pose of the moment. While a ball stays in contact there is no
+ * new outside position, so the reference stayed at the tick's start — and the
+ * axis it was being measured against went on rotating underneath it. Eight
+ * degrees of blade is 4.4 px at mid-blade, so on the tick a struck ball is
+ * still embedded and the bat reaches its stop, the stale point crosses to the
+ * far side of the NEW axis, `wrongSide` fires, and the resolver ejects the ball
+ * out of the bottom face with no impulse at all (the stop has already zeroed
+ * the rate). That is the operator's report — "the ball goes under the flipper
+ * instead of shooting up" — and it is a defect of the reference frame, not of
+ * the contact. `resolveOne` now decides the side WHEN the ball was outside,
+ * against the pose it was outside AT, and carries the answer.
  *
  * TWO DEGENERATE CASES A CAPSULE NEVER HAD, both guarded here:
  *
@@ -1513,8 +1541,7 @@ function touchAt(
   ballX: Q10,
   ballY: Q10,
   ballRadius: Q10,
-  fromX: Q10 = ballX,
-  fromY: Q10 = ballY,
+  fromSide = 0,
 ): BatTouch | null {
   const body = batBodyOf(config, stroke);
   const ring = ringOffsetsFor(ballRadius);
@@ -1569,12 +1596,6 @@ function touchAt(
   // side tests are signed against.
   const perpX = -axisY | 0;
   const perpY = axisX;
-  // Which side of the axis the ball approached from: the sign of the last
-  // outside position's perpendicular offset. Zero when unknown (no swept
-  // history, or a start dead on the axis).
-  const fromPerp =
-    q10Multiply(fromX - config.pivotX, perpX) + q10Multiply(fromY - config.pivotY, perpY);
-  const fromSide = fromPerp > 0 ? 1 : fromPerp < 0 ? -1 : 0;
   const approachX = (fromSide !== 0 ? fromSide * perpX : -config.direction * axisY) | 0;
   const approachY = (fromSide !== 0 ? fromSide * perpY : config.direction * axisX) | 0;
 
@@ -1795,10 +1816,14 @@ function resolveOne(
   const total = sweep.steps.length * inner;
 
   let previous = sweep.from;
-  // The last sample the ball was NOT touching at: the side reference for
-  // `touchAt`, so the resolved face is always the one the ball came from.
-  let freeX = startX;
-  let freeY = startY;
+  // WHICH SIDE the ball was on the last time it was outside the bat, decided
+  // against the pose the bat held AT THAT MOMENT and then carried.
+  //
+  // Deciding it once and keeping it is the whole of the fix: a position kept
+  // instead of a side gets re-judged against a pose that has rotated since,
+  // and a ball still embedded when the bat reaches its stop is then declared to
+  // have come from underneath and pushed out through the blade. See `touchAt`.
+  let freeSide = sideOf(config, flipperAngle(config, sweep.from), startX, startY);
   let sampled = 0;
   for (const end of sweep.steps) {
     const span = end.stroke - previous.stroke;
@@ -1813,10 +1838,11 @@ function resolveOne(
       // bat's animation with the integrator's sub-steps.
       const sampleX = (startX + Math.trunc((deltaX * sampled) / total)) | 0;
       const sampleY = (startY + Math.trunc((deltaY * sampled) / total)) | 0;
-      const touch = touchAt(config, stroke, angle, sampleX, sampleY, ballRadius, freeX, freeY);
+      const touch = touchAt(config, stroke, angle, sampleX, sampleY, ballRadius, freeSide);
       if (touch === null) {
-        freeX = sampleX;
-        freeY = sampleY;
+        // Outside the bat at this pose, so this is a fresh reading of the side
+        // and it replaces the carried one.
+        freeSide = sideOf(config, angle, sampleX, sampleY);
         continue;
       }
 

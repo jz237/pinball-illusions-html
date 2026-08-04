@@ -354,10 +354,98 @@ const TICKS = 4000;
  *
  * Nothing else about this pin moved: same 4,000 ticks, same three tables, same
  * scripted input, same `debugSnapshot` fields. Only the digests.
+ *
+ * RE-PIN, THE BAT'S APPROACH SIDE IS A SIGN (the pathology round). ONE hash
+ * moves, and the two that do not are the argument.
+ *
+ * WHAT CHANGED. `touchAt` overrides the ring's contact normal when it disagrees
+ * with the side the ball came from, which is what stops a bat pushing a ball out
+ * through itself. It used to be handed the last POSITION the ball was outside
+ * the bat at, and re-derived the side from it against the pose of the moment.
+ * While a ball stays in contact there is no new outside position, so on a
+ * struck ball the reference stayed at the tick's start while the axis it was
+ * measured against went on rotating: the last eight degrees of the stroke are
+ * 4.4 px of blade at mid-blade, so on the tick the bat reached its stop the
+ * stale point crossed to the far side of the NEW axis, the override fired
+ * backwards, and the ball was separated DOWNWARD through the blade with no
+ * impulse at all (the stop had already zeroed the rate). `resolveOne` now
+ * decides the side WHEN the ball is outside, against the pose it is outside AT,
+ * and carries the sign. The mechanism was diagnosed in
+ * `research/view/tip-flip/FINDINGS.txt` in the round-8 investigation and never
+ * fixed; this is the fix.
+ *
+ * IT IS THE OPERATOR'S OWN REPORT — "if you let the ball roll near the end of
+ * the flipper and then flip, the ball goes under the flipper instead of
+ * shooting up" — and it is PRE-EXISTING rather than a regression: the same
+ * probe on `c9724a4` scores it worse than `822caf5` does.
+ *
+ * THE DIVERGENCE IS THE DEFECT ITSELF. Dumping all 4,000 per-tick snapshots on
+ * both trees:
+ *
+ *   law-n-justice   0 of 4,000 ticks differ
+ *   extreme-sports  0 of 4,000 ticks differ
+ *   babewatch       first differing tick index 567. The ball is on the lower
+ *                   bat: HEAD leaves it at (194,544) doing (-7548,+4237) —
+ *                   through the blade and falling — and this tree leaves it at
+ *                   (199,527) doing (+1457,-16252), launched at the clamp. The
+ *                   very first tick that moves is a ball that used to be thrown
+ *                   down through the bat and is now shot up it. 3,433 of the
+ *                   4,000 differ afterwards, which is what one saved ball does
+ *                   to the rest of a game.
+ *
+ * Two unmoved tables are a real control here and not luck: this script's Law 'n
+ * Justice and Extreme Sports windows never present the bat with a ball that is
+ * still embedded when the stroke reaches its stop, and if either had moved,
+ * something other than the side reference would have changed with it.
+ *
+ * THE FLIPPER PROBE, `scripts/flipper-probe.mts`, 108 roll-and-flip trials per
+ * bat — ball set on the resting blade, allowed to roll toward the tip, flipped
+ * after k ticks — counting the trials that end with the ball UNDER a blade it
+ * was on top of, at `c9724a4` -> `822caf5` -> this tree:
+ *
+ *   lower-left   LnJ 10 -> 6 -> 0     lower-right  LnJ 44 -> 29 -> 3
+ *                BW   9 -> 4 -> 0                  BW  43 -> 29 -> 3
+ *                ES   9 -> 5 -> 0                  ES  44 -> 29 -> 3
+ *   all six bats        159 -> 102 -> 9 of 648
+ *   outer blade only    138 ->  84 -> 9 of 384   (`along` >= 22 px at the press)
+ *   falling onto the blade and flipped on arrival: 30 -> 21 -> 14 of 210
+ *
+ * `tests/flipper-pass-under.test.ts` is the suite's copy: the canonical case
+ * plus a ceiling over the whole outer band, and a cradle check on all six bats
+ * so the same rule cannot have made the blade porous the other way.
+ *
+ * THE CENSUS, 90 games x 3 tables x 40,000 ticks, aggressive player,
+ * `822caf5` -> this tree. Every table still completes 90/90 with ZERO
+ * write-offs; the ball is simply saved more often, which is what a working
+ * flipper does:
+ *
+ *   law-n-justice   ends 274 -> 279; median 695,000 -> 1,127,500; max
+ *                   9,165,000 -> 21,880,000; zeros 2/90 -> 1/90; distinct 81;
+ *                   BALL 1 median 267,500 -> 295,000.
+ *   babewatch       ends 270; median 1,386,170 -> 1,896,170; min 350,000 ->
+ *                   425,000; max 8,910,000 -> 11,994,680; distinct 81 -> 87;
+ *                   BALL 1 median 320,000 -> 355,000.
+ *   extreme-sports  ends 270; median 347,500 -> 702,500; min 150,000; max
+ *                   9,280,000 -> 10,964,000; distinct 64 -> 75; BALL 1 median
+ *                   65,000 -> 120,000.
+ *   worst write-off rate 0.0% -> 0.0%.
+ *
+ * The other gates: full suite green, `npx tsc --noEmit` clean, public-build
+ * guard 286 gated, and — the one that matters most for a change inside the
+ * contact model — THE PHYSICS GATE UNMOVED at its baseline
+ * 576/218/466/517/1790/464. It is unmoved by construction: its corpus excludes
+ * every frame in which the machine's own ball was in bat contact, so a change
+ * confined to `flippers.ts` cannot reach it, and a change that moved it would
+ * not have been confined.
+ *
+ * The digests this entry replaced, recorded so the move is auditable:
+ *   law-n-justice   29c573580c2edd9cec313ebfe6c0c827157d121d87ad099e14635a2141652b00 (UNCHANGED)
+ *   babewatch       d1358da0fef0abb2038238f211281072b2e4ce850c074fa23eebfd0489a4c9dc
+ *   extreme-sports  05cf9bbd1334ff9fac6d5e26aa69708765f364db9678ed2eb064a2f18cb3c823 (UNCHANGED)
  */
 const PINNED: Record<TableId, string> = {
   "law-n-justice": "29c573580c2edd9cec313ebfe6c0c827157d121d87ad099e14635a2141652b00",
-  "babewatch": "d1358da0fef0abb2038238f211281072b2e4ce850c074fa23eebfd0489a4c9dc",
+  "babewatch": "6fe25c2e110feeb90805e9b1f75901387e5b70842b8805d9f0354c159aa4818a",
   "extreme-sports": "05cf9bbd1334ff9fac6d5e26aa69708765f364db9678ed2eb064a2f18cb3c823",
 };
 

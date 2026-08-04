@@ -853,6 +853,19 @@ export interface GameTickReport {
   /** Everything that scored this tick, in the order it scored. */
   readonly awards: readonly Award[];
   /**
+   * The COMBO CHAIN'S OWN PAYMENT this tick, which is not an award.
+   *
+   * Mission award effects 16 and 7 pay a counter record's accumulator straight
+   * into the player's score through `$6BCC` — one BCD field, score only, with
+   * no element and no bonus beside it — where an ordinary element award goes
+   * through `$6B96` and pays the pair. So it is a third way the score moves,
+   * alongside `awards` and the end-of-ball bonus, and it was the one way that
+   * nothing outside this module could see. `tests/scoring-play.test.ts` needs
+   * all three to say what it means to say: that the score is exactly the sum of
+   * what the shipped data paid and never a digit more.
+   */
+  readonly comboPaid: number;
+  /**
    * Element indices the mode VM STARTed this tick, in execution order.
    *
    * These three lists are the score panel's feed: the element's +$14 display
@@ -1232,6 +1245,7 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     missionStarted: -1,
     missionEnded: false,
     awards: [],
+    comboPaid: 0,
     elementStarts: [],
     elementAwards: [],
     messagesShown: [],
@@ -1755,6 +1769,7 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     missionStarted: modeTick.missionStarted,
     missionEnded: modeTick.missionEnded,
     awards,
+    comboPaid: modeTick.comboPaid,
     elementStarts: modeTick.elementStarts,
     elementAwards: modeTick.awards.map((award) => award.element),
     messagesShown: modeTick.messagesShown,

@@ -94,6 +94,7 @@ function reportWith(over: Partial<GameTickReport> = {}): GameTickReport {
     missionStarted: -1,
     missionEnded: false,
     awards: [],
+    comboPaid: 0,
     elementStarts: [],
     elementAwards: [],
     messagesShown: [],

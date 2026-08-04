@@ -120,6 +120,27 @@ describe("the machine keeps score", () => {
       let awarded = 0;
       let total = 0;
       let totalBonus = 0;
+      // THE OTHER TWO WAYS THE SCORE GROWS, both of them outside `awards`.
+      // `$51DA` adds the end-of-ball bonus in one `ABCD` chain when the TOTAL
+      // panel runs out, and `$6BCC` pays the combo chain's accumulator on the
+      // tick award effect 16 or 7 fires — so the score is the awards plus every
+      // bonus paid plus every combo paid, and the bonus field is what has
+      // accrued since the last payment (`clearBonusForNewBall` empties it on
+      // the same tick).
+      //
+      // This used to read `score === sum(award.score)` and `bonus ===
+      // sum(award.bonus)` flat, which is the same statement only while no ball
+      // in the window ever earns a bonus. That held by luck: it broke the first
+      // time a change let BabeWatch reach a bonus-bearing mission award inside
+      // 6,000 ticks, and the identity it was really asserting was never in
+      // doubt. Both payments are now accounted, which also pins the thing the
+      // flat version could not say at all — THE MACHINE PAYS WHAT IT SHOWED,
+      // the figure under the TOTAL BONUS caption and not a recomputation of it.
+      let paid = 0;
+      let combos = 0;
+      let owed = 0;
+      let showing = false;
+      let lastTotalPanel = 0;
       for (const report of runTicks(game, playingInput(), 6_000)) {
         for (const award of report.awards) {
           expect(permitted.has(award.score), `${tableId} awarded ${award.score}`).toBe(true);
@@ -130,13 +151,26 @@ describe("the machine keeps score", () => {
           awarded += 1;
           total += award.score;
           totalBonus += award.bonus;
+          owed += award.bonus;
+        }
+        combos += report.comboPaid;
+        const view = report.bonus;
+        if (view !== null) {
+          showing = true;
+          if (view.stage === "total") lastTotalPanel = view.value ?? 0;
+        } else if (showing) {
+          paid += lastTotalPanel;
+          owed = 0;
+          lastTotalPanel = 0;
+          showing = false;
         }
       }
 
       expect(awarded, `${tableId} scored nothing at all in 6000 ticks`).toBeGreaterThan(0);
       // The packed-BCD fields and ordinary arithmetic have to agree exactly.
-      expect(debugSnapshot(game).score).toBe(total % 1_000_000_000_000);
-      expect(debugSnapshot(game).bonus).toBe(totalBonus % 1_000_000_000_000);
+      expect(debugSnapshot(game).score).toBe((total + paid + combos) % 1_000_000_000_000);
+      expect(debugSnapshot(game).bonus).toBe(owed % 1_000_000_000_000);
+      expect(totalBonus).toBeGreaterThanOrEqual(owed);
     }
   });
 
