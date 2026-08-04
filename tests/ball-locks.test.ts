@@ -810,6 +810,12 @@ describe("the zero-deadlock guarantee, restated for locks", () => {
       game.laneBallId = null;
       game.pendingServes = 0;
       game.serveCountdown = 0;
+      // AND THE BALL SAVE HAS RUN OUT. This test manufactures the last drain of
+      // a ball to reach the end-of-ball path; with `$D8A` still running the
+      // machine would give that ball back instead (+0x004E4E), which is a
+      // different and correct outcome and not the one under test here. Five
+      // seconds into a ball is where the saver is spent anyway.
+      game.ballSaveTicks = 0;
 
       // One tick with a drain in it takes the end-of-ball path.
       const spare = spawnBall(game.balls, pixelsToQ10(168), pixelsToQ10(599), 0, 4000, 0);

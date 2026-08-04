@@ -93,6 +93,24 @@ export interface TableLamps {
   /** MEASURED: frames per blink half-period (START writes 8 into the reload). */
   readonly blinkHalfPeriodFrames: number;
   readonly lamps: readonly TableLamp[];
+  /**
+   * THE ENGINE LAMP LIST, descriptor +$64 (`$2352(a5)`) — three slots, -1 for
+   * an empty one. These are the lamps the ENGINE drives directly rather than
+   * any mode script, and they are written as whole bytes, so they are on for
+   * every player at once.
+   *
+   *   [0] SHOOT AGAIN, `st.b $5(a1)` at +0x00606C (the extra-ball award) and at
+   *       +0x0050E0 (the ball-end teardown, when the player has one banked)
+   *   [1] BALL SAVE, blinked off the `$D8A` countdown at +0x004DF6..+0x004E20
+   *       and cleared at +0x004E4C when the last ball goes
+   *   [2] no reader anywhere in the segment; it is the same lamp as [0] on Law
+   *       'n Justice and Extreme Sports and a different one on BabeWatch
+   *
+   * BABEWATCH'S SLOT 1 IS EMPTY — a genuine null in the table data, and the
+   * engine's own `beq.b $4e22` at +0x004DFE is the branch that expects it. That
+   * table has a ball saver and no lamp to show it with.
+   */
+  readonly engine: readonly number[];
   /** Dense, in the modes document's element-pool order. */
   readonly elements: readonly LampWiring[];
   /** Per lamp, the elements whose START path lights it. Derived, for the renderer. */
@@ -235,10 +253,18 @@ export function parseTableLampsDocument(doc: TableLampsDocument): TableLamps {
     elements.push(Object.freeze({ start, award }));
   }
 
+  const engineValue = raw["engine"];
+  const engine = Array.isArray(engineValue)
+    ? engineValue.map((one, at) =>
+        requireWholeNumber(one, `${label} engine lamp ${at}`, -1, lamps.length - 1),
+      )
+    : [];
+
   return Object.freeze({
     tableId,
     displayName,
     blinkHalfPeriodFrames,
+    engine: Object.freeze(engine),
     lamps: Object.freeze(lamps),
     elements: Object.freeze(elements),
     startElementsByLamp: Object.freeze(startElementsByLamp.map((list) => Object.freeze(list))),

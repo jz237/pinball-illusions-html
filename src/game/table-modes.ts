@@ -57,7 +57,9 @@ export const TABLE_MODES_BASE_PATH = "generated/tables/";
  *
  *   e  element index, -1 when the operand was NULL
  *   s  script index                    m  message index
- *   o  a record this decode has not identified; always -1 here
+ *   o  an opaque record pointer, -1 — EXCEPT on the six opcodes whose record
+ *      type is now pooled, where it is an index: 6/7/13/18 name a
+ *      progress-counter record and 15/16 name a ramp record
  *   n  a progress-counter index (SET_COUNT), -1 when the record is not one
  *   w  a signed word                   c  a branch target, -1 when it dangles
  *   i  a 32-bit immediate
@@ -173,6 +175,60 @@ export interface ModeElement {
    * and the lock tests ask about; the record's own ladder is on the counter.
    */
   readonly ladder: number;
+  /**
+   * Award effects 15 and 25: the element's OWN six packed-BCD bytes at
+   * +$3A..$3F, which +0x0060DC adds into and +0x0060B2 subtracts from the
+   * counter record's RUNNING STEP. Zero for every other effect.
+   *
+   * This is what GROWS a growing jackpot on BabeWatch: its eleven gym targets
+   * (elements 37..47) each carry 500,000 to 5,000,000 and all eleven pump
+   * counter 1, whose step starts at 20,000,000 and is what "SHOW YOUR MUSCLES
+   * TO SCORE JACKPOTS" then pays.
+   */
+  readonly stepAddend: number;
+  /**
+   * Award effect 27's RAMP: an index into `TableModes.ramps`, or -1.
+   *
+   * +0x0060FA takes the record the element's +$38 points at — the base of a
+   * ramp's live-value slot, `ramp + 2` — and enters effect 15's `abcd` body, so
+   * the addend is the ramp's CURRENT value rather than a constant. Extreme
+   * Sports' six are its two hurry-up jackpots: elements 26/27/28 harvest the
+   * three rising ramps and 48/49/50 the three falling ones.
+   */
+  readonly stepRamp: number;
+  /**
+   * Award effect 10's PAY COUNT: the element's +$38 as a word, the number of
+   * times +0x0061BA pays the counter's accumulator. Zero for every other
+   * effect; Law 'n Justice's element 89 (25) is the corpus's one site.
+   */
+  readonly payCount: number;
+}
+
+/**
+ * ONE RAMP RECORD, off the descriptor's own list at +$68 (`$2356(a5)`).
+ *
+ * A value that climbs or falls by `increment` every frame — serviced by
+ * +0x006334, called from the frame chain at +0x004B70 — from `start` toward
+ * `limit`, where it clamps to exactly `limit` and stops. Started by opcode 15
+ * (`RESTORE_POS`, +0x005DDA: reload the start value and set the running byte)
+ * and stopped by opcode 16 (`CLEAR_BYTE`, +0x005DEE).
+ *
+ * NOTHING ELSE RESETS ONE. Neither reset walk (+0x0040CA, +0x00412C) touches
+ * this list, so a ramp's value survives a ball and a player rotation; what
+ * bounds it is that +0x006334 only runs while a ball is in play.
+ */
+export interface ModeRamp {
+  readonly index: number;
+  /** `+$01` bit 0 clear: `abcd` UP toward the limit. Set: `sbcd` DOWN to it. */
+  readonly up: boolean;
+  /** `+$00` in the shipped file. All twelve ship stopped. */
+  readonly running: boolean;
+  /** `+$0C..$11`, the value opcode 15 seeds `+$04..$09` with. */
+  readonly start: number;
+  /** `+$14..$19`: a ceiling counting up, a floor counting down. */
+  readonly limit: number;
+  /** `+$1C..$21`, added or subtracted once per frame. */
+  readonly increment: number;
 }
 
 /**
@@ -405,6 +461,8 @@ export interface TableModes {
   readonly ladders: readonly ModeLadder[];
   /** The progress-counter records, in the descriptor's own list order. */
   readonly counters: readonly ModeCounter[];
+  /** The ramp records off descriptor +$68, in list order. See `ModeRamp`. */
+  readonly ramps: readonly ModeRamp[];
   /** The lamp groups off descriptor +$38, in table order. See `ModeLampGroup`. */
   readonly lampGroups: readonly ModeLampGroup[];
   /** Hook 2's ball-start multiplier restore, or null. See `ModeMultiplierRestore`. */
@@ -640,6 +698,23 @@ export function parseTableModesDocument(doc: TableModesDocument): TableModes {
     );
   }
 
+  // --- ramps ---------------------------------------------------------------
+  const ramps: ModeRamp[] = [];
+  for (const [at, entry] of requireArray(raw["ramps"] ?? [], `${label} ramps`).entries()) {
+    const item = entry as Record<string, unknown>;
+    const where = `${label} ramp ${at}`;
+    ramps.push(
+      Object.freeze({
+        index: requireWholeNumber(item["index"], `${where} index`, at, at),
+        up: item["up"] === true,
+        running: item["running"] === true,
+        start: requireWholeNumber(item["start"], `${where} start`, 0, Number.MAX_SAFE_INTEGER),
+        limit: requireWholeNumber(item["limit"], `${where} limit`, 0, Number.MAX_SAFE_INTEGER),
+        increment: requireWholeNumber(item["increment"], `${where} increment`, 0, Number.MAX_SAFE_INTEGER),
+      }),
+    );
+  }
+
   // --- elements ------------------------------------------------------------
   const rawElements = requireArray(raw["elements"], `${label} elements`);
   const elements: ModeElement[] = [];
@@ -666,6 +741,14 @@ export function parseTableModesDocument(doc: TableModesDocument): TableModes {
         displayAward,
         counter: requireWholeNumber(item["counter"] ?? -1, `${where} counter`, -1, counters.length - 1),
         ladder: requireWholeNumber(item["ladder"] ?? -1, `${where} ladder`, -1, ladders.length - 1),
+        stepAddend: requireWholeNumber(
+          item["stepAddend"] ?? 0,
+          `${where} stepAddend`,
+          0,
+          Number.MAX_SAFE_INTEGER,
+        ),
+        stepRamp: requireWholeNumber(item["stepRamp"] ?? -1, `${where} stepRamp`, -1, ramps.length - 1),
+        payCount: requireWholeNumber(item["payCount"] ?? 0, `${where} payCount`, 0, 0xffff),
       }),
     );
   }
@@ -958,6 +1041,7 @@ export function parseTableModesDocument(doc: TableModesDocument): TableModes {
     armElements: Object.freeze(armElements),
     ladders: Object.freeze(ladders),
     counters: Object.freeze(counters),
+    ramps: Object.freeze(ramps),
     lampGroups: Object.freeze(lampGroups),
     multiplierRestore,
     awardLitSurvivesBall: Object.freeze(awardLitSurvivesBall),

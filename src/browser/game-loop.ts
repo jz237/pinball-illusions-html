@@ -248,7 +248,12 @@ import {
 import type { TableAcceleration } from "../game/table-accel.js";
 import { tableAccelerationFor } from "../game/table-accel.js";
 import type { PlungerConfig } from "../game/plunger.js";
-import { SIMULATION_GRAVITY, SIMULATION_X_TILT } from "../game/timebase.js";
+import {
+  SIMULATION_GRAVITY,
+  SIMULATION_X_TILT,
+  TICKS_PER_SECOND,
+  ballSaveSecondsFor,
+} from "../game/timebase.js";
 import {
   CLEARED_TROUGH_RECORD,
   autoLaunchOutcome,
@@ -530,6 +535,17 @@ export interface GameOptions {
   readonly tiltX: Q10;
   readonly serveDelayTicks: number;
   readonly firstServeDelayTicks: number;
+  /**
+   * BALL SAVE seconds — `tableNNN.opt` record 5, the one option record that is
+   * NOT the same on all three files (5 / 5 / 10; see `ballSaveSecondsFor`).
+   *
+   * `null` means "whatever the table ships", which is what a game the player
+   * starts uses and what the census and the pin run with. A number overrides
+   * it, exactly as the options screen's 0..10 slider does — and 0, a setting
+   * the machine genuinely offers, is how a test that is about something else
+   * says so out loud instead of quietly working around the saver.
+   */
+  readonly ballSaveSeconds: number | null;
   /** Motionless ticks before a ball is written off. See BALL_SEARCH_TICKS. */
   readonly ballSearchTicks: number;
   readonly simulation: Partial<SimulationOptions>;
@@ -542,6 +558,7 @@ export const DEFAULT_GAME_OPTIONS: GameOptions = Object.freeze({
   tiltX: SIMULATION_X_TILT,
   serveDelayTicks: SERVE_DELAY_TICKS,
   firstServeDelayTicks: FIRST_SERVE_DELAY_TICKS,
+  ballSaveSeconds: null,
   ballSearchTicks: BALL_SEARCH_TICKS,
   simulation: Object.freeze({}),
   camera: DEFAULT_CAMERA_OPTIONS,
@@ -562,6 +579,7 @@ function resolveGameOptions(options?: Partial<GameOptions>): GameOptions {
     gravityY: options?.gravityY ?? DEFAULT_GAME_OPTIONS.gravityY,
     tiltX: options?.tiltX ?? DEFAULT_GAME_OPTIONS.tiltX,
     serveDelayTicks: options?.serveDelayTicks ?? DEFAULT_GAME_OPTIONS.serveDelayTicks,
+    ballSaveSeconds: options?.ballSaveSeconds ?? DEFAULT_GAME_OPTIONS.ballSaveSeconds,
     firstServeDelayTicks: options?.firstServeDelayTicks ?? DEFAULT_GAME_OPTIONS.firstServeDelayTicks,
     ballSearchTicks: options?.ballSearchTicks ?? DEFAULT_GAME_OPTIONS.ballSearchTicks,
     simulation: options?.simulation ?? DEFAULT_GAME_OPTIONS.simulation,
@@ -705,6 +723,37 @@ export interface Game {
   pendingServes: number;
   /** True from the moment a multiball starts until it is back down to one ball. */
   multiball: boolean;
+  /**
+   * THE BALL SAVE COUNTDOWN, the original's `$D8A(a5)`, in ticks.
+   *
+   * Armed by every charged serve — state 5's first three instructions,
+   * +0x0049AE, from `.opt` record 5 (`ballSaveSecondsFor`) — re-armed at any
+   * length by mode-script opcode 11 (+0x005992, a plain `move.w`, so it SETS
+   * rather than extends), ticked down once per in-play frame at +0x004DF2, and
+   * cleared by the end-of-ball teardown at +0x0050FA. While it is non-zero the
+   * reaper at +0x0052CE gives every drained ball straight back.
+   *
+   * NOT PER PLAYER: one word, machine-global, and it does not need to be —
+   * it is armed fresh at each player's own serve and cleared between them.
+   * NOT RE-ARMED BY A SAVE either: nothing in the save path writes it, so one
+   * armed window can give the same ball back over and over until it runs out.
+   */
+  ballSaveTicks: number;
+  /**
+   * THE ORIGINAL'S STATE 6, the one state this port had never had: the machine
+   * is holding a "DON'T MOVE" card while a saved LAST ball comes back.
+   *
+   * Entered only from +0x004EB8 — the last ball drained with `$D8A` still
+   * running — and left at +0x004FA4 when a ball is out of the trough and the
+   * lane is free again (`tst.w $d7e / beq` then `tst.b $d88 / bne`). State 6
+   * runs the physics and the serve but NOT the reaper and NOT the `$D8A` tick,
+   * so the saver's clock is stopped for as long as the card is up.
+   *
+   * `move.w #$6,$8e(a5)` occurs at exactly one address in the whole segment,
+   * which is what identifies this state: the shipped documents had it down as a
+   * tilt warning, and the tilt card is state 8's, at +0x004D98.
+   */
+  ballSaving: boolean;
   /**
    * Saucers whose script has run `PUSH` and which are counting down to spitting
    * their ball back onto the playfield, newest first.
@@ -1017,6 +1066,8 @@ export function createGame(map: TableMap, options?: Partial<GameOptions>): Game 
     locks: createLockBank(map.tableId),
     pendingServes: 0,
     multiball: false,
+    ballSaveTicks: 0,
+    ballSaving: false,
     lockEjectStack: [],
     lockEjecting: null,
     pushClamp: null,
@@ -1104,6 +1155,8 @@ export function startGame(game: Game, players: number = 1): void {
   game.modeState = first.modeState;
   game.modeMessages = [];
   game.laneBallId = null;
+  game.ballSaveTicks = 0;
+  game.ballSaving = false;
   game.serveCountdown = game.options.firstServeDelayTicks;
   game.stillTicks = 0;
   game.searchPulses = BALL_SEARCH_PULSES;
@@ -1420,6 +1473,17 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
           game.autoLaunchCountdown = AUTO_LAUNCH_DELAY_TICKS;
         } else {
           game.ballsServed += 1;
+          // THE BALL SAVE IS ARMED HERE AND NOWHERE ELSE. State 5 opens with
+          // `move.w $e8e(a5),d0 / mulu.w $50(a5),d0 / move.w d0,$d8a(a5)` at
+          // +0x0049AE, and `$d8a` has exactly two writers in the segment: that
+          // one and mode-script opcode 11. So it is the CHARGED serve that arms
+          // it — a machine-owed serve does not pass through state 5 and neither
+          // does the extra-ball state 7, whose own entry at +0x004FC0 sets
+          // `$d7b` and leaves `$d8a` as the teardown at +0x0050FA left it,
+          // which is zero. An extra ball gets no ball saver.
+          game.ballSaveTicks =
+            (game.options.ballSaveSeconds ?? ballSaveSecondsFor(game.map.tableId)) *
+            TICKS_PER_SECOND;
           game.tilt = resetTiltForNewBall();
           game.ballsLocked = 0;
           game.searchPulses = BALL_SEARCH_PULSES;
@@ -1767,6 +1831,58 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
       game.announcingServe = false;
     }
     pruneInactiveBalls(game.balls);
+    // ---- THE BALL SAVE, +0x0052CE and +0x004E4E ---------------------------
+    //
+    // Two sites, one rule: while `$D8A` is running, a ball that drains comes
+    // straight back. The reaper's own site handles the ones that leave another
+    // ball on the table —
+    //
+    //     0052C8  subq.w #$1,$d7e(a5)      live--, and the ball is NOT over
+    //     0052CC  beq.b  $52e2             ...unless that was the last one
+    //     0052CE  tst.w  $d8a(a5)          BALL SAVE running?
+    //     0052D2  beq.b  $52d8
+    //     0052D4  addq.w #$1,$d86(a5)      yes -> owe one more serve
+    //
+    // — and the LAST ball is handled by state 3's own `bmi` road at +0x004E40,
+    // which tests the same word at +0x004E4E and, if it is still running,
+    // re-queues at +0x004EB4 and goes to STATE 6 instead of ending the ball.
+    // Both add one serve per ball, so with the saver armed EVERY drained ball
+    // comes back and the only difference between the two is the card.
+    //
+    // NOTHING HERE RE-ARMS OR CLEARS `$D8A`. One five-second window can give
+    // the same ball back four times if the player drains it four times.
+    //
+    // AND NOT WHILE TILTED. State 8 does not take the +0x004E4E road at all —
+    // its `bmi.w $4ec0` at +0x004D68 jumps straight to the real end of ball —
+    // and it opens every frame with `clr.w $d86(a5)` at +0x004D4C, which is
+    // the line this loop already models at the top of the serve section. The
+    // machine's own frame order does let ONE re-served ball out of the lane
+    // during a tilt runout, because +0x004B58's serve runs after the reaper and
+    // before the next frame's clear; this port serves at the top of the tick
+    // and drains at the bottom, so the clear always wins here. A tilt inside an
+    // armed save window with two balls out is the only state that can tell the
+    // two apart, and this port's answer — no save at all once tilted — is the
+    // one the tilt's own `clr.w` is there to produce.
+    //
+    // AND ONLY FOR A REAL DRAIN. `step.drained` is a ball that went out of the
+    // bottom, which is the `cmpi.w #$258,d1 / bgt` at +0x00B29A; `lost` is the
+    // ball SEARCH writing one off after it has been wedged for
+    // `ballSearchTicks`, which is this port's own deadlock guarantee and not
+    // anything the machine does. Giving a written-off ball back would hand it
+    // straight into the same wedge with the clock stopped, so the saver takes
+    // no notice of one.
+    const lastBallGone = freeBallCount(game.balls) === 0 && game.pendingServes === 0;
+    if (game.ballSaveTicks > 0 && !game.tilt.tilted && step.drained.length > 0) {
+      game.pendingServes += step.drained.length;
+      if (lastBallGone) {
+        // State 6. The re-serve does NOT pass through state 5, so there is no
+        // PLAYER/BALL card, no tilt-meter reset (`clr.w $23f0` at +0x0054B6
+        // hangs off `$d7b`, which only states 5 and 7 set) and no charge to
+        // `ballsServed`.
+        game.ballSaving = true;
+        game.serveCountdown = game.options.serveDelayTicks;
+      }
+    }
     // "Nothing in play and nothing owed", not "no active balls": a held ball is
     // active. See the header — testing the active count here is a silent hang.
     if (freeBallCount(game.balls) === 0 && game.pendingServes === 0) {
@@ -1833,6 +1949,36 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
   if (game.multiball && freeBallCount(game.balls) + heldBallCount(game.locks) + game.pendingServes <= 1) {
     game.multiball = false;
     if (game.modeState !== null) signalMultiballEnded(game.modeState);
+  }
+
+  // ---- the ball save clock, +0x004DEC ------------------------------------
+  //
+  // `tst.w $d8a(a5) / beq / subq.w #$1,$d8a(a5)`, ONCE per state-3 frame, and
+  // its slot in that frame is after the reaper (+0x004DB8) and after the serve
+  // (+0x004DC2) — which is why it runs here, at the tail, and why the drain
+  // above sees the value the frame started with.
+  //
+  // STATE 3 ONLY. The tick is not in state 4's ball end, not in state 6's card
+  // loop (+0x004F50, which has no `$d8a` instruction at all), not in state 8's
+  // tilt runout, and not in the two wind-down loops. So the countdown STOPS
+  // while the saved ball is coming back, while the bonus counts, and for the
+  // whole of a tilted runout — and this port stops it for exactly those.
+  if (
+    game.phase === "in-play" &&
+    game.bonus === null &&
+    game.endHoldTicks === 0 &&
+    !game.ballSaving &&
+    !game.tilt.tilted &&
+    game.ballSaveTicks > 0
+  ) {
+    game.ballSaveTicks -= 1;
+  }
+  // State 6 ends at +0x004F98: `tst.w $d7e(a5) / beq` — a ball is out of the
+  // trough — then `tst.b $d88(a5) / bne` — and the lane is free again. The
+  // second test is what holds the card up until the saved ball has actually
+  // been plunged rather than merely served.
+  if (game.ballSaving && freeBallCount(game.balls) > 0 && game.laneBallId === null) {
+    game.ballSaving = false;
   }
 
   // ---- camera ------------------------------------------------------------
@@ -1905,6 +2051,11 @@ function anyControlPressed(snapshot: ControlSnapshot): boolean {
  * Answers whether the game ended.
  */
 function endBallAfterBonus(game: Game): boolean {
+  // `clr.w $d8a(a5)` at +0x0050FA, in the teardown both the player rotation and
+  // the extra-ball state run through. The saver never crosses a ball, so it
+  // never needs to be per player.
+  game.ballSaveTicks = 0;
+  game.ballSaving = false;
   if (game.playerCount <= 1) {
     clearBonusForNewBall(game.scoring);
     // Descriptor HOOK 2, `jsr ([$94,a5],$A4)` at +0x005116, runs on the
@@ -2227,6 +2378,11 @@ function runModes(game: Game, awards: readonly Award[]): ModeTickReport {
     oweServes(game, ballsToTopUp(report.ballsUpTo, inPlay, game.pendingServes));
     if (report.ballsUpTo > 1) game.multiball = true;
   }
+  // Mode-script opcode 11: a mission arming its own ball save. TWELVE OF THE
+  // THIRTEEN MULTIBALL SCRIPTS DO IT the instant `BALLS_UP_TO` runs — 10 s and
+  // 30 s on Law 'n Justice, 15 s on BabeWatch and Extreme Sports — and it is a
+  // plain `move.w`, so it SETS the countdown rather than adding to it.
+  if (report.ballSaveTicks >= 0) game.ballSaveTicks = report.ballSaveTicks;
   return report;
 }
 
@@ -2929,6 +3085,10 @@ export interface GameDebugState {
   /** Balls the machine owes the lane that cost the player nothing. */
   readonly pendingServes: number;
   readonly multiball: boolean;
+  /** `$D8A(a5)`: ticks left on the ball save, 0 when none is armed. */
+  readonly ballSaveTicks: number;
+  /** The original's state 6: a saved last ball is coming back. */
+  readonly ballSaving: boolean;
   readonly ballsLocked: number;
   /** Player score, read back out of the packed-BCD field. */
   readonly score: number;
@@ -3030,6 +3190,8 @@ export function debugSnapshot(game: Game): GameDebugState {
     pendingServes: game.pendingServes,
     multiball: game.multiball,
     ballsLocked: game.ballsLocked,
+    ballSaveTicks: game.ballSaveTicks,
+    ballSaving: game.ballSaving,
     score: readBcdField(game.scoring.score),
     bonus: readBcdField(game.scoring.bonus),
     bonusMultiplier: game.scoring.multiplier,
@@ -3250,6 +3412,14 @@ export interface PanelCard {
 /** The card the panel should carry this frame, or null for the normal views. */
 export function panelCardOf(game: Game): PanelCard | null {
   if (game.phase !== "in-play") return null;
+  // STATE 6, +0x004F50: while a saved last ball is coming back the machine
+  // clears the text plane and redraws one card every frame, and the card is the
+  // display list at +0x004FAC — `00A0 0002 0001 0002` and then the ten bytes
+  // "DON'T MOVE". It outranks the score for the same reason the PLAYER/BALL
+  // card does: `jsr $6B06` wipes the plane ahead of it every frame.
+  if (game.ballSaving) {
+    return { top: "DON'T MOVE", bottom: null, score: readBcdField(game.scoring.score) };
+  }
   if (game.endHoldTicks > 0) {
     return {
       top: `PL ${game.activePlayer + 1}`,
@@ -3344,6 +3514,11 @@ export function renderGame(
       game.modeState,
       game.tick,
       fullTable,
+      // The ball-save lamp is the ENGINE's, not a mission's: +0x004DEC writes
+      // the byte every in-play frame off the countdown, and +0x004E4C puts it
+      // out when the last ball goes — which is the whole of the time state 6's
+      // card is up. See `ballSaveLampLit`.
+      game.ballSaving ? 0 : game.ballSaveTicks,
     );
   }
   // The bats and the balls, as decoded SPRITES on the playfield's own pixel

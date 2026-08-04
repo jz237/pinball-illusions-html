@@ -134,6 +134,19 @@ const OP_JMP = 10;
 const OP_SET_BALL_SAVE = 11;
 const OP_CLEAR_DONE = 12;
 const OP_LAMP_OFF = 14;
+/**
+ * The running-step opcodes. The exporter's names are kept — they were given
+ * before the record types were known and renaming them would break the operand
+ * table's join with the shipped documents — but the handlers are:
+ * 6 = restore the step, 7 = set the step, 13 = reset the whole record,
+ * 15 = start a ramp, 16 = stop a ramp, 18 = set the accumulator.
+ */
+const OP_LINK_RESTORE = 6;
+const OP_SET_VALUE = 7;
+const OP_RESET_GROUP = 13;
+const OP_RAMP_START = 15;
+const OP_RAMP_STOP = 16;
+const OP_SET_MAX = 18;
 const OP_MESSAGE = 17;
 /**
  * Opcode 19: POST A MUSIC COMMAND. Decoded; it used to be called OP_ANIMATE on
@@ -247,23 +260,44 @@ const EFFECT_SET_MULTIPLIER = 5;
  * +0x004136 the clear runs before the keep-flag tests — and a bit-0 record
  * then rebuilds accumulator = step x count from the kept count (+0x00417C).
  *
- * STILL LEFT OUT, all decoded to the instruction and none run — the record's
- * OTHER value machine, the one built on the RUNNING step rather than the
- * accumulator. Effect 10 (0x61BA) pays the accumulator min(element +$38,
- * count) times and zeroes the count only when it held fewer than the ask
- * (0x61CA's bpl skips the write-back otherwise); effect 14 (0x61E6) pays one
- * RUNNING step straight to the score; and three effects MUTATE that step —
- * 15 (0x60DC) adds the element's own +$3A..$3F into it, 25 (0x60B2) is the
- * same six bytes subtracted (`sbcd`), 27 (0x60FA) adds from the record the
- * element's +$38 points at, entering 15's abcd body. The +$28..$2F master
- * copy exists so the window expiry and both reset walks can restore what
- * 15/25/27 mutate. Extreme Sports' and BabeWatch's effect-14/15/27 sets are
- * whole build-then-collect machines on exactly this; Law 'n Justice's
- * element 89 is its one effect-10. All keep their element-score-only
- * behaviour until a round means to move them.
+ * AND THE RUNNING-STEP MACHINE RUNS NOW TOO — the record's OTHER value, built
+ * on +$30..$37 rather than on the accumulator, and the thing the tables spell
+ * "JACKPOT". Five effects and six opcodes, all of them BCD instructions
+ * Capstone cannot decode at all and all of them read as raw words
+ * (research/BALL_SAVER_JACKPOTS.md):
+ *
+ *     10  0x61BA  the accumulator paid min(element +$38, count) times, the
+ *                 count zeroed only when it held fewer than the ask (0x61CA's
+ *                 `bpl` skips the write-back otherwise)
+ *     14  0x61E6  one RUNNING step straight to the score, through the same
+ *                 $6BCC effect 7 pays the accumulator with — the difference is
+ *                 one `lea`, +$38 against +$40
+ *     15  0x60DC  step += the element's own +$3A..$3F  (six `abcd`)
+ *     25  0x60B2  step -= the same six bytes            (six `sbcd`)
+ *     27  0x60FA  step += a RAMP's live value, entering 15's body with the
+ *                 source swapped for `ramp + 2`
+ *   op 6  0x5C40  step := its +$28 master
+ *   op 7  0x5C7E  step := eight bytes inline in the script
+ *   op 13 0x59BC  step := master, counts := +$02, accumulator := 0
+ *   op 18 0x5C52  accumulator := eight bytes inline in the script
+ *   op 15 0x5DDA  a RAMP is seeded from its +$0A and started
+ *   op 16 0x5DEE  a RAMP is stopped where it stands
+ *
+ * BabeWatch's "SHOW YOUR MUSCLES TO SCORE JACKPOTS" is the plainest example
+ * and the reason this round happened: its eleven gym targets are effect 15 on
+ * counter 1, whose master step is 20,000,000; its jackpot shots are effect 14
+ * on the same record; and every one of its five jackpot missions opens with an
+ * `op 6` that puts the step back to 20,000,000. Before this round every one of
+ * those shots paid ZERO, because `payStep` did not exist.
  */
 const EFFECT_COUNT_DISPATCH = 6;
 const EFFECT_PAY_ACCUMULATOR = 7;
+/** The five that make up the RUNNING-STEP machine. See `ModeState.counterSteps`. */
+const EFFECT_PAY_N = 10;
+const EFFECT_PAY_STEP = 14;
+const EFFECT_STEP_ADD = 15;
+const EFFECT_STEP_SUBTRACT = 25;
+const EFFECT_STEP_ADD_RAMP = 27;
 const EFFECT_ADD_STEP = 11;
 const EFFECT_COUNT_AND_PAY = 16;
 const EFFECT_COUNT_AND_ADD = 18;
@@ -379,6 +413,37 @@ export interface ModeState {
    * after both interpreters), and cleared by both reset walks.
    */
   readonly counterWindows: Int32Array;
+  /**
+   * PER COUNTER RECORD, the packed-BCD RUNNING STEP at +$32..$37 — the record's
+   * OTHER value, and the one the growing jackpots are made of.
+   *
+   * The record carries the same eight bytes twice: a MASTER at +$28..$2F that
+   * nothing ever writes, and this working copy at +$30..$37 that six sites
+   * restore from it (`move.l $28(a1),$30(a1) / move.l $2c(a1),$34(a1)` at
+   * +0x0040D4 the new-game walk, +0x00414C the per-ball walk, +0x0056EA the
+   * window expiry, +0x0059C0 opcode 13, +0x005C44 opcode 6 and +0x005F48 the
+   * ladder wrap). In every shipped record the two are byte-identical, so the
+   * master IS `ModeCounter.step` and no second field is exported.
+   *
+   * Three award effects mutate it — 15 adds the element's own +$3A..$3F, 25
+   * subtracts the same six bytes, 27 adds a RAMP's live value — and effect 14
+   * pays it straight to the score. Until this round the port treated the step as
+   * immutable configuration, which is why BabeWatch's "SHOW YOUR MUSCLES TO
+   * SCORE JACKPOTS" paid nothing at all.
+   *
+   * Float64 for the same reason `counterAccumulators` is: twelve BCD digits.
+   */
+  readonly counterSteps: Float64Array;
+  /**
+   * PER RAMP RECORD, the packed-BCD LIVE VALUE at +$04..$09, and its +$00
+   * RUNNING byte. See `ModeRamp` for the record and +0x006334 for the service.
+   *
+   * Both ship at zero and stopped, and NEITHER RESET WALK TOUCHES THIS LIST, so
+   * they are created once and only opcodes 15 and 16 and the service itself
+   * ever write them.
+   */
+  readonly rampValues: Float64Array;
+  readonly rampRunning: Uint8Array;
 
   /**
    * PER LAMP-GROUP LAMP (flattened over `TableModes.lampGroups` in group then
@@ -499,18 +564,6 @@ export interface ModeState {
    * (+0x005864), so it lives exactly as long as one teardown.
    */
   abortWait: boolean;
-  /**
-   * `$d8a(a5)`: the BALL-SAVE countdown, in ticks.
-   *
-   * DECODED, and it is not an "intro delay": opcode 11 (`main.seg00
-   * +0x005992`) writes the ball-save seconds, the same word SERVE arms at
-   * `+0x0049AE` from `$e8e(a5)` (`.opt` record 5, default 5 / 5 / 10 s). The
-   * renderer at `+0x004DEC..+0x004E20` blinks the descriptor's engine[1] lamp
-   * from it — > 100 frames 4-on/4-off, 51..100 1-on/1-off, <= 50 off — and
-   * `+0x0052CE` gives the ball back on a drain while it is non-zero.
-   * Carried here, not yet spent: nothing reads it until the ball saver lands.
-   */
-  ballSaveTicks: number;
 
   /** RECONSTRUCTION. Which selector entry the next arm shot will start. */
   selectorCursor: number;
@@ -547,6 +600,13 @@ export function createModeState(modes: TableModes): ModeState {
     // test — so both start at zero however the counts start.
     counterAccumulators: new Float64Array(modes.counters.length),
     counterWindows: new Int32Array(modes.counters.length),
+    // The RUNNING STEP starts as the master copy, which is the same walk's
+    // `move.l $28(a1),$30(a1)` at +0x0040D4 — and in every shipped record the
+    // two are already equal, so this is also just "as the file ships".
+    counterSteps: Float64Array.from(modes.counters, (counter) => counter.step),
+    // The ramps ship stopped with a zero value and no walk resets them.
+    rampValues: new Float64Array(modes.ramps.length),
+    rampRunning: Uint8Array.from(modes.ramps, (ramp) => (ramp.running ? 1 : 0)),
     groupLampLit: new Uint8Array(lampCount),
     groupLampAlways: new Uint8Array(lampCount),
     groupFired: new Uint8Array(modes.lampGroups.length),
@@ -569,7 +629,6 @@ export function createModeState(modes: TableModes): ModeState {
     resumePc: -1,
     waitIndefinite: false,
     abortWait: false,
-    ballSaveTicks: 0,
     selectorCursor: 0,
     played: new Uint8Array(modes.missions.length),
   };
@@ -623,16 +682,24 @@ export function resetModesForNewBall(modes: TableModes, state: ModeState): void 
     // before either keep-flag test, so even a per-game counter loses them.
     state.counterAccumulators[counter.index] = 0;
     state.counterWindows[counter.index] = 0;
-    if (counter.keepAcrossBall) {
-      // A bit-0 record then REBUILDS accumulator = step x kept count, the
-      // six-`abcd` loop at +0x00417C — once per count, no clamp. Bit 3 keeps
-      // the count and leaves the accumulator at zero.
-      if ((counter.flags & COUNTER_FLAG_REBUILD_ACCUMULATOR) !== 0) {
-        state.counterAccumulators[counter.index] =
-          counter.step * Math.max(0, state.counterCounts[counter.index] ?? 0);
-      }
+    if ((counter.flags & COUNTER_FLAG_REBUILD_ACCUMULATOR) !== 0) {
+      // BIT 0 IS THE ONLY FLAG THAT SKIPS THE STEP RESTORE. `btst.b #$0,(a1) /
+      // bne $417c` at +0x004146 jumps PAST the `move.l $28(a1),$30(a1)` at
+      // +0x00414C as well as past the count reset, so a bit-0 record's GROWN
+      // running step carries across the ball — and the rebuild that follows
+      // multiplies the grown step, not the master, because +0x004184's `lea
+      // $38(a1),a2` walks +$37..$32. That is BabeWatch's counter 1, flags
+      // exactly $01: its jackpot grows for the whole game and no drain takes
+      // any of it back.
+      state.counterAccumulators[counter.index] =
+        (state.counterSteps[counter.index] ?? counter.step) *
+        Math.max(0, state.counterCounts[counter.index] ?? 0);
       continue;
     }
+    // Everything else falls through +0x00414C, bit-3 records included, so its
+    // running step goes back to the master whether or not the count follows.
+    state.counterSteps[counter.index] = counter.step;
+    if (counter.keepAcrossBall) continue;
     state.counterCounts[counter.index] = counter.reset;
     state.counterTotals[counter.index] = counter.reset;
   }
@@ -1271,6 +1338,12 @@ export interface ModeTickReport {
    * multiplier and the two holds above are. See `forceStartLampsOff`.
    */
   readonly clearedFlagIds: readonly string[];
+  /**
+   * Ticks mode-script opcode 11 (+0x005992) set the BALL SAVE to, or -1 for a
+   * tick in which no script ran one. Reported, not applied: `$D8A(a5)` is one
+   * machine-global word and the loop owns it. See `Game.ballSaveTicks`.
+   */
+  readonly ballSaveTicks: number;
   /** Opcodes executed whose behaviour is not decoded. See the header. */
   readonly unimplemented: number;
 }
@@ -1299,6 +1372,7 @@ export const EMPTY_MODE_TICK: ModeTickReport = Object.freeze({
   holdMultiplier: false,
   comboPaid: 0,
   clearedFlagIds: Object.freeze([]),
+  ballSaveTicks: -1,
   unimplemented: 0,
 });
 
@@ -1318,6 +1392,14 @@ interface Accumulator {
   holdBonus: boolean;
   holdMultiplier: boolean;
   comboPaid: number;
+  /**
+   * Ticks mode-script opcode 11 wrote into `$D8A(a5)` this tick, or -1 for "it
+   * did not run". REPORTED rather than applied, and that is the correction:
+   * `$d8a` is ONE machine-global word (+0x00599A `move.w d0,$d8a(a5)`), not a
+   * per-player field, so a copy sitting in this bank would be the wrong shape
+   * the moment a second player existed. The loop owns the word.
+   */
+  ballSaveTicks: number;
   /**
    * Scoring-layer flag ids the force-off's `bclr` re-armed this tick, in the
    * order it cleared them. Reported rather than applied: the flag set belongs
@@ -1472,6 +1554,15 @@ function walkLadder(modes: TableModes, state: ModeState, counterIndex: number, l
   let total = state.counterTotals[counterIndex] ?? 0;
   // Bounded so a wrap word that cannot catch the total (or a wrap of zero, the
   // 0xFFFF-terminated tables) ends the walk instead of spinning.
+  //
+  // THE MACHINE'S WRAP DOES MORE THAN SUBTRACT: at +0x005F2A, when no ladder
+  // entry has fired for this player yet, it queues the record's +$4C and then
+  // resets the record outright — running step back to master, counts back to
+  // +$02, accumulator cleared (+0x005F48..+0x005F64). None of that is modelled
+  // and none of it is reachable by the running-step machine: EVERY counter any
+  // of effects 10/14/15/25/27 names has `ladder` -1 (BabeWatch 1 and 3, Extreme
+  // Sports 6, 7, 10 and 14, Law 'n Justice 4 and 14), so this walk returns
+  // above before it could ever touch a jackpot.
   const lastId = ladder.entries[ladder.entries.length - 1]?.id ?? 0;
   while (ladder.wrap > 0 && total > lastId) total -= ladder.wrap;
   state.counterTotals[counterIndex] = total;
@@ -1520,11 +1611,19 @@ function bumpCounter(modes: TableModes, state: ModeState, counterIndex: number, 
  * exactly it; effects 11, 16 and 18 all enter here, so the clamp guards every
  * add. The ball-start rebuild is the one step-multiplier that does NOT come
  * through this routine, and it is the one place the clamp does not run.
+ *
+ * THE STEP IT ADDS IS THE RUNNING ONE. `lea $38(a0),a1` predecrements into
+ * +$37..$32, not into the +$2F..$2A master, so a step that effect 15/25/27 or
+ * opcode 6/7/13 has moved is the step this adds. No shipped counter is on both
+ * sides of that — the six records effects 11/16/18 reach are named by no
+ * step-writing opcode but `RESET_GROUP`, which writes the master back — so the
+ * corpus cannot tell the two readings apart today; the running one is what the
+ * instruction says.
  */
 function addStepToAccumulator(modes: TableModes, state: ModeState, counterIndex: number): void {
   const counter = modes.counters[counterIndex];
   if (counter === undefined) return;
-  let value = (state.counterAccumulators[counterIndex] ?? 0) + counter.step;
+  let value = (state.counterAccumulators[counterIndex] ?? 0) + (state.counterSteps[counterIndex] ?? counter.step);
   if (counter.target >= 0 && value > counter.target) value = counter.target;
   state.counterAccumulators[counterIndex] = value;
 }
@@ -1538,6 +1637,65 @@ function addStepToAccumulator(modes: TableModes, state: ModeState, counterIndex:
  */
 function payAccumulator(state: ModeState, out: Accumulator, counterIndex: number): void {
   out.comboPaid += state.counterAccumulators[counterIndex] ?? 0;
+}
+
+/**
+ * THE RUNNING STEP, mutated. 0x60DC (effect 15) and 0x60B2 (effect 25) are the
+ * same six backwards BCD bytes with `abcd` and `sbcd`; 0x60FA (effect 27) is
+ * 15's body with the source swapped for a ramp's live value.
+ *
+ * The floor at zero is the `sbcd` chain's own: six bytes of packed BCD cannot
+ * go negative, they borrow out of the top and wrap to 10^12 minus the
+ * difference. NOTHING in the corpus reaches it — there is not one effect-25
+ * element on any of the three tables (see `BALL_SAVER_JACKPOTS.md` §5) — so the
+ * wrap is unreachable and a clamp is the honest reconstruction of an
+ * unreachable case rather than a guess at one.
+ */
+/**
+ * The eight inline bytes opcodes 7 and 18 store, as the six-byte packed-BCD
+ * number the record's own field is.
+ *
+ * The two operands are the record's +$30..$33 and +$34..$37 (or +$38..$3B and
+ * +$3C..$3F); the BCD is the LOW SIX of those eight, so the first long
+ * contributes only its bottom half-word. Every shipped operand has the first
+ * long zero, so the high half is never anything but a check — but it is read,
+ * because a document that quietly dropped it would be lying about its source.
+ */
+function bcdPairToNumber(high: number, low: number): number {
+  const bytes = [
+    (high >>> 8) & 0xff,
+    high & 0xff,
+    (low >>> 24) & 0xff,
+    (low >>> 16) & 0xff,
+    (low >>> 8) & 0xff,
+    low & 0xff,
+  ];
+  let value = 0;
+  for (const byte of bytes) {
+    const hi = byte >> 4;
+    const lo = byte & 0x0f;
+    if (hi > 9 || lo > 9) return 0;
+    value = value * 100 + hi * 10 + lo;
+  }
+  return value;
+}
+
+function addToStep(state: ModeState, counterIndex: number, delta: number): void {
+  const value = (state.counterSteps[counterIndex] ?? 0) + delta;
+  state.counterSteps[counterIndex] = Math.max(0, value);
+}
+
+/**
+ * 0x61E6, award effect 14: `movea.l $34(a2),a0 / lea $38(a0),a3 / jsr $6BCC`.
+ *
+ * `$6BCC` predecrements a3 six times, so the six bytes it pays are +$37..$32 —
+ * the RUNNING STEP, not the accumulator that effect 7's `lea $40(a0),a3` pays.
+ * Score only, and the step is NOT consumed: a table that wants the jackpot to
+ * drop after a collect says so with opcode 6 or 7, which BabeWatch's script 145
+ * and Extreme Sports' 81 and 112 all do.
+ */
+function payStep(state: ModeState, out: Accumulator, counterIndex: number): void {
+  out.comboPaid += state.counterSteps[counterIndex] ?? 0;
 }
 
 /**
@@ -1633,6 +1791,43 @@ function applyAwardEffect(
     }
     if (element.effect === EFFECT_PAY_ACCUMULATOR) {
       payAccumulator(state, out, element.counter);
+      return;
+    }
+    // THE RUNNING-STEP MACHINE. See `ModeState.counterSteps`.
+    if (element.effect === EFFECT_PAY_STEP) {
+      payStep(state, out, element.counter);
+      return;
+    }
+    if (element.effect === EFFECT_STEP_ADD || element.effect === EFFECT_STEP_SUBTRACT) {
+      addToStep(
+        state,
+        element.counter,
+        element.effect === EFFECT_STEP_ADD ? element.stepAddend : -element.stepAddend,
+      );
+      return;
+    }
+    if (element.effect === EFFECT_STEP_ADD_RAMP) {
+      // 0x60FA harvests whatever the ramp has reached — running or stopped, and
+      // zero before its mission ever started it, which is exactly what the
+      // machine's own uninitialised +$04..$09 gives.
+      if (element.stepRamp >= 0) {
+        addToStep(state, element.counter, state.rampValues[element.stepRamp] ?? 0);
+      }
+      return;
+    }
+    if (element.effect === EFFECT_PAY_N) {
+      // 0x61BA: pay the ACCUMULATOR `min(ask, count)` times, and zero the count
+      // ONLY when it held fewer than the ask — `sub.w d0,d1 / bpl $61d2` skips
+      // the `clr.w $6(a0,d6.w*2)` when the count could cover it, so a count
+      // that can pay in full is not spent at all. Law 'n Justice's element 89
+      // asks for 25.
+      const count = Math.max(0, state.counterCounts[element.counter] ?? 0);
+      let times = element.payCount;
+      if (count < times) {
+        times = count;
+        state.counterCounts[element.counter] = 0;
+      }
+      for (let i = 0; i < times; i += 1) payAccumulator(state, out, element.counter);
       return;
     }
     if (element.effect === EFFECT_ARM_WINDOW) {
@@ -1833,8 +2028,82 @@ function step(
     case OP_SET_BALL_SAVE:
       // Opcode 11 is SET BALL SAVE SECONDS, not "set intro". Law 'n Justice's
       // scripts re-arm it with 2, 10 and 30-second operands.
-      state.ballSaveTicks = Math.max(0, args[0] ?? 0) * TICKS_PER_SECOND;
+      // +0x005992 is `move.w $2(a1),d0 / mulu.w $50(a5),d0 / move.w d0,$d8a(a5)`
+      // — a plain store, so a script SETS the saver rather than extending it,
+      // and a script that arms 10 seconds over a running 30 shortens it.
+      out.ballSaveTicks = Math.max(0, args[0] ?? 0) * TICKS_PER_SECOND;
       return next;
+
+    // THE FOUR OPCODES OF THE RUNNING-STEP MACHINE. An opcode is in this set
+    // exactly when its handler writes the counter record's step (+$30..$37) or
+    // its accumulator (+$38..$3F); opcode 22 (SET_COUNT_SELF, 0x5C2E) writes
+    // neither and stays a no-op, as it was.
+    case OP_LINK_RESTORE: {
+      // 0x5C40: `move.l $28(a2),$30(a2) / move.l $2c(a2),$34(a2)` — the step
+      // alone, back to its master. BabeWatch's script 145 opens with one.
+      const counter = args[0] ?? -1;
+      const record = counter < 0 ? undefined : modes.counters[counter];
+      if (record !== undefined) state.counterSteps[counter] = record.step;
+      return next;
+    }
+
+    case OP_SET_VALUE: {
+      // 0x5C7E: `move.l $6(a1),$30(a2) / move.l $a(a1),$34(a2)` — the step SET
+      // from eight bytes of packed BCD inline in the script. The step's own six
+      // are +$32..$37, so the low half-word of the first long and all of the
+      // second; every shipped operand has the first long zero.
+      const counter = args[0] ?? -1;
+      if (counter >= 0 && modes.counters[counter] !== undefined) {
+        state.counterSteps[counter] = bcdPairToNumber(args[1] ?? 0, args[2] ?? 0);
+      }
+      return next;
+    }
+
+    case OP_RESET_GROUP: {
+      // 0x59BC: the step back to its master, both per-player words back to the
+      // record's +$02, and the accumulator cleared — the per-ball walk's body
+      // without the flag tests, on one named record.
+      const counter = args[0] ?? -1;
+      const record = counter < 0 ? undefined : modes.counters[counter];
+      if (record !== undefined) {
+        state.counterSteps[counter] = record.step;
+        state.counterCounts[counter] = record.reset;
+        state.counterTotals[counter] = record.reset;
+        state.counterAccumulators[counter] = 0;
+      }
+      return next;
+    }
+
+    case OP_SET_MAX: {
+      // 0x5C52: `move.l $6(a1),$38(a2) / move.l $a(a1),$3c(a2)` — the same
+      // shape as SET_VALUE for the ACCUMULATOR instead of the step.
+      const counter = args[0] ?? -1;
+      if (counter >= 0 && modes.counters[counter] !== undefined) {
+        state.counterAccumulators[counter] = bcdPairToNumber(args[1] ?? 0, args[2] ?? 0);
+      }
+      return next;
+    }
+
+    case OP_RAMP_START: {
+      // 0x5DDA: `move.l $a(a2),$2(a2) / move.l $e(a2),$6(a2) / st.b (a2)` —
+      // reload the start value and run. SET, so re-issuing it restarts the ramp
+      // from the top however far it had climbed.
+      const ramp = args[0] ?? -1;
+      const record = ramp < 0 ? undefined : modes.ramps[ramp];
+      if (record !== undefined) {
+        state.rampValues[ramp] = record.start;
+        state.rampRunning[ramp] = 1;
+      }
+      return next;
+    }
+
+    case OP_RAMP_STOP: {
+      // 0x5DEE: `clr.b (a2)`. The VALUE is left exactly where it stopped, which
+      // is what lets Extreme Sports' Iron Man stop a hurry-up and still pay it.
+      const ramp = args[0] ?? -1;
+      if (ramp >= 0 && modes.ramps[ramp] !== undefined) state.rampRunning[ramp] = 0;
+      return next;
+    }
 
     case OP_MESSAGE:
       pushMessage(modes, out, args[0] ?? -1);
@@ -2094,6 +2363,7 @@ export function tickModes(modes: TableModes, state: ModeState): ModeTickReport {
     holdMultiplier: false,
     comboPaid: 0,
     clearedFlagIds: [],
+    ballSaveTicks: -1,
     unimplemented: 0,
   };
 
@@ -2119,18 +2389,39 @@ export function tickModes(modes: TableModes, state: ModeState): ModeTickReport {
   // scan so a group completed this tick starts its sixteen frames on the next
   // one, which is the order the frame chain has them in.
   serviceGroupFlash(modes, state, out);
+  // THE RAMP SERVICE, 0x6334: every running ramp's value moves one increment
+  // toward its limit, and reaching the limit clamps to exactly it and STOPS the
+  // ramp. Its slot in the frame chain at +0x004B70 is between the mission
+  // interpreter (+0x004B6A) and the window service (+0x004B76), which is where
+  // it runs here.
+  for (const ramp of modes.ramps) {
+    if (state.rampRunning[ramp.index] !== 1) continue;
+    const value = (state.rampValues[ramp.index] ?? 0) + (ramp.up ? ramp.increment : -ramp.increment);
+    // `bcs $63b2` on the borrow out of the `sbcd` chain and the two `cmp.l`
+    // pairs either side of it are one test in decimal: has it reached the end?
+    if (ramp.up ? value >= ramp.limit : value <= ramp.limit) {
+      state.rampValues[ramp.index] = ramp.limit;
+      state.rampRunning[ramp.index] = 0;
+      continue;
+    }
+    state.rampValues[ramp.index] = value;
+  }
+
   // THE WINDOW SERVICE, 0x56D4: every record's +$26 counts down and, on the
-  // tick it reaches zero, the accumulator is cleared. Its slot in the frame
-  // chain at +0x004B46 is AFTER both interpreters (`jsr $58BC .. $5786 ..
-  // $56D4`), so an award on the window's last tick pays before the expiry
-  // wipes it — kept here by running the service at the tail of the tick. The
-  // original also restores the step slot from its +$28 copy; this port's step
-  // is immutable configuration, so there is nothing to restore.
+  // tick it reaches zero, the accumulator is cleared AND the running step goes
+  // back to its +$28 master. Its slot in the frame chain at +0x004B46 is AFTER
+  // both interpreters (`jsr $58BC .. $5786 .. $56D4`), so an award on the
+  // window's last tick pays before the expiry wipes it — kept here by running
+  // the service at the tail of the tick.
   for (let index = 0; index < state.counterWindows.length; index += 1) {
     const left = state.counterWindows[index] ?? 0;
     if (left <= 0) continue;
     state.counterWindows[index] = left - 1;
-    if (left === 1) state.counterAccumulators[index] = 0;
+    if (left === 1) {
+      state.counterAccumulators[index] = 0;
+      const counter = modes.counters[index];
+      if (counter !== undefined) state.counterSteps[index] = counter.step;
+    }
   }
 
   if (
@@ -2150,6 +2441,7 @@ export function tickModes(modes: TableModes, state: ModeState): ModeTickReport {
     !out.holdMultiplier &&
     out.comboPaid === 0 &&
     out.clearedFlagIds.length === 0 &&
+    out.ballSaveTicks < 0 &&
     out.unimplemented === 0
   ) {
     return EMPTY_MODE_TICK;
@@ -2171,6 +2463,7 @@ export function tickModes(modes: TableModes, state: ModeState): ModeTickReport {
     holdMultiplier: out.holdMultiplier,
     comboPaid: out.comboPaid,
     clearedFlagIds: out.clearedFlagIds,
+    ballSaveTicks: out.ballSaveTicks,
     unimplemented: out.unimplemented,
   };
 }

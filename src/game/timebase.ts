@@ -338,3 +338,43 @@ export const ORIGINAL_ANGLE_UNITS_PER_TURN =
  * Four, not one and not eight.
  */
 export const ORIGINAL_FLIPPER_STEPS_PER_FRAME = ORIGINAL_COLLISION_PASSES_PER_FRAME;
+
+// ---------------------------------------------------------------------------
+// The ball saver
+// ---------------------------------------------------------------------------
+
+/**
+ * THE BALL SAVE option, `tableNNN.opt` record 5: (min 0, max 10, cur, DEFAULT
+ * 5 / 5 / 10) — and unlike gravity and the two tilts, this record is NOT the
+ * same on all three files.
+ *
+ * MEASURED, from the same 70-byte load the gravity note above describes. Seven
+ * ten-byte records of (min, max, current, default, -1); +0x0009E6 copies each
+ * default over its current; +0x0009FE copies the seven currents into
+ * `$E84..$E90`. Record 5 lands in `$E8E(a5)`, which has exactly ONE reader in
+ * the whole segment:
+ *
+ *     0049AE  move.w  $e8e(a5),d0
+ *     0049B2  mulu.w  $50(a5),d0     ; x VBlankFrequency, 50 on this PAL machine
+ *     0049B6  move.w  d0,$d8a(a5)    ; THE BALL-SAVE COUNTDOWN
+ *
+ * — the first three instructions of state 5, the ball intro. So every charged
+ * serve on every table arms a ball save, and the shipped lengths are five
+ * seconds on Law 'n Justice and BabeWatch and TEN on Extreme Sports. The
+ * player can pick 0..10 from the options screen, and 0 means no saver at all.
+ *
+ * The raw records, for the check: `0000 000a 0000 0005 ffff` in `table001.opt`
+ * and `table002.opt`, `0000 000a 0000 000a ffff` in `table003.opt`.
+ */
+export const ORIGINAL_BALL_SAVE_MIN = 0;
+export const ORIGINAL_BALL_SAVE_MAX = 10;
+export const ORIGINAL_BALL_SAVE_SECONDS: Readonly<Record<string, number>> = Object.freeze({
+  "law-n-justice": 5,
+  babewatch: 5,
+  "extreme-sports": 10,
+});
+
+/** The shipped ball-save length for a table, in seconds. Unknown tables get 5. */
+export function ballSaveSecondsFor(tableId: string): number {
+  return ORIGINAL_BALL_SAVE_SECONDS[tableId] ?? ORIGINAL_BALL_SAVE_SECONDS["law-n-justice"] ?? 5;
+}

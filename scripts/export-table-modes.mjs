@@ -322,6 +322,79 @@ const EFFECT_SET_MULTIPLIER = 5;
  */
 const ELEMENT_WINDOW = 0x38;
 const EFFECT_ARM_WINDOW = 20;
+/**
+ * THE RUNNING-STEP ADDEND, the element's OWN six packed-BCD bytes at +$3A..$3F.
+ *
+ * Award effect 15 (+0x0060DC) is `lea $40(a2),a1 / movea.l $34(a2),a0 /
+ * lea $38(a0),a2` and then six backwards `abcd -(a1),-(a2)`: the destination
+ * walks the COUNTER's +$37..$32 — its RUNNING STEP — and the source walks the
+ * ELEMENT's +$3F..$3A. Effect 25 (+0x0060B2) is the identical six bytes with
+ * `sbcd`. Capstone decodes NEITHER instruction, so both bodies were read as raw
+ * words; see research/BALL_SAVER_JACKPOTS.md.
+ *
+ * Read ONLY for effects 15 and 25. The same eight bytes are something else on
+ * every other element, and every one of the sixteen elements that do carry it
+ * passes the packed-BCD check.
+ */
+const ELEMENT_STEP_ADDEND = 0x3a;
+const EFFECT_STEP_ADD = 15;
+const EFFECT_STEP_SUBTRACT = 25;
+/**
+ * Award effect 27 (+0x0060FA) is `movea.l $38(a2),a1 / addq.w #8,a1` and then a
+ * `bra` INTO effect 15's body at +0x0060E0, so its six source bytes are the ones
+ * six predecrements below +$08 of whatever the element's +$38 points at.
+ *
+ * That target is a RAMP RECORD PLUS TWO on all six shipped sites (Extreme Sports
+ * elements 26/27/28 and 48/49/50): the pointer is the base of the ramp's live
+ * value slot, so the six bytes are the ramp's +$04..$09 — its CURRENT value.
+ * Proven, not inferred: every one of the six lands exactly two bytes past a
+ * record on the descriptor's own ramp list at +$68, and no other relocated
+ * longword in the package points at `ramp + 2`. See `rampList`.
+ */
+const ELEMENT_STEP_RAMP = 0x38;
+const EFFECT_STEP_ADD_RAMP = 27;
+/**
+ * Award effect 10 (+0x0061BA) reads the SAME +$38 word as effect 20 does, but as
+ * a PAY COUNT: `move.w $38(a2),d0`, compared against the per-player count at
+ * `$6(a0,d6.w*2)`, and the accumulator is then paid `min(ask, count)` times.
+ * Read only for effect 10, whose one shipped site is Law 'n Justice element 89.
+ */
+const EFFECT_PAY_N = 10;
+/**
+ * THE RAMP RECORDS — the table's ticking values, list at descriptor +$68
+ * (`$2356(a5)`), serviced every frame by +0x006334, which is called from the
+ * frame chain at +0x004B70 between the mission interpreter and the window
+ * service. Forty-two bytes each:
+ *
+ *   +$00 b   RUNNING. Non-zero ticks; +0x006340's `tst.b (a1) / beq` skips it.
+ *   +$01 b   bit 0 = DIRECTION: clear counts UP (`abcd` at +0x006358), set
+ *            counts DOWN (`sbcd` at +0x006392).
+ *   +$02..$09  8-byte LIVE VALUE, packed BCD in +$04..$09 (`lea $a(a1),a2`
+ *            then six backwards). The whole eight are what the limit test
+ *            compares (`movem.l $2(a1),d0-d1` at +0x006364).
+ *   +$0A..$11  8-byte START value, packed BCD in +$0C..$11. Opcode 15 copies
+ *            all eight into +$02 and sets +$00 (+0x005DDE).
+ *   +$12..$19  8-byte LIMIT, packed BCD in +$14..$19 — a ceiling counting up,
+ *            a floor counting down. Reaching it CLAMPS to exactly it and
+ *            STOPS the ramp (`clr.b (a1)` at +0x006382 / +0x0063BE).
+ *   +$1A..$21  8-byte INCREMENT PER FRAME, packed BCD in +$1C..$21
+ *            (`lea $22(a1),a3` then six backwards).
+ *   +$22..$29  eight bytes, zero on all twelve shipped records.
+ *
+ * Nothing resets a ramp: no reset walk touches this list. Only opcode 15
+ * (START, which reloads the start value) and opcode 16 (STOP) write +$00.
+ */
+/** "o" operands that name a counter record, and the two that name a ramp. */
+const OPAQUE_COUNTER_OPS = new Set([6, 7, 13, 18]);
+const OPAQUE_RAMP_OPS = new Set([15, 16]);
+const HEADER_RAMPS = 0x68;
+const RAMP_STRIDE = 0x2a;
+const RAMP_RUNNING = 0x00;
+const RAMP_DIRECTION = 0x01;
+const RAMP_START = 0x0c;
+const RAMP_LIMIT = 0x14;
+const RAMP_INCREMENT = 0x1c;
+const RAMP_DIRECTION_DOWN = 0x01;
 
 /**
  * THE PROGRESS-COUNTER RECORD, decoded field by field from its users.
@@ -420,7 +493,14 @@ const OPCODES = [
   { index: 8, name: "PUSH", length: 6, args: "e" },
   { index: 9, name: "MODE_START", length: 6, args: "s" },
   { index: 10, name: "JMP", length: 4, args: "c" },
-  { index: 11, name: "SET_INTRO", length: 4, args: "w" },
+  // SET_BALL_SAVE, not "SET_INTRO". Handler `$5916 + $007C = $5992`:
+  //     005992  move.w  $2(a1),d0
+  //     005996  mulu.w  $50(a5),d0     ; x VBlankFrequency
+  //     00599A  move.w  d0,$d8a(a5)    ; THE BALL-SAVE COUNTDOWN
+  // and `$d8a` is the word the drain reaper tests at +0x0052CE before giving a
+  // ball back. The old name was inherited from the shipped documents and was
+  // never anything but a guess at an operand that happens to be small.
+  { index: 11, name: "SET_BALL_SAVE", length: 4, args: "w" },
   { index: 12, name: "CLEAR_DONE", length: 6, args: "e" },
   { index: 13, name: "RESET_GROUP", length: 6, args: "o" },
   { index: 14, name: "LAMP_OFF", length: 6, args: "e" },
@@ -786,6 +866,31 @@ function counterList(pkg) {
   return out;
 }
 
+/**
+ * The RAMP records, off the descriptor's own list at +$68 — the same shape as
+ * `counterList`, and terminated the same way. See `HEADER_RAMPS`.
+ */
+function rampList(pkg) {
+  const base = descriptorPointer(pkg, HEADER_RAMPS);
+  if (base === null) return [];
+  const out = [];
+  for (let index = 0; ; index += 1) {
+    const at = { hunk: base.hunk, offset: base.offset + 4 * index };
+    if (!inBounds(pkg, at, 4)) break;
+    if (readU32(pkg, at) === 0 && !pkg.relocations.has(key(at))) break;
+    const record = follow(pkg, at);
+    if (record === null) {
+      throw new Error(`${pkg.stem}: ramp list entry ${index} at ${key(at)} is not a relocated pointer`);
+    }
+    if (index > 64) throw new Error(`${pkg.stem}: ramp list is not terminated`);
+    if (!inBounds(pkg, record, RAMP_STRIDE)) {
+      throw new Error(`${pkg.stem}: ramp ${index} at ${key(record)} does not fit its 42-byte record`);
+    }
+    out.push(record);
+  }
+  return out;
+}
+
 /** Bytes of the table's bonus routine scanned for the combo read. LnJ's is at +0xB4. */
 const COMBO_SCAN_BYTES = 0x200;
 
@@ -908,6 +1013,36 @@ function elementWindowSeconds(pkg, at) {
     throw new Error(`${pkg.stem}: effect-20 element at ${key(at)} arms a ${value}-second window`);
   }
   return value;
+}
+
+/**
+ * Award effect 15's and 25's own six packed-BCD bytes at +$3A..$3F, as a decimal
+ * number, and 0 for every other effect. See `ELEMENT_STEP_ADDEND`.
+ */
+function elementStepAddend(pkg, at) {
+  const effect = readU16(pkg, at, ELEMENT_EFFECT);
+  if (effect !== EFFECT_STEP_ADD && effect !== EFFECT_STEP_SUBTRACT) return 0;
+  if (!inBounds(pkg, at, ELEMENT_STEP_ADDEND + BCD_BYTES)) return 0;
+  if (pkg.relocations.has(`${at.hunk}:${at.offset + ELEMENT_STEP_ADDEND}`)) {
+    throw new Error(
+      `${pkg.stem}: effect-${effect} element at ${key(at)} has a RELOCATED +$3A; ` +
+        "effects 15 and 25 read those six bytes as packed BCD, so this is not one",
+    );
+  }
+  return readBcd(pkg, at, ELEMENT_STEP_ADDEND, `effect-${effect} element step addend`);
+}
+
+/** Award effect 10's PAY COUNT, the element's +$38 as a word. See `EFFECT_PAY_N`. */
+function elementPayCount(pkg, at) {
+  if (readU16(pkg, at, ELEMENT_EFFECT) !== EFFECT_PAY_N) return 0;
+  if (!inBounds(pkg, at, ELEMENT_WINDOW + 2)) return 0;
+  if (pkg.relocations.has(`${at.hunk}:${at.offset + ELEMENT_WINDOW}`)) {
+    throw new Error(
+      `${pkg.stem}: effect-10 element at ${key(at)} has a RELOCATED +$38; ` +
+        "award effect 10 reads that field as a word of payments, so this is not one",
+    );
+  }
+  return readU16(pkg, at, ELEMENT_WINDOW);
 }
 
 /**
@@ -1550,6 +1685,40 @@ function decode(pkg, table) {
   const elementCounter = elementList.map((at) => counterIndexOf(follow(pkg, at, ELEMENT_COUNTER)));
   const comboCounter = comboCounterOf(pkg, counterIndexOf);
 
+  // THE RAMPS, off the descriptor's list at +$68. Pooled the same way the
+  // counters are, and indexed two ways: by the record itself (opcodes 15 and 16
+  // name the base) and by BASE PLUS TWO (award effect 27's element +$38 names
+  // the live value slot, which is +$02 of the same record — see
+  // `ELEMENT_STEP_RAMP`).
+  const rampRecords = rampList(pkg);
+  const rampIndexByKey = new Map(rampRecords.map((at, index) => [key(at), index]));
+  const rampIndexByValueSlot = new Map(
+    rampRecords.map((at, index) => [key({ hunk: at.hunk, offset: at.offset + 2 }), index]),
+  );
+  const ramps = rampRecords.map((at, index) => ({
+    index,
+    up: (readU8(pkg, at, RAMP_DIRECTION) & RAMP_DIRECTION_DOWN) === 0,
+    // Every shipped record ships stopped with a zero live value; the runtime's
+    // is state, and only opcode 15 ever seeds it.
+    running: readU8(pkg, at, RAMP_RUNNING) !== 0,
+    start: readBcd(pkg, at, RAMP_START, "ramp start"),
+    limit: readBcd(pkg, at, RAMP_LIMIT, "ramp limit"),
+    increment: readBcd(pkg, at, RAMP_INCREMENT, "ramp increment"),
+  }));
+  const elementStepRamp = elementList.map((at) => {
+    if (readU16(pkg, at, ELEMENT_EFFECT) !== EFFECT_STEP_ADD_RAMP) return -1;
+    const target = follow(pkg, at, ELEMENT_STEP_RAMP);
+    const found = target === null ? undefined : rampIndexByValueSlot.get(key(target));
+    if (found === undefined) {
+      throw new Error(
+        `${pkg.stem}: effect-27 element at ${key(at)} points its +$38 at ` +
+          `${target === null ? "nothing" : key(target)}, which is not a ramp record plus two; ` +
+          "award effect 27 reads six packed-BCD bytes below that address + 8",
+      );
+    }
+    return found;
+  });
+
   // THE LAMP GROUPS off descriptor +$38, and the hook-2 multiplier restore
   // decoded from the descriptor's own tail. See `HEADER_LAMP_GROUPS`.
   const groups = lampGroups(pkg, scriptIndex, elementList, residue);
@@ -1572,6 +1741,12 @@ function decode(pkg, table) {
     displayAward: messageIndex.get(keyOrNull(follow(pkg, at, ELEMENT_DISPLAY_AWARD))) ?? -1,
     counter: elementCounter[index],
     ladder: elementLadder[index],
+    // THE RUNNING-STEP MACHINE. `stepAddend` is what effects 15 and 25 add to
+    // and subtract from the counter's running step; `stepRamp` is the ramp
+    // effect 27 harvests instead; `payCount` is effect 10's ask.
+    stepAddend: elementStepAddend(pkg, at),
+    stepRamp: elementStepRamp[index],
+    payCount: elementPayCount(pkg, at),
   }));
 
   const messages = messageList.map((at, index) => ({ index, lines: messageText(pkg, at) }));
@@ -1604,6 +1779,35 @@ function decode(pkg, table) {
         // SET_COUNT names a record on the descriptor's counter list; anything
         // else is exported unresolved, exactly as the opaque pointers are.
         if (arg.kind === "n") return counterIndexOf(arg.target);
+        // THE FOUR "o" OPCODES WHOSE RECORD IS NOW POOLED. Their handlers name
+        // the pool for them and every shipped operand lands in it:
+        //   6  LINK_RESTORE 0x5C40  `move.l $28(a2),$30(a2)` — a COUNTER
+        //   7  SET_VALUE    0x5C7E  `move.l $6(a1),$30(a2)`  — a COUNTER
+        //  15  RESTORE_POS  0x5DDA  `move.l $a(a2),$2(a2) / st.b (a2)` — a RAMP
+        //  16  CLEAR_BYTE   0x5DEE  `clr.b (a2)`            — a RAMP
+        // 13 (RESET_GROUP) and 18 (SET_MAX) are counters too and are resolved
+        // with them; 22 (SET_COUNT_SELF) is a counter this round does not run
+        // and stays opaque, because nothing would read the index.
+        if (arg.kind === "o" && OPAQUE_COUNTER_OPS.has(op.index)) {
+          const resolved = counterIndexOf(arg.target);
+          if (resolved < 0) {
+            throw new Error(
+              `${pkg.stem}: script ${index} op ${op.name} operand ${key(arg.target)} is not on the ` +
+                "descriptor's counter list",
+            );
+          }
+          return resolved;
+        }
+        if (arg.kind === "o" && OPAQUE_RAMP_OPS.has(op.index)) {
+          const resolved = rampIndexByKey.get(key(arg.target));
+          if (resolved === undefined) {
+            throw new Error(
+              `${pkg.stem}: script ${index} op ${op.name} operand ${key(arg.target)} is not on the ` +
+                "descriptor's ramp list",
+            );
+          }
+          return resolved;
+        }
         // CHECK 4 — the operand must be in the pool its opcode requires.
         const pool =
           arg.kind === "e" ? elementIndex : arg.kind === "m" ? messageIndex : arg.kind === "s" ? scriptIndex : null;
@@ -1724,6 +1928,7 @@ function decode(pkg, table) {
     missions,
     ladders,
     counters,
+    ramps,
     comboCounter,
     lampGroups: groups,
     multiplierRestore,
@@ -1792,6 +1997,7 @@ function buildDocument(table, decoded) {
     missions: decoded.missions,
     ladders: decoded.ladders,
     counters: decoded.counters,
+    ramps: decoded.ramps,
     comboCounter: decoded.comboCounter,
     lampGroups: decoded.lampGroups,
     multiplierRestore: decoded.multiplierRestore,

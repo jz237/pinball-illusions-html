@@ -681,10 +681,47 @@ const TICKS = 4000;
  * probe, the trap census, and `tests/ball-spin.test.ts`'s own union counts
  * against the machine's RAM — and it moves no byte of these three games.
  */
+/**
+ * RE-PINNED — THE BALL SAVER (this round). Same script, same strictness, same
+ * 4,000 ticks, three new digests. The old ones were
+ *
+ *   law-n-justice   a41f900e57cc38f3759aa0bca236600726e5ba3974d40a68def10c46bfce2493
+ *   babewatch       4ab5a715fa45de855691e81d78d5338e96682613a36e3dc60f57ae0c690cc3c7
+ *   extreme-sports  9ffff59755535963edd0a72d95e5bbe14b6ec327dd68b5d7978f6da25fc9b303
+ *
+ * and they moved because `$D8A(a5)` is now armed at every charged serve from
+ * `.opt` record 5 and spent by the drain reaper. THE FIRST DIVERGENT TICK WAS
+ * MEASURED, not assumed: the tree at 1778bf4 was checked out into a second
+ * worktree and run through this exact harness, and the two runs' per-tick
+ * snapshots were compared with the two NEW fields (`ballSaveTicks`,
+ * `ballSaving`) projected out, so what the comparison sees is behaviour and not
+ * the arrival of a field.
+ *
+ *   law-n-justice   TICK 658. Ball 2 drains 75 frames short of the end of its
+ *                   five-second save. At 1778bf4 that was the end of the ball
+ *                   and `bonusPhase` opened; now `pendingServes` goes to 1,
+ *                   `ballSaving` goes up and the same ball comes back. The three
+ *                   fields that differ on that tick are `bonusPhase`,
+ *                   `pendingServes` and `serveCountdown`, and nothing else.
+ *   extreme-sports  TICK 302. The same event on ball 1, 223 frames into its TEN
+ *                   second save — the one table whose option record 5 is 10
+ *                   rather than 5, which is why it is the earliest of the three.
+ *   babewatch       NO BEHAVIOURAL TICK AT ALL. Over the whole 4,000 ticks not
+ *                   one projected snapshot differs: this script's drains on that
+ *                   table all land after the five seconds are spent. Its digest
+ *                   moves for the two new fields alone, and that is the honest
+ *                   reading of it rather than a claim that nothing changed.
+ *
+ * The growing-jackpot half of the same round moves NONE of the three. It is
+ * reachable only through award effects 10/14/15/25/27 and opcodes 6/7/13/15/16/18,
+ * and this script never starts a mission, so no element carrying one is ever
+ * awarded and no ramp is ever started. `tests/growing-jackpots.test.ts` is where
+ * that half is measured.
+ */
 const PINNED: Record<TableId, string> = {
-  "law-n-justice": "a41f900e57cc38f3759aa0bca236600726e5ba3974d40a68def10c46bfce2493",
-  "babewatch": "4ab5a715fa45de855691e81d78d5338e96682613a36e3dc60f57ae0c690cc3c7",
-  "extreme-sports": "9ffff59755535963edd0a72d95e5bbe14b6ec327dd68b5d7978f6da25fc9b303",
+  "law-n-justice": "9038d64e08bd11116334e6e4e3f77009cad5968b64e585e952dcf7029afac3b9",
+  "babewatch": "3a34ce15ca448917b2a554bddc6ca725b3699a18badb95b388fe3064eebcd3b7",
+  "extreme-sports": "88834d88e7b19b6d443d558bd840df8110c97dbf00573155b14a77f57922bf78",
 };
 
 /** Same shape as the determinism harness's input: behaviour = f(tick index). */

@@ -141,8 +141,50 @@ export function buildLampSprites(art: TableArt, lamps: TableLamps): LampSprite[]
  * gate and the same rule applies here: the mode is BLINKING, and the phase
  * decides visibility.
  */
-export function lampModes(lamps: TableLamps, state: ModeState | null): Uint8Array {
+/**
+ * THE BALL-SAVE LAMP'S OWN BLINK, +0x004DEC..+0x004E20, which is not the
+ * eight-frame group blink and is not anchored to the tick either — it is
+ * anchored to the countdown itself:
+ *
+ *     004DEC  tst.w   $d8a(a5)
+ *     004DF0  beq.b   $4e22             ; nothing armed -> leave the lamp alone
+ *     004DF2  subq.w  #$1,$d8a(a5)
+ *     004DF6  move.l  ([$2352,a5],$4),d0
+ *     004DFE  beq.b   $4e22             ; no ball-save lamp on this table
+ *     004E02  move.w  $d8a(a5),d0
+ *     004E06  cmpi.w  #$64,d0 / bhi  $4e1c    ; > 100 frames
+ *     004E0C  cmpi.w  #$32,d0 / bhi  $4e16    ; 51..100
+ *     004E12  clr.b   (a1)                    ; <= 50: DARK
+ *     004E16  andi.w  #$1,d0 / bra $4e20      ; 51..100: on every other frame
+ *     004E1C  andi.w  #$4,d0                  ; > 100: four on, four off
+ *     004E20  sne.b   (a1)
+ *
+ * So the lamp flashes slowly while more than two seconds remain, flashes at
+ * 25 Hz through the last two, and goes OUT for the final second — a warning
+ * that gets more urgent and then stops, which is why the byte is written with
+ * `sne` off a mask of the countdown rather than off any clock.
+ *
+ * `ticks` is the value the countdown holds AFTER this frame's decrement, which
+ * is what +0x004E02 re-reads. Returns null when nothing is armed, so the caller
+ * leaves the lamp to whatever the mode layer wanted.
+ */
+export function ballSaveLampLit(ticks: number): boolean | null {
+  if (ticks <= 0) return null;
+  if (ticks > 100) return (ticks & 4) !== 0;
+  if (ticks > 50) return (ticks & 1) !== 0;
+  return false;
+}
+
+/** Descriptor +$64 slot 1. See `TableLamps.engine`. */
+export const BALL_SAVE_ENGINE_SLOT = 1;
+
+export function lampModes(
+  lamps: TableLamps,
+  state: ModeState | null,
+  ballSaveTicks = 0,
+): Uint8Array {
   const modes = new Uint8Array(lamps.lamps.length);
+  applyBallSaveLamp(lamps, modes, ballSaveTicks);
   if (state === null) return modes;
   for (let lamp = 0; lamp < modes.length; lamp += 1) {
     let mode: LampMode = LAMP_OFF;
@@ -160,7 +202,19 @@ export function lampModes(lamps: TableLamps, state: ModeState | null): Uint8Arra
     }
     modes[lamp] = mode;
   }
+  // AFTER the mode walk as well as before it, because the engine writes the
+  // lamp byte itself every frame and nothing in the mode layer can outvote it.
+  applyBallSaveLamp(lamps, modes, ballSaveTicks);
   return modes;
+}
+
+/** Engine slot 1, when the table has one and something is armed. */
+function applyBallSaveLamp(lamps: TableLamps, modes: Uint8Array, ballSaveTicks: number): void {
+  const lamp = lamps.engine[BALL_SAVE_ENGINE_SLOT] ?? -1;
+  if (lamp < 0 || lamp >= modes.length) return;
+  const lit = ballSaveLampLit(ballSaveTicks);
+  if (lit === null) return;
+  modes[lamp] = lit ? LAMP_STEADY : LAMP_OFF;
 }
 
 /**

@@ -733,6 +733,8 @@ function drainConnected(tableId: TableId): Set<number> {
 interface WriteOffCensus {
   readonly drained: number;
   readonly writtenOff: number;
+  /** Charged serves across every game — three per game when nothing hangs. */
+  readonly served: number;
   /** Write-off sites, most frequent first, for a failure message worth reading. */
   readonly sites: readonly (readonly [string, number])[];
   /** Games that reached `game-over` having served every ball. */
@@ -804,6 +806,7 @@ function writeOffCensus(tableId: TableId): WriteOffCensus {
 
   let drained = 0;
   let writtenOff = 0;
+  let served = 0;
   let completed = 0;
   let games = 0;
   const sites = new Map<string, number>();
@@ -878,6 +881,7 @@ function writeOffCensus(tableId: TableId): WriteOffCensus {
     }
 
     const end = debugSnapshot(game);
+    served += end.ballsServed;
     if (end.phase === "game-over" && end.ballsServed === game.options.ballsPerGame) {
       completed += 1;
     } else {
@@ -892,6 +896,7 @@ function writeOffCensus(tableId: TableId): WriteOffCensus {
   const census: WriteOffCensus = {
     drained,
     writtenOff,
+    served,
     completed,
     games,
     stalls,
@@ -1111,7 +1116,12 @@ describe("all three tables", () => {
       const run = runFor(tableId);
       expect(run.phase, `stalled after ${run.ballsServed} balls`).toBe("game-over");
       expect(run.ballsServed).toBe(3);
-      expect(run.ends).toHaveLength(3);
+      // Three CHARGED serves, and at least three ends — the shipped ball save
+      // is armed at every one of those serves (`ballSaveSecondsFor`: five
+      // seconds here, ten on Extreme Sports) and this bot drains early enough
+      // to collect one or two of them per ball. `ends` counts every ball that
+      // left the playfield, saved or not.
+      expect(run.ends.length).toBeGreaterThanOrEqual(3);
     });
 
     it(`${tableId} launches, reaches the playfield and drains out of the bottom`, () => {
@@ -1286,7 +1296,13 @@ describe("all three tables", () => {
     // `playfield-levels.ts` are that pair of hand-offs, both read off the map.
     for (const tableId of TABLE_IDS) {
       const ends = runFor(tableId).ends;
-      expect(ends.map((end) => end.drained), `${tableId}`).toEqual([true, true, true]);
+      // EVERY end, not the first three: the shipped ball save turns one charged
+      // ball into several playfield exits, and each one of them still has to be
+      // a real drain out of the bottom row rather than the search retiring a
+      // stuck ball. Asserting the whole list is strictly more than the old
+      // three-element compare, and it is the assertion this test is for.
+      expect(ends.length, `${tableId} ball ends`).toBeGreaterThanOrEqual(3);
+      expect(ends.map((end) => end.drained), `${tableId}`).toEqual(ends.map(() => true));
       for (const end of ends) expect(end.y).toBeGreaterThanOrEqual(590);
     }
   });
@@ -1454,11 +1470,21 @@ describe("all three tables", () => {
     // finish the game. On no table, at no starting pull, may the playfield stop
     // giving the ball back.
     for (const tableId of TABLE_IDS) {
-      const { completed, games, stalls, drained, writtenOff } = writeOffCensus(tableId);
+      const { completed, games, stalls, drained, writtenOff, served } = writeOffCensus(tableId);
       expect(completed, `${tableId} stalled ${games - completed} of ${games}:\n${stalls.join("\n")}`)
         .toBe(games);
-      // And every one of those games really did play three balls out.
-      expect(drained + writtenOff, `${tableId} ball ends`).toBe(games * 3);
+      // And every one of those games really did play three balls out. The
+      // count is `ballsServed`, not the drain count, because a BALL AND A DRAIN
+      // ARE NO LONGER THE SAME THING: with the shipped ball save armed at every
+      // serve (five seconds here, ten on Extreme Sports) a ball that drains
+      // inside the window comes straight back, so three balls now cost between
+      // three and a dozen drains. `completed` above already requires
+      // `ballsServed === ballsPerGame` for every game; this states the total.
+      expect(served, `${tableId} balls served`).toBe(games * 3);
+      // Every ball still ENDS by leaving the playfield, and now at least once
+      // each. The saved re-drains are the surplus and they are counted, not
+      // waved through: see `tests/ball-saver.test.ts` for what they are worth.
+      expect(drained + writtenOff, `${tableId} ball ends`).toBeGreaterThanOrEqual(games * 3);
     }
   });
 

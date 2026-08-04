@@ -74,9 +74,17 @@ class Quiet implements InputSource {
 }
 
 function startedGame(options: Partial<GameOptions> = {}): Game {
+  // BALL SAVE OFF, DELIBERATELY AND BY THE MACHINE'S OWN KNOB. `tableNNN.opt`
+  // record 5 is a 0..10 slider and 0 is a setting the options screen offers;
+  // every ball in this block is driven straight into the drain to reach the
+  // thing under test, and with the shipped five seconds armed each of those
+  // drains comes back instead. The saver has its own file — see
+  // `tests/ball-saver.test.ts`, which drives it at the shipped lengths on all
+  // three tables — and nothing here is testing it.
   const game = createGame(mapFor("law-n-justice"), {
     firstServeDelayTicks: 2,
     serveDelayTicks: 3,
+    ballSaveSeconds: 0,
     ...options,
   });
   startGame(game);

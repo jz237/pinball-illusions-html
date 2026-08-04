@@ -138,6 +138,7 @@ const BLINK_HALF_PERIOD = 8;
 /** Bounds on the walks, all far above anything shipped. */
 const MAX_GROUPS = 64;
 const MAX_CHAIN = 64;
+const ENGINE_LAMP_SLOTS = 3;
 const MAX_ENGINE = 16;
 
 const TABLES = [
@@ -376,25 +377,45 @@ function discoverLamps(pkg, stem) {
     }
   }
 
+  // THE ENGINE LAMP LIST, in order: `$2352(a5)` is descriptor +$64, and the
+  // two engine lamps the ENGINE itself drives (rather than any mode script) are
+  // its first two entries.
+  //
+  //   [0] SHOOT AGAIN — `move.l ([$2352,a5]),d0 / st.b $5(a1)` at +0x00606C,
+  //       the extra-ball award, and again at +0x0050E0 when the end-of-ball
+  //       teardown finds `$10` of the player record non-zero.
+  //   [1] BALL SAVE   — `move.l ([$2352,a5],$4),d0` at +0x004DF6, blinked off
+  //       the `$D8A` countdown every in-play frame and cleared at +0x004E4C
+  //       when the last ball drains.
+  //
+  // Both are written as WHOLE BYTES ($FF / $00, `sne.b` and `clr.b`), which is
+  // the per-player steady mask set for every player at once — the engine's
+  // lamps are not per player.
+  const engine = [];
   const engineBase = follow(pkg, descriptor, HEADER_ENGINE_LAMPS);
   if (engineBase !== null) {
-    for (let i = 0; ; i += 1) {
-      if (i > MAX_ENGINE) throw new Error(`${stem}: engine lamp list is not terminated`);
-      if (!inBounds(pkg, engineBase, i * 4 + 4) || readU32(pkg, engineBase, i * 4) === 0) break;
+    for (let i = 0; i < ENGINE_LAMP_SLOTS; i += 1) {
+      if (!inBounds(pkg, engineBase, i * 4 + 4)) break;
+      // A FIXED THREE SLOTS, and a NULL slot is kept as one. The list is not
+      // zero-terminated: BabeWatch's slot 1 is a genuine null (raw 0x00000000,
+      // not relocated) with a real relocated pointer after it in slot 2, and the
+      // engine's own `move.l ([$2352,a5],$4),d0 / beq.b $4e22` at +0x004DF6 says
+      // so in as many words — a table with no ball-save lamp simply skips the
+      // blink. An earlier walk here stopped at the first non-relocated long and
+      // therefore reported BabeWatch as having ONE engine lamp; it has three
+      // slots like the others, the middle one empty. Slot 3 is 0x02000000 on all
+      // three tables, which is the next record.
       const at = follow(pkg, engineBase, i * 4);
-      // The list's terminator is not pinned: the longs after the genuine
-      // entries are neither zero nor relocated (whatever record follows the
-      // list starts there), so the walk stops at the first long the relocation
-      // table does not claim. Every entry it yields IS a lamp object, and on
-      // all three shipped tables every one is already in the group table, so
-      // this list changes nothing there — it is kept for a package where the
-      // engine lamps are NOT group-reachable, which would otherwise vanish.
-      if (at === null) break;
+      if (at === null) {
+        engine.push(null);
+        continue;
+      }
       admit(at, -1, `${stem} engine lamp ${i} (${key(at)})`);
+      engine.push(at);
     }
   }
 
-  return { lamps, byKey };
+  return { lamps, byKey, engine };
 }
 
 /** The element pool, exactly as export-table-modes.mjs derives it. */
@@ -421,7 +442,7 @@ function elementPool(pkg) {
 // ---------------------------------------------------------------------------
 
 function decode(pkg, table, modesDoc) {
-  const { lamps, byKey } = discoverLamps(pkg, table.stem);
+  const { lamps, byKey, engine } = discoverLamps(pkg, table.stem);
   const indices = artworkIndices(pkg);
 
   // Decode every lamp's graphics and verify the lit-artwork invariant.
@@ -513,7 +534,12 @@ function decode(pkg, table, modesDoc) {
     };
   });
 
-  return { lamps: docs, elements: wiring, maskPixels };
+  return {
+    lamps: docs,
+    elements: wiring,
+    maskPixels,
+    engine: engine.map((at) => (at === null ? -1 : (byKey.get(key(at))?.index ?? -1))),
+  };
 }
 
 function buildDocument(table, decoded) {
@@ -524,6 +550,7 @@ function buildDocument(table, decoded) {
     provenance: PROVENANCE,
     blink: { halfPeriodFrames: BLINK_HALF_PERIOD },
     lamps: decoded.lamps,
+    engine: decoded.engine,
     elements: decoded.elements,
   };
 }
