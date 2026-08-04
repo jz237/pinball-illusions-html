@@ -51,6 +51,8 @@ import {
 import type { PanelAnimation, PanelBonusView, PanelCardView, PanelState } from "./panel-renderer.js";
 import { createPixelTarget } from "./playfield-renderer.js";
 import type { PixelTarget } from "./playfield-renderer.js";
+import { dmdBandOffset, dmdGeometryFor, renderDmdInto } from "./panel-dmd.js";
+import type { DmdGeometry } from "./panel-dmd.js";
 import { PANEL_UNLIT } from "./palette.js";
 import { decodePanelObjectFrames, panelFramePixels } from "../game/table-panel.js";
 import type { TablePanel } from "../game/table-panel.js";
@@ -91,6 +93,26 @@ export class PanelDisplay implements PanelPresenter {
   #surface: HTMLCanvasElement | OffscreenCanvas | null = null;
   #surfaceContext: { putImageData(data: ImageData, x: number, y: number): void } | null = null;
   #image: ImageData | null = null;
+
+  // ---------------------------------------------------------------------
+  // The DOT-MATRIX path (`panel-dmd.ts`), live only at scale >= DMD_MIN_SCALE.
+  //
+  // Built lazily and rebuilt only when the 320 x 16 raster actually CHANGES,
+  // which on this panel is rare in the extreme: session 5 counted FOURTEEN
+  // distinct panel images in 3,761 filmed frames, every one of them
+  // bit-identical for the whole of its delay. So the per-frame cost is the
+  // 20 KB raster comparison and one `drawImage`; the 1344 x 64 expansion and
+  // its `putImageData` happen on the frames the panel changes and no others.
+  // ---------------------------------------------------------------------
+  #dmd: PixelTarget | null = null;
+  #dmdSurface: HTMLCanvasElement | OffscreenCanvas | null = null;
+  #dmdContext: { putImageData(data: ImageData, x: number, y: number): void } | null = null;
+  #dmdImage: ImageData | null = null;
+  /** The raster the dot surface was last built from; empty until it has been. */
+  #dmdRaster: Uint8ClampedArray | null = null;
+  /** The geometry the dot surface was built for, so a resize rebuilds it. */
+  #dmdCell = 0;
+  #dmdBand = 0;
 
   constructor(
     panel: TablePanel,
@@ -211,6 +233,11 @@ export class PanelDisplay implements PanelPresenter {
    * glass across the full width, the 320-px strip centred in it (the view is
    * 336 source pixels wide; the original's display, and the strip, are 320).
    * Returns false — drawing nothing — until the shell font has arrived.
+   *
+   * At `DMD_MIN_SCALE` and above the band is drawn as the DOT MATRIX the
+   * machine actually displays (`panel-dmd.ts`); below it — every native build,
+   * and every phone, since `canvas-fit.ts` caps a coarse pointer at 2 — this is
+   * byte for byte the pre-HD draw.
    */
   draw(
     context: CanvasRenderingContext2D,
@@ -223,6 +250,9 @@ export class PanelDisplay implements PanelPresenter {
     if (font === null) return false;
 
     renderPanelInto(this.#state, score, font, this.#target, this.#bonus, card);
+
+    const geometry = dmdGeometryFor(scale);
+    if (geometry !== null) return this.#drawDotMatrix(context, geometry, viewWidth);
 
     if (this.#surface === null) {
       this.#surface = this.#createSurface(PANEL_WIDTH, PANEL_HEIGHT);
@@ -249,6 +279,60 @@ export class PanelDisplay implements PanelPresenter {
       PANEL_WIDTH * scale,
       PANEL_HEIGHT * scale,
     );
+    return true;
+  }
+
+  /**
+   * The dot-matrix band, blitted 1:1.
+   *
+   * The expansion is skipped whenever the 320 x 16 raster and the geometry are
+   * both what the surface already holds — which, on a panel that shows fourteen
+   * distinct images in seventy-five seconds, is nearly every frame.
+   */
+  #drawDotMatrix(
+    context: CanvasRenderingContext2D,
+    geometry: DmdGeometry,
+    viewWidth: number,
+  ): boolean {
+    const band = Math.max(PANEL_WIDTH, Math.floor(viewWidth));
+    const width = band * geometry.cell;
+    const height = PANEL_HEIGHT * geometry.cell;
+    if (this.#dmdCell !== geometry.cell || this.#dmdBand !== band) {
+      this.#dmd = createPixelTarget(width, height);
+      this.#dmdSurface = this.#createSurface(width, height);
+      const surfaceContext = this.#dmdSurface.getContext("2d");
+      if (surfaceContext === null) return false;
+      this.#dmdContext = surfaceContext as unknown as {
+        putImageData(data: ImageData, x: number, y: number): void;
+      };
+      this.#dmdImage = new ImageData(width, height);
+      this.#dmdRaster = null;
+      this.#dmdCell = geometry.cell;
+      this.#dmdBand = band;
+    }
+    const dmd = this.#dmd;
+    if (dmd === null || this.#dmdContext === null || this.#dmdImage === null) return false;
+
+    const raster = this.#target.data;
+    let stale = this.#dmdRaster === null;
+    if (!stale) {
+      const held = this.#dmdRaster as Uint8ClampedArray;
+      for (let i = 0; i < raster.length; i += 1) {
+        if (held[i] !== raster[i]) {
+          stale = true;
+          break;
+        }
+      }
+    }
+    if (stale) {
+      renderDmdInto(this.#target, dmd, geometry, band, dmdBandOffset(band, PANEL_WIDTH));
+      this.#dmdImage.data.set(dmd.data);
+      this.#dmdContext.putImageData(this.#dmdImage, 0, 0);
+      this.#dmdRaster = new Uint8ClampedArray(raster);
+    }
+
+    context.imageSmoothingEnabled = false;
+    context.drawImage(this.#dmdSurface as CanvasImageSource, 0, 0);
     return true;
   }
 }

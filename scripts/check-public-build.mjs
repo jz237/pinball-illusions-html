@@ -167,6 +167,17 @@ const DERIVED_MARKERS = [
   { class: "disk-derived-lamp-overlays-hd", noun: "HD lamp patch atlas" },
   { class: "disk-derived-ball-sprite-hd", noun: "HD ball sprite" },
   { class: "disk-derived-flipper-sprites-hd", noun: "HD flipper bat atlas" },
+  // Phase 3, the shell. The two menu fonts and the three backdrop strips at 4x
+  // (scripts/export-shell-art-hd.mjs). They ship as INDEX MAPS rather than
+  // pictures, because the runtime still has to colour them — the page palette
+  // fades and the ink follows the screen — but an index map of the disk's
+  // artwork is no less disk-derived than the artwork, so it claims its files
+  // through the same images[] branch its native class uses.
+  { class: "disk-derived-shell-artwork-hd", noun: "HD shell artwork" },
+  // The loading strip at 4x. Its palette is the loader's own copper list and
+  // never fades, so unlike the shell set this one ships as finished RGBA — one
+  // PNG through the single-image branch, exactly like its native class.
+  { class: "disk-derived-loading-logo-hd", noun: "HD loading logo" },
   // The front door's card thumbnails: top-of-table crops of the HD masters
   // (scripts/export-shell-thumbs.mjs). A crop of a derived picture is still
   // disk-derived, so each ships as one WebP claimed by its own manifest
@@ -192,6 +203,8 @@ const MEDIA_MARKERS = new Map([
   ["disk-derived-lamp-overlays-hd", { noun: "HD lamp patch atlas", extensions: IMAGE_EXT }],
   ["disk-derived-ball-sprite-hd", { noun: "HD ball sprite", extensions: IMAGE_EXT }],
   ["disk-derived-flipper-sprites-hd", { noun: "HD flipper bat atlas", extensions: IMAGE_EXT }],
+  ["disk-derived-shell-artwork-hd", { noun: "HD shell artwork", extensions: IMAGE_EXT }],
+  ["disk-derived-loading-logo-hd", { noun: "HD loading logo", extensions: IMAGE_EXT }],
   ["disk-derived-table-thumbnail", { noun: "table thumbnail", extensions: IMAGE_EXT }],
   ["disk-derived-intro", { noun: "intro animation", extensions: DATA_EXT }],
 ]);
@@ -204,7 +217,14 @@ const SINGLE_IMAGE_CLASSES = new Set([
   "disk-derived-ball-sprite-hd",
   "disk-derived-flipper-sprites-hd",
   "disk-derived-loading-logo",
+  "disk-derived-loading-logo-hd",
   "disk-derived-table-thumbnail",
+]);
+
+/** Manifest classes that claim SEVERAL rasters through an `images: []` array. */
+const IMAGE_ARRAY_CLASSES = new Set([
+  "disk-derived-shell-artwork",
+  "disk-derived-shell-artwork-hd",
 ]);
 
 /** Tolerates both `"sourceClass":"x"` and the spaced form a formatter might emit. */
@@ -261,14 +281,14 @@ for await (const file of walk(root)) {
     claim(rel, doc?.image?.file, doc?.image?.sha256, media_marker.noun, `${media_marker.noun} manifest`);
     continue;
   }
-  if (marker.class === "disk-derived-shell-artwork") {
+  if (IMAGE_ARRAY_CLASSES.has(marker.class)) {
     const shellImages = Array.isArray(doc?.images) ? doc.images : null;
     if (shellImages === null) {
-      violations.push(`${rel}: shell artwork manifest carries no images array`);
+      violations.push(`${rel}: ${media_marker.noun} manifest carries no images array`);
       continue;
     }
     for (const image of shellImages) {
-      claim(rel, image?.file, image?.sha256, media_marker.noun, "shell artwork manifest");
+      claim(rel, image?.file, image?.sha256, media_marker.noun, `${media_marker.noun} manifest`);
     }
     continue;
   }

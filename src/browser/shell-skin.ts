@@ -52,6 +52,7 @@ import {
   STRIP_WIDTH,
 } from "../game/shell-art.js";
 import type { LoadingLogo } from "../game/loading-logo.js";
+import type { HdIndexMap, LoadingLogoHd, ShellArtHd } from "../game/shell-art-hd.js";
 
 /** The slice of a canvas this module needs from its factory. */
 export interface SkinCanvas {
@@ -262,6 +263,18 @@ export interface ShellSkin {
   /** The decoded data itself: metrics, sine, dissolve orders, palettes. */
   readonly art: ShellArt;
   /**
+   * How many surface pixels one shell pixel is: 1 normally, `HD_ASSET_SCALE`
+   * when the HD set (`shell-art-hd.ts`) is loaded.
+   *
+   * Every surface this skin hands out — strips, font atlases, the loading
+   * strip — is at this scale, and `shell-screens.ts` multiplies its SOURCE
+   * rectangles by it while leaving every DESTINATION coordinate alone. That is
+   * the same seam the HD playfield uses (`playfield-renderer.ts`): the shell's
+   * geometry is the original's at every scale, and only the pixel density
+   * behind it moves.
+   */
+  readonly sourceScale: number;
+  /**
    * One strip painted through `palette` (48 bytes, as `ShellBackdropFrame`
    * carries it). Repainted only when the palette actually changed, so the 250
    * frames a page is held cost nothing.
@@ -329,25 +342,86 @@ interface StripSurface {
   painted: Uint8Array;
 }
 
+/**
+ * The HD presentation set, when a build has one.
+ *
+ * All four members move together or not at all: a skin with an HD strip and a
+ * native font atlas would be drawing two resolutions of the same screen, which
+ * is a seam nobody chose. `main.ts` therefore passes this whole object or null.
+ */
+export interface ShellSkinHd {
+  readonly art: ShellArtHd;
+  readonly logo: LoadingLogoHd | null;
+}
+
+/**
+ * Whether an HD set REGISTERS with the native artwork it magnifies.
+ *
+ * `shell-screens.ts` indexes the HD font atlases with the NATIVE font's own
+ * glyph metrics multiplied by the scale, so an atlas whose row count is not
+ * exactly `native rows x scale` would slice every glyph out of the wrong place
+ * — silently, and further out of true the further down the atlas it got. This
+ * is the first place that holds BOTH the native art and the HD set, so it is
+ * the only place the check can be made: `shell-art-hd.ts` cannot make it,
+ * because a loader never sees the native atlas it is standing in for.
+ */
+function hdRegisters(hd: ShellSkinHd, art: ShellArt): boolean {
+  const scale = hd.art.scale;
+  if (!Number.isInteger(scale) || scale < 1) return false;
+  const fonts: readonly (readonly [HdIndexMap, { readonly rows: number }])[] = [
+    [hd.art.font1, art.font1],
+    [hd.art.font2, art.font2],
+  ];
+  for (const [map, native] of fonts) {
+    if (map.width !== FONT_ATLAS_WIDTH * scale) return false;
+    if (map.height !== native.rows * scale) return false;
+    if (map.indices.length !== map.width * map.height) return false;
+  }
+  for (const role of ["attract", "menu", "select"] as const) {
+    const map = hd.art.backdrops[role];
+    if (map === undefined) return false;
+    if (map.width !== STRIP_WIDTH * scale || map.height !== STRIP_HEIGHT * scale) return false;
+    if (map.indices.length !== map.width * map.height) return false;
+  }
+  return true;
+}
+
 export function createShellSkin(
   art: ShellArt,
   createCanvas: SkinCanvasFactory,
   logo: LoadingLogo | null = null,
+  requested: ShellSkinHd | null = null,
 ): ShellSkin {
+  // An HD set that does not register with the native artwork is DROPPED, not
+  // thrown: the contract for the whole HD pass is that a build without it draws
+  // the native path unchanged, and silently mis-slicing every glyph is the one
+  // outcome nobody would choose.
+  const hd = requested === null || hdRegisters(requested, art) ? requested : null;
+  if (requested !== null && hd === null) {
+    console.warn(
+      "pinball-illusions: the HD shell set does not register with the native artwork, using native",
+    );
+  }
+  // One number decides every surface's size below, and `shell-screens.ts`
+  // multiplies its source rectangles by the same one.
+  const sourceScale = hd?.art.scale ?? 1;
+  const stripWidth = STRIP_WIDTH * sourceScale;
+  const stripHeight = STRIP_HEIGHT * sourceScale;
+  const atlasWidth = FONT_ATLAS_WIDTH * sourceScale;
   const strips = new Map<ShellBackdropRole, StripSurface>();
 
   const backdrop = (role: ShellBackdropRole, palette: Uint8Array): CanvasImageSource => {
     let held = strips.get(role);
     if (held === undefined) {
       held = {
-        canvas: createCanvas(STRIP_WIDTH, STRIP_HEIGHT),
-        rgba: new Uint8ClampedArray(STRIP_WIDTH * STRIP_HEIGHT * 4),
+        canvas: createCanvas(stripWidth, stripHeight),
+        rgba: new Uint8ClampedArray(stripWidth * stripHeight * 4),
         // Impossible as a real palette (a live one starts black), so the first
         // call always paints.
         painted: new Uint8Array(SHELL_PALETTE_COLOURS * 3).fill(0xff),
       };
-      held.canvas.width = STRIP_WIDTH;
-      held.canvas.height = STRIP_HEIGHT;
+      held.canvas.width = stripWidth;
+      held.canvas.height = stripHeight;
       strips.set(role, held);
     }
     let same = true;
@@ -359,7 +433,11 @@ export function createShellSkin(
     }
     if (!same) {
       held.painted.set(palette);
-      const pixels = art.backdrops[role].pixels;
+      // The HD strip is the SAME KIND of data — one palette index per pixel —
+      // so the repaint below is the native one verbatim, sixteen times as many
+      // pixels. That is what lets the page-palette fade go on running at HD:
+      // nothing about the colour arithmetic knows which map it is walking.
+      const pixels = hd === null ? art.backdrops[role].pixels : hd.art.backdrops[role].indices;
       for (let i = 0; i < pixels.length; i += 1) {
         const entry = (pixels[i] ?? 0) * 3;
         const at = i * 4;
@@ -370,7 +448,7 @@ export function createShellSkin(
       }
       const context = held.canvas.getContext("2d");
       if (context === null) throw new Error("skin canvas gave no 2d context");
-      context.putImageData(new ImageData(held.rgba, STRIP_WIDTH, STRIP_HEIGHT), 0, 0);
+      context.putImageData(new ImageData(held.rgba, stripWidth, stripHeight), 0, 0);
     }
     return held.canvas as unknown as CanvasImageSource;
   };
@@ -381,10 +459,15 @@ export function createShellSkin(
     const cached = atlases.get(key);
     if (cached !== undefined) return cached as unknown as CanvasImageSource;
     const data = font === "font1" ? art.font1 : art.font2;
+    const map = hd === null ? null : font === "font1" ? hd.art.font1 : hd.art.font2;
+    // The HD atlas is a PLANE-VALUE map, the same 0..3 the native atlas holds,
+    // so the ink ramp below is untouched and any ink colour still works.
+    const values = map === null ? data.pixels : map.indices;
+    const rows = map === null ? data.rows : map.height;
     const ink = parseHexColour(colour);
-    const rgba = new Uint8ClampedArray(FONT_ATLAS_WIDTH * data.rows * 4);
-    for (let i = 0; i < data.pixels.length; i += 1) {
-      const value = data.pixels[i] ?? 0;
+    const rgba = new Uint8ClampedArray(atlasWidth * rows * 4);
+    for (let i = 0; i < values.length; i += 1) {
+      const value = values[i] ?? 0;
       if (value === 0) continue; // bare backdrop: there is no knockout
       const scale = (INK_RAMP[value] ?? 255) / 255;
       const at = i * 4;
@@ -393,15 +476,29 @@ export function createShellSkin(
       rgba[at + 2] = Math.round(ink[2] * scale);
       rgba[at + 3] = 255;
     }
-    const built = surface(createCanvas, FONT_ATLAS_WIDTH, data.rows, rgba);
+    const built = surface(createCanvas, atlasWidth, rows, rgba);
     atlases.set(key, built);
     return built as unknown as CanvasImageSource;
   };
 
   let logoSurface: SkinCanvas | null = null;
   const loadingLogo = (): CanvasImageSource | null => {
-    if (logo === null) return null;
+    const hdLogo = hd?.logo ?? null;
+    if (logo === null && hdLogo === null) return null;
     if (logoSurface === null) {
+      // The HD strip arrives already composited — its palette is the loader's
+      // own copper list and never fades, so it ships as finished RGBA and there
+      // is nothing left to do but hand it over.
+      if (hdLogo !== null) {
+        logoSurface = surface(
+          createCanvas,
+          hdLogo.width,
+          hdLogo.height,
+          hdLogo.data as Uint8ClampedArray<ArrayBuffer>,
+        );
+        return logoSurface as unknown as CanvasImageSource;
+      }
+      if (logo === null) return null;
       const rgba = new Uint8ClampedArray(logo.width * logo.height * 4);
       for (let i = 0; i < logo.indices.length; i += 1) {
         const index = logo.indices[i] ?? 0;
@@ -424,9 +521,10 @@ export function createShellSkin(
 
   return {
     art,
+    sourceScale,
     backdrop,
     fontAtlas,
     loadingLogo,
-    loadingLogoTop: () => logo?.top ?? null,
+    loadingLogoTop: () => logo?.top ?? hd?.logo?.top ?? null,
   };
 }

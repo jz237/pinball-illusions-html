@@ -1,0 +1,81 @@
+{
+  "schema": "pinball-illusions/shell-art-hd/v1",
+  "scale": 4,
+  "images": [
+    {
+      "file": "shell-backdrop-attract-hd.png",
+      "role": "attract",
+      "kind": "index-map",
+      "width": 5888,
+      "height": 128,
+      "colours": 16,
+      "byteLength": 47535,
+      "sha256": "5ae468204bc2b1958bff9179756cbe37b6a80a4c82203d05583cc952b7d43a48",
+      "source": {
+        "file": "shell-backdrop-attract.png",
+        "sha256": "2fcd2b64de77beaa9e6d06de157426f11a084fd6af9eb360e02a7e48a7d74007"
+      }
+    },
+    {
+      "file": "shell-backdrop-menu-hd.png",
+      "role": "menu",
+      "kind": "index-map",
+      "width": 5888,
+      "height": 128,
+      "colours": 16,
+      "byteLength": 31841,
+      "sha256": "fa6cf62364154b6f4bb578dc11c099e7170b6836e2ee2be29366d5b726862b8d",
+      "source": {
+        "file": "shell-backdrop-menu.png",
+        "sha256": "dabc3aecca6cbecf5c55952b17aefe940a42da26f475050c609100a57e779361"
+      }
+    },
+    {
+      "file": "shell-backdrop-select-hd.png",
+      "role": "select",
+      "kind": "index-map",
+      "width": 5888,
+      "height": 128,
+      "colours": 16,
+      "byteLength": 62611,
+      "sha256": "69d1fee097017e99763e7cd551c7ebdaced62c0c4589063e6f4cb9a4c9ec5bf7",
+      "source": {
+        "file": "shell-backdrop-select.png",
+        "sha256": "5bfddd9e6ce3024cf53da1c62e95012baf298e75c47cdb133ce17fa4d32354d2"
+      }
+    },
+    {
+      "file": "shell-font1-hd.png",
+      "role": "font1",
+      "kind": "plane-values",
+      "width": 64,
+      "height": 5784,
+      "colours": 4,
+      "byteLength": 13618,
+      "sha256": "f445f947b8b643478c7b5bcf5e37de11d28a1f6a03080c65c183bb4c44ab2402",
+      "source": {
+        "file": "shell-font1.png",
+        "sha256": "496497f4248aceae4a5a7566de4b7d525344e7ba3e20fb485be66d28f44ebdf9"
+      }
+    },
+    {
+      "file": "shell-font2-hd.png",
+      "role": "font2",
+      "kind": "plane-values",
+      "width": 64,
+      "height": 3340,
+      "colours": 4,
+      "byteLength": 3623,
+      "sha256": "2d5b6119f418a1197cc2746c14f576023ee73eee02786a70aa23fa00a17daf7d",
+      "source": {
+        "file": "shell-font2.png",
+        "sha256": "d10de9cfcea7224bccedda79f95098a9554a330f75b37ca091ea0a3edb10cf55"
+      }
+    }
+  ],
+  "provenance": {
+    "sourceClass": "disk-derived-shell-artwork-hd",
+    "description": "The shipped shell artwork at 4x. Backdrop strips are index maps upscaled by xbrz-js@1.9.2 (xBRZ v1.9), format argb, default config through each of the first 8 live page palettes and reduced by per-pixel majority vote, so the runtime palette fade is unaffected; the two menu fonts are plane-value maps upscaled the same way against the original's own three-step ink ramp with alpha thresholded at half. No de-dither prepass: the exporter's own checkerboard census finds attract 0, menu 0, select 0 1x1 cells. Derived from disk artwork; still disk-derived.",
+    "authorizationRequired": true
+  }
+}

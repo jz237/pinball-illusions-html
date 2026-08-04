@@ -363,6 +363,22 @@ function skinFontData(skin: ShellSkin, font: SkinFontKey): ShellFont {
 }
 
 /**
+ * Whether a skinned blit should be filtered.
+ *
+ * NEAREST when the source and the destination are at the same scale, which is
+ * every native build and an HD build on a full-size desktop window: one 1995
+ * pixel lands on an exact square block and nothing is resampled. SMOOTH only
+ * when a 4x source is being resolved DOWN — a phone, where `canvas-fit.ts` caps
+ * a coarse pointer at 2 — because that is a supersample, and a bilinear
+ * downscale of a supersample is the whole point of shipping a 4x master. It is
+ * the same stance `playfield-renderer.ts` takes for the full-table blit and the
+ * one both sibling remakes ship.
+ */
+function smoothFor(skin: ShellSkin, scale: number): boolean {
+  return skin.sourceScale !== scale && skin.sourceScale > 1;
+}
+
+/**
  * One run of text in a decoded font.
  *
  * `y` is the glyph-box top, which is the coordinate the original's TEXT opcode
@@ -389,8 +405,9 @@ function glyphs(
 ): void {
   const data = skinFontData(skin, font);
   const atlas = skin.fontAtlas(font, colour);
+  const source = skin.sourceScale;
   let pen = alignShellText(data, value, x, align);
-  ctx.imageSmoothingEnabled = false;
+  ctx.imageSmoothingEnabled = smoothFor(skin, scale);
   for (let i = 0; i < value.length; i += 1) {
     const glyph = data.glyphs[shellCharCode(value, i)];
     if (glyph === undefined) continue;
@@ -398,9 +415,9 @@ function glyphs(
       ctx.drawImage(
         atlas,
         0,
-        glyph.top,
-        FONT_ATLAS_WIDTH,
-        glyph.height,
+        glyph.top * source,
+        FONT_ATLAS_WIDTH * source,
+        glyph.height * source,
         px(pen, scale),
         py(y + glyph.yOffset, scale),
         FONT_ATLAS_WIDTH * scale,
@@ -444,19 +461,23 @@ function skinBands(
   tick: number,
 ): void {
   const strip = skin.backdrop(role, palette);
-  ctx.imageSmoothingEnabled = false;
+  const source = skin.sourceScale;
+  ctx.imageSmoothingEnabled = smoothFor(skin, scale);
   ctx.save();
   ctx.beginPath();
   ctx.rect(px(FIELD_X, scale), py(FIELD_Y, scale), FIELD_WIDTH * scale, FIELD_HEIGHT * scale);
   ctx.clip();
   for (let band = 0; band < BAND_COUNT; band += 1) {
+    // The band offset is decided in the ORIGINAL's units — it is the disk's own
+    // sine table over the disk's own scroll counter — and only then multiplied
+    // into the source raster, so the wobble is the same at every scale.
     const left = shellBandOffset(skin.art.sine, tick, band);
     ctx.drawImage(
       strip,
-      Math.max(0, Math.min(STRIP_WIDTH - FIELD_WIDTH, left)),
+      Math.max(0, Math.min(STRIP_WIDTH - FIELD_WIDTH, left)) * source,
       0,
-      FIELD_WIDTH,
-      BAND_HEIGHT,
+      FIELD_WIDTH * source,
+      BAND_HEIGHT * source,
       px(FIELD_X, scale),
       py(band * BAND_HEIGHT, scale),
       FIELD_WIDTH * scale,
@@ -1165,12 +1186,13 @@ function drawLoading(ctx: ShellContext, scale: number, state: ShellState, skin: 
   const logo = skin.loadingLogo();
   const logoTop = skin.loadingLogoTop();
   if (logo !== null && logoTop !== null) {
+    ctx.imageSmoothingEnabled = smoothFor(skin, scale);
     ctx.drawImage(
       logo,
       0,
       0,
-      LOADING_LOGO_WIDTH,
-      LOADING_LOGO_HEIGHT,
+      LOADING_LOGO_WIDTH * skin.sourceScale,
+      LOADING_LOGO_HEIGHT * skin.sourceScale,
       px(0, scale),
       py(logoTop, scale),
       LOADING_LOGO_WIDTH * scale,

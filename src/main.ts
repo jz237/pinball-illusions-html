@@ -102,6 +102,7 @@ import type { ShellArtworkSource } from "./browser/shell-screens.js";
 import { createShellSkin } from "./browser/shell-skin.js";
 import type { ShellSkin } from "./browser/shell-skin.js";
 import { loadShellArt } from "./game/shell-art.js";
+import { loadLoadingLogoHd, loadShellArtHd } from "./game/shell-art-hd.js";
 import { loadLoadingLogo } from "./game/loading-logo.js";
 import { loadShellMusic } from "./audio/shell-music.js";
 import type { ShellFont } from "./game/shell-art.js";
@@ -608,6 +609,22 @@ async function boot(): Promise<void> {
         console.warn("pinball-illusions: loading logo unavailable, using the font", error);
         return null;
       });
+      // THE HD SHELL SET (phase 3). Optional-with-loud-fallback, exactly like a
+      // table's HD master: a build without it draws the shell through the
+      // native path unchanged. The two HD files move together — a 4x strip
+      // under a native font atlas would be two resolutions of one screen — so a
+      // failed strip fetch takes the whole HD skin down and nothing else.
+      const artHd = await loadShellArtHd().catch((error: unknown) => {
+        console.warn("pinball-illusions: HD shell artwork unavailable, using native", error);
+        return null;
+      });
+      const logoHd =
+        artHd === null
+          ? null
+          : await loadLoadingLogoHd().catch((error: unknown) => {
+              console.warn("pinball-illusions: HD loading logo unavailable, using native", error);
+              return null;
+            });
       skin = createShellSkin(
         art,
         (width, height) => {
@@ -617,7 +634,16 @@ async function boot(): Promise<void> {
           return surface;
         },
         logo,
+        artHd === null ? null : { art: artHd, logo: logoHd },
       );
+      // The shell is the FIRST thing on screen and every screen before a table
+      // loads is one of its pages, so the HD presentation has to go live here
+      // rather than waiting for a board. Same flip, same refit, same one-way
+      // latch as the table path below.
+      if (artHd !== null && !hdActive) {
+        hdActive = true;
+        scale = refit();
+      }
     })
     .catch((error: unknown) => {
       console.warn("pinball-illusions: shell artwork unavailable, using placeholder", error);

@@ -515,3 +515,217 @@ export function batPoseRgba(pose, plane2RowOffset, palette) {
   }
   return rgba;
 }
+
+// ---------------------------------------------------------------------------
+// PHASE 3: the SHELL's rasters, which cannot use the board recipe unchanged
+// ---------------------------------------------------------------------------
+//
+// The board recipe upscales RGB and ships RGB. The shell cannot: both of its
+// raster families are re-coloured AT RUNTIME.
+//
+//   - the backdrop strips are painted through one of sixteen page palettes and
+//     `shell-skin.ts` repaints them EVERY FRAME OF A FADE, one nibble per gun
+//     per frame. Freezing a palette into an RGB upscale would freeze the fade.
+//   - the two menu fonts are painted through whatever INK a screen asks for,
+//     their two glyph planes being a three-step anti-alias ramp rather than
+//     fill and outline.
+//
+// So what ships is an upscaled INDEX MAP in both cases, and the runtime keeps
+// its colour arithmetic exactly as it is. Everything below is deterministic.
+
+/** PNG colour type 3 — the form `src/game/table-art.ts` already decodes. */
+export function encodeIndexedPng(indices, width, height, paletteRgb, transparentCount = 0) {
+  if (indices.length !== width * height) {
+    throw new Error(`index buffer is ${indices.length}, expected ${width * height}`);
+  }
+  if (paletteRgb.length % 3 !== 0 || paletteRgb.length === 0) {
+    throw new Error(`palette is ${paletteRgb.length} bytes, expected a multiple of 3`);
+  }
+  const raw = Buffer.alloc(height * (1 + width));
+  for (let y = 0; y < height; y += 1) {
+    raw.set(indices.subarray(y * width, (y + 1) * width), y * (1 + width) + 1);
+  }
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 3;
+  const chunks = [PNG_SIGNATURE, chunk("IHDR", ihdr), chunk("PLTE", Buffer.from(paletteRgb))];
+  if (transparentCount > 0) chunks.push(chunk("tRNS", Buffer.alloc(transparentCount)));
+  chunks.push(chunk("IDAT", deflateSync(raw, { level: 9 })), chunk("IEND", Buffer.alloc(0)));
+  return Buffer.concat(chunks);
+}
+
+/**
+ * One AGA page palette as RGB bytes — the arithmetic of `shellFadeBlend`:
+ * each 4-bit gun times 17, and colour 0 forced black because the hardware
+ * register behind it is written to $0000 once at init and never again.
+ */
+export function agaPaletteRgb(aga, colours = 16) {
+  const rgb = new Uint8Array(colours * 3);
+  for (let i = 0; i < colours; i += 1) {
+    const word = aga[i] ?? 0;
+    rgb[i * 3] = ((word >> 8) & 0xf) * 17;
+    rgb[i * 3 + 1] = ((word >> 4) & 0xf) * 17;
+    rgb[i * 3 + 2] = (word & 0xf) * 17;
+  }
+  rgb[0] = 0;
+  rgb[1] = 0;
+  rgb[2] = 0;
+  return rgb;
+}
+
+/** Indices through an RGB palette, as flat RGB bytes. */
+export function paintIndices(indices, paletteRgb) {
+  const out = new Uint8Array(indices.length * 3);
+  for (let i = 0; i < indices.length; i += 1) {
+    const entry = indices[i] * 3;
+    out[i * 3] = paletteRgb[entry] ?? 0;
+    out[i * 3 + 1] = paletteRgb[entry + 1] ?? 0;
+    out[i * 3 + 2] = paletteRgb[entry + 2] ?? 0;
+  }
+  return out;
+}
+
+/** Every RGB pixel replaced by the palette entry nearest it, squared distance. */
+function snapToPalette(rgb, paletteRgb, colours) {
+  const count = rgb.length / 3;
+  const out = new Uint8Array(count);
+  for (let i = 0; i < count; i += 1) {
+    const r = rgb[i * 3];
+    const g = rgb[i * 3 + 1];
+    const b = rgb[i * 3 + 2];
+    let best = 0;
+    let bestDistance = Infinity;
+    for (let entry = 0; entry < colours; entry += 1) {
+      const dr = r - paletteRgb[entry * 3];
+      const dg = g - paletteRgb[entry * 3 + 1];
+      const db = b - paletteRgb[entry * 3 + 2];
+      const distance = dr * dr + dg * dg + db * db;
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        best = entry;
+      }
+    }
+    out[i] = best;
+  }
+  return out;
+}
+
+/**
+ * An index map at HD_SCALE, by MAJORITY VOTE across several palettes.
+ *
+ * Why a vote and not one reference palette: snapping an xBRZ output back to
+ * indices is only as good as the palette it snaps through, and every live page
+ * palette has DUPLICATE COLOURS — two indices with the same RGB, which that
+ * palette cannot tell apart but the other eight can. Upscaling through each
+ * palette in turn and taking the per-pixel majority lets the palettes that can
+ * see a difference outvote the one that cannot.
+ *
+ * MEASURED (research/hd/phase23/INDEX.txt section 4), scored against the ideal
+ * of a direct per-palette xBRZ, mean |dRGB| averaged over the eight palettes:
+ *
+ *   strip     nearest 4x (shipped)   single reference   MAJORITY VOTE
+ *   attract        3.946                  2.215             1.295
+ *   menu           2.107                  1.490             0.568
+ *   select         4.607                  2.693             1.667
+ *
+ * Ties go to the lowest index, which only decides pixels no palette agreed on.
+ */
+export function xbrzIndexVote(indices, width, height, palettes, colours) {
+  if (palettes.length === 0) throw new Error("an index vote needs at least one palette");
+  const count = width * HD_SCALE * height * HD_SCALE;
+  const ballots = palettes.map((palette) =>
+    snapToPalette(xbrzScaleRgb(paintIndices(indices, palette), width, height), palette, colours),
+  );
+  const out = new Uint8Array(count);
+  const tally = new Uint16Array(colours);
+  for (let i = 0; i < count; i += 1) {
+    tally.fill(0);
+    for (const ballot of ballots) tally[ballot[i]] += 1;
+    let best = 0;
+    let bestCount = -1;
+    for (let entry = 0; entry < colours; entry += 1) {
+      if (tally[entry] > bestCount) {
+        bestCount = tally[entry];
+        best = entry;
+      }
+    }
+    out[i] = best;
+  }
+  return out;
+}
+
+/**
+ * The three-step ink ramp the two menu fonts are drawn through.
+ *
+ * Plane value 1 is the ink itself, 2 is 170/255 of it and 3 is 119/255 —
+ * $fff / $aaa / $777, the text colours measured off every filmed page
+ * (`shell-skin.ts`'s INK_RAMP, and `palette.ts` for the measurement). Value 0
+ * is not ink at all: the backdrop shows through it, so it is transparent.
+ */
+export const SHELL_INK_RAMP = Object.freeze([0, 255, 170, 119]);
+
+/** The ramp as a viewable greyscale PLTE; entry 0 is the transparent one. */
+export const SHELL_RAMP_PALETTE = Uint8Array.from([
+  0, 0, 0, 255, 255, 255, 170, 170, 170, 119, 119, 119,
+]);
+
+/**
+ * A font atlas's plane-value map at HD_SCALE.
+ *
+ * The atlas is upscaled as RGBA — white ink at the ramp's own three levels,
+ * alpha 0 where there is no ink — and snapped back to the four plane values, so
+ * what ships is the same kind of map `shell-art.ts` already loads and
+ * `shell-skin.ts` already colours. The runtime's ink arithmetic is untouched.
+ *
+ * ALPHA IS THRESHOLDED AT HALF, not carried. The original's glyphs have hard
+ * edges — its ramp IS its anti-aliasing, and there is no knockout and no alpha
+ * anywhere in `menudata.bin` — so a partly transparent pixel that xBRZ invents
+ * on a glyph's rim resolves to backdrop, exactly as the original's rim does.
+ */
+export function xbrzRampMap(values, width, height) {
+  const rgba = new Uint8Array(width * height * 4);
+  for (let i = 0; i < values.length; i += 1) {
+    const value = values[i] & 3;
+    if (value === 0) continue;
+    const level = SHELL_INK_RAMP[value];
+    rgba[i * 4] = level;
+    rgba[i * 4 + 1] = level;
+    rgba[i * 4 + 2] = level;
+    rgba[i * 4 + 3] = 255;
+  }
+  const scaled = xbrzScaleRgba(rgba, width, height);
+  const count = width * HD_SCALE * height * HD_SCALE;
+  const out = new Uint8Array(count);
+  for (let i = 0; i < count; i += 1) {
+    if (scaled[i * 4 + 3] < 128) continue;
+    const grey = scaled[i * 4];
+    let best = 1;
+    let bestDistance = Infinity;
+    for (let value = 1; value <= 3; value += 1) {
+      const distance = Math.abs(grey - SHELL_INK_RAMP[value]);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        best = value;
+      }
+    }
+    out[i] = best;
+  }
+  return out;
+}
+
+/** RGBA at HD_SCALE from indices through a FIXED palette; index 0 transparent. */
+export function xbrzIndexedRgba(indices, width, height, paletteRgb) {
+  const rgba = new Uint8Array(width * height * 4);
+  for (let i = 0; i < indices.length; i += 1) {
+    const index = indices[i];
+    if (index === 0) continue;
+    const entry = index * 3;
+    rgba[i * 4] = paletteRgb[entry] ?? 0;
+    rgba[i * 4 + 1] = paletteRgb[entry + 1] ?? 0;
+    rgba[i * 4 + 2] = paletteRgb[entry + 2] ?? 0;
+    rgba[i * 4 + 3] = 255;
+  }
+  return xbrzScaleRgba(rgba, width, height);
+}

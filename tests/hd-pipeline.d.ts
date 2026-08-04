@@ -62,6 +62,43 @@ declare module "*hd-pipeline.mjs" {
   ): { width: number; height: number; placed: Map<string, { x: number; y: number }> };
   export function ballRgba(ballDoc: unknown, palette: Uint8Array): Uint8Array;
   export function batPoseRgba(pose: unknown, plane2RowOffset: number, palette: Uint8Array): Uint8Array;
+  // Phase 3, the shell's index-map recipes.
+  export const SHELL_INK_RAMP: readonly number[];
+  export const SHELL_RAMP_PALETTE: Uint8Array;
+  export function encodeIndexedPng(
+    indices: Uint8Array,
+    width: number,
+    height: number,
+    paletteRgb: Uint8Array,
+    transparentCount?: number,
+  ): Buffer;
+  export function agaPaletteRgb(aga: readonly number[], colours?: number): Uint8Array;
+  export function paintIndices(indices: Uint8Array, paletteRgb: Uint8Array): Uint8Array;
+  export function xbrzIndexVote(
+    indices: Uint8Array,
+    width: number,
+    height: number,
+    palettes: readonly Uint8Array[],
+    colours: number,
+  ): Uint8Array;
+  export function xbrzRampMap(values: Uint8Array, width: number, height: number): Uint8Array;
+  export function xbrzIndexedRgba(
+    indices: Uint8Array,
+    width: number,
+    height: number,
+    paletteRgb: Uint8Array,
+  ): Uint8Array;
+}
+
+declare module "*export-shell-art-hd.mjs" {
+  export const SHELL_ART_HD_SCHEMA: string;
+  export const LOADING_LOGO_HD_SCHEMA: string;
+  export const SHELL_BACKDROP_ROLES: readonly string[];
+  export const VOTING_PALETTES: number;
+  export function buildShellArtHd(): {
+    files: Map<string, Buffer>;
+    dither: Record<string, { checker1x1Px: number; checker2x2Px: number }>;
+  };
 }
 
 declare module "*export-table-art-hd.mjs" {

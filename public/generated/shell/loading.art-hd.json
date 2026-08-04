@@ -1,0 +1,23 @@
+{
+  "schema": "pinball-illusions/loading-logo-hd/v1",
+  "scale": 4,
+  "placement": {
+    "top": 84
+  },
+  "image": {
+    "file": "loading-logo-hd.png",
+    "width": 1280,
+    "height": 64,
+    "byteLength": 9209,
+    "sha256": "5d99f7563be80f4e45ed529812041f6b49f584bd5b623b81ff017997bb0cf13e"
+  },
+  "source": {
+    "file": "loading-logo.png",
+    "sha256": "c631a7bd7d8284710940b2bb3a21fa6b4f13f9227c43c6a31f92a22e89e2d5bc"
+  },
+  "provenance": {
+    "sourceClass": "disk-derived-loading-logo-hd",
+    "description": "The loader's own Loading strip at 4x, upscaled by xbrz-js@1.9.2 (xBRZ v1.9), format argb, default config through its own fixed 32-colour copper palette with index 0 transparent. The palette never fades, so this ships as finished RGBA and loses nothing to quantisation. Derived from disk artwork; still disk-derived.",
+    "authorizationRequired": true
+  }
+}
