@@ -313,6 +313,15 @@ const ELEMENT_COUNTER = 0x34;
  * not a multiplier).
  */
 const EFFECT_SET_MULTIPLIER = 5;
+/**
+ * Award effect 20's WINDOW SECONDS, the element's +$38 read as a WORD:
+ * `move.w $38(a2),d0 / mulu.w $50(a5),d0 / move.w d0,$26(a0)` at +0x006212
+ * arms the counter record's +$26 countdown with seconds x ticks-per-second.
+ * Per-effect like +$34: effect 10's handler reads the SAME word as a pay
+ * count (+0x0061BE), so the field is read as a window ONLY for effect 20.
+ */
+const ELEMENT_WINDOW = 0x38;
+const EFFECT_ARM_WINDOW = 20;
 
 /**
  * THE PROGRESS-COUNTER RECORD, decoded field by field from its users.
@@ -345,6 +354,14 @@ const COUNTER_FLAGS = 0x00;
 const COUNTER_RESET = 0x02;
 const COUNTER_TARGET = 0x04;
 const COUNTER_STEP = 0x32;
+/**
+ * The BCD TARGET slot at +$40..$47, the clamp's ceiling for the accumulator:
+ * 0x6000 (the tail every step-add falls through) compares the accumulator
+ * slot against it long by long and writes it back over an accumulator that
+ * has passed it. `bmi` at +0x00600A takes a negative high long — $FFFFFFFF on
+ * every shipped record without a ceiling — as "no target".
+ */
+const COUNTER_BCD_TARGET = 0x40;
 const COUNTER_CONTINUATION = 0x48;
 /** Flags bit 0: the ball-start walk branches away before the count reset. */
 const COUNTER_FLAG_BCD_FROM_COUNT = 0x01;
@@ -844,6 +861,51 @@ function elementMultiplier(pkg, at) {
   const value = readU16(pkg, at, ELEMENT_COUNTER);
   if (value > 99) {
     throw new Error(`${pkg.stem}: effect-5 element at ${key(at)} sets multiplier ${value}`);
+  }
+  return value;
+}
+
+/**
+ * The +$40 BCD target as a decimal number, or -1 for "none".
+ *
+ * The clamp's own test is the sign of the HIGH LONG (`move.l $40(a0),d2` then
+ * `bmi` at +0x00600A), so that is the sentinel test here. A real target shares
+ * the step's 8-byte shape — two zero bytes, then six packed-BCD at +$42..$47 —
+ * and a non-zero, non-negative high word would mean digits this read cannot
+ * see, so it refuses rather than truncates.
+ */
+function counterTarget(pkg, at) {
+  if (readU32(pkg, at, COUNTER_BCD_TARGET) >= 0x8000_0000) return -1;
+  if (readU16(pkg, at, COUNTER_BCD_TARGET) !== 0) {
+    throw new Error(
+      `${pkg.stem}: counter at ${key(at)} has BCD-target high word 0x` +
+        `${readU16(pkg, at, COUNTER_BCD_TARGET).toString(16)}; a 13th digit is not a target this ` +
+        "decode understands",
+    );
+  }
+  return readBcd(pkg, at, COUNTER_BCD_TARGET + 2, "counter BCD target");
+}
+
+/**
+ * Award effect 20's window seconds: the element's +$38 as a word.
+ *
+ * Read ONLY for effect-20 elements — the field is per-effect, exactly as +$34
+ * is (see `elementMultiplier`). A relocated +$38 would be an address half and
+ * a minutes-long window is a misread, not data; the shipped windows are 5 and
+ * 10 seconds.
+ */
+function elementWindowSeconds(pkg, at) {
+  if (readU16(pkg, at, ELEMENT_EFFECT) !== EFFECT_ARM_WINDOW) return 0;
+  if (!inBounds(pkg, at, ELEMENT_WINDOW + 2)) return 0;
+  if (pkg.relocations.has(`${at.hunk}:${at.offset + ELEMENT_WINDOW}`)) {
+    throw new Error(
+      `${pkg.stem}: effect-20 element at ${key(at)} has a RELOCATED +$38; ` +
+        "award effect 20 reads that field as a word of seconds, so this is not one",
+    );
+  }
+  const value = readU16(pkg, at, ELEMENT_WINDOW);
+  if (value > 600) {
+    throw new Error(`${pkg.stem}: effect-20 element at ${key(at)} arms a ${value}-second window`);
   }
   return value;
 }
@@ -1477,6 +1539,9 @@ function decode(pkg, table) {
       // own constant at h4+0x2BA2 spells — and because a counter with no step
       // is visibly a plain tally rather than a scoring chain.
       step: readBcd(pkg, at, COUNTER_STEP, "counter step"),
+      // The +$40..$47 ceiling the clamp holds the accumulator to, -1 for the
+      // $FFFFFFFF sentinel. See `COUNTER_BCD_TARGET` and `counterTarget`.
+      target: counterTarget(pkg, at),
       continuation: script,
       ladder: ladderIndexOf(at),
       keepAcrossBall: (readU8(pkg, at, COUNTER_FLAGS) & COUNTER_FLAGS_KEEP_ACROSS_BALL) !== 0,
@@ -1497,6 +1562,7 @@ function decode(pkg, table) {
     bonus: readBcd(pkg, at, ELEMENT_BONUS, "element bonus"),
     effect: readU16(pkg, at, ELEMENT_EFFECT),
     multiplier: elementMultiplier(pkg, at),
+    windowSeconds: elementWindowSeconds(pkg, at),
     countdown: readS16(pkg, at, ELEMENT_COUNTDOWN),
     lampStart: follow(pkg, at, ELEMENT_LAMP_START) !== null,
     lampAward: follow(pkg, at, ELEMENT_LAMP_AWARD) !== null,
@@ -1805,7 +1871,8 @@ function main(argv) {
     const combo = decoded.counters[decoded.comboCounter];
     console.log(
       `  ${pad}  ${decoded.counters.length} progress counters (` +
-        `${decoded.counters.filter((one) => one.keepAcrossBall).length} carried across a ball); ` +
+        `${decoded.counters.filter((one) => one.keepAcrossBall).length} carried across a ball, ` +
+        `${decoded.counters.filter((one) => one.target >= 0).length} with a BCD target); ` +
         (combo === undefined
           ? "no live combo counter — the bonus routine throws its player index away"
           : `combo counter ${combo.index}, ${combo.step.toLocaleString()} a combo, ` +

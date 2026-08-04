@@ -1766,6 +1766,11 @@ function runModes(game: Game, awards: readonly Award[]): ModeTickReport {
     addToBcdField(game.scoring.score, award.score);
     addToBcdField(game.scoring.bonus, award.bonus);
   }
+  // The combo chain's own payment — award effects 16 and 7 paying a counter
+  // record's accumulator. SCORE only: their $6BCC adds one BCD field into the
+  // player's score, where the element award's $6B96 above pays score and
+  // bonus as a pair. See `ModeTickReport.comboPaid`.
+  if (report.comboPaid > 0) addToBcdField(game.scoring.score, report.comboPaid);
   // The three player-record award effects the mission machine reports rather
   // than applies, because the record belongs to the scoring layer: effect 5
   // SETS the bonus multiplier to the element's own +$34, effects 2 and 8 arm

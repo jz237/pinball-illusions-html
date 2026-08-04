@@ -96,6 +96,17 @@ export const ELEMENT_FLAG_LIT_AT_GAME_START = 0x02;
 export const ELEMENT_FLAG_DONE_SURVIVES_BALL = 0x20;
 
 /**
+ * Counter flags bit 0: the ball-start walk REBUILDS the record's BCD
+ * accumulator from the kept count. `+0x00417C` multiplies the step back in
+ * with the same six-`abcd` add the effects use, once per count, after the
+ * unconditional clear at +0x004136 — so a bit-0 counter starts every ball
+ * with accumulator = step x count, unclamped. Bit 3, the other
+ * `keepAcrossBall` bit, keeps the count but leaves the accumulator cleared
+ * (+0x004158 branches straight to the next record).
+ */
+export const COUNTER_FLAG_REBUILD_ACCUMULATOR = 0x01;
+
+/**
  * One playfield element: a shot a mission can arm, award and wait on.
  *
  * `score` and `bonus` are the packed-BCD fields at +$1E and +$26 read as decimal
@@ -118,6 +129,15 @@ export interface ModeElement {
    * x2..x10 insert row on the playfield art — and 2/3/4/5 on Extreme Sports.
    */
   readonly multiplier: number;
+  /**
+   * Award effect 20's WINDOW in seconds: the element's +$38 as a word, which
+   * `move.w $38(a2),d0 / mulu.w $50(a5),d0 / move.w d0,$26(a0)` at +0x006212
+   * turns into ticks on the counter record's +$26 countdown. Zero for every
+   * other effect — the field is per-effect, exactly as `multiplier`'s +$34 is.
+   * The shipped windows: Law 'n Justice 5 s and 10 s on its combo record,
+   * Extreme Sports 12 s on its.
+   */
+  readonly windowSeconds: number;
   /** The record's own countdown field; -1 is "no timer". */
   readonly countdown: number;
   readonly lampStart: boolean;
@@ -187,6 +207,14 @@ export interface ModeCounter {
    * by, from a different place in the package.
    */
   readonly step: number;
+  /**
+   * The BCD TARGET at +$40..$47: the ceiling the clamp at 0x6000 — the tail
+   * every step-add falls through — holds the accumulator to, or -1 for the
+   * $FFFFFFFF "no target" sentinel (`bmi` at +0x00600A). One shipped counter
+   * carries one: Law 'n Justice's counter 1, whose 1,000,000-a-shot jackpot
+   * accumulator caps at 25,000,000.
+   */
+  readonly target: number;
   /** +$48, the script queued when the count reaches `cap`, or -1. */
   readonly continuation: number;
   /** The launcher table inline at +$50: index into `ladders`, or -1. */
@@ -604,6 +632,7 @@ export function parseTableModesDocument(doc: TableModesDocument): TableModes {
         reset: requireWholeNumber(item["reset"], `${where} reset`, 0, 0xffff),
         cap: requireWholeNumber(item["cap"], `${where} cap`, 0, 0xffff),
         step: requireWholeNumber(item["step"], `${where} step`, 0, Number.MAX_SAFE_INTEGER),
+        target: requireWholeNumber(item["target"] ?? -1, `${where} target`, -1, Number.MAX_SAFE_INTEGER),
         continuation: requireWholeNumber(item["continuation"], `${where} continuation`, -1, scriptCount - 1),
         ladder: requireWholeNumber(item["ladder"], `${where} ladder`, -1, ladders.length - 1),
         keepAcrossBall: item["keepAcrossBall"] === true,
@@ -627,6 +656,7 @@ export function parseTableModesDocument(doc: TableModesDocument): TableModes {
         bonus: requireWholeNumber(item["bonus"], `${where} bonus`, 0, Number.MAX_SAFE_INTEGER),
         effect: requireWholeNumber(item["effect"], `${where} effect`, 0, 0xffff),
         multiplier: requireWholeNumber(item["multiplier"] ?? 0, `${where} multiplier`, 0, 99),
+        windowSeconds: requireWholeNumber(item["windowSeconds"] ?? 0, `${where} windowSeconds`, 0, 0xffff),
         countdown: requireWholeNumber(item["countdown"], `${where} countdown`, -0x8000, 0x7fff),
         lampStart: item["lampStart"] === true,
         lampAward: item["lampAward"] === true,

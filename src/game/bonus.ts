@@ -257,20 +257,18 @@
  * Sports +0x2B92. Law 'n Justice's counter record carries the same figure as its
  * own BCD step at h4+0x457C, from a different place in the package.
  *
+ * THE COMBO'S OWN SCORING — the accumulator field of the same record — is no
+ * longer this file's gap: `mode-vm.ts` now runs the whole of it (the step-add
+ * `$5FE4` with its `$6000` clamp, the payment `$61AA` through `$6BCC`, effect
+ * 20's window and the expiry service `$56D4`; see `EFFECT_COUNT_*` there). A
+ * Law 'n Justice chain pays 1,000,000, then 2,000,000, then 3,000,000 while
+ * the window holds, DURING PLAY; this bonus still pays count x combo value at
+ * the ball's end from its own package constants, and neither reads the other,
+ * which is the machine's own arrangement.
+ *
  * ---------------------------------------------------------------------------
  * WHAT IS STILL NOT RECONSTRUCTED
  * ---------------------------------------------------------------------------
- * THE COMBO'S OWN SCORING, which is a different field of the same record. Award
- * effect 16 is three subroutines — `$5FE4` adds the record's packed-BCD STEP
- * (+$32..$37) into its ACCUMULATOR (+$3A..$3F), `$5E5A` is the count, and
- * `$61AA` pays the accumulator to the player's score through `$6BCC` — so a Law
- * 'n Justice chain pays 1,000,000, then 2,000,000, then 3,000,000 while the
- * window holds, on top of each element's own 1,000,000. Award effect 20 arms
- * that window and the per-frame service at `$56D4` clears the accumulator when it
- * expires. `mode-vm.ts` runs the COUNT and not the accumulator; the fields are
- * decoded and exported (`ModeCounter.step`), and the panel this file draws does
- * not depend on them.
- *
  * THE COMBO PANEL HAS STILL NEVER BEEN FILMED. Session 5 filmed a real earned
  * bonus with a multiplier, but its combo count was zero, so the film shows only
  * that the stage is SKIPPED at zero. What one looks like at one is decode alone.

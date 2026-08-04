@@ -91,6 +91,7 @@
  */
 
 import {
+  COUNTER_FLAG_REBUILD_ACCUMULATOR,
   ELEMENT_FLAG_LIT_AT_GAME_START,
   GROUP_FLAG_KEEP_ALWAYS_ON,
   GROUP_FLAG_SUPPRESS_FIRE,
@@ -212,20 +213,60 @@ const EFFECT_SET_MULTIPLIER = 5;
  * effect-16 elements, and until the count moved for them the combo term of the
  * end-of-ball bonus could only ever be zero.
  *
- * WHAT IS DELIBERATELY LEFT OUT, and it is the other half of effects 11/16/18:
- * the record's own packed-BCD ACCUMULATOR at +$3A..$3F, the STEP at +$32..$37
- * that 0x5FE4 adds into it, the payment of the accumulator to the score at
- * 0x61AA, the WINDOW TIMER effect 20 (0x620E) writes into +$26 and the per-frame
- * service at 0x56D4 that clears the accumulator when it expires. That machinery
- * is the combo's own SCORING — on Law 'n Justice a chain pays 1,000,000, then
- * 2,000,000, then 3,000,000 while the 5- or 10-second window holds — and it is a
- * separate feature from the COUNT, which is what the bonus needs and what this
- * change delivers. `ModeCounter.step` carries the decoded per-tick value so the
- * day it lands there is nothing left to decode.
+ * THE OTHER HALF OF THE RECORD — ITS OWN BCD SCORING — RUNS NOW TOO:
+ *
+ *      7  0x61AA  the ACCUMULATOR (+$3A..$3F) is paid to the player's SCORE
+ *                 through $6BCC — score only; the two-field payer $6B96 is the
+ *                 element award's own
+ *     11  0x5FE4  the record's packed-BCD STEP (+$32..$37) is added into the
+ *                 accumulator (six backwards `abcd`), falling straight through
+ *                 into the clamp at 0x6000: an accumulator past the record's
+ *                 +$40..$47 BCD TARGET is written back as exactly it, and a
+ *                 negative high long ($FFFFFFFF, `bmi` at 0x600A) means none
+ *     16, 18      both call 0x5FE4 BEFORE their shared count body, so a count
+ *                 already at its cap still grows the accumulator; 16's third
+ *                 call is 0x61AA, the payment
+ *     20  0x620E  the WINDOW: counter +$26 := element +$38 seconds x $50(a5)
+ *                 ticks — and $50(a5) is ExecBase VBlankFrequency, read at
+ *                 +0x00040E, 50 on the PAL machine this reconstruction is.
+ *                 The per-frame service 0x56D4 — called at +0x004B76, AFTER
+ *                 both interpreters — counts it down and, on the tick it
+ *                 reaches zero, clears the accumulator (and restores the
+ *                 RUNNING step +$30..$37 from its +$28..$2F master, which
+ *                 only the unwired step-mutating effects below can make mean
+ *                 anything, so a no-op here).
+ *
+ * On Law 'n Justice that is the combo chain — 1,000,000, then 2,000,000, then
+ * 3,000,000 while the 5- or 10-second window holds, on top of each element's
+ * own 1,000,000 — and the jackpot: elements 49..51 pump counter 1's
+ * accumulator 1,000,000 an award toward its 25,000,000 target and elements
+ * 53..57 pay it. Extreme Sports' pair (elements 10/11) is the same chain with
+ * a 2,000,000 step and a 12-second window. The resets are the walks'
+ * own: both clear the accumulator and the window UNCONDITIONALLY — at
+ * +0x004136 the clear runs before the keep-flag tests — and a bit-0 record
+ * then rebuilds accumulator = step x count from the kept count (+0x00417C).
+ *
+ * STILL LEFT OUT, all decoded to the instruction and none run — the record's
+ * OTHER value machine, the one built on the RUNNING step rather than the
+ * accumulator. Effect 10 (0x61BA) pays the accumulator min(element +$38,
+ * count) times and zeroes the count only when it held fewer than the ask
+ * (0x61CA's bpl skips the write-back otherwise); effect 14 (0x61E6) pays one
+ * RUNNING step straight to the score; and three effects MUTATE that step —
+ * 15 (0x60DC) adds the element's own +$3A..$3F into it, 25 (0x60B2) is the
+ * same six bytes subtracted (`sbcd`), 27 (0x60FA) adds from the record the
+ * element's +$38 points at, entering 15's abcd body. The +$28..$2F master
+ * copy exists so the window expiry and both reset walks can restore what
+ * 15/25/27 mutate. Extreme Sports' and BabeWatch's effect-14/15/27 sets are
+ * whole build-then-collect machines on exactly this; Law 'n Justice's
+ * element 89 is its one effect-10. All keep their element-score-only
+ * behaviour until a round means to move them.
  */
 const EFFECT_COUNT_DISPATCH = 6;
+const EFFECT_PAY_ACCUMULATOR = 7;
+const EFFECT_ADD_STEP = 11;
 const EFFECT_COUNT_AND_PAY = 16;
 const EFFECT_COUNT_AND_ADD = 18;
+const EFFECT_ARM_WINDOW = 20;
 const EFFECT_ADVANCE_LADDER = 21;
 const EFFECT_COUNT_DOWN = 24;
 const EFFECT_HOLD_MULTIPLIER = 8;
@@ -306,6 +347,32 @@ export interface ModeState {
    * Sports' — now reset with the ball, as the machine's own walk does.
    */
   readonly counterTotals: Int32Array;
+  /**
+   * PER COUNTER RECORD, the packed-BCD ACCUMULATOR at +$3A..$3F, as a number.
+   *
+   * The record's own scoring, distinct from both counts: effects 11/16/18 add
+   * the record's step into it (0x5FE4, clamped to the record's +$40 target
+   * when it has one), effects 7 and 16 pay it to the score (0x61AA), and the
+   * window expiry and both reset walks clear it. ONE slot, not eight — unlike
+   * the counts this field is machine-global, which changes nothing for this
+   * one-player reconstruction.
+   *
+   * Float64 rather than Int32 because twelve BCD digits outgrow an int32 (Law
+   * 'n Justice's counter 0 steps 5,000,000 at a time); every value the field
+   * can hold is a whole number far below 2^53, so the arithmetic stays exact
+   * and deterministic — the no-floating-point rule above is about physics
+   * state, and this is a score.
+   */
+  readonly counterAccumulators: Float64Array;
+  /**
+   * PER COUNTER RECORD, the +$26 WINDOW countdown in ticks; 0 is "no window".
+   *
+   * Armed by award effect 20 (seconds x `$50(a5)`, 0x620E — SET, not
+   * extended), decremented once a tick by the service this port runs at the
+   * tail of `tickModes` (0x56D4's own slot in the frame chain at +0x004B76 is
+   * after both interpreters), and cleared by both reset walks.
+   */
+  readonly counterWindows: Int32Array;
 
   /**
    * PER LAMP-GROUP LAMP (flattened over `TableModes.lampGroups` in group then
@@ -400,6 +467,11 @@ export function createModeState(modes: TableModes): ModeState {
     timers: new Int32Array(count),
     counterCounts,
     counterTotals: Int32Array.from(counterCounts),
+    // The game-start walk clears every record's accumulator and window
+    // outright — `clr.l $38 / clr.l $3c / clr.w $26` at +0x0040F2, no flag
+    // test — so both start at zero however the counts start.
+    counterAccumulators: new Float64Array(modes.counters.length),
+    counterWindows: new Int32Array(modes.counters.length),
     groupLampLit: new Uint8Array(lampCount),
     groupLampAlways: new Uint8Array(lampCount),
     groupFired: new Uint8Array(modes.lampGroups.length),
@@ -466,7 +538,21 @@ export function resetModesForNewBall(modes: TableModes, state: ModeState): void 
     if (lit.has(index)) state.armed[index] = 1;
   }
   for (const counter of modes.counters) {
-    if (counter.keepAcrossBall) continue;
+    // The accumulator and the window die with the ball WHATEVER the flags
+    // say: the walk's `clr.l $38 / clr.l $3c / clr.w $26` at +0x004136 runs
+    // before either keep-flag test, so even a per-game counter loses them.
+    state.counterAccumulators[counter.index] = 0;
+    state.counterWindows[counter.index] = 0;
+    if (counter.keepAcrossBall) {
+      // A bit-0 record then REBUILDS accumulator = step x kept count, the
+      // six-`abcd` loop at +0x00417C — once per count, no clamp. Bit 3 keeps
+      // the count and leaves the accumulator at zero.
+      if ((counter.flags & COUNTER_FLAG_REBUILD_ACCUMULATOR) !== 0) {
+        state.counterAccumulators[counter.index] =
+          counter.step * Math.max(0, state.counterCounts[counter.index] ?? 0);
+      }
+      continue;
+    }
     state.counterCounts[counter.index] = counter.reset;
     state.counterTotals[counter.index] = counter.reset;
   }
@@ -864,6 +950,13 @@ export interface ModeTickReport {
   readonly holdBonus: boolean;
   /** An award effect 8 fired: this ball's multiplier survives into the next one. */
   readonly holdMultiplier: boolean;
+  /**
+   * What award effects 16 and 7 paid of their counters' accumulators this
+   * tick, through $6BCC: SCORE only, no bonus half, on top of the element's
+   * own score and bonus riding in `awards`. Reported rather than applied for
+   * the same reason the multiplier is — the score is the scoring state's.
+   */
+  readonly comboPaid: number;
   /** Opcodes executed whose behaviour is not decoded. See the header. */
   readonly unimplemented: number;
 }
@@ -890,6 +983,7 @@ export const EMPTY_MODE_TICK: ModeTickReport = Object.freeze({
   bonusMultiplier: -1,
   holdBonus: false,
   holdMultiplier: false,
+  comboPaid: 0,
   unimplemented: 0,
 });
 
@@ -908,6 +1002,7 @@ interface Accumulator {
   bonusMultiplier: number;
   holdBonus: boolean;
   holdMultiplier: boolean;
+  comboPaid: number;
   unimplemented: number;
 }
 
@@ -1063,6 +1158,33 @@ function bumpCounter(modes: TableModes, state: ModeState, counterIndex: number, 
 }
 
 /**
+ * 0x5FE4, the six backwards `abcd`: accumulator += step — and the CLAMP at
+ * 0x6000 the add falls straight through into. When the record carries a BCD
+ * target (+$40 not $FFFFFFFF) an accumulator past it is written back as
+ * exactly it; effects 11, 16 and 18 all enter here, so the clamp guards every
+ * add. The ball-start rebuild is the one step-multiplier that does NOT come
+ * through this routine, and it is the one place the clamp does not run.
+ */
+function addStepToAccumulator(modes: TableModes, state: ModeState, counterIndex: number): void {
+  const counter = modes.counters[counterIndex];
+  if (counter === undefined) return;
+  let value = (state.counterAccumulators[counterIndex] ?? 0) + counter.step;
+  if (counter.target >= 0 && value > counter.target) value = counter.target;
+  state.counterAccumulators[counterIndex] = value;
+}
+
+/**
+ * 0x61AA: the accumulator is paid to the player's SCORE through $6BCC — and
+ * ONLY the score: the element award's own $6B96 pays score and bonus as a
+ * pair, this routine pays one field. The accumulator itself is NOT consumed;
+ * only the window expiry and the resets clear it, which is exactly what makes
+ * a chain pay 1,000,000 then 2,000,000 then 3,000,000.
+ */
+function payAccumulator(state: ModeState, out: Accumulator, counterIndex: number): void {
+  out.comboPaid += state.counterAccumulators[counterIndex] ?? 0;
+}
+
+/**
  * The award-effect table at 0x5D0E. Six of its entries are decoded well
  * enough to run and all six matter — three for progression, three for the
  * end-of-ball bonus; the rest are left alone.
@@ -1089,10 +1211,15 @@ function bumpCounter(modes: TableModes, state: ModeState, counterIndex: number, 
  *       therefore runs the Nth launcher — "BALL 1 LOCKED" through the multiball
  *       MODE_STARTs and the "n MORE TO START MODE" alternates are all just
  *       positions on one linear counter. See `ModeLadder` in table-modes.ts.
- *   16, handler 0x5E4E and 18, handler 0x5E46 — the COMBO effects. Both step the
- *       same record the same way; 16 additionally pays the record's own BCD
- *       accumulator to the score, which this port does not yet do. See the
- *       `EFFECT_COUNT_*` note for exactly what is and is not reproduced.
+ *   16, handler 0x5E4E and 18, handler 0x5E46 — the COMBO effects. Both add the
+ *       record's step into its BCD accumulator (0x5FE4, clamped at 0x6000) and
+ *       then step the record exactly as effect 6 does; 16 additionally pays the
+ *       accumulator to the score (0x61AA). 7, handler 0x61AA alone, pays it
+ *       without stepping anything; 11, handler 0x5FE4 alone, grows it without
+ *       paying; 20, handler 0x620E, arms the record's expiry window with the
+ *       element's +$38 seconds. See the `EFFECT_COUNT_*` note for the whole
+ *       machine and for the unwired remainder (10, 14 and the running-step
+ *       mutators 15/25/27).
  *   21, handler 0x5FA8 — the LADDER. Steps the record and, when the count
  *       reaches the record's cap, queues its +$48 continuation ONCE. This is how
  *       a mission's later shots get armed at all.
@@ -1124,14 +1251,39 @@ function applyAwardEffect(
     out.holdMultiplier = true;
     return;
   }
-  // The five counting effects, all on the record the element's +$34 names.
+  // The counting and accumulator effects, all on the record the element's
+  // +$34 names.
   if (element.counter >= 0) {
-    if (
-      element.effect === EFFECT_COUNT_DISPATCH ||
-      element.effect === EFFECT_COUNT_AND_PAY ||
-      element.effect === EFFECT_COUNT_AND_ADD
-    ) {
+    if (element.effect === EFFECT_COUNT_DISPATCH) {
       bumpCounter(modes, state, element.counter, true);
+      return;
+    }
+    if (element.effect === EFFECT_COUNT_AND_PAY || element.effect === EFFECT_COUNT_AND_ADD) {
+      // 0x5E4E and 0x5E46 share their first two calls IN THIS ORDER — the
+      // add (0x5FE4) runs before the count body (0x5E5A), so a count already
+      // sitting at its cap still grows the accumulator — and 16's third call
+      // (0x61AA) pays the freshly grown value, which is why the first combo
+      // of a chain is worth one whole step.
+      addStepToAccumulator(modes, state, element.counter);
+      bumpCounter(modes, state, element.counter, true);
+      if (element.effect === EFFECT_COUNT_AND_PAY) {
+        payAccumulator(state, out, element.counter);
+      }
+      return;
+    }
+    if (element.effect === EFFECT_ADD_STEP) {
+      addStepToAccumulator(modes, state, element.counter);
+      return;
+    }
+    if (element.effect === EFFECT_PAY_ACCUMULATOR) {
+      payAccumulator(state, out, element.counter);
+      return;
+    }
+    if (element.effect === EFFECT_ARM_WINDOW) {
+      // 0x620E: the window is SET, not extended — `move.w d0,$26(a0)` — so
+      // re-arming with a shorter window shortens it, and the two Law 'n
+      // Justice arms (5 s and 10 s) really are different windows.
+      state.counterWindows[element.counter] = element.windowSeconds * TICKS_PER_SECOND;
       return;
     }
     if (element.effect === EFFECT_ADVANCE_LADDER) {
@@ -1530,6 +1682,7 @@ export function tickModes(modes: TableModes, state: ModeState): ModeTickReport {
     bonusMultiplier: -1,
     holdBonus: false,
     holdMultiplier: false,
+    comboPaid: 0,
     unimplemented: 0,
   };
 
@@ -1551,6 +1704,19 @@ export function tickModes(modes: TableModes, state: ModeState): ModeTickReport {
   // original; here it runs after the interpreters so a lamp lit by this tick's
   // physics is seen this tick, and the fired script queues for the next.
   scanLampGroups(modes, state);
+  // THE WINDOW SERVICE, 0x56D4: every record's +$26 counts down and, on the
+  // tick it reaches zero, the accumulator is cleared. Its slot in the frame
+  // chain at +0x004B46 is AFTER both interpreters (`jsr $58BC .. $5786 ..
+  // $56D4`), so an award on the window's last tick pays before the expiry
+  // wipes it — kept here by running the service at the tail of the tick. The
+  // original also restores the step slot from its +$28 copy; this port's step
+  // is immutable configuration, so there is nothing to restore.
+  for (let index = 0; index < state.counterWindows.length; index += 1) {
+    const left = state.counterWindows[index] ?? 0;
+    if (left <= 0) continue;
+    state.counterWindows[index] = left - 1;
+    if (left === 1) state.counterAccumulators[index] = 0;
+  }
 
   if (
     out.awards.length === 0 &&
@@ -1567,6 +1733,7 @@ export function tickModes(modes: TableModes, state: ModeState): ModeTickReport {
     out.bonusMultiplier < 0 &&
     !out.holdBonus &&
     !out.holdMultiplier &&
+    out.comboPaid === 0 &&
     out.unimplemented === 0
   ) {
     return EMPTY_MODE_TICK;
@@ -1586,6 +1753,7 @@ export function tickModes(modes: TableModes, state: ModeState): ModeTickReport {
     bonusMultiplier: out.bonusMultiplier,
     holdBonus: out.holdBonus,
     holdMultiplier: out.holdMultiplier,
+    comboPaid: out.comboPaid,
     unimplemented: out.unimplemented,
   };
 }

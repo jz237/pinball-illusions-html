@@ -188,21 +188,30 @@ function resetFixture(): TableModes {
 }
 
 /**
- * The same table with TWO PROGRESS COUNTERS and four elements that step them.
+ * The same table with FOUR PROGRESS COUNTERS and the elements that drive them.
  *
  * Counter 0 is the shape of Law 'n Justice's counter 14: a reset value of one,
  * a cap of three and a continuation. Counter 1 is the shape of its COMBO record:
  * flags $08 (bit 3 — the ball-start walk at +0x004158 branches past the reset),
- * uncapped, with a packed-BCD step of 1,000,000.
+ * uncapped, with a packed-BCD step of 1,000,000. Counter 2 is the shape of its
+ * JACKPOT record, the corpus's one BCD target: a step of 1,000,000 clamped at
+ * 2,500,000. Counter 3 carries flags $01 (bit 0 — the ball-start walk REBUILDS
+ * the accumulator from the kept count at +0x00417C).
  *
  * Elements 3 and 4 both name counter 0, which is the point of the fixture: the
- * count belongs to the RECORD, so two different shots step one word.
+ * count belongs to the RECORD, so two different shots step one word. The
+ * accumulator cast: 5 pays the whole chain (effect 16), 7 arms counter 1's
+ * 5-second window (effect 20), 12 pays counter 1 without stepping (effect 7);
+ * 8 and 9 grow and pay the clamped counter 2 (effects 11 and 7); 10 and 11
+ * step and grow the bit-0 counter 3 (effects 18 and 11).
  */
 function counterFixture(): TableModes {
   const doc = fixtureDocument() as unknown as Record<string, unknown>;
   doc["counters"] = [
     { index: 0, flags: 0, reset: 1, cap: 3, step: 0, continuation: 2, ladder: -1, keepAcrossBall: false },
     { index: 1, flags: 0x08, reset: 0, cap: 0, step: 1_000_000, continuation: -1, ladder: -1, keepAcrossBall: true },
+    { index: 2, flags: 0, reset: 0, cap: 0, step: 1_000_000, target: 2_500_000, continuation: -1, ladder: -1, keepAcrossBall: false },
+    { index: 3, flags: 0x01, reset: 0, cap: 0, step: 500_000, continuation: -1, ladder: -1, keepAcrossBall: true },
   ];
   doc["elements"] = [
     ...(doc["elements"] as unknown[]),
@@ -210,6 +219,12 @@ function counterFixture(): TableModes {
     element(4, 100, 0, 0, 21, 0),
     element(5, 100, 0, 0, 16, 1),
     element(6, 100, 0, 0, 24, 0),
+    { ...element(7, 0, 0, 0, 20, 1), windowSeconds: 5 },
+    element(8, 0, 0, 0, 11, 2),
+    element(9, 0, 0, 0, 7, 2),
+    element(10, 0, 0, 0, 18, 3),
+    element(11, 0, 0, 0, 11, 3),
+    element(12, 0, 0, 0, 7, 1),
   ];
   doc["scripts"] = [
     ...(doc["scripts"] as unknown[]),
@@ -217,6 +232,12 @@ function counterFixture(): TableModes {
     { index: 7, ops: [{ pc: 0, op: 5, args: [4] }, { pc: 6, op: 0, args: [] }] },
     { index: 8, ops: [{ pc: 0, op: 5, args: [5] }, { pc: 6, op: 0, args: [] }] },
     { index: 9, ops: [{ pc: 0, op: 5, args: [6] }, { pc: 6, op: 0, args: [] }] },
+    { index: 10, ops: [{ pc: 0, op: 5, args: [7] }, { pc: 6, op: 0, args: [] }] },
+    { index: 11, ops: [{ pc: 0, op: 5, args: [8] }, { pc: 6, op: 0, args: [] }] },
+    { index: 12, ops: [{ pc: 0, op: 5, args: [9] }, { pc: 6, op: 0, args: [] }] },
+    { index: 13, ops: [{ pc: 0, op: 5, args: [10] }, { pc: 6, op: 0, args: [] }] },
+    { index: 14, ops: [{ pc: 0, op: 5, args: [11] }, { pc: 6, op: 0, args: [] }] },
+    { index: 15, ops: [{ pc: 0, op: 5, args: [12] }, { pc: 6, op: 0, args: [] }] },
   ];
   return parseTableModesDocument(doc as unknown as TableModesDocument);
 }
@@ -280,11 +301,11 @@ function lampGroupFixture(): TableModes {
 }
 
 /** Arms `element`, fires the one-op script that AWARDs it, and lets it run. */
-function fireShot(modes: TableModes, state: ModeState, element: number, script: number): void {
+function fireShot(modes: TableModes, state: ModeState, element: number, script: number) {
   state.armed[element] = 1;
   state.done[element] = 0;
   queueScript(state, script);
-  run(modes, state, 8);
+  return run(modes, state, 8);
 }
 
 /** Runs `ticks` frames and returns everything that happened, flattened. */
@@ -293,14 +314,16 @@ function run(modes: TableModes, state: ModeState, ticks: number) {
   let started = 0;
   let ended = 0;
   let ballsUpTo = 0;
+  let comboPaid = 0;
   for (let i = 0; i < ticks; i += 1) {
     const report = tickModes(modes, state);
     awards.push(...report.awards);
     if (report.missionStarted >= 0) started += 1;
     if (report.missionEnded) ended += 1;
     ballsUpTo = Math.max(ballsUpTo, report.ballsUpTo);
+    comboPaid += report.comboPaid;
   }
-  return { awards, started, ended, ballsUpTo };
+  return { awards, started, ended, ballsUpTo, comboPaid };
 }
 
 /** A digest of everything mutable, for the determinism check. */
@@ -311,6 +334,8 @@ function digest(state: ModeState): string {
     timers: [...state.timers],
     counterCounts: [...state.counterCounts],
     counterTotals: [...state.counterTotals],
+    counterAccumulators: [...state.counterAccumulators],
+    counterWindows: [...state.counterWindows],
     groupLampLit: [...state.groupLampLit],
     groupLampAlways: [...state.groupLampAlways],
     groupFired: [...state.groupFired],
@@ -753,6 +778,123 @@ describe("a progress counter, keyed by RECORD and not by element", () => {
   });
 });
 
+describe("the record's BCD half: the accumulator, the window and the clamp", () => {
+  it("pays one whole step more on each link of an effect-16 chain", () => {
+    // 0x5E4E is add (0x5FE4), count (0x5E5A), pay (0x61AA) IN THAT ORDER, so
+    // the first award pays one whole step, the second two, the third three —
+    // Law 'n Justice's 1,000,000 / 2,000,000 / 3,000,000 — and the element's
+    // own score rides beside the chain payment, not inside it.
+    const modes = counterFixture();
+    const state = createModeState(modes);
+    const first = fireShot(modes, state, 5, 8);
+    expect(first.comboPaid).toBe(1_000_000);
+    expect(first.awards[0]?.score, "the element's own score is its own").toBe(100);
+    expect(fireShot(modes, state, 5, 8).comboPaid).toBe(2_000_000);
+    expect(fireShot(modes, state, 5, 8).comboPaid).toBe(3_000_000);
+    expect(state.counterAccumulators[1]).toBe(3_000_000);
+    expect(state.counterCounts[1], "the count is the other half, still stepping").toBe(3);
+  });
+
+  it("grows without paying on effect 18 and 11, and pays without growing on 7", () => {
+    const modes = counterFixture();
+    const state = createModeState(modes);
+    // Effect 18 (0x5E46) is the first two thirds of 16: add and count, no pay.
+    const grown = fireShot(modes, state, 10, 13);
+    expect(grown.comboPaid).toBe(0);
+    expect(state.counterAccumulators[3]).toBe(500_000);
+    expect(state.counterCounts[3]).toBe(1);
+    // Effect 11 (0x5FE4 alone) is the first third: add, no count, no pay.
+    fireShot(modes, state, 11, 14);
+    expect(state.counterAccumulators[3]).toBe(1_000_000);
+    expect(state.counterCounts[3], "effect 11 does not count").toBe(1);
+    // Effect 7 (0x61AA alone) is the last third — and paying does NOT consume:
+    // only the window expiry and the resets clear the accumulator.
+    fireShot(modes, state, 5, 8);
+    expect(fireShot(modes, state, 12, 15).comboPaid).toBe(1_000_000);
+    expect(fireShot(modes, state, 12, 15).comboPaid, "the payment is repeatable").toBe(1_000_000);
+    expect(state.counterAccumulators[1]).toBe(1_000_000);
+    expect(state.counterCounts[1], "effect 7 does not count").toBe(1);
+  });
+
+  it("clamps the accumulator to the record's +$40 target, and pays the clamped value", () => {
+    // 0x6000, the tail every add falls through: an accumulator past the BCD
+    // target is written back as exactly it. Three 1,000,000 steps against a
+    // 2,500,000 target leave 2,500,000, which is what effect 7 then pays.
+    const modes = counterFixture();
+    const state = createModeState(modes);
+    fireShot(modes, state, 8, 11);
+    fireShot(modes, state, 8, 11);
+    expect(state.counterAccumulators[2]).toBe(2_000_000);
+    fireShot(modes, state, 8, 11);
+    expect(state.counterAccumulators[2], "the third step hits the clamp").toBe(2_500_000);
+    expect(fireShot(modes, state, 9, 12).comboPaid).toBe(2_500_000);
+  });
+
+  it("arms the window on effect 20 and clears the accumulator — not the count — when it expires", () => {
+    const modes = counterFixture();
+    const state = createModeState(modes);
+    fireShot(modes, state, 5, 8);
+    expect(state.counterAccumulators[1]).toBe(1_000_000);
+    // 0x620E: seconds x $50(a5). The award lands on the first of fireShot's
+    // eight ticks and the service (0x56D4, the tail of every tick) decrements
+    // from that same tick on: 5 x 50 = 250, minus eight ticks gone.
+    fireShot(modes, state, 7, 10);
+    expect(state.counterWindows[1]).toBe(242);
+    // While the window holds, the chain keeps escalating.
+    expect(fireShot(modes, state, 5, 8).comboPaid).toBe(2_000_000);
+    // Run the window out: the expiry clears the ACCUMULATOR; the counts and
+    // the totals are the bonus's half of the record and stay where they were.
+    run(modes, state, state.counterWindows[1] ?? 0);
+    expect(state.counterWindows[1]).toBe(0);
+    expect(state.counterAccumulators[1]).toBe(0);
+    expect(state.counterCounts[1], "the expiry does not touch the count").toBe(2);
+    // The next link starts a new chain at one step.
+    expect(fireShot(modes, state, 5, 8).comboPaid).toBe(1_000_000);
+  });
+
+  it("pays an award landing on the window's last tick before the expiry wipes it", () => {
+    // The frame chain at +0x004B46 calls the window service (jsr $56D4) AFTER
+    // both interpreters, so the shot wins the tie: it pays the grown
+    // accumulator and the expiry then clears it.
+    const modes = counterFixture();
+    const state = createModeState(modes);
+    fireShot(modes, state, 5, 8);
+    state.counterWindows[1] = 1;
+    state.armed[5] = 1;
+    state.done[5] = 0;
+    queueScript(state, 8);
+    expect(run(modes, state, 4).comboPaid, "the last-tick award pays first").toBe(2_000_000);
+    expect(state.counterWindows[1]).toBe(0);
+    expect(state.counterAccumulators[1], "and the expiry then clears the record").toBe(0);
+  });
+
+  it("dies with the ball whatever the flags say, except a bit-0 record rebuilds from its count", () => {
+    const modes = counterFixture();
+    const state = createModeState(modes);
+    // A plain record: everything clears.
+    fireShot(modes, state, 8, 11);
+    state.counterWindows[2] = 37;
+    // Bit 3 (the combo record): the count is kept, but the clear at +0x004136
+    // runs BEFORE the keep-flag tests, so the accumulator still dies.
+    fireShot(modes, state, 5, 8);
+    fireShot(modes, state, 5, 8);
+    // Bit 0: two counted steps and one uncounted one, so the rebuild's
+    // step x count = 1,000,000 is visibly not the 1,500,000 it replaces.
+    fireShot(modes, state, 10, 13);
+    fireShot(modes, state, 10, 13);
+    fireShot(modes, state, 11, 14);
+    expect(state.counterAccumulators[3]).toBe(1_500_000);
+
+    resetModesForNewBall(modes, state);
+    expect(state.counterAccumulators[2]).toBe(0);
+    expect(state.counterWindows[2]).toBe(0);
+    expect(state.counterCounts[1], "bit 3 keeps its count").toBe(2);
+    expect(state.counterAccumulators[1], "bit 3 does NOT keep its accumulator").toBe(0);
+    expect(state.counterCounts[3], "bit 0 keeps its count").toBe(2);
+    expect(state.counterAccumulators[3], "bit 0 rebuilds step x count, +0x00417C").toBe(1_000_000);
+  });
+});
+
 describe("the wait machinery", () => {
   it("holds a WAIT with a clock and no shot for the whole clock", () => {
     // The intro pause every mission opens with is `WAIT NULL, 3, <pc>`: three
@@ -1058,6 +1200,60 @@ describe("on the shipped Law 'n Justice data", () => {
     queueScript(state, shots[0] ?? -1);
     run(modes, state, 200);
     expect(comboCount(modes, state), "an unlit combo shot counted").toBe(6);
+  });
+
+  it("ships the accumulator fields the effects read, and the corpus's one BCD target", () => {
+    const modes = modesFor("law-n-justice");
+    const combo = modes.counters[modes.comboCounter];
+    expect(combo?.step, "a combo step is 1,000,000, h4+0x457C").toBe(1_000_000);
+    expect(combo?.target, "the combo record carries the $FFFFFFFF sentinel").toBe(-1);
+    // The two window arms, 0x620E's element +$38: 5 seconds and 10.
+    expect(modes.elements[34]?.effect).toBe(20);
+    expect(modes.elements[34]?.counter).toBe(modes.comboCounter);
+    expect(modes.elements[34]?.windowSeconds).toBe(5);
+    expect(modes.elements[35]?.counter).toBe(modes.comboCounter);
+    expect(modes.elements[35]?.windowSeconds).toBe(10);
+    // The corpus's one BCD target: the jackpot record's 1,000,000-a-shot
+    // accumulator caps at 25,000,000.
+    expect(modes.counters[1]?.step).toBe(1_000_000);
+    expect(modes.counters[1]?.target).toBe(25_000_000);
+  });
+
+  it("pays a real chain 1,000,000 then 2,000,000, and a chain gone cold starts over", () => {
+    // The chain's own window plumbing, straight off the shipped scripts: every
+    // combo script AWARDs the window arms 34/35 — REFUSED while they are dark
+    // — and then START_TIMEDs the next one, so the FIRST link of a chain arms
+    // no window and the SECOND link's award is what starts the 5-second clock.
+    const modes = modesFor("law-n-justice");
+    const combo = modes.comboCounter;
+    const shots = [modes.scriptForZone(1, 7), modes.scriptForZone(1, 8), modes.scriptForZone(1, 9)];
+    const ownElement = (script: number) =>
+      (modes.scripts[script]?.ops ?? [])
+        .filter((op) => op.op === 5)
+        .map((op) => op.args[0] ?? -1)
+        .find((index) => modes.elements[index]?.counter === combo && modes.elements[index]?.effect === 16) ?? -1;
+
+    const state = createModeState(modes);
+    const fire = (script: number) => {
+      const element = ownElement(script);
+      expect(element).toBeGreaterThanOrEqual(0);
+      state.armed[element] = 1;
+      state.done[element] = 0;
+      queueScript(state, script);
+      return run(modes, state, 30);
+    };
+
+    expect(fire(shots[0] ?? -1).comboPaid).toBe(1_000_000);
+    expect(state.counterWindows[combo], "the first link finds 34/35 dark").toBe(0);
+    expect(fire(shots[1] ?? -1).comboPaid).toBe(2_000_000);
+    expect(state.counterWindows[combo], "the second link's AWARD 34 arms the clock").toBeGreaterThan(0);
+
+    // Let the window run out: the accumulator dies, the count does not.
+    run(modes, state, state.counterWindows[combo] ?? 0);
+    expect(state.counterAccumulators[combo]).toBe(0);
+    expect(comboCount(modes, state)).toBe(2);
+    expect(fire(shots[2] ?? -1).comboPaid, "a cold chain starts over at one step").toBe(1_000_000);
+    expect(comboCount(modes, state)).toBe(3);
   });
 
   it("is deterministic: the same frames from the same start give the same state", () => {
