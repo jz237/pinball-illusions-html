@@ -248,37 +248,40 @@ describe("a flipper does not throw the ball through itself", () => {
    * tables.
    *
    * The pass-under count over this band was 138 of 384 at `c9724a4`, 84 at
-   * `822caf5` and 9 at `ed5e01d` — zero on the left bats and three per right
-   * bat. The assertion is a CEILING and not the count: a ceiling cannot be
-   * satisfied by a change that merely moves the residue around, and a count
-   * would fail on any improvement.
+   * `822caf5`, 9 at `ed5e01d` and 12 after the spin round. It is now ZERO, and
+   * the ceiling is zero: the invariant this file is named for is that a flipper
+   * does not throw the ball through itself, and a non-zero ceiling was only ever
+   * a truce with a defect nobody owned.
    *
-   * RAISED TO 12 BY THE SPIN ROUND, and this is the one figure that round moved
-   * the wrong way. It is disclosed rather than absorbed:
+   * WHAT CLOSED IT was the deviation the spin round disclosed and left open —
+   * `resolveFlipperContacts` running ONCE PER TICK after `stepBalls` where the
+   * machine walks the flipper records at the head of the same collision routine
+   * that blits the map, four times a frame (main.seg00 +0x00B278, called from
+   * +0x00A7E0 at +0x00A64C/696/6E0/728). Three things went with it, and each is
+   * a separate reason the residue could not survive:
    *
-   *   THE MECHANISM IS THE FIX, not a new defect. The port stopped applying the
-   *   tangential toll as a `keep` fraction of a vector — which truncated away up
-   *   to one part in 1024 of the along-blade speed at every one of the four
-   *   contacts a tick — and started applying it to the machine's own signed
-   *   scalar. A ball that keeps the speed the machine leaves it ROLLS FURTHER
-   *   OUT THE BLADE before the stroke starts, so more trials land in the band
-   *   where the residue lives. Ablated on `scripts/flipper-probe.mts`, which
-   *   runs 648 of these trials rather than this file's 168: the scalar tangent
-   *   alone takes it 9 -> 15, and the spin word then wins half of that back,
-   *   15 -> 12.
+   *   THE BALL IS TESTED WHERE IT STANDS. The old resolve sampled four
+   *   INTERPOLATED points along the tick's net displacement, because by the time
+   *   it ran the intermediate positions no longer existed. They exist now.
    *
-   *   THE SITES ARE THE SAME BAND, all twelve on the lower-RIGHT outer blade at
-   *   `along` 30-37, which is where `ed5e01d` left its three. Nothing appeared
-   *   on a left bat, no cradle was lost on any of the six, and drop-and-flip
-   *   pass-under went the other way, 14 -> 13 of 210.
+   *   NOTHING REWINDS THE BALL. The old resolve ended by moving the ball back to
+   *   the crossing point, discarding up to three quarters of the tick's travel —
+   *   measured on a ball rolling down the resting left bat, 0.13 px a tick
+   *   against a velocity of 0.55 to 1.04. A ball that rolls at its real speed
+   *   reaches the tip sooner and is struck earlier in the stroke, which is the
+   *   opposite of the "still embedded when the bat hits its stop" state the
+   *   pass-under needs.
    *
-   *   THE UNDERLYING DEFECT IS DISCLOSED AND UNOWNED BY THIS ROUND.
-   *   `resolveFlipperContacts` runs ONCE PER TICK after `stepBalls` where the
-   *   machine blits the bat mask into the same four collision passes as the map
-   *   (ARCH_NORMAL_DECODE section 9.4, SPIN_DECODE section 7.4). Until the bat
-   *   joins the passes a ball can reach the blade tip between one bat contact
-   *   and the next, and making the ball ARRIVE more faithfully exposes that more
-   *   often. That is the round to fix it, not this one.
+   *   THE POSE AT A PASS IS THE POSE BEFORE THAT PASS'S ANIMATION STEP. `jsr
+   *   $bc24` comes AFTER the ball loop in every one of the frame's four groups,
+   *   so a pass reads the pose the previous step wrote. The port read the pose
+   *   AFTER the step, which put the bat a quarter tick ahead of the ball and ran
+   *   a fresh stroke's four passes at rates 20/40/60/80 where the machine runs
+   *   0/20/40/60.
+   *
+   * Measured on `scripts/flipper-probe.mts`, which runs 648 of these trials
+   * rather than this file's 168: roll pass-under 12 -> 0 of 648, drop-and-flip
+   * 13 -> 0 of 210, cradles still held on all six lower bats.
    */
   it("keeps outer-blade flips out of the underside on every lower bat", () => {
     const seats = [8, 12, 16, 20];
@@ -310,7 +313,7 @@ describe("a flipper does not throw the ball through itself", () => {
     // exactly how the previous tip-flip figure came to read "0 of 882" while
     // every one of its 882 trials was a clean MISS.
     expect(trials).toBeGreaterThan(100);
-    expect(under, `${under}/${trials} passed under: ${sites.join("; ")}`).toBeLessThanOrEqual(12);
+    expect(under, `${under}/${trials} passed under: ${sites.join("; ")}`).toBe(0);
   });
 
   /**

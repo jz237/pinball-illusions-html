@@ -1375,15 +1375,26 @@ export function flipperEndpoints(
  * bat pixel sat on the ring and the map was silent — 97.3% of those on the
  * striking face, which is where balls actually meet bats.
  *
- * WHAT THIS DOES NOT DO. In the machine there is ONE probe and ONE normal for
- * `map OR bat`: `+0x0039FA` ORs a window of the collision map INTO each pose's
- * mask at table-load time, so the mask is a superset of the map and a ball
- * touching both gets one answer. Here the map is still resolved inside
- * `stepBalls` and the bat afterwards, so a ball touching both gets two. That is
- * 61,280 of 270,683 bat contacts (22.6%) in the census above, it is unchanged
- * from before this round, and closing it means giving the integrator's own
- * level view a per-tick bat overlay. It is named here so this is not read as
- * claiming the bat is now exact.
+ * WHAT THIS DOES NOT DO — THE LAST DEVIATION LEFT ON THE BAT PATH. In the
+ * machine there is ONE probe and ONE normal for `map OR bat`: `+0x0039FA` ORs a
+ * window of the collision map INTO each pose's mask at table-load time
+ * (`BLTCON0 = $0DFC`, `D = A OR B`), so the mask is a superset of the map, and
+ * `+0x00B278` returns the moment a pose's box admits the ball so the map blit
+ * at `$b43a` is never reached. A ball touching both therefore gets ONE answer,
+ * over the union geometry.
+ *
+ * Here the map and the bat are both resolved, at the same pass since the bat
+ * joined the frame, so a ball touching both gets two — 61,280 of 270,683 bat
+ * contacts (22.6%) in the census this note was first written against. The
+ * cheap half of the difference was tried and rejected on measurement: making a
+ * resolved bat contact SUPPRESS that pass's map probe moves the Law 'n Justice
+ * census write-offs 4 -> 3 at the same pocket cluster, drops the median from
+ * 4,980,000 to 3,287,500, and withholds from the scoring layer surface ids the
+ * machine reports whichever blit produced the contact (`+0x00AD4C` reads the
+ * map's own surface plane at the contact pixel either way). Closing it properly
+ * means building the union mask the machine builds — the level view's own
+ * pixels ORed into each pose at load time — and that is a round of its own.
+ * It is named here so this is not read as claiming the bat is now exact.
  */
 function batStrokeShapeOf(config: FlipperConfig): BatStrokeShape {
   return {
@@ -1529,7 +1540,7 @@ function sideOf(config: FlipperConfig, angle: number, x: Q10, y: Q10): number {
  *     whole overlapping set the maximum is 180, and those are the deep centres.
  *     A hit set spanning more than half the ring therefore takes the approach
  *     side instead. The machine cannot reach this — a 15 px bat cannot engulf a
- *     17 px ball — but `moveTo` and `separate` push against walls, and this port
+ *     17 px ball — but `separate` pushes against walls, and this port
  *     can.
  *   - No approach side and no usable mean at all falls back to the face the bat
  *     sweeps toward, as the capsule did.
@@ -1661,14 +1672,17 @@ function touchAt(
 }
 
 /**
- * Poses to sample inside ONE step of the stroke.
+ * Poses that would have to be sampled inside ONE step of the stroke for a bat
+ * not to be able to step its own tip over a ball: ONE, on every shipped bat.
  *
- * The tick is already divided into the original's own four steps, and at the
- * coil's cap of 120 bat units a step the tip covers 4.4 px — barely half a ball.
- * So this is one on the shipped bats and exists for the same reason
- * `substepsFor` did: a longer or faster bat must not be able to step its tip
- * over a ball, and the count is derived from the configuration rather than
- * chosen.
+ * DIAGNOSTIC SINCE THE BAT JOINED THE FRAME, and it is kept because the answer
+ * is the argument. At the coil's cap of 120 bat units a step the tip covers
+ * 4.4 px against a ball radius of 8, so the machine's four passes are already
+ * fine enough and the resolver tests exactly the four poses `+0x00BC24` writes
+ * — one per pass, no subdivision, which is all the machine does. A bat that
+ * answered anything but 1 here would be a bat this port could not resolve on
+ * the machine's own schedule, and `tests/flippers.test.ts` asserts none of the
+ * nine does.
  */
 export function substepsPerStrokeStep(
   config: FlipperConfig,
@@ -1680,11 +1694,9 @@ export function substepsPerStrokeStep(
 }
 
 /**
- * Poses sampled across a whole tick: the four steps, each subdivided.
- *
- * The subdivision used to be derived from the tick's total turn and was not
- * aligned to anything; it is now the original's own four collision passes, so a
- * sampled pose and the rate that goes with it are the same pair the machine had.
+ * Poses across a whole tick: the machine's four collision passes, times the
+ * subdivision above. FOUR on every shipped bat, which is the machine's own
+ * count and is what `createFlipperPass` actually runs.
  */
 export function substepsFor(config: FlipperConfig, ballRadius: Q10 = DEFAULT_PROBE_RADIUS): number {
   return FLIPPER_STEPS_PER_TICK * substepsPerStrokeStep(config, ballRadius);
@@ -1730,41 +1742,128 @@ function clampVelocity(value: number): number {
   return q10Clamp(Math.trunc(value), -VELOCITY_LIMIT, VELOCITY_LIMIT);
 }
 
-/** The last position a ball was at before this tick's step, for the sweep. */
-export interface BallStart {
-  readonly x: Q10;
-  readonly y: Q10;
+/**
+ * WHICH SIDE OF EACH BAT EACH BALL WAS LAST OUTSIDE ON — memory that has to
+ * outlive a tick, and that is the point of it.
+ *
+ * `ed5e01d` established the rule: decide the approach side WHEN the ball is
+ * outside the bat, against the pose it is outside AT, and carry the SIGN rather
+ * than the position, because a position gets re-judged against an axis that has
+ * rotated underneath it. What that round could not do, because the bat was
+ * resolved once per tick, was carry the answer any further than the tick it was
+ * read in — so every tick re-seeded the side from wherever the ball happened to
+ * start, INCLUDING the ticks a cradled or struck ball spent wholly inside the
+ * blade, where "the ball's position" is not outside anything and the reading is
+ * meaningless. That is the same stale-reference class one level down, and
+ * resolving four times a tick would have made it four times as frequent.
+ *
+ * So the side is now per (ball, bat) state that persists until the next time the
+ * ball is genuinely outside that bat. Keyed by `ball.id * 8 + surfaceId` — a
+ * number, so a Map lookup on the physics path allocates nothing, and the bat's
+ * responder id rather than its array index, so the key cannot be re-pointed by a
+ * change to the order the sweeps arrive in.
+ *
+ * A missing entry is 0, "unknown", which `touchAt` already answers with the face
+ * the bat sweeps toward. Bounded by construction: three balls times three bats.
+ */
+export type FlipperApproachSides = Map<number, number>;
+
+export function createFlipperApproachSides(): FlipperApproachSides {
+  return new Map<number, number>();
+}
+
+function sideKey(ball: BallState, config: FlipperConfig): number {
+  return ball.id * 8 + config.surfaceId;
 }
 
 /**
- * Resolves every ball against every flipper for one tick.
+ * THE BATS AT ONE COLLISION PASS — the shape the machine's own frame has.
  *
- * Runs AFTER `stepBalls`: the bats guard the drain, and a ball must be given its
- * chance to be saved at the position it actually reached this tick rather than
- * the one it started from.
- *
- * `starts` is where each ball BEGAN the tick, keyed by ball id, and it is what
- * makes the contact test SWEPT rather than endpoint-only. This used to test only
- * the end-of-tick position, and that was the reconstruction's #1 defect (B1): a
- * ball at 9–16 px/tick crosses the whole bat capsule inside one tick, the
- * end-of-tick sample sits past the axis, the nearest-point normal reads off the
- * far face, and the "already leaving" guard then waves it through — 161
- * bat-crossings-while-raised in 80 census games, all through that seam. With
- * `starts`, the ball's motion segment is sampled once per collision pass
- * (matching the original, which tests the bat 4x per frame with at most ~4 px of
- * ball motion between tests — main.seg00 $A618's pass structure), each sample
- * against the pose the bat holds at that pass, and the FIRST approaching touch
- * resolves AT THE CROSSING POINT. Sample spacing (≤4 px of ball travel + ≤4.4 px
- * of tip travel) is well under the thinnest inflated capsule (ball 8 + tip 1 =
- * 9 px each side), so no motion the clamp permits can step over the bat.
- *
- * Callers that pass no `starts` get the endpoint test, which is still right for
- * a ball that did not move (unit harnesses that advance balls by hand).
+ * Returned as a pair so the caller cannot run the passes without collecting what
+ * they reported: `resolve` is handed to `stepBalls` as its `bats` option and is
+ * called at substeps 0, 2, 4 and 6 of every ball's integration, and `contacts`
+ * accumulates every contact every pass resolved. One contact PER PASS, not per
+ * tick, because that is what the machine records: `+0x00AED2` writes the reduced
+ * bat rate back to `$10(a0)` inside each pass, so a ball lying on a rising blade
+ * loads it four times a frame and this port used to charge it once.
+ */
+export interface FlipperPass {
+  /** `BatPassResolver`: one ball, one of the frame's four collision passes. */
+  readonly resolve: (ball: BallState, pass: number) => void;
+  /** Every contact resolved since this object was built, in pass order. */
+  readonly contacts: readonly FlipperContact[];
+}
+
+/**
+ * Builds this tick's bat resolver.
  *
  * `clamp` is the same map-aware push limiter `resolveBallCollisions` takes, and
  * for the same reason: separating a ball from a bat with an unlimited shove can
  * bury it in a wall, and a ball outside the bitmap can never move again. It is
  * optional only so the impulse can be tested without a map.
+ *
+ * `sides` is the approach-side memory (see `FlipperApproachSides`). Null gives a
+ * resolver with a memory of its own, which is right for a harness that builds
+ * one per tick and wrong for a game, where the memory is the whole point.
+ */
+export function createFlipperPass(
+  sweeps: readonly FlipperSweep[],
+  ballRadius: Q10 = DEFAULT_PROBE_RADIUS,
+  clamp: PushClamp | null = null,
+  restThreshold: number = DEFAULT_SIMULATION_OPTIONS.restThreshold,
+  sides: FlipperApproachSides | null = null,
+): FlipperPass {
+  const contacts: FlipperContact[] = [];
+  const memory = sides ?? createFlipperApproachSides();
+  return {
+    contacts,
+    resolve(ball: BallState, pass: number): void {
+      if (!ball.active) return;
+      for (const sweep of sweeps) {
+        // THE LEVEL GATE, and it is the machine's own: `cmp.l $1c(a0),d2 / bne`
+        // at +0x00B2B0 compares the ball's collision plane with the record's
+        // own pose bank and steps to the next record when they differ. A bat's
+        // pixels are on one collision level, and a ball riding the other one
+        // passes under or over it untouched. This was harmless while every bat
+        // was at the drain — there is no raised playfield down there — and
+        // became load-bearing the moment BabeWatch's (205,115) and Extreme
+        // Sports' (182,194) upper bats were wired: both sit over main-level
+        // playfield a ball rolls across.
+        if (sweep.config.level !== ball.level) continue;
+        const contact = resolveAtPass(
+          ball,
+          sweep,
+          pass,
+          ballRadius,
+          clamp,
+          restThreshold,
+          memory,
+        );
+        if (contact !== null) contacts.push(contact);
+      }
+    },
+  };
+}
+
+/**
+ * Resolves every ball against every flipper for a whole tick, at the ball's
+ * current position.
+ *
+ * A THIN WRAPPER OVER THE FOUR PASSES, and it has to be: the game drives
+ * `createFlipperPass` from inside the integrator, and a second contact model
+ * living behind this name is precisely the drift the rest of this file argues
+ * against. What it is for is the harnesses that advance a ball by hand and want
+ * one tick's worth of bat — they get the four passes with no motion between
+ * them, which is what a ball that did not move gets in the game either.
+ *
+ * IT USED TO SWEEP, and the sweep is gone rather than lost. `starts` handed this
+ * function the ball's position at the START of the tick and it sampled four
+ * INTERPOLATED points along the tick's net displacement, because the bat ran
+ * after `stepBalls` had already spent the whole frame and the real intermediate
+ * positions no longer existed. They exist now: the resolver is called from
+ * inside the integrator at the machine's own four passes, so every sample is a
+ * position the ball actually stood at, with the velocity it actually had, and
+ * an impulse delivered at pass 0 is carried by the six substeps that follow it.
  */
 export function resolveFlipperContacts(
   balls: readonly BallState[],
@@ -1772,223 +1871,199 @@ export function resolveFlipperContacts(
   ballRadius: Q10 = DEFAULT_PROBE_RADIUS,
   clamp: PushClamp | null = null,
   restThreshold: number = DEFAULT_SIMULATION_OPTIONS.restThreshold,
-  starts: ReadonlyMap<number, BallStart> | null = null,
+  sides: FlipperApproachSides | null = null,
 ): readonly FlipperContact[] {
-  const contacts: FlipperContact[] = [];
+  const pass = createFlipperPass(sweeps, ballRadius, clamp, restThreshold, sides);
   for (const ball of balls) {
-    if (!ball.active) continue;
-    for (const sweep of sweeps) {
-      // THE LEVEL GATE. A bat's pixels are on one collision level, and a ball
-      // riding the other one passes under or over it untouched. This was
-      // harmless while every bat was at the drain — there is no raised
-      // playfield down there — and became load-bearing the moment BabeWatch's
-      // (205,115) and Extreme Sports' (182,194) upper bats were wired: both sit
-      // over main-level playfield a ball rolls across.
-      if (sweep.config.level !== ball.level) continue;
-      const contact = resolveOne(
-        ball,
-        sweep,
-        ballRadius,
-        clamp,
-        restThreshold,
-        starts?.get(ball.id) ?? null,
-      );
-      if (contact !== null) contacts.push(contact);
+    for (let index = 0; index < FLIPPER_STEPS_PER_TICK; index += 1) {
+      pass.resolve(ball, index);
     }
   }
-  return contacts;
+  return pass.contacts;
 }
 
-function resolveOne(
+/**
+ * One ball against one bat at ONE of the frame's four collision passes.
+ *
+ * ---------------------------------------------------------------------------
+ * THE POSE AT A PASS IS THE POSE BEFORE THAT PASS'S ANIMATION STEP
+ * ---------------------------------------------------------------------------
+ * MEASURED, off the unrolled frame at main.seg00 +0x00A618, and this port had it
+ * one step out. Each of the four groups is
+ *
+ *     for every ball:  clr.b $3(a4) / jsr $a7e0 (probe) / jsr $b4ba (respond)
+ *     jsr $bc24        ; THE BAT ANIMATION — one step, AFTER the collision pass
+ *     jsr $b6e8        ; substep
+ *     jsr $b6e8        ; substep
+ *
+ * (+0x00A64C/65A/660/666, +0x00A696/6A4/6AA/6B0, +0x00A6E0/6EE/6F4/6FA,
+ * +0x00A728/736/73C/742, and the two ball-less paths at +0x00A750 and +0x00A770
+ * call `$bc24` four times on their own so the bat animates whether or not there
+ * is a ball to hit.) So the pose a pass reads out of `$1a(a0)` is the pose the
+ * PREVIOUS animation step wrote: pass 0 sees the pose the last frame ended on,
+ * and the pose this frame ends on is not tested until the next frame's pass 0.
+ * The rate is the same word `$10(a0)` the animation is about to move by, so the
+ * pair (pose, rate) at a pass is always "here, and about to go this fast".
+ *
+ * The port sampled `sweep.steps[pass]` — the state AFTER that step — which put
+ * the bat a quarter of a tick ahead of the ball at every pass and, on a fresh
+ * stroke, read the rates 20/40/60/80 where the machine reads 0/20/40/60.
+ *
+ * ---------------------------------------------------------------------------
+ * NOTHING MOVES THE BALL TO MEET THE BAT
+ * ---------------------------------------------------------------------------
+ * The old swept resolve ended by rewinding the ball to the crossing point, which
+ * was the only honest thing it could do with a contact it had discovered after
+ * the fact. The machine's responder cannot move a ball at all (its one exception
+ * is the ejector at +0x00B6BE, which is the integrator's business and belongs to
+ * every surface equally), and this one no longer does: the ball is already at the
+ * pass's own position because the pass IS one of the integrator's. `separate`
+ * survives, and is this port's own answer to a mask body's whole-pixel overlap;
+ * it is idempotent, so running it at four passes rather than one does not
+ * compound.
+ */
+function resolveAtPass(
   ball: BallState,
   sweep: FlipperSweep,
+  pass: number,
   ballRadius: Q10,
   clamp: PushClamp | null,
   restThreshold: number,
-  start: BallStart | null,
+  sides: FlipperApproachSides,
 ): FlipperContact | null {
   const { config } = sweep;
-  const inner = substepsPerStrokeStep(config, ballRadius);
-  const startX = start?.x ?? ball.x;
-  const startY = start?.y ?? ball.y;
-  const deltaX = ball.x - startX;
-  const deltaY = ball.y - startY;
-  const total = sweep.steps.length * inner;
-
-  let previous = sweep.from;
-  // WHICH SIDE the ball was on the last time it was outside the bat, decided
-  // against the pose the bat held AT THAT MOMENT and then carried.
-  //
-  // Deciding it once and keeping it is the whole of the fix: a position kept
-  // instead of a side gets re-judged against a pose that has rotated since,
-  // and a ball still embedded when the bat reaches its stop is then declared to
-  // have come from underneath and pushed out through the blade. See `touchAt`.
-  let freeSide = sideOf(config, flipperAngle(config, sweep.from), startX, startY);
-  let sampled = 0;
-  for (const end of sweep.steps) {
-    const span = end.stroke - previous.stroke;
-    for (let sample = 1; sample <= inner; sample += 1) {
-      sampled += 1;
-      // Truncated rather than rounded so the samples advance monotonically and
-      // the last one is exactly the pose the step ended on.
-      const stroke = previous.stroke + Math.trunc((span * sample) / inner);
-      const angle = flipperAngle(config, { stroke, rate: end.rate });
-      // The ball's position at this pass: the tick's displacement is spent
-      // one collision pass at a time, exactly as the original interleaves the
-      // bat's animation with the integrator's sub-steps.
-      const sampleX = (startX + Math.trunc((deltaX * sampled) / total)) | 0;
-      const sampleY = (startY + Math.trunc((deltaY * sampled) / total)) | 0;
-      const touch = touchAt(config, stroke, angle, sampleX, sampleY, ballRadius, freeSide);
-      if (touch === null) {
-        // Outside the bat at this pose, so this is a fresh reading of the side
-        // and it replaces the carried one.
-        freeSide = sideOf(config, angle, sampleX, sampleY);
-        continue;
-      }
-
-      // The bat's surface velocity at the touched point, in BEARING units per
-      // tick: four steps of the rate this step carried. Used for the gate and
-      // for what the contact reports, never for the impulse's size.
-      const turnPerTick = config.direction * batAngleToBearing(end.rate * FLIPPER_STEPS_PER_TICK);
-      const surfaceX = -tangentialSpeed(touch.armY, turnPerTick);
-      const surfaceY = tangentialSpeed(touch.armX, turnPerTick);
-
-      const approachSpeed =
-        q10Multiply(ball.velocityX - surfaceX, touch.normalX) +
-        q10Multiply(ball.velocityY - surfaceY, touch.normalY);
-
-      // A mid-path touch the ball is already LEAVING is not resolved there:
-      // pulling the ball back to a graze it was departing from would cost it
-      // most of a tick of travel for a contact that changes nothing. The final
-      // sample still resolves whatever it finds — that is the endpoint test
-      // this function has always run, and it is what keeps a ball that ends
-      // the tick embedded in the bat separated rather than left inside it.
-      if (approachSpeed >= 0 && sampled < total) continue;
-
-      // Resolve AT THE CROSSING POINT: the ball is placed at the sample that
-      // first met the bat, not at wherever the map integration finished. The
-      // discarded remainder of the tick is at most one pass's travel — the
-      // same granularity the original loses between its own collision passes.
-      //
-      // CLAMPED, like `separate()` below and for the same reason: this is a
-      // positional write with no collision test of its own, and on a bat whose
-      // capsule overlaps the collision line — Law 'n Justice's upper-left one —
-      // it can put the ball's centre inside a wall just as surely as the
-      // separation can. Round 5 left both unclamped and the two together drove
-      // 10.7% of at-rest balls near that bat through a 2 px boundary into the
-      // off-playfield shaft behind it.
-      moveTo(ball, sampleX, sampleY, clamp);
-
-      // THE GATE, +0x00AEAC and the eight octant masks at $B036+0x3C*n: the bat
-      // imparts only when it is sweeping toward the face the ball is on. A rate
-      // of zero fails it outright, which is the `beq -> rts`.
-      const facing =
-        q10Multiply(surfaceX, touch.normalX) + q10Multiply(surfaceY, touch.normalY);
-      let rateTaken = 0;
-      if (end.rate !== 0 && facing > 0) {
-        const dx = Math.trunc(Math.abs(ball.x - config.pivotX) / Q10_ONE);
-        const dy = Math.trunc(Math.abs(ball.y - config.pivotY) / Q10_ONE);
-        rateTaken = Math.min(Math.abs(end.rate), flipperRateTaken(dx, dy));
-        // The rate AFTER the ball has taken its share, which is what the impulse
-        // is computed from: +0x00AED2..+0x00AEE4 writes the reduced rate back
-        // before +0x00AEF0 even looks at the magnitude. Signed the way the
-        // ORIGINAL signs it — the disk's left bat runs its coil at -120 and its
-        // right at +120, which this port folds into `direction`.
-        const driven = (Math.abs(end.rate) - rateTaken) * (config.direction * end.rate < 0 ? -1 : 1);
-        const magnitude = flipperImpulseMagnitude(dx, dy);
-        // WHY THERE IS NO FACTOR OF TWO HERE and the sub-handlers have one. The
-        // rotation into the contact frame at +0x00B4FE multiplies by tables
-        // scaled to 2^14 and takes `(x << 3) >> 16`, i.e. it DOUBLES both
-        // components, and the inverse at +0x00B666 halves them again. The
-        // handlers' `magnitude * 2 * rate` and `8 * 2 * rate` are written into
-        // that doubled frame, so the impulse a ball actually receives is
-        // `magnitude * rate` outward and `8 * rate` along the surface. Missing
-        // the doubling puts every flipper shot at twice the machine's own
-        // velocity clamp, where the whole bat saturates and nothing has range.
-        const normal = originalVelocityToQ10(magnitude * Math.abs(driven));
-        const tangent = originalVelocityToQ10(ORIGINAL_IMPULSE_TANGENT * driven);
-        // The normal is always outward — the sub-handlers negate `d2` on
-        // whichever branch keeps `$1c` negative, and +0x00B550's `tst.w d0 /
-        // ble` shows the frame's first axis points INTO the surface. The tangent
-        // runs along `(normalY, -normalX)` and its sign is the bat's own rotation
-        // sign and NOT a projection: the bat's surface velocity is perpendicular
-        // to the arm and the arm runs down the bat's axis, so the surface
-        // velocity is almost entirely along the NORMAL and its along-face
-        // component is numerical noise that no sign can be read off.
-        //
-        // The consequence, which is worth stating because it is testable: both
-        // bats deflect the ball toward their own pivot, by `atan(8/M)` — about
-        // 32 degrees at the boss and 13 at the tip. The two are exact mirrors,
-        // which is the check that the handedness above is not inverted.
-        ball.velocityX = clampVelocity(
-          ball.velocityX +
-            q10Multiply(normal, touch.normalX) +
-            q10Multiply(tangent, -touch.normalY),
-        );
-        ball.velocityY = clampVelocity(
-          ball.velocityY +
-            q10Multiply(normal, touch.normalY) +
-            q10Multiply(tangent, touch.normalX),
-        );
-      }
-
-      // Then the ordinary bounce, in the WORLD frame — the original has no bat
-      // frame, and `reflectVelocity` returns untouched when the ball is already
-      // leaving, which is exactly the `tst.w d0 / ble` that skips the bounce at
-      // +0x00B550 once the kick above has sent the ball outward.
-      //
-      // AND IT IS THE MAP'S OWN RESPONDER, WITH THE BAT'S OWN ROW. This used to
-      // pass no surface at all, which sent a bat contact down `reflectVelocity`'s
-      // no-surface branch: the row's restitution by way of `FLIPPER_SURFACE`, but
-      // this port's Coulomb friction instead of the row's `$3A` slip and none of
-      // the row's `$34` graze gate. That was a second contact model living behind
-      // the bats, and the machine has one: the mask blit at +0x00B2A2 leaves its
-      // result in the same 68-byte buffer as the map blit at +0x00B4B0, the same
-      // ring evaluator at +0x00A9C4 reads it, and the four constants at
-      // `$34/$36/$38/$3A` were loaded by `movem.w (a0,d2.w*8),d3-d6` at
-      // +0x00AE14 from the surface id under the contact — which for a bat is the
-      // id the shipped maps paint over its own swept footprint (1..4, see
-      // `FlipperRecord.surfaceId`). So the bat inherits the whole responder and
-      // not merely its normal.
-      //
-      // WHAT MOVED, measured on the Law 'n Justice apron: a ball arriving on the
-      // resting left bat at (2.53,12.45) px/tick left it at (6.69,-1.53) under
-      // the Coulomb rule and leaves at (9.24,-0.35) under the row's, against the
-      // film's own 10.0-11.5 px/tick eastbound roll. The normal channel is
-      // untouched — both rules take 115/256 of it, which is what
-      // `FLIPPER_SURFACE.elasticity` already carried — and the difference is
-      // entirely tangential: Coulomb charged 36% of the along-face speed to one
-      // contact where `$3A` = 12800 charges 1.25% plus the fixed decay.
-      reflectVelocity(
-        ball,
-        config.surface,
-        touch.normalX,
-        touch.normalY,
-        restThreshold,
-        surfaceResponseFor(config.surfaceId),
-      );
-
-      separate(ball, touch, clamp);
-
-      const batSpeed = tangentialSpeed(
-        integerSqrt(touch.armX * touch.armX + touch.armY * touch.armY),
-        turnPerTick,
-      );
-      return {
-        ballId: ball.id,
-        flipperId: config.id,
-        normalX: touch.normalX,
-        normalY: touch.normalY,
-        along: touch.along,
-        batSpeed,
-        approachSpeed,
-        struck: end.rate !== 0 && facing > 0,
-        rateTaken,
-      };
-    }
-    previous = end;
+  // See the header: the pose and rate a pass reads are the ones the animation
+  // has not spent yet, so pass 0 is the tick's own starting state.
+  const state = pass === 0 ? sweep.from : (sweep.steps[pass - 1] ?? sweep.from);
+  const stroke = state.stroke;
+  const angle = flipperAngle(config, state);
+  const key = sideKey(ball, config);
+  const touch = touchAt(config, stroke, angle, ball.x, ball.y, ballRadius, sides.get(key) ?? 0);
+  if (touch === null) {
+    // Outside the bat at this pose, so this is a fresh reading of the side and
+    // it replaces the carried one. This is the ONLY place the side is written.
+    sides.set(key, sideOf(config, angle, ball.x, ball.y));
+    return null;
   }
-  return null;
+
+  // The bat's surface velocity at the touched point, in BEARING units per
+  // tick: four steps of the rate this pass carried. Used for the gate and
+  // for what the contact reports, never for the impulse's size.
+  const turnPerTick = config.direction * batAngleToBearing(state.rate * FLIPPER_STEPS_PER_TICK);
+  const surfaceX = -tangentialSpeed(touch.armY, turnPerTick);
+  const surfaceY = tangentialSpeed(touch.armX, turnPerTick);
+
+  const approachSpeed =
+    q10Multiply(ball.velocityX - surfaceX, touch.normalX) +
+    q10Multiply(ball.velocityY - surfaceY, touch.normalY);
+
+  // THE GATE, +0x00AEAC and the eight octant masks at $B036+0x3C*n: the bat
+  // imparts only when it is sweeping toward the face the ball is on. A rate
+  // of zero fails it outright, which is the `beq -> rts`.
+  const facing =
+    q10Multiply(surfaceX, touch.normalX) + q10Multiply(surfaceY, touch.normalY);
+  let rateTaken = 0;
+  if (state.rate !== 0 && facing > 0) {
+    const dx = Math.trunc(Math.abs(ball.x - config.pivotX) / Q10_ONE);
+    const dy = Math.trunc(Math.abs(ball.y - config.pivotY) / Q10_ONE);
+    rateTaken = Math.min(Math.abs(state.rate), flipperRateTaken(dx, dy));
+    // The rate AFTER the ball has taken its share, which is what the impulse
+    // is computed from: +0x00AED2..+0x00AEE4 writes the reduced rate back
+    // before +0x00AEF0 even looks at the magnitude. Signed the way the
+    // ORIGINAL signs it — the disk's left bat runs its coil at -120 and its
+    // right at +120, which this port folds into `direction`.
+    const driven =
+      (Math.abs(state.rate) - rateTaken) * (config.direction * state.rate < 0 ? -1 : 1);
+    const magnitude = flipperImpulseMagnitude(dx, dy);
+    // WHY THERE IS NO FACTOR OF TWO HERE and the sub-handlers have one. The
+    // rotation into the contact frame at +0x00B4FE multiplies by tables
+    // scaled to 2^14 and takes `(x << 3) >> 16`, i.e. it DOUBLES both
+    // components, and the inverse at +0x00B666 halves them again. The
+    // handlers' `magnitude * 2 * rate` and `8 * 2 * rate` are written into
+    // that doubled frame, so the impulse a ball actually receives is
+    // `magnitude * rate` outward and `8 * rate` along the surface. Missing
+    // the doubling puts every flipper shot at twice the machine's own
+    // velocity clamp, where the whole bat saturates and nothing has range.
+    const normal = originalVelocityToQ10(magnitude * Math.abs(driven));
+    const tangent = originalVelocityToQ10(ORIGINAL_IMPULSE_TANGENT * driven);
+    // The normal is always outward — the sub-handlers negate `d2` on
+    // whichever branch keeps `$1c` negative, and +0x00B550's `tst.w d0 /
+    // ble` shows the frame's first axis points INTO the surface. The tangent
+    // runs along `(normalY, -normalX)` and its sign is the bat's own rotation
+    // sign and NOT a projection: the bat's surface velocity is perpendicular
+    // to the arm and the arm runs down the bat's axis, so the surface
+    // velocity is almost entirely along the NORMAL and its along-face
+    // component is numerical noise that no sign can be read off.
+    //
+    // The consequence, which is worth stating because it is testable: both
+    // bats deflect the ball toward their own pivot, by `atan(8/M)` — about
+    // 32 degrees at the boss and 13 at the tip. The two are exact mirrors,
+    // which is the check that the handedness above is not inverted.
+    ball.velocityX = clampVelocity(
+      ball.velocityX +
+        q10Multiply(normal, touch.normalX) +
+        q10Multiply(tangent, -touch.normalY),
+    );
+    ball.velocityY = clampVelocity(
+      ball.velocityY +
+        q10Multiply(normal, touch.normalY) +
+        q10Multiply(tangent, touch.normalX),
+    );
+  }
+
+  // Then the ordinary bounce, in the WORLD frame — the original has no bat
+  // frame, and `reflectVelocity` returns untouched when the ball is already
+  // leaving, which is exactly the `tst.w d0 / ble` that skips the bounce at
+  // +0x00B550 once the kick above has sent the ball outward.
+  //
+  // AND IT IS THE MAP'S OWN RESPONDER, WITH THE BAT'S OWN ROW. This used to
+  // pass no surface at all, which sent a bat contact down `reflectVelocity`'s
+  // no-surface branch: the row's restitution by way of `FLIPPER_SURFACE`, but
+  // this port's Coulomb friction instead of the row's `$3A` slip and none of
+  // the row's `$34` graze gate. That was a second contact model living behind
+  // the bats, and the machine has one: the mask blit at +0x00B2A2 leaves its
+  // result in the same 68-byte buffer as the map blit at +0x00B4B0, the same
+  // ring evaluator at +0x00A9C4 reads it, and the four constants at
+  // `$34/$36/$38/$3A` were loaded by `movem.w (a0,d2.w*8),d3-d6` at
+  // +0x00AE14 from the surface id under the contact — which for a bat is the
+  // id the shipped maps paint over its own swept footprint (1..4, see
+  // `FlipperRecord.surfaceId`). So the bat inherits the whole responder and
+  // not merely its normal.
+  //
+  // WHAT MOVED, measured on the Law 'n Justice apron: a ball arriving on the
+  // resting left bat at (2.53,12.45) px/tick left it at (6.69,-1.53) under
+  // the Coulomb rule and leaves at (9.24,-0.35) under the row's, against the
+  // film's own 10.0-11.5 px/tick eastbound roll. The normal channel is
+  // untouched — both rules take 115/256 of it, which is what
+  // `FLIPPER_SURFACE.elasticity` already carried — and the difference is
+  // entirely tangential: Coulomb charged 36% of the along-face speed to one
+  // contact where `$3A` = 12800 charges 1.25% plus the fixed decay.
+  reflectVelocity(
+    ball,
+    config.surface,
+    touch.normalX,
+    touch.normalY,
+    restThreshold,
+    surfaceResponseFor(config.surfaceId),
+  );
+
+  separate(ball, touch, clamp);
+
+  const batSpeed = tangentialSpeed(
+    integerSqrt(touch.armX * touch.armX + touch.armY * touch.armY),
+    turnPerTick,
+  );
+  return {
+    ballId: ball.id,
+    flipperId: config.id,
+    normalX: touch.normalX,
+    normalY: touch.normalY,
+    along: touch.along,
+    batSpeed,
+    approachSpeed,
+    struck: state.rate !== 0 && facing > 0,
+    rateTaken,
+  };
 }
 
 /**
@@ -2022,10 +2097,13 @@ function moveBy(ball: BallState, deltaX: Q10, deltaY: Q10, clamp: PushClamp | nu
   ball.y = placed.y;
 }
 
-/** Moves a ball TO a point, as far as the map allows. */
-function moveTo(ball: BallState, x: Q10, y: Q10, clamp: PushClamp | null): void {
-  moveBy(ball, (x - ball.x) | 0, (y - ball.y) | 0, clamp);
-}
+// `moveTo` USED TO LIVE HERE and it is gone with the sweep. It rewound the ball
+// to the crossing point of a contact the swept resolve had found after the tick
+// was already spent, which was the honest thing to do with a contact discovered
+// after the fact and is not a thing the machine ever does. A pass now happens
+// where the ball stands, so there is nowhere to rewind it to. The only
+// positional write left on this path is `separate`, which is the mask body's
+// whole-pixel overlap and is clamped.
 
 // ---------------------------------------------------------------------------
 // A whole table's flippers

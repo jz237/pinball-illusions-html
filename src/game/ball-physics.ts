@@ -370,6 +370,66 @@ function viewForLevel(views: LevelViews, level: PlayfieldLevel): TableMap {
   return level === 1 ? views.upper : views.lower;
 }
 
+/**
+ * THE BATS, resolved at the frame's own collision passes.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY THE INTEGRATOR HAS TO CALL THE FLIPPERS
+ * ---------------------------------------------------------------------------
+ * The machine has ONE collision routine and the bats are the first thing in it.
+ * `main.seg00 +0x00B278` — the routine `+0x00A7E0` calls on every pass, for
+ * every ball — walks the four flipper records at `$2346(a5)` BEFORE it ever
+ * touches the playfield plane:
+ *
+ *     00b2a2  movea.l $2346(a5), a0     ; the flipper record array
+ *     00b2a6  tst.b   (a0)              ; type 0 -> $b43a, THE MAP BLIT
+ *     00b2ac  move.l  $54(a4), d2       ; the ball's own collision plane
+ *     00b2b0  cmp.l   $1c(a0), d2 / bne ; the LEVEL gate -> next record
+ *     00b2b8  move.w  $1a(a0), d2       ; THE POSE the animation last wrote
+ *     00b2be  movem.w $1fa(a0,d2*8), d2-d5   ; that pose's own four-word box
+ *     00b2d0  ...four inclusive compares against the ball's top-left...
+ *     00b2f2  movea.l $30(a0), a1       ; that pose's own MASK
+ *     ...     BLTCON0 = shift | $0BA0   ; D = A AND C, into the SAME $44 buffer
+ *     00b360  moveq   #0, d0 / rts      ; and the map is never blitted at all
+ *     00b432  lea     $1fa(a0), a0 / bra $b2a6      ; else the next record
+ *     00b43a  ...the map blit, identical shape, BLTAMOD $26 for its 42-byte rows
+ *
+ * So a bat contact is not a second contact model bolted on after the tick: it
+ * is the ordinary contact, taken at the ordinary pass, by the ordinary
+ * evaluator (`+0x00A9C4`) and the ordinary responder (`+0x00B4BA`). This port
+ * used to resolve it ONCE PER TICK after `stepBalls` had already spent the
+ * whole frame, which meant a struck ball carried the bat's impulse for zero of
+ * its own substeps and a rolling ball was tested at four INTERPOLATED positions
+ * rather than the four it actually stood at. `flippers.ts` owns the bat; this
+ * is the seam through which the frame lends it the machine's own four passes.
+ *
+ * `pass` is 0..3. It is called AFTER the map's own `respondAt` for that pass,
+ * which is the one place this port deliberately differs from the instruction
+ * order, and the difference is disclosed rather than absorbed.
+ *
+ * THE MACHINE'S BAT BLIT REPLACES THE MAP BLIT. `+0x00B278` returns as soon as
+ * a record's per-pose box admits the ball, so `$b43a` — the map blit — is never
+ * reached on that pass; and it can afford that because each pose's mask has the
+ * local window of the collision map ORed INTO it at table-load time
+ * (`+0x0039FA`, `BLTCON0 = $0DFC`, `D = A OR B`). So the machine answers ONE
+ * contact over the UNION of bat and map, and neither "the map then the bat" nor
+ * "the bat instead of the map" is that.
+ *
+ * BOTH WERE MEASURED and the map is kept. Letting a resolved bat contact
+ * suppress the pass's map probe — the nearer of the two to the instruction
+ * order — was run over the full 90 x 40,000-tick Law 'n Justice census: it
+ * moves the write-off count 4 -> 3, at the same pocket cluster, and takes the
+ * median from 4,980,000 down to 3,287,500. It also withholds from the scoring
+ * layer the surface ids under a ball that is touching a bat, which the machine
+ * does NOT do — `+0x00AD4C` reads `$50(a4)`, the map's own surface plane, at
+ * the contact pixel whichever blit produced it. So this port runs the map
+ * first and the bat second, which gives the bat the last word on the velocity
+ * without taking the map's report away. The real closure is a per-pose mask
+ * with the map ORed in, exactly as the machine builds one; that is a round of
+ * its own and it is named in `flippers.ts`.
+ */
+export type BatPassResolver = (ball: BallState, pass: number) => void;
+
 /** Tunables for one simulation. Every default is a chosen value, not a measured one. */
 export interface SimulationOptions {
   /** Ball radius in Q10. Also the radius of the contact probe ring. */
@@ -452,6 +512,17 @@ export interface SimulationOptions {
    * loop does register it — see `createGame`.
    */
   readonly surfaces: SurfaceIdMap | null;
+  /**
+   * The flipper bats, resolved at this frame's four collision passes. See
+   * `BatPassResolver`.
+   *
+   * Null means "no bats", which is right for every synthetic map in the suite
+   * and for the many harnesses that drive `stepBalls` with no table. The game
+   * loop always supplies one — `createFlipperPass` builds it from the tick's
+   * own sweeps — and a null here is the difference between a bat that is not
+   * there and a bat that is not resolved, which are the same thing.
+   */
+  readonly bats: BatPassResolver | null;
 }
 
 /**
@@ -495,6 +566,7 @@ export const DEFAULT_SIMULATION_OPTIONS: SimulationOptions = {
   poweredKicksLive: true,
   rampDrive: null,
   surfaces: null,
+  bats: null,
 };
 
 interface ResolvedOptions {
@@ -507,6 +579,7 @@ interface ResolvedOptions {
   readonly poweredKicksLive: boolean;
   readonly rampDrive: TableAcceleration | null;
   readonly surfaces: SurfaceIdMap | null;
+  readonly bats: BatPassResolver | null;
 }
 
 /**
@@ -539,6 +612,7 @@ function resolveOptions(map: TableMap, options?: Partial<SimulationOptions>): Re
     poweredKicksLive: options?.poweredKicksLive ?? DEFAULT_SIMULATION_OPTIONS.poweredKicksLive,
     rampDrive: options?.rampDrive ?? DEFAULT_SIMULATION_OPTIONS.rampDrive,
     surfaces: options?.surfaces ?? DEFAULT_SIMULATION_OPTIONS.surfaces,
+    bats: options?.bats ?? DEFAULT_SIMULATION_OPTIONS.bats,
   };
 }
 
@@ -2101,6 +2175,12 @@ function integrateBall(
     const velocityY = ball.velocityY;
     if (substep % RESPOND_EVERY === 0) {
       respondAt(ball, map, materials, passable, ring, log, options, surfaceAt);
+      // THE BATS, at the machine's own pass and nowhere else. `+0x00B278` walks
+      // the flipper records at the head of the very collision routine this
+      // `respondAt` is the tail of, so a bat contact happens four times a frame
+      // at the position the ball actually stands in — never once at the end of
+      // a tick the ball has already spent. See `BatPassResolver`.
+      options.bats?.(ball, substep / RESPOND_EVERY);
     }
 
     const stepX = ball.velocityX >> 3;

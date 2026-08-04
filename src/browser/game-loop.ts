@@ -105,7 +105,7 @@
  * back to the trough first.
  *
  * ---------------------------------------------------------------------------
- * `resolveFlipperContacts` IS CALLED WITH THE MAP'S OWN PUSH CLAMP
+ * THE BAT RESOLVER IS BUILT WITH THE MAP'S OWN PUSH CLAMP
  * ---------------------------------------------------------------------------
  * Round 5 passed `null` here and argued the unclamped case was recoverable: a
  * bat can push a ball at most its own penetration, a few pixels, and `stepBalls`
@@ -117,7 +117,9 @@
  * whose recovery walk is 34 px wide on that table rather than 16 because the
  * budget was tied to the virtual top wall. `ball-physics.ts` now exports
  * `pushClampForMap`, so there is one clamp with one implementation and the bat
- * cannot write a ball through a wall in the first place.
+ * cannot write a ball through a wall in the first place. `createFlipperPass`
+ * takes it, and the resolver it builds runs inside `stepBalls` at the frame's
+ * four collision passes — see `BatPassResolver`.
  */
 
 import type { Control, ControlSnapshot } from "./input.js";
@@ -171,14 +173,15 @@ import {
 } from "../game/ball-locks.js";
 import { BALL_RADIUS_PIXELS, DEFAULT_PROBE_RADIUS } from "../game/collision-probe.js";
 import { SLINGSHOT_KICK } from "../game/surface-physics.js";
-import type { FlipperBank } from "../game/flippers.js";
+import type { FlipperApproachSides, FlipperBank } from "../game/flippers.js";
 import {
   UPPER_FLIPPER_RECORDS,
   applyFlipperReactions,
+  createFlipperApproachSides,
   createFlipperBank,
+  createFlipperPass,
   flipperInputFrom,
   isFullyFlipped,
-  resolveFlipperContacts,
   tickFlipperBank,
 } from "../game/flippers.js";
 import { materialTableFor } from "../game/materials.js";
@@ -761,6 +764,17 @@ export interface Game {
   stillAnchors: readonly BallAnchor[];
   tilt: TiltState;
   flippers: FlipperBank;
+  /**
+   * WHICH SIDE OF EACH BAT EACH BALL WAS LAST OUTSIDE ON, carried across ticks.
+   *
+   * The bats resolve four times a tick now, inside the integrator, so the
+   * approach side `ed5e01d` made a sign instead of a position has to outlive the
+   * tick it was read in — a cradled ball spends hundreds of consecutive passes
+   * inside the blade with no fresh reading available. See
+   * `FlipperApproachSides`. It is game state and not a cache: two games with the
+   * same inputs and different memories here are two different games.
+   */
+  flipperSides: FlipperApproachSides;
   camera: CameraState;
   paused: boolean;
   /** Player's whole-table override, on top of the automatic multiball reframe. */
@@ -1007,6 +1021,7 @@ export function createGame(map: TableMap, options?: Partial<GameOptions>): Game 
     stillAnchors: [],
     tilt: INITIAL_TILT,
     flippers: createFlipperBank(map.tableId),
+    flipperSides: createFlipperApproachSides(),
     camera: INITIAL_CAMERA,
     paused: false,
     forceFullTable: false,
@@ -1523,18 +1538,34 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     nudgeX,
     nudgeY,
   };
-  // Where every ball BEGAN the tick, for the flippers' swept contact test: the
-  // bats must see the whole motion segment, or a ball fast enough to cross the
-  // bat line inside one tick is tested only where it ended — on the wrong
-  // side. That endpoint-only seam was the reconstruction's #1 defect (B1).
-  const flipperStarts = new Map<number, { readonly x: Q10; readonly y: Q10 }>();
   /** Which line each in-play ball was on entering the step, for the report. */
   const levelsBefore = new Map<number, PlayfieldLevel>();
   for (const ball of game.balls.balls) {
     if (!ballIsInPlay(ball)) continue;
-    flipperStarts.set(ball.id, { x: ball.x, y: ball.y });
     levelsBefore.set(ball.id, ball.level);
   }
+  // THE BATS GO INTO THE STEP, and they used to come after it.
+  //
+  // `resolveFlipperContacts` ran here, once, on the position `stepBalls` had
+  // already integrated the ball all the way to, and it recovered the four
+  // collision passes the machine has by INTERPOLATING the tick's net
+  // displacement. The machine's own frame (main.seg00 +0x00A618) has no such
+  // seam: `+0x00B278` walks the flipper records at the head of the same
+  // collision routine that blits the map, four times a frame, at the position
+  // the ball actually stands in. So the resolver is handed to `stepBalls` and
+  // called from inside the integrator — which also means an impulse landed at
+  // pass 0 is carried by the six substeps after it instead of being spent on
+  // the next tick. See `BatPassResolver` and `createFlipperPass`.
+  //
+  // The side memory is the GAME'S and not the resolver's; the resolver is
+  // rebuilt every tick and the memory must not be.
+  const bats = createFlipperPass(
+    bankTick.sweeps,
+    ballRadiusOf(game),
+    pushClampFor(game),
+    restThresholdOf(game),
+    game.flipperSides,
+  );
   // The drive is spread in LAST so a caller cannot switch it off through
   // `options.simulation` without noticing they have done it — and it is the
   // game's own, from the registry, not something the options carry.
@@ -1546,6 +1577,7 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     // kicking (and stop scoring, gated below) but keep their restitution,
     // which is the original's gate at +0x00B216/+0x00B234.
     poweredKicksLive: poweredSurfacesLive(game.tilt),
+    bats: bats.resolve,
   });
   // The step is where the two collision lines exchange balls (zone actions 10
   // and 11 and the surface hand-offs), so a line change across it IS a level
@@ -1556,14 +1588,10 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     const before = levelsBefore.get(ball.id);
     if (before !== undefined && ball.level !== before) levelTransfers.push(ball.id);
   }
-  const flipperContacts = resolveFlipperContacts(
-    game.balls.balls,
-    bankTick.sweeps,
-    ballRadiusOf(game),
-    pushClampFor(game),
-    restThresholdOf(game),
-    flipperStarts,
-  );
+  // Every contact the four passes above resolved, in pass order. A ball lying
+  // on a rising blade reports one per pass, which is what the machine records:
+  // +0x00AED2 writes the reduced bat rate back inside every pass.
+  const flipperContacts = bats.contacts;
   // The ball takes angular momentum out of the bat — measured, see
   // `applyFlipperReactions` — so the bank has to be told what it just paid for.
   game.flippers = applyFlipperReactions(game.flippers, flipperContacts);

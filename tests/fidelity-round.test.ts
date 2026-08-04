@@ -22,6 +22,7 @@ import { Q10_ONE, pixelsToQ10, q10Multiply, q10ToPixel } from "../src/core/fixed
 import type { Q10 } from "../src/core/fixed-point.js";
 import {
   DEFAULT_SIMULATION_OPTIONS,
+  SUBSTEP_GRAVITY,
   createBall,
   createBallSet,
   reflectVelocity,
@@ -30,9 +31,11 @@ import {
 } from "../src/game/ball-physics.js";
 import { BUMPER_KICK, SLINGSHOT_KICK, surfaceResponseFor } from "../src/game/surface-physics.js";
 import { BALL_RADIUS_PIXELS, cosineUnits, sineUnits } from "../src/game/collision-probe.js";
-import type { FlipperConfig, FlipperState, BallStart } from "../src/game/flippers.js";
+import type { FlipperApproachSides, FlipperConfig, FlipperState } from "../src/game/flippers.js";
 import {
   FLIPPER_AT_REST,
+  createFlipperApproachSides,
+  createFlipperPass,
   flipperAngle,
   flipperConfigsFor,
   resolveFlipperContacts,
@@ -41,7 +44,12 @@ import {
 } from "../src/game/flippers.js";
 import { materialTableFor } from "../src/game/materials.js";
 import { tableDevicesFor } from "../src/game/table-devices.js";
-import { SIMULATION_GRAVITY, VELOCITY_CLAMP_Q10 } from "../src/game/timebase.js";
+import {
+  ORIGINAL_COLLISION_PASSES_PER_FRAME,
+  ORIGINAL_SUBSTEPS_PER_FRAME,
+  SIMULATION_GRAVITY,
+  VELOCITY_CLAMP_Q10,
+} from "../src/game/timebase.js";
 import {
   BALL_SEARCH_PULSES,
   BALL_SEARCH_TICKS,
@@ -70,28 +78,44 @@ const LEFT = flipperConfigsFor("law-n-justice")[0] as FlipperConfig;
 // ---------------------------------------------------------------------------
 
 /**
- * One tick exactly as `tickGame` orders it for a ball near a bat: capture the
- * start, integrate (gravity + straight motion here — the drop sites are open
- * space), then the SWEPT flipper resolve with the starts map. This is the
- * seam B1 lived in, so the harness must reproduce it rather than shortcut it.
+ * One tick exactly as `integrateBall` orders it for a ball near a bat: the
+ * machine's eight substeps, with the bat resolved at the four collision passes
+ * and gravity added per substep. The drop sites are open space, so the map is
+ * the only thing this leaves out.
+ *
+ * IT USED TO BE A SWEPT RESOLVE AFTER A WHOLE-TICK MOVE, and the change is the
+ * point. B1's defect was a ball crossing the bat inside one tick and being
+ * tested only where it ENDED; the swept resolve answered it by interpolating
+ * four samples along the tick's net displacement after the fact. The bat now
+ * runs inside the frame, so the four samples are the four positions the ball
+ * genuinely occupies and the impulse is carried by the substeps after it. A
+ * harness that kept moving the ball a whole tick and then testing four times at
+ * the SAME point would be an endpoint test wearing the old name, and would have
+ * let B1 back in while still passing.
+ *
+ * `sides` is the caller's approach-side memory, threaded because it is game
+ * state: see `FlipperApproachSides`.
  */
 function sweptTick(
   balls: BallState[],
   config: FlipperConfig,
   state: FlipperState,
   held: boolean,
+  sides: FlipperApproachSides = createFlipperApproachSides(),
 ): { state: FlipperState; contacts: number } {
-  const starts = new Map<number, BallStart>();
-  for (const ball of balls) starts.set(ball.id, { x: ball.x, y: ball.y });
   const sweep = tickFlipper(config, state, held);
+  const bats = createFlipperPass([sweep], BALL_RADIUS, null, undefined, sides);
+  const respondEvery = ORIGINAL_SUBSTEPS_PER_FRAME / ORIGINAL_COLLISION_PASSES_PER_FRAME;
   for (const ball of balls) {
     if (!ball.active) continue;
-    ball.velocityY = Math.min(VELOCITY_CLAMP_Q10, ball.velocityY + SIMULATION_GRAVITY);
-    ball.x = (ball.x + ball.velocityX) | 0;
-    ball.y = (ball.y + ball.velocityY) | 0;
+    for (let substep = 0; substep < ORIGINAL_SUBSTEPS_PER_FRAME; substep += 1) {
+      if (substep % respondEvery === 0) bats.resolve(ball, substep / respondEvery);
+      ball.x = (ball.x + (ball.velocityX >> 3)) | 0;
+      ball.y = (ball.y + (ball.velocityY >> 3)) | 0;
+      ball.velocityY = Math.min(VELOCITY_CLAMP_Q10, ball.velocityY + SUBSTEP_GRAVITY);
+    }
   }
-  const contacts = resolveFlipperContacts(balls, [sweep], BALL_RADIUS, null, undefined, starts);
-  return { state: sweep.to, contacts: contacts.length };
+  return { state: sweep.to, contacts: bats.contacts.length };
 }
 
 /** Signed distance of a ball centre from the bat's axis, along the striking face. */
@@ -195,8 +219,12 @@ describe("B1: the static-bat drop matrix", () => {
         );
         let bat = state;
         let contacts = 0;
+        // One memory for the whole run: the approach side is per (ball, bat)
+        // state that outlives a tick, so a harness that re-seeded it every tick
+        // would be testing something the game does not do.
+        const sides = createFlipperApproachSides();
         for (let tick = 0; tick < 40; tick += 1) {
-          const out = sweptTick([ball], LEFT, bat, held);
+          const out = sweptTick([ball], LEFT, bat, held, sides);
           bat = out.state;
           contacts += out.contacts;
 
@@ -243,8 +271,9 @@ describe("B1: the static-bat drop matrix", () => {
     const ball = createBall(0, Math.round(103.6 * 1024), Math.round(535.4 * 1024), 2305, 12427);
     let bat = raised(LEFT);
     let contacts = 0;
+    const sides = createFlipperApproachSides();
     for (let tick = 0; tick < 6; tick += 1) {
-      const out = sweptTick([ball], LEFT, bat, true);
+      const out = sweptTick([ball], LEFT, bat, true, sides);
       bat = out.state;
       contacts += out.contacts;
       expect(ball.y, `sank under the raised bat on tick ${tick}`).toBeLessThan(pixelsToQ10(566));
@@ -270,8 +299,9 @@ describe("B1: the static-bat drop matrix", () => {
     );
     let bat = raised(LEFT);
     let sawSpan = 0;
+    const sides = createFlipperApproachSides();
     for (let tick = 0; tick < 8; tick += 1) {
-      bat = sweptTick([ball], LEFT, bat, true).state;
+      bat = sweptTick([ball], LEFT, bat, true, sides).state;
       const alongNow = axisOffset(LEFT, bat, ball);
       if (alongNow > -BALL_RADIUS && alongNow < LEFT.length + BALL_RADIUS) {
         sawSpan += 1;
@@ -411,17 +441,60 @@ describe("the ball search reaches a ball wedged against the RESTING upper bat", 
     return game;
   }
 
+  /**
+   * Pins the game's one ball where it settles, and gives back the function that
+   * puts it there again.
+   *
+   * The FREE position one tick in, not the raw site: `recoverPenetration` moves
+   * a ball placed inside solid material, so re-pinning the raw coordinate every
+   * tick would have the recovery walk it out again every tick and the ball
+   * would travel twenty pixels a tick while claiming to be wedged.
+   */
+  function holderFor(game: Game): () => void {
+    runTicks(game, idle, 1);
+    const ball = game.balls.balls[0];
+    expect(ball).toBeDefined();
+    const at = { x: ball?.x ?? 0, y: ball?.y ?? 0 };
+    return (): void => {
+      if (ball === undefined) return;
+      ball.x = at.x;
+      ball.y = at.y;
+      ball.velocityX = 0;
+      ball.velocityY = 0;
+      ball.level = 0;
+    };
+  }
+
   for (const [x, y] of SITES) {
-    it(`(${x},${y}): the stillness clock runs and the first window pulses`, () => {
+    it(`(${x},${y}): a ball held against the RESTING bat runs the clock and pulses`, () => {
+      // THE BALL NO LONGER STAYS PUT HERE, and that is a result rather than a
+      // reason to drop the pin. This case used to place a ball in the pocket
+      // and watch it sit at velocity exactly (0,0) while `stillTicks` refused
+      // to move; with the bats resolved at the frame's four collision passes
+      // the pocket ejects it within four ticks and it rolls away down the
+      // table (measured: (24,304) leaves on tick 4 to (39.3,292.1), (41,339)
+      // on tick 6), so the site can no longer EXHIBIT the defect at all.
+      //
+      // What the defect was about is the RULE, not the pocket: any bat contact
+      // used to make a ball cradle-exempt, and a ball leaning on a bat nobody
+      // is driving is furniture. So the ball is held still by hand — the wedge
+      // the map used to provide — and the rule is tested directly. A resting
+      // bat must not stop the clock.
       const game = wedgedGame(x, y);
-      // The defect's signature was stillTicks pinned at 0 by the resting
-      // bat's contact. It must accumulate now.
-      runTicks(game, idle, 100);
+      const hold = holderFor(game);
+      for (let tick = 0; tick < 100; tick += 1) {
+        runTicks(game, idle, 1);
+        hold();
+      }
       expect(debugSnapshot(game).stillTicks).toBeGreaterThan(90);
       // ... and the first expiry must spend a coil pulse on the wedged ball.
-      runTicks(game, idle, BALL_SEARCH_TICKS - 100 + 20);
+      for (let tick = 0; tick < BALL_SEARCH_TICKS - 100 + 20; tick += 1) {
+        runTicks(game, idle, 1);
+        hold();
+      }
       expect(debugSnapshot(game).searchPulses).toBeLessThan(BALL_SEARCH_PULSES);
     });
+
 
     it(`(${x},${y}): the wedged ball is rescued and the game moves on`, () => {
       const game = wedgedGame(x, y);
@@ -435,6 +508,34 @@ describe("the ball search reaches a ball wedged against the RESTING upper bat", 
       expect(end.ballsServed, "the stalled ball never ended").toBeGreaterThanOrEqual(2);
     });
   }
+
+  it("a DRIVEN bat FREEZES the clock instead of resetting it", () => {
+    // The other half of the same rule, and nothing pinned it before. While
+    // every free ball is in a driven bat's grip the clock must FREEZE — no
+    // advance, no reset — so a blind flip cadence through a wedged ball cannot
+    // hold it under its own beat for ever. Law 'n Justice's upper bat is bound
+    // to the LEFT button, so holding left drives the bat the ball leans on.
+    //
+    // (24,304) ONLY, and the reason is worth recording: the ball placed at
+    // (41,339) settles at (61.0,335.1), which the bat can reach at rest and
+    // cannot reach once it is flipped up, so at that site there is no grip to
+    // freeze and the clock correctly goes on running (measured: 40 -> 77).
+    const game = wedgedGame(24, 304);
+    const hold = holderFor(game);
+    const leftDown = new ScriptedInput(() => ["leftFlipper"]);
+    for (let tick = 0; tick < 40; tick += 1) {
+      runTicks(game, idle, 1);
+      hold();
+    }
+    const before = debugSnapshot(game).stillTicks;
+    expect(before, "the resting-bat half of this rule stopped working").toBeGreaterThan(30);
+    for (let tick = 0; tick < 40; tick += 1) {
+      runTicks(game, leftDown, 1);
+      hold();
+    }
+    // Frozen, not reset: the clock is exactly where the resting half left it.
+    expect(debugSnapshot(game).stillTicks).toBe(before);
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { SIMULATION_GRAVITY } from "../src/game/timebase.js";
+import {
+  ORIGINAL_COLLISION_PASSES_PER_FRAME,
+  ORIGINAL_SUBSTEPS_PER_FRAME,
+  SIMULATION_GRAVITY,
+} from "../src/game/timebase.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
@@ -72,7 +76,9 @@ import {
   FLIPPER_UP_MAX_RATE,
   batAngleToBearing,
   batRadiusAt,
+  createFlipperApproachSides,
   createFlipperBank,
+  createFlipperPass,
   flipperAngle,
   flipperConfigsFor,
   flipperEndpoints,
@@ -84,6 +90,7 @@ import {
   isFullyFlipped,
   resolveFlipperContacts,
   substepsFor,
+  substepsPerStrokeStep,
   sweptAngle,
   applyFlipperReactions,
   flipperImpulseMagnitude,
@@ -312,11 +319,21 @@ function speedOf(ball: BallState): number {
 }
 
 /**
- * A minimal integrator: gravity, straight-line motion, then the flipper pass.
+ * A minimal integrator: THE MACHINE'S EIGHT SUBSTEPS, with the bats resolved at
+ * the four collision passes and gravity spent one substep at a time.
  *
  * Deliberately not `stepBalls` — these cases are about the bat alone, and the
  * map would add contacts that make a launch speed hard to attribute. The
  * integration test at the bottom uses the real thing.
+ *
+ * IT USED TO MOVE A WHOLE TICK AND THEN RESOLVE, which is what the bat's own
+ * code did when it ran once per tick after `stepBalls`. It does not any more:
+ * `createFlipperPass` is called from inside the integrator at substeps 0, 2, 4
+ * and 6, so a harness that moved the ball a whole tick and then ran four passes
+ * at the SAME point would be answering a question the game never asks — and
+ * would hand the ball four impulses from four poses at one position. The
+ * approach-side memory is carried across ticks for the same reason: it is game
+ * state, not a per-tick scratch value. See `FlipperApproachSides`.
  */
 function runTicks(
   balls: BallState[],
@@ -327,19 +344,29 @@ function runTicks(
   gravity = GRAVITY,
 ): { states: FlipperState[]; contacts: number } {
   let contacts = 0;
+  const sides = createFlipperApproachSides();
+  const respondEvery = ORIGINAL_SUBSTEPS_PER_FRAME / ORIGINAL_COLLISION_PASSES_PER_FRAME;
+  // The tick's gravity split exactly, remainder on the last substep, so a
+  // caller that passes an odd figure still spends precisely that much.
+  const each = Math.trunc(gravity / ORIGINAL_SUBSTEPS_PER_FRAME);
+  const last = gravity - each * (ORIGINAL_SUBSTEPS_PER_FRAME - 1);
   for (let tick = 0; tick < ticks; tick += 1) {
     const sweeps: FlipperSweep[] = configs.map((config, index) => {
       const sweep = tickFlipper(config, states[index] as FlipperState, held[index] === true);
       states[index] = sweep.to;
       return sweep;
     });
+    const bats = createFlipperPass(sweeps, BALL_RADIUS, null, undefined, sides);
     for (const ball of balls) {
       if (!ball.active) continue;
-      ball.velocityY += gravity;
-      ball.x = (ball.x + ball.velocityX) | 0;
-      ball.y = (ball.y + ball.velocityY) | 0;
+      for (let substep = 0; substep < ORIGINAL_SUBSTEPS_PER_FRAME; substep += 1) {
+        if (substep % respondEvery === 0) bats.resolve(ball, substep / respondEvery);
+        ball.x = (ball.x + (ball.velocityX >> 3)) | 0;
+        ball.y = (ball.y + (ball.velocityY >> 3)) | 0;
+        ball.velocityY += substep === ORIGINAL_SUBSTEPS_PER_FRAME - 1 ? last : each;
+      }
     }
-    contacts += resolveFlipperContacts(balls, sweeps, BALL_RADIUS).length;
+    contacts += bats.contacts.length;
   }
   return { states, contacts };
 }
@@ -869,6 +896,20 @@ describe("the bat's silhouette", () => {
     // No two consecutive poses put the tip further apart than the ball is wide.
     expect(tipTravel / steps).toBeLessThan(2 * BALL_RADIUS);
   });
+
+  it("needs NO subdivision inside a stroke step, on any of the nine bats", () => {
+    // The machine tests the bat once per collision pass and never between two,
+    // so a bat that needed its stroke step subdivided would be a bat this port
+    // could not resolve on the machine's own schedule. None of the nine does:
+    // at the coil's cap the tip covers 4.4 px against a ball radius of 8. The
+    // derivation is kept as the diagnostic that says so.
+    for (const tableId of TABLE_IDS) {
+      for (const config of flipperConfigsFor(tableId)) {
+        expect(substepsPerStrokeStep(config, BALL_RADIUS), `${tableId} ${config.id}`).toBe(1);
+        expect(substepsFor(config, BALL_RADIUS)).toBe(FLIPPER_STEPS_PER_TICK);
+      }
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1007,15 +1048,198 @@ describe("a flipper at rest", () => {
     const sweep = tickFlipper(FLAT, FLIPPER_AT_REST, false);
     ball.y = (ball.y + ball.velocityY) | 0;
     const contacts = resolveFlipperContacts([ball], [sweep], BALL_RADIUS);
-    expect(contacts).toHaveLength(1);
-    const contact = contacts[0];
-    expect(contact?.batSpeed).toBe(0);
-    expect(contact?.struck).toBe(false);
-    expect(contact?.flipperId).toBe(FLAT.id);
+    // ONE PER COLLISION PASS, and the count is the machine's four. A ball
+    // touching a bat is touching it at every pass of the frame, and the machine
+    // answers every one of them: `+0x00B278` runs inside `+0x00A7E0`, which the
+    // unrolled frame calls four times. This used to be one, because the bat was
+    // resolved once per tick after `stepBalls` had finished.
+    expect(contacts).toHaveLength(FLIPPER_STEPS_PER_TICK);
+    for (const contact of contacts) {
+      expect(contact.batSpeed).toBe(0);
+      expect(contact.struck).toBe(false);
+      expect(contact.flipperId).toBe(FLAT.id);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The bat inside the frame: WHEN it is tested, and against WHICH pose
+// ---------------------------------------------------------------------------
+
+describe("the bat is resolved at the frame's own collision passes", () => {
+  /**
+   * THE SEAM ITSELF. `stepBalls` calls the bat resolver at substeps 0, 2, 4 and
+   * 6 of the eight-substep frame and nowhere else — the machine's own schedule
+   * (main.seg00 +0x00A64C/696/6E0/728, with `+0x00B278` walking the flipper
+   * records at the head of each) — and the ball it hands over is the ball AS IT
+   * THEN STANDS.
+   *
+   * The second half is what makes this a pin and not a restatement: the four
+   * positions are recorded and must be four DIFFERENT ones, strictly advancing
+   * down the ball's own path. A bat resolved after the tick, or four times at
+   * the end of it, would report four identical positions and still be called
+   * four times.
+   */
+  it("hands the bat four passes a tick, at four different ball positions", () => {
+    // The shooter lane, which is the longest clear vertical run on any shipped
+    // table: eight pixels a tick from y=300 falls freely for the whole frame.
+    const map = shippedMapFor("law-n-justice");
+    const materials = materialTableFor("law-n-justice");
+    const balls = createBallSet([
+      createBall(0, pixelsToQ10(321), pixelsToQ10(300), 0, pixelsToQ10(8)),
+    ]);
+    const ball = balls.balls[0] as BallState;
+    const forces: SimulationForces = { gravityY: GRAVITY, nudgeX: 0, nudgeY: 0 };
+    const seen: { pass: number; y: number }[] = [];
+    stepBalls(balls, map, materials, forces, {
+      bats: (which, pass) => {
+        seen.push({ pass, y: which.y });
+      },
+    });
+    expect(seen.map((one) => one.pass)).toEqual([0, 1, 2, 3]);
+    // Strictly advancing, so the resolver genuinely ran inside the integration.
+    for (let i = 1; i < seen.length; i += 1) {
+      expect(seen[i]?.y, `pass ${i} saw the same place as pass ${i - 1}`)
+        .toBeGreaterThan(seen[i - 1]?.y ?? 0);
+    }
+    // And the last pass is not the end of the tick: two substeps still follow.
+    expect(ball.y).toBeGreaterThan(seen[3]?.y ?? 0);
+  });
+
+  /**
+   * THE POSE AT A PASS IS THE POSE BEFORE THAT PASS'S ANIMATION STEP, and this
+   * port had it one step out until the frame was read instruction by
+   * instruction. Each of the four groups at main.seg00 +0x00A618 is
+   *
+   *     for every ball: jsr $a7e0 (probe) / jsr $b4ba (respond)
+   *     jsr $bc24      ; the bat animation — AFTER the collision pass
+   *     jsr $b6e8 / jsr $b6e8
+   *
+   * so the pose a pass reads out of `$1a(a0)` is the one the PREVIOUS animation
+   * step wrote, and the rate it reads out of `$10(a0)` is the rate that step is
+   * about to move by. Pass 0 therefore sees the state the tick STARTED in.
+   *
+   * On the first tick of a press that state is `rate 0` — a bat that has not
+   * moved yet imparts nothing, which is the handler's own `beq -> rts` at
+   * +0x00AEAC. The port used to read `steps[pass]`, the state AFTER the step,
+   * and so ran the four passes of a fresh stroke at rates 20/40/60/80 where the
+   * machine runs them at 0/20/40/60.
+   */
+  it("reads the pose and rate the pass starts with, not the one it ends with", () => {
+    // A bat laid flat, as the rest-contact block above uses: the pose set is
+    // the shipped one and the horizontal axis makes the seat trivial to state.
+    const flat: FlipperConfig = validateFlipperConfig({ ...LEFT, restAngle: 0, restPose: 0 });
+    const sweep = tickFlipper(flat, FLIPPER_AT_REST, true);
+    // The tick's own four animation steps do accelerate from a standstill...
+    expect(sweep.from.rate).toBe(0);
+    expect(sweep.steps.map((one) => one.rate)).toEqual([20, 40, 60, 80]);
+
+    const start = ballRestingOn(flat, FLIPPER_AT_REST, 20);
+    const ball = createBall(0, start.x, start.y, 0, 200);
+    const contacts = resolveFlipperContacts([ball], [sweep], BALL_RADIUS);
+    expect(contacts).toHaveLength(FLIPPER_STEPS_PER_TICK);
+
+    // ... and the FIRST pass still meets a bat that is not turning. Under
+    // `steps[pass]` this contact would carry rate 20 and report `struck`.
+    expect(contacts[0]?.batSpeed).toBe(0);
+    expect(contacts[0]?.struck).toBe(false);
+    expect(contacts[0]?.rateTaken).toBe(0);
+    // The other three carry 20, 40 and 60 — `sweep.steps[0..2]` — so their bat
+    // speeds rise, and none of them is the 80 the tick ends on.
+    const speeds = contacts.slice(1).map((one) => Math.abs(one.batSpeed));
+    expect(speeds[0]).toBeGreaterThan(0);
+    expect(speeds[1]).toBeGreaterThan(speeds[0] ?? 0);
+    expect(speeds[2]).toBeGreaterThan(speeds[1] ?? 0);
+  });
+
+  /**
+   * `ed5e01d` AT PASS GRANULARITY — the regression that round's fix has to
+   * survive four times a tick instead of once.
+   *
+   * The rule is that the approach side is decided WHEN THE BALL IS OUTSIDE the
+   * bat, against the pose it is outside AT, and then carried; a POSITION kept
+   * instead of a sign gets re-judged against an axis that has rotated
+   * underneath it, `wrongSide` fires backwards, and the resolver ejects the
+   * ball out of the blade's underside. Resolving four times a tick gives that
+   * four times as many chances to go wrong, and re-seeding the side once a tick
+   * — which is all the old per-tick resolve could do — would be re-reading it
+   * from a position INSIDE the bat on every tick of a struck or cradled ball.
+   *
+   * So the side is per (ball, bat) state that outlives the tick, written only
+   * where `touchAt` reports no contact. What this asserts is the consequence:
+   * over a whole stroke, with the ball never once leaving the blade, EVERY
+   * contact normal of every pass points out of the face the ball arrived on.
+   * One that did not would be the ejection ed5e01d fixed.
+   */
+  it("keeps every pass's normal on the face the ball came from, all stroke long", () => {
+    for (const config of [LEFT, RIGHT]) {
+      const sides = createFlipperApproachSides();
+      let state: FlipperState = FLIPPER_AT_REST;
+      let checked = 0;
+      // TICK ZERO reads the side, and it is the only reading there will be: the
+      // ball is seated two pixels CLEAR of the resting blade, no button, so the
+      // pass finds nothing and `sideOf` records which face it is on.
+      const clear = ballRestingOn(config, state, 30, 2);
+      const ball = createBall(0, clear.x, clear.y);
+      const first = createFlipperPass(
+        [tickFlipper(config, state, false)],
+        BALL_RADIUS,
+        null,
+        undefined,
+        sides,
+      );
+      first.resolve(ball, 0);
+      expect(first.contacts, "the side reading was supposed to be a MISS").toHaveLength(0);
+
+      // AND THEN THE BALL NEVER LEAVES. It is re-seated a pixel INTO the face
+      // of whatever pose the bat holds, on every tick of the whole stroke, so
+      // `touchAt` never once reports "outside" and the side can never be
+      // re-read — while the axis it is measured against turns through all
+      // fifty-four degrees and slams into the stop. That is exactly the state
+      // ed5e01d's defect fired in, held for the entire stroke, and now sampled
+      // four times a tick instead of once.
+      for (let tick = 0; tick < 10; tick += 1) {
+        const seat = ballRestingOn(config, state, 30, -1);
+        ball.x = seat.x;
+        ball.y = seat.y;
+        ball.velocityX = 0;
+        ball.velocityY = 0;
+        const sweep = tickFlipper(config, state, true);
+        state = sweep.to;
+        const bats = createFlipperPass([sweep], BALL_RADIUS, null, undefined, sides);
+        for (let substep = 0; substep < ORIGINAL_SUBSTEPS_PER_FRAME; substep += 1) {
+          if (substep % 2 === 0) bats.resolve(ball, substep / 2);
+          ball.x = (ball.x + (ball.velocityX >> 3)) | 0;
+          ball.y = (ball.y + (ball.velocityY >> 3)) | 0;
+        }
+        // The striking face at the pose this tick ended on: every normal has to
+        // have a positive component along it, whatever the ring read.
+        const angle = flipperAngle(config, state);
+        const faceX = (-config.direction * sineUnits(angle)) | 0;
+        const faceY = (config.direction * cosineUnits(angle)) | 0;
+        for (const contact of bats.contacts) {
+          checked += 1;
+          expect(
+            q10Multiply(contact.normalX, faceX) + q10Multiply(contact.normalY, faceY),
+            `${config.id} tick ${tick}: a pass resolved through the blade`,
+          ).toBeGreaterThan(0);
+        }
+      }
+      // Nearly every pass of every tick, or the assertion above is empty — the
+      // vacuity trap the old tip-flip figure fell into. Not all forty: the
+      // impulse and `separate` lift the ball clear of the blade for a pass or
+      // two after each re-seat, which is the bat doing its job.
+      expect(checked, `${config.id} never met the bat at all`).toBeGreaterThan(25);
+      expect(checked).toBeLessThanOrEqual(10 * FLIPPER_STEPS_PER_TICK);
+      // And the bat did reach its stop while the ball was inside it, which is
+      // the tick the old defect fired on.
+      expect(state.stroke).toBe(config.sweep);
+    }
   });
 });
 
 describe("flipping", () => {
+
   it("launches a resting ball up the table", () => {
     const start = ballRestingOn(LEFT, FLIPPER_AT_REST, 25);
     const ball = createBall(0, start.x, start.y);
@@ -1041,10 +1265,22 @@ describe("flipping", () => {
     //
     // So the mirror is claimed where it IS exact, and PINNED where the raster
     // decides it, with every figure measured here rather than picked:
-    //   velocityY   exactly equal              (-15,996 on both)
-    //   speed       within 0.1%                (16,069.3 vs 16,058.8, 0.065%)
-    //   velocityX   opposite in sign, and PINNED EXACTLY (-1,533 vs +1,419)
+    //   velocityY   exactly equal              (-15,772 on both)
+    //   speed       within 0.1%
+    //   velocityX   opposite in sign, and PINNED EXACTLY (+2,310 vs -2,227)
     //   placement   mirrored within one pixel  (+28,+1) vs (-29,+0)
+    //
+    // THE PAIR MOVED AND ITS SIGN TURNED OVER when the bats went into the
+    // frame's four collision passes, from (-1,533, +1,419) to (+2,310,
+    // -2,227), and the sign is the interesting half. Under the swept resolve
+    // the ball was rewound to the crossing point on every tick it stayed in
+    // contact, so it rode the blade all the way to the STOP and left along the
+    // fully-flipped face's normal, which on a left bat points up and to the
+    // LEFT. Resolved at the pass, it takes the impulse early in the stroke and
+    // leaves along the near-rest face's normal, up and to the RIGHT — which is
+    // where a left flipper sends a ball. The mirror itself is untouched: the
+    // two velocityY figures are still equal to the unit and the two speeds are
+    // still inside 0.1%.
     //
     // THE X ASYMMETRY GREW WHEN THE CONTACT ANGLE BECAME THE MACHINE'S, from
     // (-1,529, +1,460) — 4.5% — to (-1,533, +1,419) — 7.4%. That is the
@@ -1073,7 +1309,7 @@ describe("flipping", () => {
     const speedRight = speedOf(rightBall);
     expect(Math.abs(speedRight - speedLeft) / speedLeft).toBeLessThan(0.001);
     expect({ left: leftBall.velocityX, right: rightBall.velocityX })
-      .toEqual({ left: -1533, right: 1419 });
+      .toEqual({ left: 2310, right: -2227 });
     // The placement mirrors to a pixel, and the outgoing position with it.
     expect(
       Math.abs(q10ToPixel(right.x) - q10ToPixel(RIGHT.pivotX) +
@@ -1883,7 +2119,12 @@ describe("placement", () => {
       spin: 0,
     });
     const sweep = tickFlipper(upper, FLIPPER_AT_REST, true);
-    expect(resolveFlipperContacts([at(1)], [sweep], BALL_RADIUS)).toHaveLength(1);
+    // Four contacts on the bat's own line — one per collision pass — and none
+    // at all on the other, which is the machine's `cmp.l $1c(a0),d2 / bne` at
+    // +0x00B2B0 stepping straight past a record whose pose bank is not the
+    // ball's own collision plane.
+    expect(resolveFlipperContacts([at(1)], [sweep], BALL_RADIUS))
+      .toHaveLength(FLIPPER_STEPS_PER_TICK);
     expect(resolveFlipperContacts([at(0)], [sweep], BALL_RADIUS)).toHaveLength(0);
   });
 

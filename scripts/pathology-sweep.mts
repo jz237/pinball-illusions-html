@@ -103,7 +103,22 @@
 //
 
 import { readFileSync, writeFileSync } from "node:fs";
-import { createBallSet, spawnBall, stepBalls, playfieldViewFor, VIRTUAL_TOP_WALL_ROWS } from "../src/game/ball-physics.js";
+import {
+  createBallSet,
+  pushClampForMap,
+  spawnBall,
+  stepBalls,
+  playfieldViewFor,
+  VIRTUAL_TOP_WALL_ROWS,
+} from "../src/game/ball-physics.js";
+import {
+  UPPER_FLIPPER_RECORDS,
+  createFlipperApproachSides,
+  createFlipperBank,
+  createFlipperPass,
+  flipperInputFrom,
+  tickFlipperBank,
+} from "../src/game/flippers.js";
 import { materialTableFor } from "../src/game/materials.js";
 import { tableAccelerationFor } from "../src/game/table-accel.js";
 import { tableDevicesFor } from "../src/game/table-devices.js";
@@ -739,6 +754,23 @@ function trapCensus(tableId: TableId, level: 0 | 1, step: number): TrapCensus {
   // would be about a machine this project does not ship. `game-loop.ts` spreads
   // exactly these two in for the same reason.
   const options = { rampDrive: tableAccelerationFor(tableId), surfaces: tableDevicesFor(tableId) };
+  // THE BATS ARE NOT OPTIONAL EITHER, and leaving them out is why this census
+  // could not see the round that put them into the frame. `stepBalls` defaults
+  // `bats` to null, so every release here used to run past nine bats that were
+  // not there — and the two pockets this census exists to name both sit against
+  // Law 'n Justice's resting upper bat. Measured: identical figures before and
+  // after the bats joined the collision passes, on 121,639 releases, which is a
+  // statement about the instrument and not about the tree.
+  //
+  // Nobody is pressing anything, so the bank is at rest and the sweeps are
+  // constant for the whole census: a bat standing still is exactly the
+  // furniture a stranded ball leans on. The clamp is the map's own, as the game
+  // loop's is.
+  const batSweeps = tickFlipperBank(
+    createFlipperBank(tableId),
+    flipperInputFrom(false, false, UPPER_FLIPPER_RECORDS[tableId].role),
+  ).sweeps;
+  const clamp = pushClampForMap(map, materials, options);
   const sites = new Map<string, number>();
   let starts = 0;
   let drained = 0;
@@ -755,9 +787,12 @@ function trapCensus(tableId: TableId, level: 0 | 1, step: number): TrapCensus {
       starts += 1;
       const set = createBallSet();
       const ball = spawnBall(set, pixelsToQ10(x), pixelsToQ10(y), 0, 0, level);
+      // One approach-side memory per release, because it is per (ball, bat)
+      // state that outlives a tick. One resolver too: the sweeps never change.
+      const bats = createFlipperPass(batSweeps, undefined, clamp, undefined, createFlipperApproachSides());
       let gone = false;
       for (let tick = 0; tick < TRAP_TICKS; tick += 1) {
-        const result = stepBalls(set, map, materials, forces, options);
+        const result = stepBalls(set, map, materials, forces, { ...options, bats: bats.resolve });
         if (result.drained.length > 0) {
           gone = true;
           break;

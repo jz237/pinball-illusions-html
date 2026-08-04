@@ -566,11 +566,101 @@ const TICKS = 4000;
  *   law-n-justice   29c573580c2edd9cec313ebfe6c0c827157d121d87ad099e14635a2141652b00
  *   babewatch       6fe25c2e110feeb90805e9b1f75901387e5b70842b8805d9f0354c159aa4818a
  *   extreme-sports  05cf9bbd1334ff9fac6d5e26aa69708765f364db9678ed2eb064a2f18cb3c823
+ *
+ * RE-PIN, THE BAT JOINS THE FRAME (the per-substep flipper round). All three
+ * hashes moved, and all three FIRST DIVERGENT TICKS are the same deleted
+ * instruction.
+ *
+ * WHAT CHANGED. `resolveFlipperContacts` ran once per tick, after `stepBalls`
+ * had already spent the whole frame, and recovered the machine's four collision
+ * passes by INTERPOLATING four points along the tick's net displacement. The
+ * machine has no such seam: main.seg00 +0x00B278 — the routine +0x00A7E0 calls
+ * on every pass, for every ball — walks the four flipper records at $2346(a5)
+ * BEFORE it blits the map, gated by the ball's own collision plane
+ * (`cmp.l $1c(a0),d2` at +0x00B2B0) and by the box the record carries FOR THAT
+ * POSE (`movem.w $1fa(a0,d2.w*8),d2-d5` at +0x00B2BE, indexed by `$1a(a0)`).
+ * The bat is now resolved from inside `integrateBall`, at substeps 0, 2, 4 and
+ * 6, at the position the ball actually stands in — so an impulse landed at pass
+ * 0 is carried by the six substeps after it. Three consequences moved ticks:
+ *
+ *   THE CROSSING-POINT REWIND IS GONE. The swept resolve ended by moving the
+ *   ball BACK to the sample that first met the bat, discarding the rest of the
+ *   tick — the only honest thing to do with a contact discovered after the fact,
+ *   and a thing the machine's responder cannot do at all. Measured on a ball
+ *   rolling down the resting Law 'n Justice left bat: 0.13 px of travel a tick
+ *   against a velocity of 0.55 to 1.04.
+ *
+ *   THE POSE AT A PASS IS THE POSE BEFORE THAT PASS'S ANIMATION STEP. `jsr
+ *   $bc24` follows the ball loop in every one of the frame's four groups
+ *   (+0x00A65A, +0x00A6A4, +0x00A6EE, +0x00A736), so a pass reads the pose the
+ *   PREVIOUS step wrote. The port read `steps[pass]`, the state after the step,
+ *   which ran a fresh stroke's four passes at rates 20/40/60/80 where the
+ *   machine runs them at 0/20/40/60.
+ *
+ *   THE BAT IS LOADED ONCE PER PASS. `+0x00AED2..+0x00AEE4` subtracts half the
+ *   impulse-table entry from `$10(a0)` and writes it back INSIDE the pass, so a
+ *   ball lying on a rising blade takes angular momentum out of it four times a
+ *   frame. The port charged it once, a four-fold under-count.
+ *
+ * THE FIRST DIVERGENT TICK, per table, and it is the rewind on all three. Every
+ * earlier tick is byte-identical; at the tick named, the velocity is the same to
+ * within a few Q10 and only the POSITION moves, by exactly the travel the old
+ * resolve threw away.
+ *
+ *   law-n-justice  t197. Ball (58.826,320.341) v=(2183,11832) entering the
+ *                  RESTING upper-left bat at (37,302). HEAD advances it
+ *                  (+1.06,+5.81) — half a tick — to (59.889,326.146); this tree
+ *                  advances the whole (+2.15,+11.54) to (60.975,331.876), with
+ *                  the velocity within 12 Q10 either way.
+ *   babewatch      t803. Ball (204.418,550.383) v=(-2270,6800) onto the resting
+ *                  lower-right bat. HEAD (203.309,553.730), this tree
+ *                  (200.461,554.668): (-1.11,+3.35) against (-3.96,+4.29).
+ *   extreme-sports t241. Ball (157.854,190.261)L1 v=(-3452,3153) at the upper
+ *                  bat (182,194)L1. HEAD (157.011,191.044) — a QUARTER of the
+ *                  tick — against (154.140,192.696).
+ *
+ * THE GATES.
+ *
+ *   THE FLIPPER PROBE, which is what this round was for. Roll-and-flip
+ *   pass-under over the six lower bats 12 -> 0 of 648 and drop-and-flip
+ *   13 -> 0 of 210; the cradle holds on all six lower bats, unchanged, and the
+ *   ceiling in `tests/flipper-pass-under.test.ts` is tightened from 12 to 0.
+ *   That is the operator's own reported defect, closed.
+ *
+ *   THE PHYSICS GATE, unmoved and exit 0 at 576/218/470/558/282/487. It is
+ *   unmoved by construction — its corpus excludes every frame the machine's own
+ *   ball spent in bat contact — and a change that had moved it would not have
+ *   been confined to the bat path.
+ *
+ *   THE CENSUS, 90 games x 3 tables x 40,000 ticks, both trees on one driver.
+ *   90/90 completed everywhere. Medians 1,612,500 -> 4,980,000 (LnJ),
+ *   3,207,500 -> 4,548,670 (BW), 682,500 -> 1,168,500 (ES); ball-1 medians
+ *   272,500 -> 620,000, 732,500 -> 1,140,000, 135,000 -> 120,000; LnJ zero
+ *   scores 5/90 -> 2/90 on ball 1 and 0/90 -> 0/90 overall.
+ *
+ *   AND THE ONE FIGURE THAT MOVED THE WRONG WAY: Law 'n Justice write-offs
+ *   0 -> 4 of 288 ball ends (1.4%), zero on the other two tables. All four are
+ *   the pocket cluster beside the upper-left bat — (24,304)L0, (25,307)L0 and
+ *   (42,341)L0 — which is the PRE-EXISTING map trap `ed5e01d` named and this
+ *   file's own re-pin above records as staying. Controlled directly: a ball
+ *   released from rest at (42,341)L0 goes DEAD STILL at (42.692,341.999) with
+ *   v=(0,0) from tick 8 on BOTH trees, tick for tick, and the 67,620-release
+ *   trap census (run with the bats present on both trees, which it had never
+ *   been before — see `scripts/pathology-sweep.mts`) moves balls that end fully
+ *   at rest 1,580 -> 1,556 and sites 2,143 -> 2,146. The traps are the same
+ *   traps; a ball that survives three times as long reaches them more often.
+ *   Closing them is map-pocket work and belongs to whoever takes the resting
+ *   ball next.
+ *
+ * The digests this entry replaced, recorded so the move is auditable:
+ *   law-n-justice   77b68e4309949efa46c658ecd734a3deaf4d14a5265db0c8989b3f9056e1ea20
+ *   babewatch       14a0ed019849b31805b1ea44a04c78cabb05820e2d32701a16fa7f8738506a56
+ *   extreme-sports  e62fdc9f1c4611960822e138114666965120247dc8e347e06f0a1927894abefd
  */
 const PINNED: Record<TableId, string> = {
-  "law-n-justice": "77b68e4309949efa46c658ecd734a3deaf4d14a5265db0c8989b3f9056e1ea20",
-  "babewatch": "14a0ed019849b31805b1ea44a04c78cabb05820e2d32701a16fa7f8738506a56",
-  "extreme-sports": "e62fdc9f1c4611960822e138114666965120247dc8e347e06f0a1927894abefd",
+  "law-n-justice": "a41f900e57cc38f3759aa0bca236600726e5ba3974d40a68def10c46bfce2493",
+  "babewatch": "4ab5a715fa45de855691e81d78d5338e96682613a36e3dc60f57ae0c690cc3c7",
+  "extreme-sports": "9ffff59755535963edd0a72d95e5bbe14b6ec327dd68b5d7978f6da25fc9b303",
 };
 
 /** Same shape as the determinism harness's input: behaviour = f(tick index). */
