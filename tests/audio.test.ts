@@ -897,19 +897,31 @@ describe("the shell music follows the shell", () => {
     "info",
     "loading",
     "failed",
+  ];
+  /**
+   * The six phases the shell's module does NOT own: every one the machine is
+   * inside a table for. `play` and `quit-confirm` were always here;
+   * `game-over`, `fanfare`, `initials` and `ladder` joined them when the round
+   * that traced and filmed the machine found the TABLE's own +$8C and +$90
+   * records sounding there — the front-end module is not even loaded at that
+   * moment. See `SILENT_PHASES` in `browser/shell-music.ts` and
+   * research/GAMEOVER_MUSIC.md.
+   */
+  const SILENT: readonly ShellPhase[] = [
+    "play",
+    "quit-confirm",
     "game-over",
     "fanfare",
     "initials",
     "ladder",
   ];
-  const SILENT: readonly ShellPhase[] = ["play", "quit-confirm"];
 
-  it("plays over every shell screen and not over the ball", () => {
+  it("plays over every menu screen and over none of the in-game ones", () => {
     for (const phase of MUSICAL_PHASES) expect(musicWantedFor(phase), phase).toBe(true);
     for (const phase of SILENT) expect(musicWantedFor(phase), phase).toBe(false);
   });
 
-  it("starts on attract, holds through the menus, stops for play, returns at game over", () => {
+  it("starts on attract, holds through the menus, stops for the table and stays stopped until the menu", () => {
     const host = new FakeMusicHost();
     const music = createShellMusic(fakeMusicStorage(), () => host);
   music.useAsset(syntheticShellMusicAsset());
@@ -933,8 +945,17 @@ describe("the shell music follows the shell", () => {
     expect(music.output.playing).toBe(false);
     expect(music.output.stream).toBeNull();
 
-    // Game over brings it back, from the top.
-    music.update("game-over");
+    // AND THE GAME-OVER WALK IS STILL THE TABLE'S. Those four screens are the
+    // in-game machine's states 2 and 0, where the TABLE's own +$8C and +$90
+    // records play; the shell's module stays down through all of them.
+    for (const phase of ["game-over", "fanfare", "initials", "ladder"] as const) {
+      music.update(phase);
+      expect(music.output.playing, phase).toBe(false);
+      expect(music.output.stream, phase).toBeNull();
+    }
+
+    // Leaving the table for the menu brings it back, from the top.
+    music.update("menu");
     expect(music.output.playing).toBe(true);
     expect(host.sources.length).toBeGreaterThan(startedOnAttract);
   });

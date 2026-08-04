@@ -757,19 +757,30 @@ describe("the table music controller", () => {
     expect(controller.output.stream?.durationMs).toBe(FIXTURE_VAMP_MS);
   });
 
-  it("leaving the table phases stops the music dead", async () => {
+  it("leaving the table phases stops the music dead, and the game-over walk is not leaving", async () => {
     const host = new FakeMusicHost();
     const controller = await readyController(host);
     controller.observe(report({ served: true }));
     controller.update("play", null);
     expect(controller.output.playing).toBe(true);
-    controller.update("game-over", null);
+    // The MENU is leaving the table: the shell's own module owns it.
+    controller.update("menu", null);
     expect(controller.output.playing).toBe(false);
     // Quit-confirm is a table phase: music through the question.
     controller.observe(report({ served: true }));
     controller.update("play", null);
     controller.update("quit-confirm", null);
     expect(controller.output.playing).toBe(true);
+    // AND SO ARE THE FOUR GAME-OVER SCREENS, which are the in-game machine's
+    // states 2 and 0. It posts the table's own +$8C on entering the walk and
+    // nothing at all on the way into the attract, so the table's module plays
+    // right through them; only going back to the front end stops it.
+    for (const phase of ["game-over", "fanfare", "initials", "ladder"] as const) {
+      controller.update(phase, null);
+      expect(controller.output.playing, phase).toBe(true);
+    }
+    controller.update("attract", null);
+    expect(controller.output.playing).toBe(false);
   });
 
   it("a mode cue's -2 switches the background at once, and it persists", async () => {

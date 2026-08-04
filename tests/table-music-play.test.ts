@@ -63,7 +63,9 @@ import { CONTROLS } from "../src/browser/input.js";
 import type { Control, ControlEdges, ControlSnapshot } from "../src/browser/input.js";
 import { createTableMusic } from "../src/browser/table-music.js";
 import type { TableMusic } from "../src/browser/table-music.js";
-import { createShellMusic } from "../src/browser/shell-music.js";
+import { SILENT_PHASES, createShellMusic, musicWantedFor } from "../src/browser/shell-music.js";
+import { TABLE_MUSIC_PHASES } from "../src/browser/table-music.js";
+import type { ShellPhase } from "../src/browser/shell.js";
 import { loadShellMusic } from "../src/audio/shell-music.js";
 import { loadTableMusic } from "../src/audio/table-music.js";
 import type { TableMusicAsset, TableMusicCue, TableMusicFetch } from "../src/audio/table-music.js";
@@ -253,6 +255,13 @@ interface Probe {
   readonly levels: number[];
   /** The section up on each tick, as `bank:position`, or null for silence. */
   readonly sections: (string | null)[];
+  /**
+   * The shell phase `run` hands the controller, `play` until a case moves it.
+   * The game-over walk is four more phases the TABLE's own module owns — see
+   * `TABLE_MUSIC_PHASES` — and `main.ts` calls `tableMusic.update(shell.phase,
+   * ...)` once a frame with whatever the shell is showing, which is this.
+   */
+  phase: ShellPhase;
   run(
     ticks: number,
     effects?: AudioBank | ((tick: number) => AudioBank),
@@ -323,7 +332,7 @@ async function openTable(
     return stream === null ? null : (names.get(sectionSignature(stream)) ?? "?");
   };
 
-  return {
+  const probe: Probe = {
     host,
     music,
     game,
@@ -332,6 +341,7 @@ async function openTable(
     times,
     levels,
     sections,
+    phase: "play",
     where,
     name: (cue) => `${cue.bank}:${cue.position}`,
     namedUniquely: (cue) => {
@@ -358,7 +368,7 @@ async function openTable(
         const report = tickGame(game, input.sample());
         onReport?.(report);
         music.observe(report);
-        music.update("play", typeof effects === "function" ? effects(times.length) : effects);
+        music.update(probe.phase, typeof effects === "function" ? effects(times.length) : effects);
         times.push(host.currentTime);
         levels.push(host.audibleAt(host.currentTime));
         sections.push(where());
@@ -367,6 +377,7 @@ async function openTable(
       return reports;
     },
   };
+  return probe;
 }
 
 /** Presses the plunger for two ticks, `after` ticks past every serve. */
@@ -763,12 +774,17 @@ describe.skipIf(!exported)("a whole game, from the first serve to the last drain
     expect(seen.has(main), "the main tune never played").toBe(true);
     expect(seen.has(stop), "the end-of-ball record never played").toBe(true);
 
-    // AND THE TWO THAT STAY DATA — but no longer for the reason that used to
-    // be written here. See the next describe: the machine DOES play both, and
-    // this port playing the shell's front-end tune over those screens instead
-    // is a divergence, not an absence. Pinned so changing it is deliberate.
-    expect(seen.has(gameOver), "the table module played the game-over record").toBe(false);
-    expect(seen.has(highScore), "the table module played the high-score record").toBe(false);
+    // AND THE GAME-OVER RECORD, which this case used to pin as never played.
+    // It is the machine's own state-2 entry ($45FE's first instruction) and it
+    // is now fired from `report.gameOver` — the tick the last player's bonus
+    // finishes, which is the same moment. See the next describe for the trace
+    // and the audio that settled it.
+    expect(seen.has(gameOver), "the game-over record never played").toBe(true);
+    expect(probe.sections[over], "the game-over record was not up on the tick the game ended").toBe(gameOver);
+    // The HIGH-SCORE record still does not, because this case never leaves the
+    // `play` phase: +$90 is posted by the walk, for a player who beat the
+    // ladder, and the walk is the shell's.
+    expect(seen.has(highScore), "the table module played the high-score record inside the ball").toBe(false);
   });
 });
 
@@ -778,24 +794,25 @@ describe.skipIf(!exported)("a whole game, from the first serve to the last drain
 
 describe.skipIf(!exported)("the game-over and high-score records, measured", () => {
   /**
-   * THE CLAIM THIS REPLACES. The round that wired the music left the +$8C and
-   * +$90 records as data and wrote that "those screens belong to the shell in
-   * this reconstruction". That is a true statement about the PORT and it was
-   * being used as if it were a statement about the MACHINE. It is not, and
-   * both halves of the real answer are cheap:
+   * WHAT THE MACHINE DOES ON THOSE SCREENS, traced and filmed.
    *
-   * WHAT THE ENGINE DOES. `main.seg00` caches the descriptor's five cue
-   * pointers at `$2372`(+$84 attract) / `$2376`(+$88 ball start) /
-   * `$237A`(+$8C game over) / `$237E`(+$90 high score) / `$2382`(+$94 tilt) —
-   * one longword each, in descriptor order. The game-over routine at `$45FE`
-   * reads `$237A` and posts it:
+   * The round that wired the music left the +$8C and +$90 records as data and
+   * wrote that "those screens belong to the shell in this reconstruction". The
+   * sweep after it proved that was a statement about the PORT being used as one
+   * about the MACHINE, and left it alone for want of a capture. This round got
+   * the capture. Full write-up: `research/GAMEOVER_MUSIC.md`.
+   *
+   * WHAT THE ENGINE DOES. The in-game state machine dispatches on `$8E(a5)`
+   * through the nine-entry table at `$3D5A`; state 2 is `$45FE`, and its first
+   * instruction posts the descriptor's +$8C:
    *
    *     0045FE  move.l   $237a(a5), d0
    *     004602  beq.b    $460c            ; a null pointer posts nothing
    *     004604  movea.l  d0, a0
    *     004606  jsr      $6868.l          ; the mailbox poster
    *
-   * and the high-score routine, under the once-per-game latch at `$4776`:
+   * and the walk that follows posts +$90 for the FIRST player who makes the
+   * ladder, under the once-per-game latch at `$4776`:
    *
    *     00465A  st.b     $93(a5)          ; this player made the ladder
    *     00465E  tst.b    $4776.l
@@ -803,19 +820,24 @@ describe.skipIf(!exported)("the game-over and high-score records, measured", () 
    *     00466A  movea.l  $237e(a5), a0
    *     00466E  jsr      $6868.l
    *
-   * So the machine posts a music command at game over and at high-score entry.
+   * READ LIVE OUT OF RAM under WinUAE (Law 'n Justice, cold boot, a5 =
+   * `$23DB56`): +$8C is `0400 FFFE 0032 0000` = kind 4, -2, position 50, bank
+   * 0 and +$90 is `0400 FFFE 0026 0000` = -2, position 38, bank 0 — the
+   * records this port already shipped as data, byte for byte. Traced on played
+   * games, the post lands on the millisecond of the state 4 -> 2 change, i.e.
+   * AFTER the end-of-ball bonus, and there is NO further post on the way into
+   * the attract, so the tune it starts runs on.
    *
-   * WHAT THOSE COMMANDS ARE. Both are `-2` background sets, and the sections
-   * they name are not stops: the case below renders each one through the same
-   * tracker the game uses and asks the mixer what comes out. They are TUNES —
-   * Law 'n Justice's game-over record is its own 141-second looping section at
-   * order slot 0:50, which no other slot shares.
+   * IDENTIFIED IN THE EMULATOR'S OWN 48 kHz AUDIO against sections rendered
+   * from these manifests, every other candidate section scored on the same
+   * window as a control:
    *
-   * The port is therefore not silent where the machine sings; it plays a
-   * DIFFERENT tune, the shell's front-end module, because `TABLE_MUSIC_PHASES`
-   * ends at the ball and `SILENT_PHASES` does not include `game-over`,
-   * `fanfare` or `initials`. That is a divergence worth naming precisely, and
-   * naming it is what this case does. See research/AUDIO_SWEEP.md.
+   *   game with no qualifier   game-over 0:50   waveform +0.629 / envelope +0.974
+   *   game with a qualifier    high-score 0:38  waveform +0.581 / envelope +0.924
+   *
+   * and in the run with a qualifier the game-over section collapses to +0.025 /
+   * +0.272, because the machine's mailbox is three words and the two posts land
+   * in the SAME frame: position 50 is never entered at all.
    */
   for (const tableId of TABLE_IDS) {
     it(`${tableId}: both records are tunes, not stops`, async () => {
@@ -828,9 +850,15 @@ describe.skipIf(!exported)("the game-over and high-score records, measured", () 
 
         // A -2 background set, as the engine's own poster makes it.
         expect(cue.command, `${tableId} ${name} is not a background set`).toBe(-2);
-        // It LOOPS: a section that ends in F00 has no restart point, and both
-        // of these have one — so neither is the tilt's kind of silence.
-        expect(stream.restartMs, `${tableId} ${name} ends in F00 rather than looping`).not.toBeNull();
+        // NOT AN F00 STOP: a section that halts the player has neither a
+        // restart point nor a handover, and every one of these six has one or
+        // the other. Five loop; BabeWatch's game-over section ends on a `B81`
+        // and crosses to the other bank, which is a handover and still not a
+        // silence.
+        expect(
+          stream.restartMs !== null || (stream.nextSection ?? null) !== null,
+          `${tableId} ${name} ends in F00 rather than looping or handing over`,
+        ).toBe(true);
 
         // AND IT SOUNDS. Rendered on its own through the real tracker, the
         // level reaching the destination is above zero across its whole pass.
@@ -848,7 +876,11 @@ describe.skipIf(!exported)("the game-over and high-score records, measured", () 
           samples += 1;
           if (host.audibleAt(at) > 0) audible += 1;
         }
-        expect(samples, `${tableId} ${name}: nothing sampled`).toBeGreaterThan(100);
+        // Sampled over the section's own length, so a 4.3 s handover is not
+        // held to a 30 s section's sample count — but never a handful, or the
+        // ratio below would be a statement about the loop rather than the tune.
+        expect(samples, `${tableId} ${name}: nothing sampled`).toBe(Math.ceil(seconds / 0.05));
+        expect(samples, `${tableId} ${name}: too few samples to mean anything`).toBeGreaterThan(50);
         expect(
           audible / samples,
           `${tableId} ${name}: only ${audible}/${samples} of the record was audible`,
@@ -909,27 +941,239 @@ describe.skipIf(!exported)("the game-over and high-score records, measured", () 
     expect(music.output.startContextTime, "the intro-to-shell handover restarted the tune").toBe(anchored);
   });
 
-  it("the shell's own module is what actually plays over those screens", async () => {
-    // The other half of the divergence, measured rather than assumed: the
-    // front-end tune is audible on the game-over card, the high-score fanfare
-    // and the name box. So the port makes A sound there — just not the
-    // machine's. A future round that moves those screens to the table's
-    // records has to silence these three phases in the same change.
+  it("the shell's own module no longer plays over any of those screens", async () => {
+    // THE OTHER HALF, and it used to assert the opposite. The front-end tune
+    // was audible 40/40 on the game-over card, the fanfare and the name box —
+    // the port made A sound there, just not the machine's, which is not even
+    // loaded at that moment. Both sets moved together, so this case is the one
+    // that fails if only one of them is reverted.
+    expect(SILENT_PHASES.has("game-over")).toBe(true);
+    expect(SILENT_PHASES.has("fanfare")).toBe(true);
+    expect(SILENT_PHASES.has("initials")).toBe(true);
+    expect(SILENT_PHASES.has("ladder")).toBe(true);
+    for (const phase of ["game-over", "fanfare", "initials", "ladder"] as const) {
+      expect(musicWantedFor(phase), `the shell still wants music on ${phase}`).toBe(false);
+      expect(TABLE_MUSIC_PHASES.has(phase), `the table music does not own ${phase}`).toBe(true);
+    }
+    // The two sets are complements over the whole phase list, which is what
+    // keeps exactly one module owning every screen.
+    for (const phase of SILENT_PHASES) expect(TABLE_MUSIC_PHASES.has(phase)).toBe(true);
+    for (const phase of TABLE_MUSIC_PHASES) expect(SILENT_PHASES.has(phase)).toBe(true);
+
+    // And measured on the graph, not on the sets: the real front-end module,
+    // driven exactly as `main.ts` drives it, makes no sound on any of them.
     const asset = await loadShellMusic((url) => shellFetch(url));
     expect(asset, "the shell module did not load").not.toBeNull();
     const host = new RecordingMusicHost();
     const music = createShellMusic({ getItem: () => null, setItem: () => undefined }, () => host);
     music.useAsset(asset);
-    for (const phase of ["game-over", "fanfare", "initials"] as const) {
+    // THE PREMISE FIRST: this instrument really can hear this module. Without
+    // it a broken host would pass every phase below by being deaf.
+    let menu = 0;
+    for (let i = 0; i < 40; i += 1) {
+      host.advance(TICK_SECONDS);
+      music.update("menu");
+      if (host.audibleAt(host.currentTime) > 0) menu += 1;
+    }
+    expect(menu, "the shell module was silent in the MENU, so this case proves nothing").toBe(40);
+    for (const phase of ["game-over", "fanfare", "initials", "ladder"] as const) {
       let audible = 0;
       for (let i = 0; i < 40; i += 1) {
         host.advance(TICK_SECONDS);
         music.update(phase);
         if (host.audibleAt(host.currentTime) > 0) audible += 1;
       }
-      expect(audible, `the shell module was silent over ${phase}`).toBe(40);
+      expect(audible, `the shell module still played over ${phase}`).toBe(0);
     }
   });
+
+  /**
+   * THE WIRING, on a game driven to its own end.
+   *
+   * Nothing synthetic: a real `createGame`/`tickGame` over the shipped map and
+   * manifest, plunged until every ball is gone, and the shell's own phases fed
+   * to the controller the way `main.ts` feeds them. The assertions are on
+   * `audibleAt` and on WHICH section is up, so a cue that fires into silence
+   * or into the wrong record fails.
+   */
+  for (const tableId of TABLE_IDS) {
+    it(`${tableId}: the TABLE's game-over record sounds at game over, and its high-score record at the initials`, async () => {
+      // A self-rearming plunger: two ticks in every sixty, so a ball that has
+      // just been served is launched without the case having to watch for it.
+      const probe = await openTable(tableId, (tick) => (tick % 60 < 2 ? ["plunger"] : []));
+      const gameOverCue = probe.reference.cues.gameOver;
+      const highScoreCue = probe.reference.cues.highScore;
+      const endStop = probe.name(probe.reference.cues.endStop);
+
+      // PREMISE ONE: the two records name sections nothing else names, or
+      // "the game-over section is up" would be a claim about a fingerprint.
+      expect(probe.namedUniquely(gameOverCue), `${tableId}: the game-over section is not uniquely named`).toBe(true);
+      expect(probe.namedUniquely(highScoreCue), `${tableId}: the high-score section is not uniquely named`).toBe(true);
+
+      // Play the whole game out. Three balls, the shipped default.
+      let ended = -1;
+      for (let tick = 0; tick < 20000 && ended < 0; tick += 1) {
+        const [report] = await probe.run(1);
+        if (report?.gameOver === true) ended = tick;
+      }
+      expect(ended, `${tableId}: no driven game reached game over`).toBeGreaterThan(0);
+      // PREMISE TWO: the bonus really did stop the music first, so what sounds
+      // next is the game-over cue starting rather than the ball's tune running
+      // on. `endStop` is the -2 into an F00 section the bonus routine fires.
+      const beforeEnd = probe.sections.slice(Math.max(0, ended - 400), ended);
+      expect(beforeEnd, `${tableId}: the end-of-ball stop never came up`).toContain(endStop);
+
+      // GAME OVER. The shell holds its card for `GAME_OVER_TICKS`; the cue was
+      // posted on the tick the bonus finished, and the player executes it on
+      // the next frame it runs — which is this one.
+      probe.phase = "game-over";
+      await probe.run(60);
+      const card = probe.sections.slice(-50);
+      expect(
+        new Set(card),
+        `${tableId}: the game-over card is playing ${[...new Set(card)].join(",")}, not ${probe.name(gameOverCue)}`,
+      ).toEqual(new Set([probe.name(gameOverCue)]));
+      const cardLevels = probe.levels.slice(-50);
+      expect(
+        cardLevels.filter((level) => level > 0).length,
+        `${tableId}: the game-over record was silent on the card`,
+      ).toBeGreaterThan(40);
+
+      // THE HIGH-SCORE FANFARE and the name box, which the machine reaches
+      // through the same walk. The cue is the shell's, because only the shell
+      // knows who beat the ladder.
+      probe.phase = "fanfare";
+      await probe.run(60);
+      const fanfare = probe.sections.slice(-50);
+      expect(
+        new Set(fanfare),
+        `${tableId}: the fanfare is playing ${[...new Set(fanfare)].join(",")}, not ${probe.name(highScoreCue)}`,
+      ).toEqual(new Set([probe.name(highScoreCue)]));
+      expect(
+        probe.levels.slice(-50).filter((level) => level > 0).length,
+        `${tableId}: the high-score record was silent on the fanfare`,
+      ).toBeGreaterThan(40);
+
+      // The name box is the same performance, not a restart: the machine posts
+      // nothing between the two.
+      const anchored = probe.music.output.startContextTime;
+      probe.phase = "initials";
+      await probe.run(60);
+      expect(
+        probe.music.output.startContextTime,
+        `${tableId}: the name box restarted the high-score tune`,
+      ).toBe(anchored);
+      expect(new Set(probe.sections.slice(-50))).toEqual(new Set([probe.name(highScoreCue)]));
+
+      // THE MULTIPLAYER WALK. `advanceScoreEntry` returns to `fanfare` for
+      // every further player who made the ladder, and the machine posts +$90
+      // for the FIRST of them only — the latch at `$4776`. Traced on a
+      // two-player game where both qualified: the current song does not move
+      // and the section does not restart when the caption turns over.
+      probe.phase = "fanfare";
+      await probe.run(30);
+      probe.phase = "initials";
+      await probe.run(30);
+      expect(
+        probe.music.output.startContextTime,
+        `${tableId}: a second qualifying player re-posted the high-score cue`,
+      ).toBe(anchored);
+      expect(new Set(probe.sections.slice(-50))).toEqual(new Set([probe.name(highScoreCue)]));
+
+      // And the table's ladder screen — the machine's own attract, state 0,
+      // which it enters with no music post at all, so the walk's tune carries
+      // straight on into it.
+      probe.phase = "ladder";
+      await probe.run(30);
+      expect(probe.music.output.startContextTime).toBe(anchored);
+      expect(
+        probe.levels.slice(-20).filter((level) => level > 0).length,
+        `${tableId}: the ladder screen fell silent`,
+      ).toBeGreaterThan(15);
+
+      // Leaving the table is where it stops, and only there.
+      probe.phase = "menu";
+      await probe.run(5);
+      expect(probe.music.output.stream, `${tableId}: the table music followed the shell into the menu`).toBeNull();
+    }, 120_000);
+  }
+
+  it("babewatch's game-over section hands back to the main tune, as the machine's B81 does", async () => {
+    // THE ONE CROSS-BANK JUMP IN THE WHOLE CORPUS. The engine's order jump
+    // takes its parameter raw and 0-based and bit 7 selects THE OTHER BANK at
+    // `param & $7F` — the `move.w #$0/#$1,$108(a2)` pair at +0x0088A8 /
+    // +0x0088B0 followed by `$8182`. `tracker.ts` renders one song and cannot
+    // follow it; `sectionStream` ends the section there and names where it
+    // goes.
+    //
+    // Traced: 4.33 s after BabeWatch's game-over cue the machine's current song
+    // moves to bank 0, and the emulator's audio from that moment identifies as
+    // BabeWatch's MAIN TUNE 0:1 at waveform NCC +0.776 / envelope +0.913, lag
+    // 0.013 s. The decoded section is 4,320 ms — 0.16 % off the trace.
+    const assets = await Promise.all(
+      TABLE_IDS.map(async (id) => [id, (await loadTableMusic(id, instantFetch, "")) as TableMusicAsset] as const),
+    );
+    // THE CENSUS, so "one" is a measurement: every renderable section of every
+    // bank of all three tables, and exactly one of them crosses.
+    const crossings: string[] = [];
+    for (const [id, asset] of assets) {
+      for (const [bank, song] of asset.songs.entries()) {
+        for (let position = 0; position < song.orders.length; position += 1) {
+          const stream = asset.section(bank, position);
+          const next = stream?.nextSection ?? null;
+          if (next !== null) crossings.push(`${id} ${bank}:${position} -> ${next.bank}:${next.position}`);
+        }
+      }
+    }
+    expect(crossings).toEqual(["babewatch 1:14 -> 0:1"]);
+
+    const babewatch = assets.find(([id]) => id === "babewatch")?.[1];
+    expect(babewatch).toBeDefined();
+    if (babewatch === undefined) return;
+    const cue = babewatch.cues.gameOver;
+    expect([cue.bank, cue.position]).toEqual([1, 14]);
+    const stream = babewatch.section(cue.bank, cue.position);
+    expect(stream?.durationMs, "the decoded handover is not at the traced 4.33 s").toBe(4320);
+    expect(stream?.restartMs, "a handover is not a loop").toBeNull();
+
+    // AND THE CONTROLLER FOLLOWS IT. A real game driven to its own end and
+    // then held on the game-over card for eight seconds, which is past the
+    // 4.32 s handover: the section changes at the right moment and the level
+    // never drops to zero across the splice — a stop would have left silence.
+    const probe = await openTable("babewatch", (tick) => (tick % 60 < 2 ? ["plunger"] : []));
+    let ended = -1;
+    for (let tick = 0; tick < 20000 && ended < 0; tick += 1) {
+      const [report] = await probe.run(1);
+      if (report?.gameOver === true) ended = tick;
+    }
+    expect(ended, "no driven babewatch game reached game over").toBeGreaterThan(0);
+    probe.phase = "game-over";
+    await probe.run(400);
+    const names = probe.sections.slice(-380);
+    const gameOver = probe.name(cue);
+    const main = probe.name(babewatch.cues.main);
+    expect(names, "the game-over section never came up").toContain(gameOver);
+    expect(names, "the handover to the main tune never happened").toContain(main);
+    expect(names.indexOf(gameOver), "the main tune came up before the game-over section").toBeLessThan(
+      names.indexOf(main),
+    );
+    // THE SHAPE OF THE SPLICE, against the machine's own audio. The film's
+    // RMS across this handover decays to EXACTLY ZERO from 19.10 s to 19.29 s
+    // and the main tune is up at 19.30 — a 0.20 s gap, because the game-over
+    // section's last notes are one-shots that run out before the row does.
+    // So the assertion is not "no hole": it is a SHORT hole and then the tune.
+    // (The section name moves up to a lookahead early, because the switch is
+    // scheduled ahead of the clock; the levels are the sounding truth.)
+    const levels = probe.levels.slice(-380);
+    const at = names.indexOf(main);
+    const gap = levels.slice(at, at + 40).filter((level) => level === 0).length;
+    expect(gap, "the cross-bank handover left a long silence").toBeLessThanOrEqual(25);
+    const after = levels.slice(at + 40, at + 140);
+    expect(
+      after.filter((level) => level > 0).length,
+      "the main tune never came up after the handover",
+    ).toBeGreaterThan(90);
+  }, 60_000);
 });
 
 // ---------------------------------------------------------------------------

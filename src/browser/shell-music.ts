@@ -52,14 +52,35 @@ export const MUSIC_TOGGLE_KEY = "`";
 export const MUSIC_MUTED_STORAGE_KEY = "pinball-illusions.music-muted";
 
 /**
- * The phases the music does NOT play in: the ball, and the "REALLY QUIT
- * TABLE?" question drawn over the ball. Everything else — the attract roll,
- * the menus, the info screen, loading, the game-over cards, the name box and
- * the ladder — is the shell's, and the shell has music.
+ * The phases the shell's music does NOT play in: every phase the machine is
+ * INSIDE A TABLE for. The ball and the "REALLY QUIT TABLE?" question drawn over
+ * it, and — since the round that went and looked — the game-over card, the
+ * high-score fanfare, the name box and the table's own ladder screen.
+ *
+ * WHY THOSE FOUR MOVED. Those screens are the in-game machine's states 2 and 0,
+ * not the front end: the engine posts the TABLE's own +$8C record on entering
+ * state 2 and its +$90 record for the first player who makes the ladder, and
+ * the emulator's own audio identifies both against sections rendered from this
+ * port's manifests (game-over 0:50 at waveform NCC +0.629 / envelope +0.974 in
+ * a game with no qualifier; high-score 0:38 at +0.581 / +0.924 in one with).
+ * The front-end module is not even loaded on the machine at that moment. See
+ * `TABLE_MUSIC_PHASES` in `browser/table-music.ts`, which is this same set from
+ * the other side, and `research/GAMEOVER_MUSIC.md`.
+ *
+ * Everything else — the attract roll, the menus, the info screen and loading —
+ * is the shell's, and the shell has music.
+ *
+ * A build with no table-music manifest is therefore SILENT on those four, the
+ * same way it is silent over the ball. Silence on a missing gated asset is the
+ * shipped policy everywhere in this layer.
  */
 export const SILENT_PHASES: ReadonlySet<ShellPhase> = new Set<ShellPhase>([
   "play",
   "quit-confirm",
+  "game-over",
+  "fanfare",
+  "initials",
+  "ladder",
 ]);
 
 export function musicWantedFor(phase: ShellPhase): boolean {

@@ -154,8 +154,68 @@
  *   the JUKEBOX. Per-table 68k is not emulated at all here (mode VM opcode 20,
  *   NATIVE, is a counted no-op), so the selector's state does not exist.
  *
- * The GAME-OVER and HIGH-SCORE cues stay data as well: those screens belong to
- * the shell in this reconstruction and its own front-end module plays on them.
+ * ---------------------------------------------------------------------------
+ * GAME OVER AND THE HIGH-SCORE WALK BELONG TO THE TABLE — TRACED AND FILMED
+ * ---------------------------------------------------------------------------
+ * They used to say "those screens belong to the shell in this reconstruction
+ * and its own front-end module plays on them". That was true of the PORT and
+ * false of the MACHINE, and this round went and looked. Evidence and figures:
+ * `research/GAMEOVER_MUSIC.md`.
+ *
+ * READ LIVE OUT OF THE MACHINE'S RAM (Law 'n Justice, cold boot, a5 =
+ * `$23DB56`): descriptor +$8C is a record at `$24DCF6` reading
+ * `0400 FFFE 0032 0000` = kind 4, command -2, position 50, bank 0, and +$90 is
+ * `$24DCD6` = `0400 FFFE 0026 0000` = -2, position 38, bank 0 — byte for byte
+ * the `gameOver` and `highScore` records this port already shipped as data.
+ *
+ * WHAT THE ENGINE DOES WITH THEM. The in-game state machine dispatches through
+ * the table at `$3D5A` on `$8E(a5)`; state 2 is `$45FE`, and its FIRST
+ * instruction posts +$8C. The traced sequence on a played game is:
+ *
+ *   state 3 -> 4   the ball ends; the bonus routine posts the END-STOP record
+ *                  (-2 into an F00 section) and the player halts 2.96 s later,
+ *                  which is the bonus count in silence
+ *   state 4 -> 2   the game-over cue is posted ON THE SAME MILLISECOND as the
+ *                  state change, i.e. AFTER the whole bonus, not during it
+ *   the walk       every player in order; the FIRST one that makes the ladder
+ *                  posts +$90, under the once-per-game latch at `$4776`
+ *                  ($4638 clears it, $465E tests it, $4678 sets it)
+ *   state 2 -> 0   the table's own attract, WITH NO FURTHER MUSIC POST — so
+ *                  whatever the walk left playing carries on into the attract
+ *
+ * WHAT IT SOUNDS LIKE, from the emulator's own 48 kHz audio against sections
+ * rendered from this port's shipped manifests (normalised cross-correlation,
+ * with every other candidate section scored on the same window as a control):
+ *
+ *   game with NO qualifier   game-over 0:50 waveform +0.629 / envelope +0.974
+ *                            (next best +0.355 / +0.247; high-score 0:38 scores
+ *                             +0.032 / +0.264)
+ *   game WITH a qualifier    high-score 0:38 waveform +0.581 / envelope +0.924
+ *                            (game-over 0:50 collapses to +0.025 / +0.272)
+ *
+ * THE MAILBOX EATS ONE OF THEM, and that is the machine's own semantics rather
+ * than a defect: `$6868` writes three words and the player reads them on its
+ * next interrupt, so when a player qualifies the +$8C post and the +$90 post
+ * land in the SAME frame and only the second survives. The trace catches it —
+ * `mail=(-2,50,0)` and `mail=(-2,38,0)` one millisecond apart with the player's
+ * current song still on the end-stop section in between, and the player then
+ * jumping straight to 0:38. Position 50 is never entered.
+ *
+ * WHAT THIS CONTROLLER DOES, and the one divergence it cannot help. The cues
+ * are posted at the two sites the machine posts them: +$8C when the game ends
+ * (`report.gameOver`, the tick the bonus finishes = the machine's state-2
+ * entry) and +$90 on the first `fanfare` of the game, under the same
+ * once-per-game latch. The table's module therefore plays over `game-over`,
+ * `fanfare`, `initials` and `ladder`, and the shell's own module is silent
+ * there.
+ *
+ * THE DIVERGENCE: the machine draws its GAME OVER banner AFTER the walk (state
+ * 2 sets `$e80(a5)` and `$e82(a5) = $64` on the way out at +0x00486C, and the
+ * ATTRACT state draws it for those 100 frames), while this shell shows its GAME
+ * OVER card BEFORE the walk. So a qualifying game here hears about two seconds
+ * of the game-over tune that the machine's mailbox would have swallowed. That
+ * is the shell's screen ORDER, not the music model; every screen still plays
+ * the tune the machine's own code posts for it.
  *
  * ---------------------------------------------------------------------------
  * CHANNEL 3 BELONGS TO THE EFFECTS WHILE ONE IS SOUNDING
@@ -208,14 +268,30 @@ import type {
 } from "../audio/table-music.js";
 
 /**
- * The phases the table music plays in: the ball, and the "REALLY QUIT
- * TABLE?" question drawn over the ball — the original has no pause there at
- * all, so the music playing on is the closer reading. Every other phase is
- * the shell's, and the shell has its own music.
+ * The phases the table music plays in — WHICH IS EVERY PHASE THE MACHINE IS
+ * INSIDE A TABLE FOR.
+ *
+ * `play` and `quit-confirm` are the ball and the "REALLY QUIT TABLE?" question
+ * drawn over it (the original has no pause there at all, so the music playing
+ * on is the closer reading). The other four are the machine's in-game states 2
+ * and 0, which `shell.ts` splits into cards: `game-over`, `fanfare` and
+ * `initials` are the state-2 walk at `$45FE`, and `ladder` is the table's own
+ * attract at `$42A2`. The machine never leaves the table module playing for any
+ * of them — it posts +$8C on entering state 2, posts +$90 for the first player
+ * who makes the ladder, and posts NOTHING on the way into the attract, so the
+ * last tune set carries on. See the header.
+ *
+ * Everything before a table is opened, and everything after it is left, is the
+ * shell's; `SILENT_PHASES` in `shell-music.ts` is the same six from the other
+ * side.
  */
 export const TABLE_MUSIC_PHASES: ReadonlySet<ShellPhase> = new Set<ShellPhase>([
   "play",
   "quit-confirm",
+  "game-over",
+  "fanfare",
+  "initials",
+  "ladder",
 ]);
 
 /** The default scheduler lookahead `pumpTracker` runs with, in seconds. */
@@ -235,12 +311,14 @@ interface Sounding extends SectionRef {
 }
 
 /**
- * The cue records this controller drives by name: the descriptor's ball-start
- * and tilt, the launch's queue-main, and the bonus routine's end stop. The
- * game-over and high-score records are decoded but not driven — those screens
- * belong to the shell here and its own front-end module plays on them.
+ * The cue records this controller drives by name: the descriptor's ball-start,
+ * tilt, game-over and high-score records, the launch's queue-main, and the
+ * bonus routine's end stop. Six of the seven fire from a tick report; the
+ * high-score one is the only cue the SHELL owns, because only the shell knows
+ * whether a player made the ladder — which is the machine's own arrangement
+ * too ($465A's `st.b $93(a5)` is set by the compare, not by the game).
  */
-type NamedCue = "ballStart" | "queueMain" | "tilt" | "endStop";
+type NamedCue = "ballStart" | "queueMain" | "tilt" | "endStop" | "gameOver" | "highScore";
 
 /**
  * ONE POST TO THE MAILBOX — a cue SITE, not a cue record.
@@ -340,6 +418,25 @@ export function createTableMusic(
    * hand the player runs every frame and executes on the spot. See the header.
    */
   let mailbox: CuePost | null = null;
+  /**
+   * THE ONCE-PER-GAME HIGH-SCORE LATCH, `$4776` in the code hunk. The machine
+   * clears it on entering the walk ($4638), tests it before posting +$90
+   * ($465E) and sets it after ($4678) — so the high-score tune is posted for
+   * the FIRST qualifying player and never again, and it plays on through every
+   * later player's fanfare and name box. Traced on a two-player game where
+   * both qualified.
+   */
+  let highScorePosted = false;
+  /** The phase the last `update` saw, so a transition can be told from a hold. */
+  let lastPhase: ShellPhase | null = null;
+  /**
+   * A CROSS-BANK HANDOVER owed by the sounding section: the context time its
+   * pass ends and the (bank, position) the machine's own loop-jump handler
+   * switches to there. One section in the shipped corpus has one — BabeWatch's
+   * game-over record, `B81` at bank 1 pattern 14 row 35 — and the machine's
+   * current song really does move to bank 0 4.33 s after that cue.
+   */
+  let handover: { readonly at: number; readonly to: SectionRef } | null = null;
 
   const streamFor = (ref: SectionRef): TrackerCommandStream | null =>
     current === null ? null : current.section(ref.bank, ref.position);
@@ -369,12 +466,13 @@ export function createTableMusic(
     sounding = { ...ref, stream, override };
     queued = null;
     startTracker(output, stream, atContextTime, fromMs);
+    const ends = output.startContextTime + stream.durationMs / 1000;
     // A section with no loop point ends in F00, and its last row is where the
-    // machine's stop flag goes up.
-    stopsAt =
-      stream.restartMs === null
-        ? output.startContextTime + stream.durationMs / 1000
-        : null;
+    // machine's stop flag goes up — UNLESS it ends by crossing to the other
+    // bank, which is a handover and not a stop.
+    const crossing = stream.nextSection ?? null;
+    stopsAt = stream.restartMs === null && crossing === null ? ends : null;
+    handover = crossing === null ? null : { at: ends, to: crossing };
     return true;
   };
 
@@ -389,7 +487,9 @@ export function createTableMusic(
     queued = null;
     ballsLive = 0;
     stopsAt = null;
+    handover = null;
     mailbox = null;
+    highScorePosted = false;
     stopTracker(output);
   };
 
@@ -633,10 +733,37 @@ export function createTableMusic(
       // The tilt: its own cue, an override on two tables and a background set
       // on the third, and on all three a section ending in F00.
       if (report.justTilted) post({ kind: "named", name: "tilt" });
-      if (report.gameOver) ballsLive = 0;
+      // GAME OVER: the machine's in-game state 2 ($45FE), whose very first
+      // instruction posts the descriptor's +$8C record. `report.gameOver` is
+      // raised by `endBallAfterBonus` on the tick the last player's bonus
+      // finishes, which is the same moment — the trace has the post landing on
+      // the millisecond of the state 4 -> 2 change, 3.0 s after the drain, with
+      // the end-stop's F00 silence in between. The -2 is a background set, so
+      // it CLEARS the stop flag the end-stop raised and the tune starts.
+      //
+      // The latch is cleared here for the same reason $4638 clears $4776 here:
+      // this is the top of the walk, and a second game played without leaving
+      // the table gets its own high-score post.
+      if (report.gameOver) {
+        ballsLive = 0;
+        highScorePosted = false;
+        post({ kind: "named", name: "gameOver" });
+      }
     },
 
     update(phase: ShellPhase, effects: AudioBank | null): void {
+      const previous = lastPhase;
+      lastPhase = phase;
+      // THE HIGH-SCORE CUE, the one the shell owns. `shell.ts`'s
+      // `advanceScoreEntry` moves to `fanfare` for each player whose score
+      // beats the ladder — the machine's $4648 compare — and the machine posts
+      // +$90 for the first of them only, under $4776. Posted BEFORE the phase
+      // gate below so a manifest still in flight leaves it in the mailbox
+      // rather than dropping it, exactly as a ball-start post survives there.
+      if (phase === "fanfare" && previous !== "fanfare" && !highScorePosted) {
+        highScorePosted = true;
+        post({ kind: "named", name: "highScore" });
+      }
       if (!TABLE_MUSIC_PHASES.has(phase) || current === null) {
         // A post the player never got to read belongs to the ball that made
         // it: leaving the table throws it away with everything else, so a
@@ -681,6 +808,22 @@ export function createTableMusic(
           } else {
             lookahead = Math.max(boundary - now - 0.001, 0.05);
           }
+        }
+      }
+
+      // THE CROSS-BANK HANDOVER, the machine's `$8182` call with the other
+      // bank: same splice as the queued switch above — the outgoing section is
+      // stopped at the exact moment the incoming one starts, and until that
+      // moment is inside the lookahead the pump is capped short of it so the
+      // outgoing one never schedules past its own last row.
+      const owed = handover;
+      if (host !== null && owed !== null) {
+        if (owed.at - now <= LOOKAHEAD_SECONDS * 0.9) {
+          handover = null;
+          saved = null;
+          play(owed.to, false, owed.at);
+        } else {
+          lookahead = Math.min(lookahead, Math.max(owed.at - now - 0.001, 0.05));
         }
       }
 

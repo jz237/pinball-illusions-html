@@ -467,6 +467,27 @@ export interface TrackerPlayer {
    * write it wins; the COUNTERS that decide whether to write are per channel.
    */
   pendingLoopRow: number | null;
+  /**
+   * THE OTHER BANK, when a `Bxx` asks for it: the position `param & $7F`, set
+   * when bit 7 of the parameter is up, and null otherwise.
+   *
+   * A table's music is TWO modules and the engine's order jump can cross
+   * between them: the loop-jump handler ends at `+0x0088A8` / `+0x0088B0`,
+   * which write `#$0` or `#$1` into the current song's bank word `$108(a2)`
+   * and then call `$8182` with that bank and the masked position. This core
+   * plays ONE song and cannot follow that, so it RECORDS the request and
+   * leaves `pendingJump` doing exactly what it always did — every existing
+   * consumer sees byte-identical output. `sectionStream` is the one caller
+   * that reads it, and it ends the section there with a handover.
+   *
+   * There is exactly ONE such cell in the whole shipped corpus: BabeWatch bank
+   * 1, pattern 14, row 35, `B81` = bank 0 position 1, which is the game-over
+   * record's own order slot handing back to the main tune. Traced on the
+   * machine (its current song goes to bank 0 4.33 s after the game-over cue)
+   * and identified in the emulator's audio (BabeWatch's main tune 0:1 at
+   * waveform NCC +0.776 / envelope +0.913, lag 0.013 s).
+   */
+  pendingOtherBank: number | null;
 }
 
 /**
@@ -522,6 +543,7 @@ export function createTrackerPlayer(song: TrackerSong, startOrder = 0): TrackerP
     pendingJump: null,
     pendingBreak: null,
     pendingLoopRow: null,
+    pendingOtherBank: null,
   };
 }
 
@@ -602,6 +624,10 @@ function applyRowStart(player: TrackerPlayer, state: ChannelState, at: TrackerCe
       break;
     }
     case 0xb:
+      // Bit 7 asks for the OTHER BANK at `param & $7F`; this core has one
+      // song, so it only records the request (see `pendingOtherBank`) and
+      // still resolves `pendingJump` exactly as it always has.
+      if (param >= 0x80) player.pendingOtherBank = param & 0x7f;
       player.pendingJump = param < player.song.orders.length ? param : 0;
       break;
     case 0xc:

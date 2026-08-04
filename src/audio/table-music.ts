@@ -414,14 +414,20 @@ const MAX_TICKS_PER_SECTION = 1_000_000;
 
 /**
  * Renders one SECTION of a bank as a timed command stream: from `entry` until
- * the position loops (a pass, `restartMs` set) or an `F00` halts the player
- * (`restartMs` null, channel stops appended). See the module header for why
- * the F00 rule lives here and not in the core.
+ * the position loops (a pass, `restartMs` set), an `F00` halts the player
+ * (`restartMs` null, channel stops appended), or a `Bxx` CROSSES TO THE OTHER
+ * BANK (`restartMs` null, `nextSection` set). See the module header for why the
+ * F00 rule lives here and not in the core.
+ *
+ * `bank` is which of the two banks `song` is, and is only used to name the
+ * other one. A caller that leaves it out gets the old behaviour exactly: a
+ * cross-bank jump falls back to the core's own out-of-range rule.
  */
 export function sectionStream(
   song: TrackerSong,
   voices: Readonly<Record<number, string>>,
   entry: number,
+  bank?: number,
 ): TrackerCommandStream {
   const player = createTrackerPlayer(song, entry);
   const commands: StreamCommand[] = [];
@@ -433,6 +439,7 @@ export function sectionStream(
     if (guard > MAX_TICKS_PER_SECTION) {
       throw new Error(`section at order ${entry} of "${song.title}" never looped or stopped`);
     }
+    const orderBefore = player.order;
 
     for (const command of stepTracker(player)) {
       switch (command.action) {
@@ -483,6 +490,19 @@ export function sectionStream(
         commands.push({ kind: "stop", timeMs: elapsedMs, channel });
       }
       return { commands, durationMs: elapsedMs, restartMs: null };
+    }
+
+    // A `Bxx` whose bit 7 was up has just been TAKEN — the order moved, which
+    // is the machine's `$8182` call with the other bank. The section ends here
+    // and hands over; it is not a loop and not a stop, so `restartMs` stays
+    // null and `nextSection` says where the player goes.
+    if (bank !== undefined && player.pendingOtherBank !== null && player.order !== orderBefore) {
+      return {
+        commands,
+        durationMs: elapsedMs,
+        restartMs: null,
+        nextSection: { bank: 1 - bank, position: player.pendingOtherBank },
+      };
     }
 
     if (player.row === 0 && player.tick === 0) {
@@ -592,7 +612,7 @@ export function assembleTableMusic(
       try {
         const song = parsed.songs[slot];
         if (song !== undefined && position >= 0 && position < song.orders.length) {
-          stream = sectionStream(song, parsed.voices[slot] ?? {}, position);
+          stream = sectionStream(song, parsed.voices[slot] ?? {}, position, slot);
         }
       } catch {
         stream = null;

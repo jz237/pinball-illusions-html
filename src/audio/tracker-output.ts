@@ -139,6 +139,17 @@ export interface TrackerCommandStream {
    * stream is treated as play-once rather than spinning forever.
    */
   readonly restartMs: number | null;
+  /**
+   * THE OTHER BANK, when the pass ended on a `Bxx` whose bit 7 is set: the
+   * (bank, position) the machine's loop-jump handler switches to at
+   * `+0x0088A8` / `+0x0088B0`. `restartMs` is null for such a pass — it does
+   * not loop, it HANDS OVER — and it is not an `F00` stop either, so a
+   * controller that sees this plays the named section at `durationMs` instead
+   * of falling silent. Absent on every other stream in the shipped corpus:
+   * there is exactly one such cell, BabeWatch's game-over section. See
+   * `sectionStream` in `table-music.ts`.
+   */
+  readonly nextSection?: { readonly bank: number; readonly position: number } | null;
 }
 
 // ---------------------------------------------------------------------------
