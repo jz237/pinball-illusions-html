@@ -121,9 +121,11 @@ import {
   DEFAULT_PROBE_RADIUS,
   flagAt,
   integerSqrt,
+  meanBearingOf,
   meanContactAngle,
   moreDeflecting,
   numberAt,
+  outwardNormalOf,
   passabilityOf,
   probeRing,
   ringOffsetsFor,
@@ -424,11 +426,93 @@ function viewForLevel(views: LevelViews, level: PlayfieldLevel): TableMap {
  * does NOT do — `+0x00AD4C` reads `$50(a4)`, the map's own surface plane, at
  * the contact pixel whichever blit produced it. So this port runs the map
  * first and the bat second, which gives the bat the last word on the velocity
- * without taking the map's report away. The real closure is a per-pose mask
- * with the map ORed in, exactly as the machine builds one; that is a round of
- * its own and it is named in `flippers.ts`.
+ * without taking the map's report away.
+ *
+ * WHAT THE UNION MASK DID CLOSE is the EJECTOR'S COUNT, which is a different
+ * question and is the one the pocket turned on: see `BatUnionMask` below. The
+ * contact model above is unchanged.
+ *
+ * ---------------------------------------------------------------------------
+ * `ejected` — THE PASS ALREADY HAD ITS POSITIONAL ANSWER
+ * ---------------------------------------------------------------------------
+ * True when the EJECTOR fired for this ball on this pass: six or more of the
+ * ring's points in `map OR bat` and half a pixel spent along the union's own
+ * outward normal (`ejectBuried`). The machine has exactly ONE positional write
+ * in a collision pass and that is it — `+0x00B6BE`, over a buffer that already
+ * contains the blade — so a bat that also lifted the ball out of its own
+ * silhouette would be a second, contradictory answer to the same question.
+ *
+ * MEASURED, at the site this round exists for. A ball at rest at Law 'n
+ * Justice's (42.692, 341.999)L0 has the upper bat's blade passing THROUGH it
+ * inside a two-pixel wall channel. The ejector's union normal points out of the
+ * channel, (+0.843, +0.537); `separate`'s bat normal points back into it; they
+ * cancel to the last Q10 and the ball stands still for ever. With the ejector
+ * left to answer alone the port's first frame lands at (44.485, 342.891)
+ * against the machine's own RAM read-back of (44.481, 342.932) — 0.004 px on x,
+ * 0.041 px on y — and the ball is out of the pocket in seven frames and drained
+ * in 144, which is what the machine does.
+ *
+ * `flippers.ts` still owns the lift everywhere the ejector does not fire, which
+ * is every blade in mid-air: the ejector is reached only through the map's own
+ * probe, so a ball on a blade over bare playfield never sees it and `separate`
+ * is its only way out of the body. Nothing else about the pass changes — the
+ * impulse, the surface row, the approach side and the contact report are all
+ * taken exactly as before.
  */
-export type BatPassResolver = (ball: BallState, pass: number) => void;
+export type BatPassResolver = (ball: BallState, pass: number, ejected: boolean) => void;
+
+/**
+ * THE BATS AS THE EJECTOR'S RING COUNTER SEES THEM — `map OR bat silhouette`.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY THE EJECTOR NEEDS ITS OWN VIEW OF THE BAT
+ * ---------------------------------------------------------------------------
+ * `+0x00B6BE` gates on `$c(a4)`, the number of ring points the collision blit
+ * lit, and inside a pose's box THAT BLIT IS THE UNION: `+0x00B278` blits the
+ * pose's own mask instead of the map's plane, and the mask has the map ORed into
+ * it at table load (`+0x0039FA`, `BLTCON0 = $0DFC`, `D = A OR B`). So the
+ * machine's ejector counts over `map ∪ bat` where this port's counts over the
+ * map alone, and at Law 'n Justice's buried-ball site (42.692, 341.999)L0 that
+ * is the difference between FIVE and SEVENTEEN against a gate of six: the
+ * machine walks the ball out of the channel at 1.6–1.8 px a frame and the port
+ * leaves it there for the rest of the game.
+ *
+ * Measured on the machine's own RAM, `research/pocket/POCKET_TRACE.md`: over a
+ * 1,097-point pinned ring scan, of the 383 positions whose ring reaches a
+ * resting bat the map model reproduces `$c(a4)` on 0 and the union model on 383;
+ * away from every bat the two are the same function and score identically. 310
+ * scanned positions eject on the machine with the port's map-only count under
+ * six. Replayed free-running from the machine's own frame-0 state, union +
+ * ejector tracks the escape to 0.265 px of mean error over 22 frames against
+ * 14.774 px for map + ejector and 11.600 px for the union with the ejector
+ * removed: both halves are necessary and together they are exact.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT THIS IS NOT
+ * ---------------------------------------------------------------------------
+ * It is NOT a contact model. The map probe runs exactly as it did, `flippers.ts`
+ * resolves the bat exactly as it did, the surface ids the scoring layer sees are
+ * the map's own (`+0x00AD4C` reads `$50(a4)` at the contact pixel whichever blit
+ * produced it), and nothing here writes a velocity. The one thing it feeds is
+ * the ejector's counter and the bearing that counter's push is taken along.
+ * Branch `union-mask-measured` (`d96a2cb`) wired the same geometry into
+ * `touchAt` and into map-probe suppression instead, and every variant of that
+ * which kept this port's invariants RAISED the census write-off count; POCKET_
+ * TRACE §7.2 is explicit that the union's job is somewhere else, and this is it.
+ *
+ * `reaches` is asked first, once per pass, so a ball nowhere near a blade pays a
+ * rectangle test and nothing else — and, more importantly, so the whole rule is
+ * provably inert away from bats, where map and union are the same set.
+ */
+export interface BatUnionMask {
+  /**
+   * Does a bat this ball can collide with stand within its ring's reach at this
+   * pass? False means the union IS the map probe and nothing more is read.
+   */
+  readonly reaches: (ball: BallState, pass: number) => boolean;
+  /** Is this playfield pixel inside one of those bats' union masks? */
+  readonly solidAt: (ball: BallState, pass: number, x: number, y: number) => boolean;
+}
 
 /** Tunables for one simulation. Every default is a chosen value, not a measured one. */
 export interface SimulationOptions {
@@ -523,6 +607,22 @@ export interface SimulationOptions {
    * there and a bat that is not resolved, which are the same thing.
    */
   readonly bats: BatPassResolver | null;
+  /**
+   * The bats' silhouettes as the EJECTOR counts them. See `BatUnionMask`.
+   *
+   * Null means "count the ejector's ring against the map alone", which is what
+   * this port did everywhere before the pocket round and is still exactly right
+   * for a simulation with no bats on it — every synthetic map in the suite, and
+   * the physics gate's corpus replay, which drives one frame at a time from the
+   * machine's own recorded states with `bats` null as well.
+   *
+   * Independent of `bats` on purpose, because the two answer different
+   * questions: `bats` decides what a blade does to a ball's velocity, this
+   * decides whether the ball is buried. A harness may legitimately want the
+   * first without the second (a bat swung over no table has no map to union
+   * with), and nothing here is meaningful without a table.
+   */
+  readonly batUnion: BatUnionMask | null;
 }
 
 /**
@@ -567,6 +667,7 @@ export const DEFAULT_SIMULATION_OPTIONS: SimulationOptions = {
   rampDrive: null,
   surfaces: null,
   bats: null,
+  batUnion: null,
 };
 
 interface ResolvedOptions {
@@ -580,6 +681,7 @@ interface ResolvedOptions {
   readonly rampDrive: TableAcceleration | null;
   readonly surfaces: SurfaceIdMap | null;
   readonly bats: BatPassResolver | null;
+  readonly batUnion: BatUnionMask | null;
 }
 
 /**
@@ -613,6 +715,7 @@ function resolveOptions(map: TableMap, options?: Partial<SimulationOptions>): Re
     rampDrive: options?.rampDrive ?? DEFAULT_SIMULATION_OPTIONS.rampDrive,
     surfaces: options?.surfaces ?? DEFAULT_SIMULATION_OPTIONS.surfaces,
     bats: options?.bats ?? DEFAULT_SIMULATION_OPTIONS.bats,
+    batUnion: options?.batUnion ?? DEFAULT_SIMULATION_OPTIONS.batUnion,
   };
 }
 
@@ -1436,15 +1539,16 @@ function respondAt(
   log: ContactLog,
   options: ResolvedOptions,
   surfaceAt: ((x: number, y: number) => number) | null,
-): void {
+  pass: number,
+): boolean {
   const probe = probeRing(map, materials, passable, ring, ball.x, ball.y);
   // Nothing under the ring means the machine never called the responder at all:
   // `jsr $a7e0 / bmi.b` at +0x00A68E skips it when the collision blit came back
   // empty, so no bounce, no spin charge and — since the ejector is the
   // responder's own last instruction — no ejection either.
-  if (probe.contactIndex < 0) return;
+  if (probe.contactIndex < 0) return false;
   logContacts(log, probe, materials);
-  if (probe.dominant === null) return;
+  if (probe.dominant === null) return false;
 
   // +0x00B54E, the leaving gate. Taken about the exact normal rather than the
   // ring entry, for the reason `outwardNormalOf` gives. A ball that is touching
@@ -1464,7 +1568,23 @@ function respondAt(
     );
   }
 
-  ejectBuried(ball, map, passable, probe);
+  // THE EJECTOR COUNTS OVER `map OR bat`, and the pass is what says which pose
+  // the bat is at. It is reached only from here, so it is reached only where the
+  // map probe found something — the machine's `jsr $a7e0 / bmi.b` on an empty
+  // blit is this port's `probe.contactIndex < 0` above. THE ONE DISCLOSED
+  // RESIDUAL: inside a pose's box the machine's blit is the union, so a ball
+  // resting on a blade over bare playfield gives it a non-empty buffer and a
+  // count of its own, where this port's map probe is empty and the responder is
+  // never called at all. Closing that means moving the responder's entry gate,
+  // which is the contact path and not the ejector; POCKET_TRACE §7.2's own
+  // minimum shape leaves the probe where it is and changes the count. What the
+  // gap costs is the bob a cradled ball would have (0.4922 px on the machine),
+  // never a ball left buried: `flippers.ts` still lifts a ball out of a blade
+  // by its own separation search.
+  //
+  // WHETHER IT FIRED IS THE PASS'S ANSWER, and the bat is told: see
+  // `BatPassResolver`'s `ejected`.
+  return ejectBuried(ball, map, passable, ring, probe, options.batUnion, pass);
 }
 
 
@@ -1942,6 +2062,20 @@ const RESPOND_EVERY = ORIGINAL_SUBSTEPS_PER_FRAME / ORIGINAL_COLLISION_PASSES_PE
  * dx -2..+2 — so the count crosses six only once the ball is a whole pixel row
  * into the surface, which is what "buried" means and what the sink between
  * collision passes eventually produces.
+ *
+ * AND THAT IS WHAT MAKES THE RULE SELF-LIMITING ON A BLADE, now that the count
+ * is taken over `map OR bat` (`BatUnionMask`). The count crosses six about a
+ * pixel into a surface and one half-pixel push takes it straight back under, so
+ * a cradled ball bobs rather than being walked off. Measured on the machine
+ * three ways: the shooter-lane seat holds `$c(a4) = 5` on all 2,996 recorded
+ * frames with 46 throw-backs of exactly 0.4922 px; BabeWatch's arch apex holds 5
+ * on 7,315 of 7,443 with 114 throw-backs of the same quantum and a `cy` that
+ * never once exceeds the row at which the count reaches six; and a ball on Law
+ * 'n Justice's resting lower-left blade rolls off at its own 0.5 px a frame with
+ * about one push every other frame. The pocket is different in kind rather than
+ * degree — there the blade passes THROUGH the ball, the count is 17 to 21, and
+ * half a pixel does not clear it, so all four passes push every frame until the
+ * ball is out.
  */
 const EJECTOR_MIN_RING_HITS = 6;
 /** `move.w #$fe00,d0` at +0x00B6CA: half a pixel, per substep, along the normal. */
@@ -1998,7 +2132,26 @@ const EJECTOR_PUSH_Q10: Q10 = Q10_ONE / 2;
  * of the ring's 44 and its single commonest value above 1 is exactly 5 — which
  * is how many points a discrete radius-8 circle puts on a flat floor it is
  * resting on (the bottom row is dx -2..+2). A count of anything else could not
- * produce that spike.
+ * produce that spike. It is also read off the evaluator directly: each lit ring
+ * point increments exactly two of the adjacent counters `d1..d4` at +0x00A9C4,
+ * and the cascade at +0x00ACF2 folds them to `2N` before `lsr.w #1` — so the
+ * `lsr` undoes the double tagging rather than scaling anything, `$c(a4)` is N on
+ * the same scale as `probe.contacts.length`, and the `divu.w d4,d5` that makes
+ * the mean bearing confirms it a second time.
+ *
+ * ---------------------------------------------------------------------------
+ * AND IT IS COUNTED OVER `map OR bat`, WHICH IS THE WHOLE OF THE POCKET DEFECT
+ * ---------------------------------------------------------------------------
+ * Both the gate and the bearing come from `unionRing` below, not from the map
+ * probe: inside a flipper pose's box the machine's collision blit IS the pose's
+ * mask with the collision plane ORed into it, so `$c(a4)` there counts ring
+ * points on the union. See `BatUnionMask` for the decode, the 383-of-383 scan
+ * and the free-running replay. At Law 'n Justice's (42.692, 341.999)L0 the map
+ * finds five points and the union seventeen; six is the gate; that one number is
+ * the whole of the census's 4-of-288 write-off.
+ *
+ * Nothing else about the rule moves. Away from a blade the union is the map and
+ * this is the same code it has always been.
  *
  * ---------------------------------------------------------------------------
  * WHAT IT REPLACES, AND WHY THE REPLACEMENT IS THE POINT
@@ -2034,24 +2187,128 @@ const EJECTOR_PUSH_Q10: Q10 = Q10_ONE / 2;
  * anti-tunnelling backstop at all. This port's is load-bearing and cheap here —
  * half a pixel samples one point — and in the case the ejector exists for, a
  * push straight out along the outward normal, it never clamps.
+ *
+ * IT DOES CLAMP IN ONE MEASURED PLACE, AND THAT IS THE ROUND'S DISCLOSED
+ * RESIDUAL. In Law 'n Justice's two-pixel diagonal channel beside the upper-left
+ * bat the ring straddles the wall and lights it on BOTH sides, so the mean
+ * bearing is degenerate and points along the wall rather than out of it —
+ * POCKET_TRACE reads 2004/2048 off the machine at (24,304) and this port's union
+ * gives 2003 — and the half pixel lands in the two pixels of wall on the far
+ * side. The MACHINE pushes the ball through it: the ball falls into the left
+ * gutter, leaves the playfield and is confiscated, so it does not give the ball
+ * back there either. Writing raw was tried this round and refused on its own
+ * measurement: it drives those balls into the off-playfield shaft at (8,388),
+ * which is a strand rather than a disposal, and the centre-in-solid invariant
+ * pays for the whole of `recoverPenetration`'s good behaviour elsewhere.
  */
 function ejectBuried(
   ball: BallState,
   map: TableMap,
   passable: readonly boolean[],
+  ring: RingOffsets,
   probe: RingProbe,
-): void {
-  if (probe.contacts.length < EJECTOR_MIN_RING_HITS) return;
+  union: BatUnionMask | null,
+  pass: number,
+): boolean {
+  const counted = unionRing(ball, map, ring, probe, union, pass);
+  if (counted.count < EJECTOR_MIN_RING_HITS) return false;
+  // THE MOVE, NOT THE GATE, is what the caller is told. `advanceCentre` refuses
+  // a push whose destination centre lands in solid material — which the machine,
+  // writing `$1e/$22` raw, never does — and a refused push has moved the ball
+  // nowhere at all. Reporting THAT as the pass's positional answer would take
+  // the bat's own lift away and put nothing in its place, leaving the ball with
+  // neither; so the bat keeps the pass wherever the ejector could not spend it.
+  //
+  // IT IS A CHOICE OF MEANING AND NOT OF MEASUREMENT, and it was measured to
+  // establish that: reading it the other way — the gate rather than the move —
+  // changes the outcome of 48 of the trap census's 121,639 releases and nothing
+  // else. Stated because the reverse would have been worth knowing.
+  //
   // `asr.l #14` against a 16384-amplitude table is a FLOOR; `>> 10` against this
   // port's own 1024-amplitude unit normal is the same operation at the same
   // scale as everything else the contact model does.
-  advanceCentre(
+  return advanceCentre(
     ball,
     map,
     passable,
-    (EJECTOR_PUSH_Q10 * probe.normalX) >> 10,
-    (EJECTOR_PUSH_Q10 * probe.normalY) >> 10,
+    (EJECTOR_PUSH_Q10 * counted.normalX) >> 10,
+    (EJECTOR_PUSH_Q10 * counted.normalY) >> 10,
   );
+}
+
+/** What the ejector gates on: `$c(a4)` and the `$28(a4)` its push is taken along. */
+interface UnionRing {
+  /** Ring points in material — map or bat. `$c(a4)`. */
+  readonly count: number;
+  /** Outward unit normal of their mean bearing, Q10. */
+  readonly normalX: number;
+  readonly normalY: number;
+}
+
+/**
+ * Scratch for the union's bearings, reused across passes.
+ *
+ * At most `ring.size` numbers and never escapes this module: `meanBearingOf`
+ * reads it and returns a scalar. A fresh array per collision pass per ball is
+ * four allocations a tick a ball for a rule that is inert on almost every one of
+ * them, and the census runs ten million ticks.
+ */
+const unionBearings: number[] = [];
+
+/**
+ * THE RING THE EJECTOR COUNTS: the map probe's own points, plus the ring points
+ * standing on a bat's silhouette.
+ *
+ * `probe` is the map's answer and it is never re-derived here — this walks the
+ * ring alongside `probe.contacts`, which `probeRing` fills in ascending ring
+ * order, and only asks the bat about the points the map did not claim. So the
+ * union is a SUPERSET OF THE MAP BY CONSTRUCTION: `count` can only ever be at or
+ * above `probe.contacts.length`, the ejector can only ever fire where it fired
+ * before or in addition, and no ball that this port used to push out can stop
+ * being pushed. That direction is the safe one and it is not an accident of the
+ * mask — see the scan in `BatUnionMask`, where the union costs six of 1,097
+ * positions in the other direction and all six are pin-drift artefacts.
+ *
+ * Points at or below the bottom map row are skipped exactly as `probeRing` skips
+ * them: that row is where a ball is supposed to leave the table, and a lower
+ * bat's mask window reaches past it.
+ *
+ * When the bat adds nothing the map probe is handed back untouched, so the
+ * bearing is bit-identical to the one this port has always ejected along — which
+ * is what makes the physics gate's corpus, and every position clear of a blade,
+ * unable to move.
+ */
+function unionRing(
+  ball: BallState,
+  map: TableMap,
+  ring: RingOffsets,
+  probe: RingProbe,
+  union: BatUnionMask | null,
+  pass: number,
+): UnionRing {
+  if (union === null || !union.reaches(ball, pass)) {
+    return { count: probe.contacts.length, normalX: probe.normalX, normalY: probe.normalY };
+  }
+  const centreX = q10ToPixel(ball.x);
+  const centreY = q10ToPixel(ball.y);
+  unionBearings.length = 0;
+  let next = 0;
+  for (let i = 0; i < ring.size; i += 1) {
+    const onMap = probe.contacts[next]?.ringIndex === i;
+    if (onMap) {
+      next += 1;
+    } else {
+      const py = centreY + numberAt(ring.dy, i);
+      if (py >= map.height) continue;
+      if (!union.solidAt(ball, pass, centreX + numberAt(ring.dx, i), py)) continue;
+    }
+    unionBearings.push(numberAt(ring.angle, i));
+  }
+  if (unionBearings.length === probe.contacts.length) {
+    return { count: probe.contacts.length, normalX: probe.normalX, normalY: probe.normalY };
+  }
+  const normal = outwardNormalOf(meanBearingOf(unionBearings));
+  return { count: unionBearings.length, normalX: normal.x, normalY: normal.y };
 }
 
 /**
@@ -2174,13 +2431,26 @@ function integrateBall(
     const velocityX = ball.velocityX;
     const velocityY = ball.velocityY;
     if (substep % RESPOND_EVERY === 0) {
-      respondAt(ball, map, materials, passable, ring, log, options, surfaceAt);
+      const pass = substep / RESPOND_EVERY;
+      const ejected = respondAt(
+        ball,
+        map,
+        materials,
+        passable,
+        ring,
+        log,
+        options,
+        surfaceAt,
+        pass,
+      );
       // THE BATS, at the machine's own pass and nowhere else. `+0x00B278` walks
       // the flipper records at the head of the very collision routine this
       // `respondAt` is the tail of, so a bat contact happens four times a frame
       // at the position the ball actually stands in — never once at the end of
-      // a tick the ball has already spent. See `BatPassResolver`.
-      options.bats?.(ball, substep / RESPOND_EVERY);
+      // a tick the ball has already spent. See `BatPassResolver`, including
+      // what `ejected` takes away from it and why that is one answer rather
+      // than two.
+      options.bats?.(ball, pass, ejected);
     }
 
     const stepX = ball.velocityX >> 3;
@@ -2308,6 +2578,41 @@ export function pushClampForMap(
     passabilityOf(materials),
     ringOffsetsFor(resolved.radius),
   );
+}
+
+/**
+ * "Is this pixel solid for a ball riding this level, AS THE RING SEES IT", for
+ * one map.
+ *
+ * Exported for the UNION MASKS: `flippers.ts` ORs the collision plane into each
+ * pose's mask at table load (`createBatUnionMasks`, the machine's `+0x0039FA`)
+ * and the plane it must OR is the one the ball is collided against — the SAME
+ * level view, with the same virtual top wall and the same passability, or the
+ * mask would carry pixels the map does not have or miss ones it does. Built from
+ * the identical public inputs `stepBalls` takes, so there is one definition of
+ * solid and the union cannot drift from the probe.
+ *
+ * INCLUDING THE BOTTOM ROW, which is not a detail. `probeRing` treats ring
+ * points at or below the last map row as OPEN — that row is where the ball
+ * leaves the table — while `materialAt` answers the solid out-of-bounds border
+ * there. A lower bat's pose window reaches about forty rows past the bottom of a
+ * 600-row map, so a mask built on `materialAt` alone would light every ring
+ * point under a ball near the drain and hand the ejector a count it invented.
+ * The rule is copied here rather than referenced because the two are the same
+ * rule and there is no third place to put it.
+ */
+export function levelSolidForMap(
+  map: TableMap,
+  materials: MaterialTable,
+  options?: Partial<SimulationOptions>,
+): (level: PlayfieldLevel, x: number, y: number) => boolean {
+  const resolved = resolveOptions(map, options);
+  const views = levelViewsFor(map, resolved.topWallRows);
+  const passable = passabilityOf(materials);
+  return (level: PlayfieldLevel, x: number, y: number): boolean => {
+    if (y >= map.height) return false;
+    return !flagAt(passable, viewForLevel(views, level).materialAt(x, y));
+  };
 }
 
 function pushClampFor(

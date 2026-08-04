@@ -105,6 +105,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import {
   createBallSet,
+  levelSolidForMap,
   pushClampForMap,
   spawnBall,
   stepBalls,
@@ -113,9 +114,12 @@ import {
 } from "../src/game/ball-physics.js";
 import {
   UPPER_FLIPPER_RECORDS,
+  batUnionMaskFor,
+  createBatUnionMasks,
   createFlipperApproachSides,
   createFlipperBank,
   createFlipperPass,
+  flipperConfigsFor,
   flipperInputFrom,
   tickFlipperBank,
 } from "../src/game/flippers.js";
@@ -771,6 +775,16 @@ function trapCensus(tableId: TableId, level: 0 | 1, step: number): TrapCensus {
     flipperInputFrom(false, false, UPPER_FLIPPER_RECORDS[tableId].role),
   ).sweeps;
   const clamp = pushClampForMap(map, materials, options);
+  // AND THE EJECTOR'S OWN VIEW OF THOSE BATS, which is not optional either and
+  // for a sharper version of the same reason: the two Law 'n Justice pockets
+  // this census exists to name are pockets the machine's ejector walks a ball
+  // out of, and it can only do that because it counts its ring over `map OR
+  // bat` (`+0x0039FA`). A census run with `batUnion` null measures a port that
+  // is not the one the game loop ships. See `BatUnionMask` in `ball-physics.ts`.
+  const batUnion = batUnionMaskFor(
+    batSweeps,
+    createBatUnionMasks(flipperConfigsFor(tableId), levelSolidForMap(map, materials, options)),
+  );
   const sites = new Map<string, number>();
   let starts = 0;
   let drained = 0;
@@ -792,7 +806,11 @@ function trapCensus(tableId: TableId, level: 0 | 1, step: number): TrapCensus {
       const bats = createFlipperPass(batSweeps, undefined, clamp, undefined, createFlipperApproachSides());
       let gone = false;
       for (let tick = 0; tick < TRAP_TICKS; tick += 1) {
-        const result = stepBalls(set, map, materials, forces, { ...options, bats: bats.resolve });
+        const result = stepBalls(set, map, materials, forces, {
+          ...options,
+          bats: bats.resolve,
+          batUnion,
+        });
         if (result.drained.length > 0) {
           gone = true;
           break;

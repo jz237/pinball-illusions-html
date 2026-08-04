@@ -573,6 +573,9 @@ export interface RingProbe extends ContactResult {
  * `outwardNormalOf` turns the answer into a vector. Nothing snaps.
  */
 export function meanContactAngle(contacts: readonly ContactPoint[]): number {
+  if (contacts.length === 0) {
+    throw new RangeError("mean contact angle of an empty contact set");
+  }
   let sum = 0;
   let quadrants = 0;
   let belowHalfTurn = 0;
@@ -582,13 +585,53 @@ export function meanContactAngle(contacts: readonly ContactPoint[]): number {
     quadrants |= 1 << (angle >> 9);
     if (angle < ANGLE_HALF_TURN) belowHalfTurn += 1;
   }
-  if (contacts.length === 0) {
+  return meanOfBearings(sum, contacts.length, quadrants, belowHalfTurn);
+}
+
+/**
+ * The same evaluator over BARE BEARINGS, for a contact set that is not a set of
+ * map pixels.
+ *
+ * There is exactly one such caller and it is the EJECTOR: the machine counts and
+ * averages its ring over `map OR the bat pose's silhouette` (`+0x0039FA` ORs the
+ * collision plane into every pose's mask at table load, and `+0x00B278`'s bat
+ * blit then replaces the map blit), so the bearings that go into `$28(a4)` there
+ * include ring points that lie on a blade and on no map pixel at all. Those
+ * points have no material and no surface id — `+0x00AD4C` still reads the map's
+ * own plane at the contact pixel — so they cannot be `ContactPoint`s, and a
+ * second copy of the wrap rule to average them with is precisely the drift this
+ * file exists to prevent. See `ejectBuried` in `ball-physics.ts`.
+ */
+export function meanBearingOf(angles: readonly number[]): number {
+  if (angles.length === 0) {
     throw new RangeError("mean contact angle of an empty contact set");
   }
+  let sum = 0;
+  let quadrants = 0;
+  let belowHalfTurn = 0;
+  for (const angle of angles) {
+    sum += angle;
+    quadrants |= 1 << (angle >> 9);
+    if (angle < ANGLE_HALF_TURN) belowHalfTurn += 1;
+  }
+  return meanOfBearings(sum, angles.length, quadrants, belowHalfTurn);
+}
+
+/**
+ * The evaluator's tail, +0x00ACD8..+0x00AD04: the three wrap masks and the
+ * truncating mean. One copy, so the two accumulators above cannot disagree about
+ * which quadrant masks get the correction.
+ */
+function meanOfBearings(
+  sum: number,
+  count: number,
+  quadrants: number,
+  belowHalfTurn: number,
+): number {
   if (quadrants === 0b1001 || quadrants === 0b1011 || quadrants === 0b1101) {
     sum += ANGLE_UNITS_PER_TURN * belowHalfTurn;
   }
-  return Math.trunc(sum / contacts.length) & (ANGLE_UNITS_PER_TURN - 1);
+  return Math.trunc(sum / count) & (ANGLE_UNITS_PER_TURN - 1);
 }
 
 /**

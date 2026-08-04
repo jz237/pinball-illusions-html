@@ -656,6 +656,30 @@ const TICKS = 4000;
  *   law-n-justice   77b68e4309949efa46c658ecd734a3deaf4d14a5265db0c8989b3f9056e1ea20
  *   babewatch       14a0ed019849b31805b1ea44a04c78cabb05820e2d32701a16fa7f8738506a56
  *   extreme-sports  e62fdc9f1c4611960822e138114666965120247dc8e347e06f0a1927894abefd
+ *
+ * NOT A RE-PIN — THE EJECTOR'S UNION COUNT (the pocket round). All three
+ * digests below are UNCHANGED by the round that made the ejector at +0x00B6BE
+ * count its ring over `map OR bat` (`BatUnionMask` in `ball-physics.ts`), and
+ * that is recorded here because a reader who knows the round moved the census
+ * would otherwise reasonably suspect this instrument of being blind to it.
+ *
+ * IT IS NOT BLIND; THE SCRIPT SIMPLY NEVER MEETS THE CASE. Instrumented over
+ * this pin's own 12,000 ticks — 4,000 on each table, through this exact harness
+ * — the ejector was reached with a blade anywhere within the ball's ring THREE
+ * times, and on none of those three did the union add a single ring point:
+ * reached 3, raised 0, fired 0. The reason is structural rather than lucky. The
+ * ejector is reached only through the MAP's own probe (`respondAt` returns on an
+ * empty blit), and the shipped collision layers carve the line OUT where a bat
+ * sweeps — 95 of 11,371 pixels under BabeWatch's lower-left bat, one under
+ * Extreme Sports' upper, none anywhere else — so a ball on a blade almost never
+ * has a map contact at the same moment. Where the two DO coincide is the pocket
+ * beside Law 'n Justice's upper-left bat, which this script never visits and
+ * which the 90-game census reaches on its own: the same counters, run over one
+ * release into that pocket, fire 3,609 times.
+ *
+ * So the change is live and is measured elsewhere — the census, the flipper
+ * probe, the trap census, and `tests/ball-spin.test.ts`'s own union counts
+ * against the machine's RAM — and it moves no byte of these three games.
  */
 const PINNED: Record<TableId, string> = {
   "law-n-justice": "a41f900e57cc38f3759aa0bca236600726e5ba3974d40a68def10c46bfce2493",

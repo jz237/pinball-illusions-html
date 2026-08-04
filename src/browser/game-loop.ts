@@ -153,6 +153,7 @@ import {
   createBallSet,
   freeBallCount,
   freeBalls,
+  levelSolidForMap,
   pruneInactiveBalls,
   pushClampForMap,
   stepBalls,
@@ -173,13 +174,16 @@ import {
 } from "../game/ball-locks.js";
 import { BALL_RADIUS_PIXELS, DEFAULT_PROBE_RADIUS } from "../game/collision-probe.js";
 import { SLINGSHOT_KICK } from "../game/surface-physics.js";
-import type { FlipperApproachSides, FlipperBank } from "../game/flippers.js";
+import type { BatUnionMasks, FlipperApproachSides, FlipperBank } from "../game/flippers.js";
 import {
   UPPER_FLIPPER_RECORDS,
   applyFlipperReactions,
+  batUnionMaskFor,
+  createBatUnionMasks,
   createFlipperApproachSides,
   createFlipperBank,
   createFlipperPass,
+  flipperConfigsFor,
   flipperInputFrom,
   isFullyFlipped,
   tickFlipperBank,
@@ -716,6 +720,13 @@ export interface Game {
   /** The map's push clamp, built on first use. See `pushClampFor`. */
   pushClamp: PushClamp | null;
   /**
+   * The bats' UNION MASKS — each pose's own pixels with this table's collision
+   * plane ORed in, which is what the machine builds at `+0x0039FA` while the
+   * table loads. Built on first use and kept: it is per (table, bat, pose) and
+   * nothing about it can change while a table is up. See `batUnionsFor`.
+   */
+  batUnions: BatUnionMasks | null;
+  /**
    * Ticks until the auto-launcher fires the ball in the lane, or 0 when it is
    * not armed. Armed only for balls the machine owes itself.
    */
@@ -1008,6 +1019,7 @@ export function createGame(map: TableMap, options?: Partial<GameOptions>): Game 
     lockEjectStack: [],
     lockEjecting: null,
     pushClamp: null,
+    batUnions: null,
     autoLaunchCountdown: 0,
     ballsLocked: 0,
     scoring,
@@ -1192,6 +1204,28 @@ function restThresholdOf(game: Game): number {
 function pushClampFor(game: Game): PushClamp {
   game.pushClamp ??= pushClampForMap(game.map, game.materials, game.options.simulation);
   return game.pushClamp;
+}
+
+/**
+ * This table's UNION MASKS, built once and kept.
+ *
+ * The machine ORs the collision plane into every pose of every flipper record
+ * while the table is loading (`+0x0039FA`; see `createBatUnionMasks`), so this
+ * is the same work at the same moment in the same life-cycle — the first tick
+ * that needs a bat rather than the load itself only because this port has no
+ * single table-load seam, and the result is identical either way because both
+ * inputs are immutable for the life of the table.
+ *
+ * `levelSolidForMap` is the physics' OWN definition of solid, options and all,
+ * so the mask cannot carry a pixel the probe would not have found.
+ */
+function batUnionsFor(game: Game): BatUnionMasks {
+  game.batUnions ??= createBatUnionMasks(
+    flipperConfigsFor(game.map.tableId),
+    levelSolidForMap(game.map, game.materials, game.options.simulation),
+    ballRadiusOf(game),
+  );
+  return game.batUnions;
 }
 
 function cameraOptionsFor(game: Game): CameraOptions {
@@ -1579,6 +1613,13 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     // which is the original's gate at +0x00B216/+0x00B234.
     poweredKicksLive: poweredSurfacesLive(game.tilt),
     bats: bats.resolve,
+    // AND THE SAME BATS AGAIN, for the EJECTOR'S RING COUNT and nothing else:
+    // inside a pose's box the machine's collision blit is the pose's mask with
+    // the map ORed in, so `$c(a4)` at +0x00B6BE counts over `map OR bat`. Built
+    // from the same sweeps at the same poses as the resolver above, so the count
+    // and the contact cannot disagree about where the blade is. See
+    // `BatUnionMask` in `ball-physics.ts` and `research/pocket/POCKET_TRACE.md`.
+    batUnion: batUnionMaskFor(bankTick.sweeps, batUnionsFor(game), ballRadiusOf(game)),
   });
   // The step is where the two collision lines exchange balls (zone actions 10
   // and 11 and the surface hand-offs), so a line change across it IS a level

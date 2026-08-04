@@ -30,6 +30,7 @@ import { SIMULATION_GRAVITY } from "../src/game/timebase.js";
 
 import type {
   MaterialIndex,
+  PlayfieldLevel,
   SimulationForces,
   TableId,
   TableMap,
@@ -37,15 +38,37 @@ import type {
 import { PLAYFIELD_HEIGHT, PLAYFIELD_WIDTH } from "../src/game/contracts.js";
 import { SOLID_BORDER_INDEX, materialTableFor } from "../src/game/materials.js";
 import { Q10_ONE, pixelsToQ10, q10Multiply } from "../src/core/fixed-point.js";
-import { probeContacts } from "../src/game/collision-probe.js";
+import {
+  PROBE_RING,
+  meanBearingOf,
+  outwardNormalOf,
+  probeContacts,
+} from "../src/game/collision-probe.js";
+import type { BallSet } from "../src/game/ball-physics.js";
 import {
   DEFAULT_SIMULATION_OPTIONS,
   createBall,
   createBallSet,
   integerSqrt,
+  levelSolidForMap,
+  pushClampForMap,
   reflectVelocity,
   stepBalls,
 } from "../src/game/ball-physics.js";
+import {
+  UPPER_FLIPPER_RECORDS,
+  batUnionSolid,
+  batUnionMaskFor,
+  createBatUnionMasks,
+  createFlipperApproachSides,
+  createFlipperBank,
+  createFlipperPass,
+  flipperConfigsFor,
+  flipperInputFrom,
+  flipperPoseAt,
+  tickFlipperBank,
+} from "../src/game/flippers.js";
+import { accelFor, devicesFor, flipperBatsFixture, mapFor } from "./table-fixtures.js";
 import {
   ORIGINAL_SPIN_UNIT_Q10,
   RESPONDER_VELOCITY_SCALE,
@@ -471,6 +494,330 @@ describe("the ejector, +0x00B6BE", () => {
     const ball = createBall(0, pixelsToQ10(160), pixelsToQ10(40), 0, 0);
     stepBalls(createBallSet([ball]), FLOORED, MATERIALS, NO_FORCES, {});
     expect(ball.y).toBe(pixelsToQ10(40));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// +0x0039FA and +0x00B278 — the count is taken over `map OR bat`
+// ---------------------------------------------------------------------------
+
+/**
+ * THE EJECTOR'S RING IS COUNTED OVER THE UNION OF THE MAP AND THE BAT.
+ *
+ * `+0x00B278` blits the flipper pose's own mask INSTEAD of the playfield plane
+ * whenever the pose's box admits the ball, and `+0x0039FA` has ORed the
+ * collision plane into that mask at table load. So `$c(a4)` — the count
+ * +0x00B6BE gates on — is a count over `map OR bat`, and this port counted the
+ * map alone.
+ *
+ * WHAT MAKES THIS FALSIFIABLE rather than a plausible re-reading: the machine's
+ * own `$c(a4)` was read out of RAM at 1,097 pinned positions on Law 'n Justice
+ * (`research/pocket/POCKET_TRACE.md` §4.3). Of the 383 whose ring reaches a
+ * resting bat the map model reproduced it on ZERO and the union model on ALL
+ * 383; of the 714 clear of every bat the two models are the same function and
+ * scored identically. The counts below are that scan's own numbers at the sites
+ * it named, asserted against the SHIPPED assets — this port's map, this port's
+ * pose bank, this port's ring — so a change to any of the three that broke the
+ * agreement would fail rather than drift.
+ */
+describe("the ejector counts over `map OR bat`, +0x0039FA / +0x00B278", () => {
+  /**
+   * The union masks and the level-solid oracle for one shipped table, built
+   * once. Memoised because it is what the game does — `+0x0039FA` runs at table
+   * LOAD — and because a sweep that rebuilds nineteen pose masks per position
+   * spends its whole budget on the same answer.
+   */
+  const fixtures = new Map<TableId, ReturnType<typeof buildUnionFixture>>();
+  function buildUnionFixture(tableId: TableId) {
+    flipperBatsFixture();
+    const map = mapFor(tableId);
+    const materials = materialTableFor(tableId);
+    const solid = levelSolidForMap(map, materials);
+    const configs = flipperConfigsFor(tableId);
+    return { map, configs, masks: createBatUnionMasks(configs, solid), solid };
+  }
+  function unionFixture(tableId: TableId): ReturnType<typeof buildUnionFixture> {
+    const found = fixtures.get(tableId);
+    if (found !== undefined) return found;
+    const built = buildUnionFixture(tableId);
+    fixtures.set(tableId, built);
+    return built;
+  }
+
+  /** `(map ring hits, union ring hits)` at a whole-pixel centre, bats at REST. */
+  function countsAt(
+    tableId: TableId,
+    level: PlayfieldLevel,
+    centreX: number,
+    centreY: number,
+  ): { readonly map: number; readonly union: number } {
+    const { map, configs, masks, solid } = unionFixture(tableId);
+    let onMap = 0;
+    let onUnion = 0;
+    for (let i = 0; i < PROBE_RING.size; i += 1) {
+      const x = centreX + (PROBE_RING.dx[i] ?? 0);
+      const y = centreY + (PROBE_RING.dy[i] ?? 0);
+      // `probeRing`'s own rule: the bottom row is where a ball leaves the table.
+      if (y >= map.height) continue;
+      const hitMap = solid(level, x, y);
+      if (hitMap) onMap += 1;
+      const hitBat = configs.some((config) => {
+        if (config.level !== level) return false;
+        const pose = masks.get(config.id)?.get(flipperPoseAt(config, 0));
+        return pose !== undefined && batUnionSolid(pose, x, y);
+      });
+      if (hitMap || hitBat) onUnion += 1;
+    }
+    return { map: onMap, union: onUnion };
+  }
+
+  it("reproduces the machine's own counts at all four Law 'n Justice pocket sites", () => {
+    // POCKET_TRACE §4.3, `map-only ring hits / union ring hits` at the ball's
+    // own integer centre. Six is the gate: not one of these four reaches it on
+    // the map and all four clear it on the union, which is the whole of the
+    // census's 4-of-288 write-off.
+    expect(countsAt("law-n-justice", 0, 24, 304)).toEqual({ map: 4, union: 15 });
+    expect(countsAt("law-n-justice", 0, 25, 307)).toEqual({ map: 4, union: 15 });
+    expect(countsAt("law-n-justice", 0, 33, 322)).toEqual({ map: 3, union: 18 });
+    expect(countsAt("law-n-justice", 0, 42, 341)).toEqual({ map: 5, union: 17 });
+  });
+
+  it("is the map itself where no blade is within the ring's reach", () => {
+    // BabeWatch's arch apex, POCKET_TRACE §8: the nearest bat rests at (189,107)
+    // with a silhouette that stops well short of this ring, so map and union are
+    // the same function and give the same three numbers the machine gives.
+    expect(countsAt("babewatch", 0, 252, 57)).toEqual({ map: 3, union: 3 });
+    expect(countsAt("babewatch", 0, 252, 58)).toEqual({ map: 5, union: 5 });
+    expect(countsAt("babewatch", 0, 252, 59)).toEqual({ map: 7, union: 7 });
+  });
+
+  it("can never count FEWER points than the map probe alone", () => {
+    // The safety property the whole change rests on: the union is a superset by
+    // construction, so the ejector can only ever fire where it fired before or
+    // in addition, and no ball this port used to push out can stop being pushed.
+    // Swept over the pocket block and the whole of the upper-left bat, which is
+    // the block POCKET_TRACE's own ring scan covers.
+    let raised = 0;
+    for (let y = 292; y <= 360; y += 2) {
+      for (let x = 16; x <= 64; x += 2) {
+        const at = countsAt("law-n-justice", 0, x, y);
+        expect(at.union).toBeGreaterThanOrEqual(at.map);
+        if (at.union > at.map) raised += 1;
+      }
+    }
+    // And it is not vacuous: the bat really is under a large part of that block.
+    expect(raised).toBeGreaterThan(100);
+  });
+
+  it("crosses the six-hit gate a PIXEL into a blade, which is what makes it self-limiting", () => {
+    // POCKET_TRACE §7.3. A ball resting ON a blade must not be walked off it,
+    // and the reason it is not is that the count only reaches six once the ball
+    // is a pixel in — one half-pixel push takes it straight back under. Law 'n
+    // Justice's lower-left blade at rest, x = 108, by ball-centre row: the
+    // machine's own `cradlegeom` reads 0, 0, 6, 9, 11, 13 down its own rows and
+    // this is that same staircase against the drawn blade this port collides on.
+    const { map, masks, configs, solid } = unionFixture("law-n-justice");
+    const blade = configs.find((config) => config.id === "lower-left");
+    if (blade === undefined) throw new Error("law-n-justice has no lower-left bat");
+    const pose = masks.get(blade.id)?.get(flipperPoseAt(blade, 0));
+    const countAt = (cy: number): number => {
+      let hits = 0;
+      for (let i = 0; i < PROBE_RING.size; i += 1) {
+        const x = 108 + (PROBE_RING.dx[i] ?? 0);
+        const y = cy + (PROBE_RING.dy[i] ?? 0);
+        if (y >= map.height) continue;
+        if (solid(0, x, y) || (pose !== undefined && batUnionSolid(pose, x, y))) hits += 1;
+      }
+      return hits;
+    };
+    expect([550, 551, 552, 553, 554, 555, 556].map(countAt)).toEqual([0, 0, 0, 6, 9, 11, 13]);
+  });
+});
+
+/**
+ * THE BURIED BALL, END TO END: the pocket the census wrote four balls off in.
+ *
+ * These drive `stepBalls` the way the game loop drives it — the resting bank's
+ * four passes, the map's own push clamp, the table's ramp drive and its surface
+ * layer — and differ from each other in exactly one option, `batUnion`. That is
+ * the whole experiment: with the machine's own count the ball leaves, with this
+ * port's map-only count it does not, and nothing else about the tick changes.
+ */
+describe("the buried-ball ejector, against the shipped tables", () => {
+  interface Rig {
+    readonly step: (set: BallSet, union: boolean) => void;
+  }
+
+  function rigFor(tableId: TableId): Rig {
+    flipperBatsFixture();
+    const map = mapFor(tableId);
+    const materials = materialTableFor(tableId);
+    const options = { rampDrive: accelFor(tableId), surfaces: devicesFor(tableId) };
+    const sweeps = tickFlipperBank(
+      createFlipperBank(tableId),
+      flipperInputFrom(false, false, UPPER_FLIPPER_RECORDS[tableId].role),
+    ).sweeps;
+    const clamp = pushClampForMap(map, materials, options);
+    const masks = createBatUnionMasks(
+      flipperConfigsFor(tableId),
+      levelSolidForMap(map, materials, options),
+    );
+    const sides = createFlipperApproachSides();
+    const batUnion = batUnionMaskFor(sweeps, masks);
+    return {
+      step(set: BallSet, union: boolean): void {
+        const bats = createFlipperPass(sweeps, undefined, clamp, undefined, sides);
+        stepBalls(set, map, materials, GRAVITY, {
+          ...options,
+          bats: bats.resolve,
+          batUnion: union ? batUnion : null,
+        });
+      },
+    };
+  }
+
+  /** The port's own dead-stop position, at the Q10 the machine was written at. */
+  const POCKET_X = Math.round(42.692 * Q10_ONE);
+  const POCKET_Y = Math.round(341.999 * Q10_ONE);
+
+  it("leaves Law 'n Justice's pocket, and does NOT on the map-only count", () => {
+    const rig = rigFor("law-n-justice");
+
+    const stuck = createBall(0, POCKET_X, POCKET_Y, 0, 0);
+    const stuckSet = createBallSet([stuck]);
+    for (let tick = 0; tick < 200; tick += 1) rig.step(stuckSet, false);
+    // The defect, pinned: the ball settles half a pixel from where it was put
+    // down and stays there for the rest of the game. (Dead still to the Q10
+    // with no bat resolved at all; with the bat's own separation running it
+    // creeps 0.2 px into the corner of the channel and stops.)
+    expect(stuck.active).toBe(true);
+    expect(Math.abs(stuck.x - POCKET_X)).toBeLessThan(Q10_ONE);
+    expect(Math.abs(stuck.y - POCKET_Y)).toBeLessThan(Q10_ONE);
+
+    const freed = createBall(0, POCKET_X, POCKET_Y, 0, 0);
+    const freedSet = createBallSet([freed]);
+    let drainedAt = -1;
+    for (let tick = 0; tick < 400 && drainedAt < 0; tick += 1) {
+      rig.step(freedSet, true);
+      if (!freed.active) drainedAt = tick;
+    }
+    // The machine walks it out at 1.6–1.8 px a frame, clears the wall in seven,
+    // crosses the flipper line at 102 and is past y = 560 at 188. This port only
+    // has to STOP HOLDING IT: the ball leaves the pocket and reaches the drain
+    // rather than sitting there until the ball search retires it.
+    expect(drainedAt).toBeGreaterThan(0);
+  });
+
+  it("moves the ball on the FIRST tick, along the outward contact bearing", () => {
+    // The machine's own first read-back, one PAL frame after the write, is
+    // already at (44.481, 342.932) — down and to the right, out of the channel.
+    // The push is four half-pixels a frame along a bearing of 206.7°, whose
+    // outward normal is (+0.893, +0.450).
+    const rig = rigFor("law-n-justice");
+    const ball = createBall(0, POCKET_X, POCKET_Y, 0, 0);
+    rig.step(createBallSet([ball]), true);
+    expect(ball.x - POCKET_X).toBeGreaterThan(Q10_ONE);
+    expect(ball.y).toBeGreaterThanOrEqual(POCKET_Y);
+  });
+
+  it("does NOT free the rest of the cluster, and the residual is the CLAMP", () => {
+    // THE DISCLOSED RESIDUAL, pinned so the next round starts from a fact.
+    //
+    // Higher up the same two-pixel diagonal channel the ejector fires — the
+    // union counts 15 to 18 against a gate of six — and the ball still does not
+    // leave, because the mean bearing there is DEGENERATE. The ring straddles
+    // the channel and lights it on both sides, so the mean points nearly along
+    // the wall: POCKET_TRACE §3.2 measures 2004/2048 = 352.3° at (24,304) and
+    // this port's union gives 2003, an outward normal of (-0.990, +0.138) —
+    // straight into the two pixels of wall on the far side.
+    //
+    // The MACHINE ejects the ball THROUGH that wall: it writes `$1e/$22` raw at
+    // +0x00B6DC and has no anti-tunnelling test at all, so the ball lands in the
+    // left gutter, falls to x = 8, leaves the playfield and is confiscated
+    // (`$09 -> $FF`). It does not hold the ball there; it disposes of it, and
+    // this port's ball search disposes of it too, by the other route. THIS PORT
+    // refuses the push instead, because `advanceCentre` may not put a centre
+    // inside solid material — and that invariant is load-bearing: letting the
+    // ejector write raw was measured this round and it drives these balls into
+    // the off-playfield shaft behind the wall at (8,388), which is a strand site
+    // rather than a disposal.
+    //
+    // So what is asserted is the SHAPE of the residual: the count is over the
+    // gate, and the step the gate authorises lands in material.
+    const { map, masks, configs, solid } = (() => {
+      flipperBatsFixture();
+      const table = mapFor("law-n-justice");
+      const materials = materialTableFor("law-n-justice");
+      const at = levelSolidForMap(table, materials);
+      const list = flipperConfigsFor("law-n-justice");
+      return { map: table, masks: createBatUnionMasks(list, at), configs: list, solid: at };
+    })();
+    for (const [x, y] of [
+      [24, 304],
+      [25, 307],
+      [33, 322],
+    ] as const) {
+      const bearings: number[] = [];
+      for (let i = 0; i < PROBE_RING.size; i += 1) {
+        const px = x + (PROBE_RING.dx[i] ?? 0);
+        const py = y + (PROBE_RING.dy[i] ?? 0);
+        if (py >= map.height) continue;
+        const hit =
+          solid(0, px, py) ||
+          configs.some((config) => {
+            if (config.level !== 0) return false;
+            const pose = masks.get(config.id)?.get(flipperPoseAt(config, 0));
+            return pose !== undefined && batUnionSolid(pose, px, py);
+          });
+        if (hit) bearings.push(PROBE_RING.angle[i] ?? 0);
+      }
+      expect(bearings.length).toBeGreaterThanOrEqual(6);
+      const normal = outwardNormalOf(meanBearingOf(bearings));
+      const stepX = x + normal.x / (2 * Q10_ONE);
+      const stepY = y + normal.y / (2 * Q10_ONE);
+      expect(solid(0, Math.floor(stepX), Math.floor(stepY)), `(${x},${y})`).toBe(true);
+    }
+  });
+
+  it("does NOT free BabeWatch's (252,57), because the machine cannot either", () => {
+    // POCKET_TRACE §8, and this is a REGRESSION TEST FOR A SITE THAT IS ALREADY
+    // FAITHFUL. A ball written into the machine's own record at rest on the apex
+    // of that rubber arch sinks two pixels and then bobs over a 0.4922 px band
+    // for 7,500 consecutive PAL frames — 150 seconds, 114 ejector throw-backs —
+    // and never leaves. No bat is within reach, so map and union are the same
+    // function there (see the counts above) and the port's map-only probe was
+    // already the machine's own answer. A change that "fixed" this site would be
+    // a regression away from the original rather than a repair.
+    const rig = rigFor("babewatch");
+    const ball = createBall(0, pixelsToQ10(252), pixelsToQ10(57), 0, 0);
+    const set = createBallSet([ball]);
+    for (let tick = 0; tick < 900; tick += 1) rig.step(set, true);
+    expect(ball.active).toBe(true);
+    expect(Math.abs(ball.x / Q10_ONE - 252)).toBeLessThan(2);
+    expect(ball.y / Q10_ONE).toBeLessThan(60);
+  });
+
+  it("does not walk a cradled ball off the blade it is lying on", () => {
+    // §7.3's invariant, driven rather than counted: a ball seated on the resting
+    // lower-left blade rolls down it at its own speed and off the end — which is
+    // what a ball on a down-sloped blade does — instead of being flung sideways
+    // by an ejector firing on every pass. The machine's own trace of exactly
+    // this (`L-cradle-LL-108-553`) covers 9.5 px in 19 frames, about half a
+    // pixel a frame, with about one push every other frame.
+    const rig = rigFor("law-n-justice");
+    const ball = createBall(0, pixelsToQ10(108), pixelsToQ10(553), 0, 0);
+    const set = createBallSet([ball]);
+    let travelled = 0;
+    for (let tick = 0; tick < 19; tick += 1) {
+      const wasX = ball.x;
+      const wasY = ball.y;
+      rig.step(set, true);
+      travelled += Math.hypot((ball.x - wasX) / Q10_ONE, (ball.y - wasY) / Q10_ONE);
+    }
+    // Nineteen frames of rolling, not of being thrown: the ejector's own quantum
+    // is half a pixel a pass, so four a frame for nineteen frames would be 38.
+    expect(travelled).toBeLessThan(20);
+    expect(ball.active).toBe(true);
   });
 });
 

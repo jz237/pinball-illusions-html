@@ -160,7 +160,7 @@ import type {
   PlayfieldLevel,
   TableId,
 } from "./contracts.js";
-import type { PushClamp } from "./ball-physics.js";
+import type { BatUnionMask, PushClamp } from "./ball-physics.js";
 import { DEFAULT_SIMULATION_OPTIONS, reflectVelocity } from "./ball-physics.js";
 import {
   ANGLE_UNITS_PER_TURN,
@@ -1391,10 +1391,17 @@ export function flipperEndpoints(
  * census write-offs 4 -> 3 at the same pocket cluster, drops the median from
  * 4,980,000 to 3,287,500, and withholds from the scoring layer surface ids the
  * machine reports whichever blit produced the contact (`+0x00AD4C` reads the
- * map's own surface plane at the contact pixel either way). Closing it properly
- * means building the union mask the machine builds — the level view's own
- * pixels ORed into each pose at load time — and that is a round of its own.
- * It is named here so this is not read as claiming the bat is now exact.
+ * map's own surface plane at the contact pixel either way).
+ *
+ * THE UNION MASK IS NOW BUILT — `createBatUnionMasks` below is the level view's
+ * own pixels ORed into each pose at load, exactly as `+0x0039FA` builds one —
+ * AND IT DOES NOT FEED THIS. It feeds the EJECTOR's ring count and nothing else
+ * (`BatUnionMask` in `ball-physics.ts`), which is where the machine's own RAM
+ * says the difference actually bites. Wiring it into `touchAt` and into pass
+ * suppression is `d96a2cb`, and every variant of that which kept this port's
+ * invariants made the census worse. So the deviation above still stands FOR THE
+ * CONTACT — a ball touching both still gets two answers — and it is named here
+ * so that neither half is read as claiming the other.
  */
 function batStrokeShapeOf(config: FlipperConfig): BatStrokeShape {
   return {
@@ -1427,6 +1434,283 @@ function batBodyOf(config: FlipperConfig, stroke: number): BatPoseBody {
     q10ToPixel(config.pivotX),
     q10ToPixel(config.pivotY),
   );
+}
+
+// ---------------------------------------------------------------------------
+// THE UNION MASK — what the EJECTOR'S ring counter sees
+// ---------------------------------------------------------------------------
+
+/**
+ * THE COLLISION MAP, ORed INTO EVERY POSE'S MASK AT TABLE LOAD.
+ *
+ * ---------------------------------------------------------------------------
+ * THE INSTRUCTIONS
+ * ---------------------------------------------------------------------------
+ * `main.seg00 +0x003948` is the per-pose mask builder, called once for every
+ * pose of every flipper record while the TABLE is loading (the loop at
+ * `+0x003882`/`+0x0038E0` walks `$8(a4)`..`$6(a4)`, stores the four-word box it
+ * returns into the record's own `$FA + pose*8` table and steps `a6` by 8, and
+ * `+0x00390E`'s `lea $1fa(a4),a4` steps to the next record — the same `$1FA`
+ * stride `+0x00B432` walks at collision time, which is what identifies `a4`
+ * here as the flipper record). It ORs the drawn planes together into the
+ * silhouette this module already builds, and then, at `+0x0039FA`:
+ *
+ *     0039 fa  movea.l $1c(a4), a2        ; THE COLLISION PLANE
+ *     0039 fe  mulu.w  #$2a, d4           ; times 42 bytes a row: the MAP's stride
+ *     003a 02  ...+ (x >> 4) * 2, so a2 is the map at the mask's own top-left...
+ *     003a 24  ori.w   #$dfc, d2          ; BLTCON0 = shift<<12 | $0DFC
+ *     003a 4a  BLTAPT = a2                ; A = the map window
+ *     003a 4e  BLTBPT = a1                ; B = the pose's mask
+ *     003a 52  BLTDPT = a1                ; D = the pose's mask, IN PLACE
+ *              BLTAMOD $1C (14+28 = the map's 42), BLTBMOD/BLTDMOD -2, width 7
+ *
+ * `$0DFC` is USEA|USEB|USED with minterm byte `$FC`, and `$FC` is 1 for every
+ * (A,B,C) with A or B set: **D = A OR B**. So the map is ORed into the pose's
+ * own mask, in place, at load, and the buffer `+0x00B278` blits the ball's ring
+ * against at collision time — the buffer `$c(a4)` counts and `$28(a4)` averages
+ * — is the UNION of the blade and the local playfield.
+ *
+ * ---------------------------------------------------------------------------
+ * WHICH PLANE, AND WHETHER IT IS PER LEVEL. IT IS PER LEVEL.
+ * ---------------------------------------------------------------------------
+ * The source is `$1c(a4)` — a LONG on the flipper record — and that is the same
+ * word the collision walk gates on: `+0x00B2AC` loads the ball's `$54(a4)` and
+ * `+0x00B2B0`'s `cmp.l $1c(a0),d2 / bne $b432` steps to the next record when
+ * they differ. And `$54(a4)` is not a level NUMBER: `+0x00B43A`, the map blit,
+ * does `movea.l $54(a4), a1` and blits the ring against it directly, so the
+ * ball's `$54` IS the base address of the collision plane it collides on.
+ *
+ * So the record's `$1c` is a POINTER TO ONE COLLISION PLANE, the "level gate" is
+ * literally "is this bat on the plane this ball collides against", and the plane
+ * ORed into that bat's masks is by construction that same plane. There is no
+ * both-levels union anywhere: a level-0 bat carries bit 0's line and a level-1
+ * bat carries bit 1's. This port's `FlipperConfig.level` is that pointer's
+ * identity and `LevelSolidAt` is asked for exactly it.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT THIS IS FOR, AND WHAT IT IS NOT FOR
+ * ---------------------------------------------------------------------------
+ * It feeds the EJECTOR at `+0x00B6BE` and nothing else — `ball-physics.ts`'s
+ * `BatUnionMask` and `unionRing`. `touchAt` below is untouched, the bat still
+ * collides on the pixels it draws, the map probe still runs on every pass, and
+ * the surface ids the scoring layer sees are still the map's own.
+ *
+ * That boundary is measured rather than tidy. Branch `union-mask-measured`
+ * (`d96a2cb`) built this same mask and wired it into `touchAt` and into
+ * suppression of the pass's map probe, and every variant that kept this port's
+ * invariants made things worse: a bat allowed to answer for a wall it is merely
+ * standing beside took the Law 'n Justice census write-offs from 4 of 288 to 9,
+ * with two new ends in the off-playfield shaft behind the 2 px wall beside the
+ * upper-left bat, and the pass-suppression half withheld surface ids the machine
+ * reports whichever blit produced the contact. `research/pocket/POCKET_TRACE.md`
+ * §7.2 says where the union does belong, in one line: not to decide bat
+ * contacts, but to feed the ejector's counter.
+ *
+ * ---------------------------------------------------------------------------
+ * THE WINDOW
+ * ---------------------------------------------------------------------------
+ * The machine's mask is the pose's 64-px-wide sprite padded to 12-byte (96 px)
+ * rows with the sprite at x=16, and `h+32` rows with the sprite at row 16 —
+ * `+0x003960`'s `adda.w #$c2,a1` is row 16, word 1 of a 12-byte row, and
+ * `+0x0039D0`'s `addi.w #$803,d6` is `(32<<6)+3`, i.e. 32 more rows and 3 more
+ * words than the sprite blit. Sixteen pixels of margin on every side, which is
+ * exactly one ball, and the map window's top-left is that same padded top-left
+ * (`+0x0039E0`..`+0x0039EE` is `pivot - hotspot - 16` on both axes).
+ *
+ * THIS PORT SIZES IT BY THE RULE RATHER THAN COPYING THE CONSTANT, because the
+ * reader is this port's ring and not the machine's box: the mask must contain
+ * every pixel the ring of a ball CLOSE ENOUGH TO MATTER can stand on. "Close
+ * enough" is `reaches` below — the ring's own bounding box overlapping the
+ * blade's — so the furthest such a ring point can be from the blade is two ball
+ * radii, and that is the margin. A pixel outside the window is answered by the
+ * map probe, which is running anyway.
+ */
+export interface BatUnionPose {
+  /** Top-left playfield pixel of the window. */
+  readonly originX: number;
+  readonly originY: number;
+  readonly width: number;
+  readonly height: number;
+  /** Bytes a row: `ceil(width / 8)`, bit 0x80 leftmost, as the silhouette packs. */
+  readonly rowBytes: number;
+  /** The pose's own pixels OR the collision plane's, over the window. */
+  readonly bits: Uint8Array;
+  /** Tight playfield bounds of the BLADE's own pixels, inclusive. See `reaches`. */
+  readonly batLeft: number;
+  readonly batTop: number;
+  readonly batRight: number;
+  readonly batBottom: number;
+  /** Pixels the blade drew, and pixels the map's OR added, so a census can state its budget. */
+  readonly batPixels: number;
+  readonly mapPixels: number;
+}
+
+/** Every bat's union masks, keyed by `FlipperConfig.id` then by DRAWN pose. */
+export type BatUnionMasks = ReadonlyMap<string, ReadonlyMap<number, BatUnionPose>>;
+
+/**
+ * "Is this pixel solid for a ball riding this level" — the one thing the union
+ * needs from the table, taken as a callback so this module keeps knowing nothing
+ * about maps, materials or level views. `levelSolidForMap` in `ball-physics.ts`
+ * is the physics' own answer and is what a real table passes.
+ */
+export type LevelSolidAt = (level: PlayfieldLevel, x: number, y: number) => boolean;
+
+/** True when the union mask draws the PLAYFIELD pixel (x, y). */
+export function batUnionSolid(union: BatUnionPose, x: number, y: number): boolean {
+  const px = x - union.originX;
+  const py = y - union.originY;
+  if (px < 0 || py < 0 || px >= union.width || py >= union.height) return false;
+  return ((union.bits[py * union.rowBytes + (px >> 3)] ?? 0) & (0x80 >> (px & 7))) !== 0;
+}
+
+/**
+ * Builds the union masks for one table's bats, at LOAD, once.
+ *
+ * Deterministic and re-derivable: the inputs are the shipped pose bank, the
+ * shipped collision map and the material table's own passability, and nothing
+ * here is tuned. It is the machine's `+0x0039FA` moved to the place this port
+ * loads a table, and it changes no shipped asset — the pose bank stays one
+ * document for three tables, which it can only do while the map is NOT baked
+ * into it. The machine has the same split for the same reason: `flipdat1.bin`
+ * is shared and the OR happens per RECORD, after the table is chosen.
+ */
+export function createBatUnionMasks(
+  configs: readonly FlipperConfig[],
+  levelSolidAt: LevelSolidAt,
+  ballRadius: Q10 = DEFAULT_PROBE_RADIUS,
+): BatUnionMasks {
+  const radiusPixels = q10ToPixel(ballRadius);
+  const masks = new Map<string, Map<number, BatUnionPose>>();
+  for (const config of configs) {
+    const byPose = new Map<number, BatUnionPose>();
+    // Every stroke the bank can be at, including the near stop `batPoseForStroke`
+    // clamps: one pose per bat-angle step, which is what the animation writes.
+    // `batPoseForStroke` shifts the stroke down by a whole pose, so a stroke
+    // between two steps lands on one of these and the enumeration is complete.
+    for (let stroke = 0; stroke <= config.sweep; stroke += BAT_ANGLE_UNITS_PER_POSE) {
+      const body = batBodyOf(config, stroke);
+      if (byPose.has(body.pose)) continue;
+      byPose.set(body.pose, unionPoseOf(config, body, radiusPixels, levelSolidAt));
+    }
+    masks.set(config.id, byPose);
+  }
+  return masks;
+}
+
+function unionPoseOf(
+  config: FlipperConfig,
+  body: BatPoseBody,
+  radiusPixels: number,
+  levelSolidAt: LevelSolidAt,
+): BatUnionPose {
+  // The blade's own tight bounds, placed on the playfield, then the reach of the
+  // ring of any ball whose ring can touch them. See the header.
+  const batLeft = body.originX + body.silhouette.left;
+  const batTop = body.originY + body.silhouette.top;
+  const batRight = body.originX + body.silhouette.right;
+  const batBottom = body.originY + body.silhouette.bottom;
+  const margin = 2 * radiusPixels;
+  const originX = batLeft - margin;
+  const originY = batTop - margin;
+  const width = batRight - batLeft + 1 + 2 * margin;
+  const height = batBottom - batTop + 1 + 2 * margin;
+  const rowBytes = Math.ceil(width / 8);
+  const bits = new Uint8Array(rowBytes * height);
+  let batPixels = 0;
+  let mapPixels = 0;
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const px = originX + x;
+      const py = originY + y;
+      const bat = batBodySolid(body, px, py);
+      if (!bat && !levelSolidAt(config.level, px, py)) continue;
+      if (bat) batPixels += 1;
+      else mapPixels += 1;
+      const at = y * rowBytes + (x >> 3);
+      bits[at] = (bits[at] ?? 0) | (0x80 >> (x & 7));
+    }
+  }
+  return Object.freeze({
+    originX,
+    originY,
+    width,
+    height,
+    rowBytes,
+    bits,
+    batLeft,
+    batTop,
+    batRight,
+    batBottom,
+    batPixels,
+    mapPixels,
+  });
+}
+
+/** The union mask for a bat at a stroke. Throws for a bank built from other bats. */
+function unionAt(unions: BatUnionMasks, config: FlipperConfig, stroke: number): BatUnionPose {
+  const pose = flipperPoseAt(config, stroke);
+  const found = unions.get(config.id)?.get(pose);
+  if (found === undefined) {
+    throw new RangeError(
+      `flipper "${config.id}" reaches pose ${pose}, which its union mask bank does not ` +
+        `carry; the bank was built for other bats or for another table`,
+    );
+  }
+  return found;
+}
+
+/**
+ * THE BATS AS THE EJECTOR COUNTS THEM, for one tick's sweeps.
+ *
+ * Handed to `stepBalls` as its `batUnion` option beside `createFlipperPass`'s
+ * `resolve`, and read only by `unionRing` in `ball-physics.ts`. It answers two
+ * questions and neither of them is "what does the bat do to this ball":
+ *
+ *   `reaches`  could any blade this ball collides with be on its ring at all?
+ *              Rectangle against rectangle, once per collision pass. False —
+ *              which is almost always — and the ejector counts the map probe
+ *              exactly as it always has, so the whole rule is inert away from a
+ *              blade, where POCKET_TRACE's scan measured map and union to be the
+ *              same function on all 714 of its bat-free points.
+ *   `solidAt`  is this playfield pixel in one of those blades' union masks?
+ *
+ * THE POSE IS `poseStateAt`'s, the same one `resolveAtPass` collides against, so
+ * the count and the contact cannot disagree about where the bat is. THE LEVEL
+ * GATE is `+0x00B2B0`'s, the same one `createFlipperPass` applies.
+ */
+export function batUnionMaskFor(
+  sweeps: readonly FlipperSweep[],
+  unions: BatUnionMasks,
+  ballRadius: Q10 = DEFAULT_PROBE_RADIUS,
+): BatUnionMask {
+  const radiusPixels = q10ToPixel(ballRadius);
+  return {
+    reaches(ball: BallState, pass: number): boolean {
+      const centreX = q10ToPixel(ball.x);
+      const centreY = q10ToPixel(ball.y);
+      for (const sweep of sweeps) {
+        if (sweep.config.level !== ball.level) continue;
+        const pose = unionAt(unions, sweep.config, poseStateAt(sweep, pass).stroke);
+        if (centreX + radiusPixels < pose.batLeft || centreX - radiusPixels > pose.batRight) {
+          continue;
+        }
+        if (centreY + radiusPixels < pose.batTop || centreY - radiusPixels > pose.batBottom) {
+          continue;
+        }
+        return true;
+      }
+      return false;
+    },
+    solidAt(ball: BallState, pass: number, x: number, y: number): boolean {
+      for (const sweep of sweeps) {
+        if (sweep.config.level !== ball.level) continue;
+        const pose = unionAt(unions, sweep.config, poseStateAt(sweep, pass).stroke);
+        if (batUnionSolid(pose, x, y)) return true;
+      }
+      return false;
+    },
+  };
 }
 
 /**
@@ -1788,8 +2072,16 @@ function sideKey(ball: BallState, config: FlipperConfig): number {
  * loads it four times a frame and this port used to charge it once.
  */
 export interface FlipperPass {
-  /** `BatPassResolver`: one ball, one of the frame's four collision passes. */
-  readonly resolve: (ball: BallState, pass: number) => void;
+  /**
+   * `BatPassResolver`: one ball, one of the frame's four collision passes.
+   *
+   * `ejected` is whether the map's own responder already spent this pass's one
+   * positional answer on the ball — the ejector at `+0x00B6BE`, over a ring
+   * counted on `map OR bat`. Default false, for the harnesses that swing a bat
+   * over no table at all and therefore have no ejector to have fired. See
+   * `BatPassResolver` in `ball-physics.ts`.
+   */
+  readonly resolve: (ball: BallState, pass: number, ejected?: boolean) => void;
   /** Every contact resolved since this object was built, in pass order. */
   readonly contacts: readonly FlipperContact[];
 }
@@ -1817,7 +2109,7 @@ export function createFlipperPass(
   const memory = sides ?? createFlipperApproachSides();
   return {
     contacts,
-    resolve(ball: BallState, pass: number): void {
+    resolve(ball: BallState, pass: number, ejected = false): void {
       if (!ball.active) return;
       for (const sweep of sweeps) {
         // THE LEVEL GATE, and it is the machine's own: `cmp.l $1c(a0),d2 / bne`
@@ -1838,11 +2130,22 @@ export function createFlipperPass(
           clamp,
           restThreshold,
           memory,
+          ejected,
         );
         if (contact !== null) contacts.push(contact);
       }
     },
   };
+}
+
+/**
+ * The (pose, rate) a pass reads — one animation step EARLIER than the state that
+ * pass's `$bc24` is about to write. `resolveAtPass`'s header has the derivation;
+ * this is it as a function so the union's pose lookup and the contact's cannot
+ * come apart.
+ */
+function poseStateAt(sweep: FlipperSweep, pass: number): FlipperState {
+  return pass === 0 ? sweep.from : (sweep.steps[pass - 1] ?? sweep.from);
 }
 
 /**
@@ -1930,11 +2233,12 @@ function resolveAtPass(
   clamp: PushClamp | null,
   restThreshold: number,
   sides: FlipperApproachSides,
+  ejected: boolean,
 ): FlipperContact | null {
   const { config } = sweep;
   // See the header: the pose and rate a pass reads are the ones the animation
   // has not spent yet, so pass 0 is the tick's own starting state.
-  const state = pass === 0 ? sweep.from : (sweep.steps[pass - 1] ?? sweep.from);
+  const state = poseStateAt(sweep, pass);
   const stroke = state.stroke;
   const angle = flipperAngle(config, state);
   const key = sideKey(ball, config);
@@ -2047,7 +2351,21 @@ function resolveAtPass(
     surfaceResponseFor(config.surfaceId),
   );
 
-  separate(ball, touch, clamp);
+  // THE PASS HAS ONE POSITIONAL ANSWER AND THE EJECTOR MAY ALREADY BE IT.
+  // `separate` is this port's own lift out of a MASK body; the machine has no
+  // such thing, because `+0x00B6BE` lifts the ball out of a buffer that already
+  // contains the blade (`+0x0039FA`). Where the ejector fired, the ball has been
+  // moved half a pixel along the union's own outward normal and a second lift
+  // along the BLADE's normal is a contradictory answer to the same question —
+  // measured at Law 'n Justice's (42.692, 341.999)L0, where the blade runs
+  // through the ball inside a two-pixel wall channel and the two pushes cancel
+  // to the last Q10 for ever. Left to the ejector alone the port's first frame
+  // lands 0.004 px from the machine's own RAM read-back and the ball is out.
+  //
+  // Everywhere the ejector did NOT fire — which is every blade in mid-air, the
+  // ejector being reached only through the map's own probe — this is exactly
+  // the lift it always was. See `BatPassResolver` in `ball-physics.ts`.
+  if (!ejected) separate(ball, touch, clamp);
 
   const batSpeed = tangentialSpeed(
     integerSqrt(touch.armX * touch.armX + touch.armY * touch.armY),
