@@ -29,6 +29,25 @@
  * right about the trajectory but wrong about the contact cannot hide, and a rule
  * that is wrong about the contact cannot be excused by drift.
  *
+ * THE ONE PIECE OF STATE THAT IS CARRIED, and it has to be. `BallState.spin` is
+ * the machine's `$26(a4)`, and it is a PERSISTENT PER-BALL STATE rather than a
+ * function of the frame: it is charged at a contact, bleeds eight units a frame
+ * in between, and nothing ever resets it (`research/spin/SPIN_DECODE.md`). The
+ * session-4 corpus predates the spin round and carries no `$26` column, so the
+ * machine's own value is not available to seed it with — and re-creating the
+ * ball at every frame does not leave the instrument neutral about the spin, it
+ * silently asserts the machine's ball had NO spin on every frame, which the RAM
+ * says is false on 42-57 % of frames. So the port's OWN spin is integrated
+ * across the scored frames of a trace, from zero at each trace start, which is
+ * exactly what the research model does (`research/spin/tools/archcorpus.py`
+ * builds its `spinmap` the same way) and is the only reason that model's
+ * predicted movement and this gate's are comparable at all.
+ *
+ * It changes nothing about the frame-at-a-time discipline for anything else:
+ * position, velocity and level are still the machine's own on every frame, and
+ * a trajectory error still cannot accumulate. And it CANNOT move the pre-spin
+ * baseline, because a tree with no spin term has nothing to carry.
+ *
  * THE CORPUS, as `research/ARCH_NORMAL_DECODE.md` section 4 defines it:
  * 866 sampled frames -> 854 pairs with a stable level -> 576 after dropping
  * frame 0 and every frame whose ring touches a FLIPPER-BAT footprint (surface
@@ -76,21 +95,44 @@ export interface GateFigures {
 }
 
 /**
- * THE BASELINE, measured on the shipped `stepBalls` at game commit 78bed65
- * ("The tick is the machine's frame: eight substeps, four collision passes").
+ * THE BASELINE, measured on the shipped `stepBalls` at the SPIN ROUND — the
+ * ball's spin word, the responder's ejector and the per-surface `$38`.
  *
  * These are not targets anybody chose. They are what the machine's own RAM says
  * this port scores, and the tolerance is EXACT — see
  * `research/physics-gate/README.md` for why a band would hide the regressions
  * that matter.
+ *
+ * RE-PINNED FROM 576 / 218 / 466 / 517 / **1790** / 464 (game `ed5e01d`,
+ * inherited from `78bed65`). Every figure moved toward the machine and the
+ * error sum fell by a factor of 6.35. The four-step ablation, run on this
+ * instrument with only the named piece switched off:
+ *
+ *     ed5e01d                                 1790   466 exact   517 <=4   464 pos
+ *     + scalar tangent (no `keep` fraction)   1743   468         523       469
+ *     + the SPIN word                         1527   470         549       484
+ *     + per-surface `$38`                     1384   470         550       484
+ *     + the ejector at +0x00B6BE               282   470         558       487
+ *
+ * The middle row is the one the decode predicted in advance: SPIN_DECODE 7.5
+ * forecast "roughly 1500-1560" for the two changes it modelled, from its own
+ * Python run over this same corpus, and the port lands on 1527. The other two
+ * rows are changes that round measured and did NOT model — it recorded the
+ * ejector as "decoded but not implemented or scored" and `$38` as "named,
+ * measured, and deliberately not changed" — so their movement is a result
+ * rather than a confirmation.
+ *
+ * The worst single frame falls from 366.17 to 12.04 and the contact p90 from
+ * 4.10 to 1.90, so this is a distribution collapsing rather than a few frames
+ * being lucky.
  */
 export const PHYSICS_GATE_BASELINE: GateFigures = {
   frames: 576,
   contacts: 218,
-  velExact: 466,
-  velWithin4: 517,
-  errorSum: 1790,
-  posExact: 464,
+  velExact: 470,
+  velWithin4: 558,
+  errorSum: 282,
+  posExact: 487,
 };
 
 /**
@@ -334,6 +376,9 @@ export function runPhysicsGate(root: string): GateReport {
     const trace = loadTrace(join(corpus, name));
     const label = name.replace(/^trace-/, "").replace(/\.csv$/, "");
     const before = rows.length;
+    // The port's own spin, integrated across this trace's scored frames from
+    // zero — see the header. Reset per trace, because each is its own ball.
+    let spin = 0;
     for (let i = 0; i < trace.length - 1; i += 1) {
       const from = trace[i];
       const to = trace[i + 1];
@@ -352,10 +397,12 @@ export function runPhysicsGate(root: string): GateReport {
         from.vy * Q10_PER_MACHINE_UNIT,
         from.level,
       );
+      ball.spin = spin;
       const set = createBallSet([ball]);
       stepBalls(set, map, materials, forces, options);
       const stepped = set.balls[0];
       if (stepped === undefined) throw new Error(`${name} frame ${from.frame}: the ball vanished`);
+      spin = stepped.spin;
 
       const portVx = stepped.velocityX / Q10_PER_MACHINE_UNIT;
       const portVy = stepped.velocityY / Q10_PER_MACHINE_UNIT;

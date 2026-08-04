@@ -2788,6 +2788,16 @@ export interface BallDebugState {
   readonly heldBy: string | null;
   /** Which collision line the ball is riding: 0 the playfield, 1 the ramps. */
   readonly level: PlayfieldLevel;
+  /**
+   * The ball's SPIN — the original's `$26(a4)`, in responder units.
+   *
+   * Here so a dump says what the contact rule is actually working with; it is
+   * NOT hashed by `tests/sim-hash-pin.test.ts`, which projects it out. See that
+   * file for why: a spin word differs on the first contact of every game, so
+   * hashing it would turn "the first divergent tick" from a statement about
+   * behaviour into a statement about bookkeeping.
+   */
+  readonly spin: number;
 }
 
 export interface GameDebugState {
@@ -2942,6 +2952,7 @@ export function debugSnapshot(game: Game): GameDebugState {
       active: ball.active,
       heldBy: ball.heldBy,
       level: ball.level,
+      spin: ball.spin,
     })),
     flippers: game.flippers.configs.map((config) => ({
       id: config.id,

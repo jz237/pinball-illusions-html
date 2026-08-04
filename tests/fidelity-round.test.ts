@@ -731,9 +731,16 @@ describe("R5a: the contact response is the original's, arithmetic for arithmetic
     //
     // The exact regression: sling id 22, the left upper face, grazed along its
     // own surface.
+    //
+    // RE-MEASURED for the spin round: -7355 became -7362. The toll is now
+    // applied to the machine's own signed tangential SCALAR rather than as a
+    // `keep` fraction of the tangential vector, which stops the port losing up
+    // to one part in 1024 of the speed at every contact — so a graze now keeps
+    // slightly LESS here, and the `x: 0` that the whole test is about is
+    // untouched. The claim is the two lines under it, not the constant.
     const grazing = { x: 1000, y: -7600 };
     const grazed = reflectAt(22, grazing, { x: -1024, y: 0 }, true);
-    expect(grazed).toEqual({ x: 0, y: -7355 });
+    expect(grazed).toEqual({ x: 0, y: -7362 });
     expect(Math.hypot(grazed.x, grazed.y)).toBeLessThan(Math.hypot(grazing.x, grazing.y));
 
     // And the invariant behind it, over every id, because everything at

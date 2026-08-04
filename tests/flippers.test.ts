@@ -503,6 +503,7 @@ describe("the flipdat1.bin sweep", () => {
         active: true,
         heldBy: null,
         level: LEFT.level,
+        spin: 0,
       };
       expect(() => resolveFlipperContacts([ball], [sweep], BALL_RADIUS)).toThrow(
         /pose bank is not registered/,
@@ -930,13 +931,22 @@ describe("a flipper at rest", () => {
     // carried became 92, because the bat's tangential rule is now the row's own
     // `$3A` slip (1.25% a contact) instead of this port's Coulomb bite (which
     // took a fifth of the normal impulse), so the ball rolls off the tapering
-    // blade FASTER and reaches its far end 25 ticks sooner. The floor is written
-    // at 80 rather than at the measurement so that a re-measurement of the slip
-    // divisor does not fail a test whose claim is about support, not speed —
-    // and the claim itself, asserted on every one of those ticks above, is
-    // unchanged: never through the bat, never unsupported.
-    expect(overTheBat).toBeGreaterThan(80);
-    expect(held).toBeGreaterThanOrEqual(Math.ceil(0.9 * overTheBat));
+    // blade FASTER and reaches its far end 25 ticks sooner.
+    //
+    // RE-MEASURED AGAIN, spin round: 97 became 77, for the same reason one step
+    // further on. The toll is now applied to the machine's own signed tangential
+    // SCALAR instead of as a `keep` fraction of the tangential vector, so the
+    // ball stops losing up to one part in 1024 of its along-blade speed at every
+    // one of the four contacts a tick and rolls off sooner again. The floor is
+    // written well under the measurement, on purpose, so that a test whose claim
+    // is about SUPPORT does not fail on a change to SPEED — and the claim
+    // itself, asserted on every one of those ticks above, is unchanged: never
+    // through the bat, never unsupported.
+    expect(overTheBat).toBeGreaterThan(60);
+    // 77 of 87 rather than 92 of 97: a faster ball spends a few more ticks a
+    // fraction of a pixel clear of its own probe ring between contacts. It is
+    // the same statement about being CARRIED, taken over a shorter roll.
+    expect(held).toBeGreaterThanOrEqual(Math.ceil(0.85 * overTheBat));
     // And it stayed a clear ball radius off the axis the whole time, which is
     // the "held up" half of the claim.
     expect(worstFace).toBeGreaterThan(pixelsToQ10(6));
@@ -968,10 +978,27 @@ describe("a flipper at rest", () => {
   });
 
   it("stops a ball dropped onto it rather than passing it through", () => {
+    // ONCE THE BALL IS PAST THE TIP THERE IS NO "UNDERNEATH" TO BE ON — the same
+    // guard its sibling above already carries, and for the same reason. This
+    // used to run a flat 120 ticks and then measure the ball against the bat's
+    // INFINITE axis; the spin round makes the ball roll off the tapering blade
+    // sooner (it no longer loses a part in 1024 of its along-blade speed at
+    // every contact), so the ball is in free flight well past the tip by tick
+    // 120 and the reading means nothing.
+    //
+    // The claim is asserted on EVERY tick the bat exists under the ball, which
+    // is strictly stronger than the single end-state check it replaces: an
+    // end-state check cannot see a ball that went through and came back.
     const start = ballRestingOn(FLAT, FLIPPER_AT_REST, 20, 30);
     const ball = createBall(0, start.x, start.y);
-    runTicks([ball], [FLAT], [false], 120);
-    expect(faceOffset(FLAT, FLIPPER_AT_REST, ball)).toBeGreaterThan(0);
+    let checked = 0;
+    for (let tick = 0; tick < 120; tick += 1) {
+      runTicks([ball], [FLAT], [false], 1);
+      if (axisOffset(FLAT, FLIPPER_AT_REST, ball) > FLAT.length + BALL_RADIUS) break;
+      expect(faceOffset(FLAT, FLIPPER_AT_REST, ball)).toBeGreaterThan(0);
+      checked += 1;
+    }
+    expect(checked).toBeGreaterThan(10);
   });
 
   it("reports a contact with no bat speed", () => {
@@ -1651,6 +1678,7 @@ describe("placement", () => {
               active: true,
               heldBy: null,
               level: config.level,
+              spin: 0,
             };
             const sweep = tickFlipper(config, state, held);
             const contacts = resolveFlipperContacts([ball], [sweep], BALL_RADIUS);
@@ -1852,6 +1880,7 @@ describe("placement", () => {
       active: true,
       heldBy: null,
       level,
+      spin: 0,
     });
     const sweep = tickFlipper(upper, FLIPPER_AT_REST, true);
     expect(resolveFlipperContacts([at(1)], [sweep], BALL_RADIUS)).toHaveLength(1);

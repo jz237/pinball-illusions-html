@@ -36,6 +36,7 @@ import {
   servePosition,
   troughPlacement,
 } from "../src/game/plunger.js";
+import { SUBSTEP_GRAVITY } from "../src/game/ball-physics.js";
 import { FixedStepScheduler } from "../src/core/fixed-step-scheduler.js";
 import { BONUS_NONE_FRAMES } from "../src/game/bonus.js";
 
@@ -158,8 +159,13 @@ describe("the ball lifecycle", () => {
     expect(ball).toBeDefined();
     expect(ball?.level).toBe(0);
     expect(ballIsOnTheRod(ball!)).toBe(true);
+    // SEATED, WHICH IS NOT FROZEN. The lane ball bobs on the ejector at
+    // +0x00B6BE exactly as the original's does — session 4 measured its seat
+    // over cy 553.53..553.91 and it never settles — so what is asserted is the
+    // residual of a seated ball: the two substeps of gravity between one
+    // collision pass and the next, and no drift in x at all.
     expect(ball?.velocityX).toBe(0);
-    expect(ball?.velocityY).toBe(0);
+    expect(Math.abs(ball?.velocityY ?? 0)).toBeLessThanOrEqual(2 * SUBSTEP_GRAVITY);
     // On the lane floor, ONE ROW BELOW the seat the lane bounds name — which is
     // the row the ORIGINAL parks it on. `LAW_N_JUSTICE_SHOOTER_LANE.bottomY` is
     // 552 because a centre there keeps the whole probe ring clear of the floor

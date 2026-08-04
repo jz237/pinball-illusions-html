@@ -139,7 +139,9 @@ import type { SurfaceResponse } from "./surface-physics.js";
 import {
   LEVEL_TO_LOWER_ID,
   LEVEL_TO_UPPER_ID,
+  ORIGINAL_SPIN_UNIT_Q10,
   SURFACE_ID_NONE,
+  minimumImpactQ10,
   surfaceResponseFor,
 } from "./surface-physics.js";
 import type { TableAcceleration } from "./table-accel.js";
@@ -575,6 +577,10 @@ export function createBall(
     // reaches the upper level by driving through a hand-off, never by being
     // placed there, so the level is always something the run earned.
     level,
+    // A NEW ball has no spin. That is the only place a zero is ever written to
+    // it: the original never resets `$26(a4)` — not at serve, not at drain, not
+    // at a lock or a release — and neither does this. See `BallState.spin`.
+    spin: 0,
   };
 }
 
@@ -758,11 +764,16 @@ function clampVelocity(value: number): number {
  * magnitude, one Q10 divide for the scale.
  *
  * RETURNS whether this was a RESTING contact — an approach too gentle to bounce
- * at all, which is what `restThreshold` names. The caller needs it because a
- * ball at rest is being HELD by the surface, and the surface's reaction is a
- * force the integrator has to know about between contact passes: see
- * `integrateBall`. It is a report about the contact, not a change to it; the
- * arithmetic below is untouched.
+ * at all. On a surface-mapped contact that is the row's own `$38` on the RAW
+ * approach (+0x00B56E); on a synthetic map it is this port's global
+ * `restThreshold` on the outgoing bounce. It is a report about the contact, not
+ * a change to it, and no part of the arithmetic depends on who reads it.
+ *
+ * IT MUTATES `ball.spin`. That is the machine's `sub.w d4,$26(a4)` at
+ * +0x00B640 and it is not optional: the SAME `d4` supplies five eighths of the
+ * translation one instruction earlier, so the two are one event and a port that
+ * took the velocity without the spin would take the spinless toll for ever. See
+ * `BallState.spin` and `research/spin/SPIN_DECODE.md`.
  */
 export function reflectVelocity(
   ball: BallState,
@@ -840,8 +851,42 @@ export function reflectVelocity(
   const grazed =
     surface !== null &&
     Math.trunc((rawTangentSpeed * 16) / approachSpeed) >= surface.constants.grazeLimit;
+  // ---------------------------------------------------------------------------
+  // `$38`, THE SECOND TEST: TOO SOFT TO BOUNCE, PER SURFACE, ON THE RAW APPROACH
+  // ---------------------------------------------------------------------------
+  //
+  //     00b56e  cmp.w  $38(a4), d0    ; d0 = the inward normal speed, unscaled
+  //     00b572  blt.b  $b57a          ;   faster than the row's minimum -> bounce
+  //     00b574  moveq  #0, d0         ;   softer -> normal component killed
+  //     00b576  bra.w  $b626          ;   and jump PAST the bumper/slingshot code
+  //
+  // The fourth and last word of the surface row, and the one this port carried
+  // as `minImpact` without applying it. Two things about it are load-bearing and
+  // neither is what the port's own global `restThreshold` did:
+  //
+  //   IT IS PER SURFACE. -800 responder units on a plain wall and on a flipper
+  //   bat, -200 on rubber and on id 9, -2000 on the two level-change ids, -400
+  //   on 12 and on 14/128..191, and ZERO on the bumpers — so a pop bumper fires
+  //   however gently it is touched, which one global number cannot express.
+  //
+  //   IT IS TESTED BEFORE THE RESTITUTION. `d0` here is still the raw approach;
+  //   `muls.w $36(a4),d0` is at +0x00B620, 178 bytes further on. The port's 853
+  //   Q10 was applied to the OUTGOING bounce, so on a plain wall it demanded
+  //   2.80 px/tick of approach where the machine asks for 1.5625 — nearly twice
+  //   as strict, and every contact in between was a bounce the machine takes and
+  //   the port killed. That is one of the two deviations behind the BabeWatch
+  //   level-1 rail site the pathology sweep recorded at ed5e01d.
+  //
+  // The graze test comes first and jumps past this one, exactly as the branch at
+  // +0x00B56A does.
+  const tooSoft =
+    surface !== null && !grazed && normalSpeedIn >= minimumImpactQ10(surface.constants);
   const fires =
-    surface !== null && !grazed && surface.kick > 0 && approachSpeed >= surface.kickThreshold;
+    surface !== null &&
+    !grazed &&
+    !tooSoft &&
+    surface.kick > 0 &&
+    approachSpeed >= surface.kickThreshold;
   const drivenIn = fires && surface !== null ? normalSpeedIn - surface.kick : normalSpeedIn;
 
   // ---------------------------------------------------------------------------
@@ -878,7 +923,11 @@ export function reflectVelocity(
 
   const bounced = -q10Multiply(drivenIn, elasticity);
   // A ball creeping into the surface under gravity must settle, not chatter.
-  const deflected = bounced <= restThreshold ? 0 : bounced;
+  // WHERE THE MAP HAS A SURFACE that is the row's own `$38` on the raw approach,
+  // decided above; where it has not, this port's global post-restitution
+  // threshold is still the only rule there is.
+  const deflected =
+    surface !== null ? (tooSoft ? 0 : bounced) : bounced <= restThreshold ? 0 : bounced;
 
   // The surface's reaction: the ball's approach killed, plus whatever of it is
   // handed back elastically. Never negative, so the friction budget cannot be.
@@ -888,7 +937,14 @@ export function reflectVelocity(
   // friction budget, or the device scrubs the very shot it exists to launch. With
   // no kick this is exactly `-normalSpeedIn + deflected` as before.
   const passiveBounce = -q10Multiply(normalSpeedIn, elasticity);
-  const passiveDeflected = passiveBounce <= restThreshold ? 0 : passiveBounce;
+  const passiveDeflected =
+    surface !== null
+      ? tooSoft
+        ? 0
+        : passiveBounce
+      : passiveBounce <= restThreshold
+        ? 0
+        : passiveBounce;
   const normalImpulse = -normalSpeedIn + passiveDeflected;
   const friction = q10Clamp(behaviour.friction, 0, Q10_ONE);
   // A loss that rounds to nothing is not a loss. `friction * normalImpulse`
@@ -938,12 +994,15 @@ export function reflectVelocity(
   // at +0x00A64C, +0x00A696, +0x00A6E0 and +0x00A728 followed by two
   // integrations each; this used to say three and had missed the first).
   //
-  // This port cannot adopt that rule wholesale, and it is worth saying why so
-  // nobody tries it as a simplification: friction on SLIP needs a spin state
-  // `BallState` does not have, and dropping the spin term leaves friction
-  // proportional to the whole tangential speed — the percentage model this file
-  // already measured and rejected above, which caps a ball on a slope at
-  // `g*sin(theta)/f` instead of letting it accelerate. At the decoded coefficient
+  // ON A SURFACE-MAPPED CONTACT THIS PORT NOW ADOPTS THAT RULE WHOLE, spin word
+  // and all: `BallState.spin` is the machine's `$26(a4)` and the block at the
+  // foot of this function is the machine's instructions. Everything from here to
+  // the `if (surface !== null)` below is what a SYNTHETIC map — no surface
+  // layer, no `$3A` to read — still runs, and it is unchanged. The reason the
+  // Coulomb rule survives there at all is worth keeping: dropping the spin term
+  // leaves friction proportional to the whole tangential speed — the percentage
+  // model this file already measured and rejected above, which caps a ball on a
+  // slope at `g*sin(theta)/f` instead of letting it accelerate. At the decoded coefficient
   // that cap is 789 Q10/tick on a 45-degree ramp, under the 1000 that "lets a
   // ball on a slope accelerate instead of settling into a crawl" demands.
   //
@@ -1023,55 +1082,122 @@ export function reflectVelocity(
   //     00b652  addq.w  #1, d3
   //     00b654  add.w   d3, d2          ; and |tangential| -= (|vt|>>12) + 1
   //
-  // TWO TERMS, both adopted:
+  // TWO TERMS, and since the spin round both are the machine's own rather than
+  // a limit of it:
   //
-  //   THE SLIP, in its spinless limit. With no spin state the `5*256/(8*$3A)`
-  //   fraction of the slip becomes `tangent * 160 / $3A` per contact — 0.74% on
-  //   a plain wall, 3.1% on rubber. That is the MOST the decoded rule can ever
-  //   take (a real ball's spin only reduces the slip against the surface), and
-  //   it replaces a Coulomb bite of 15%+ that the original does not have.
+  //   THE SLIP, against a real `BallState.spin`. `$26(a4)` is decoded, measured
+  //   and implemented (`research/spin/SPIN_DECODE.md`), so `q` is the machine's
+  //   own `q`: five eighths of it goes into the ball's along-surface speed and
+  //   ALL of it comes out of the ball's spin, and a ball rolling without
+  //   slipping (`spin == vt`) loses nothing whatever. The port used to read
+  //   `$26(a4)` as a permanent zero, which is the SPINLESS LIMIT — the most the
+  //   rule can ever take, 0.74 % on a plain wall and 3.1 % on rubber — and that
+  //   is 21 % too much toll on 75-85 % of the machine's own traced grazes.
   //
   //   THE FIXED DECAY, `(|vt| >> 12) + 1` in RESPONDER units, which are twice
   //   the ball's own — `d2` at +0x00B64C is still inside the doubled contact
-  //   frame, see `surface-physics.ts`'s RESPONDER_VELOCITY_SCALE. One responder
-  //   unit is two Q10, so the decay is `((|vt_q10| >> 13) + 1) * 2`: two Q10 per
-  //   contact below 8 px/tick and four above it. It is not a friction
-  //   coefficient at all; it is the floor that guarantees a ball sliding along a
-  //   surface reaches zero in finite time, and it is what stops a grazed ball
-  //   sliding along a flat floor for ever now that the graze rule keeps the rest
-  //   of its speed. This used to be written `(vt >> 4) + 1` in Q10 — 6.25%
-  //   rather than 0.4%, off by the 256 between the two velocity scales — and
-  //   applied only to a fired coil; round 5 fixed the size and read the shift at
-  //   the ball's scale rather than the responder's.
+  //   frame, see `surface-physics.ts`'s RESPONDER_VELOCITY_SCALE. It is not a
+  //   friction coefficient at all; it is the floor that guarantees a ball
+  //   sliding along a surface reaches zero in finite time, and it is what stops
+  //   a grazed ball sliding along a flat floor for ever now that the graze rule
+  //   keeps the rest of its speed. It is charged on the POST-slip speed, which
+  //   is where +0x00B644 reads `d2`.
+  //
+  // ---------------------------------------------------------------------------
+  // AND IT IS APPLIED TO A SCALAR, NOT AS A FRACTION OF A VECTOR
+  // ---------------------------------------------------------------------------
+  // The machine has no `keep` fraction. It holds the SIGNED tangential speed in
+  // `d2`, adds and subtracts whole units of it, and rotates the pair back out at
+  // +0x00B66A. The port used to compute `keep = trunc((vt - drop) * 1024 / vt)`
+  // and scale the tangential VECTOR by it, which truncates away up to one part
+  // in 1024 of the tangential speed at every single contact — about two Q10 at a
+  // typical 8 px/tick graze — always in the slower direction. That, and not the
+  // slip, is the other half of the along-face residual both prior rounds
+  // measured: with the spin word supplied from the machine's own RAM the toll is
+  // provably exact on 95.7 % of clean grazes and the port STILL landed a median
+  // 1.41 raw units short along the face on 84 % of them.
+  //
+  // Ablation on the Law 'n Justice trace with the machine's own spin, summed
+  // per-frame velocity error (`research/spin/out/ablation-true.txt`):
+  //
+  //     the port's rule as it stood                42395   ratio 0.774
+  //     + scalar tangent (no `keep` fraction)      41328   ratio 0.821
+  //     + SPIN                                     39025   ratio 0.948
+  //
+  // The two are orthogonal: the spin changes the DROP, the scalar form changes
+  // how faithfully the drop is applied, and both are needed.
+  //
+  // NO RE-QUANTISE IS ADDED and none should be. The arch round's unexplained C9
+  // — "no re-quantise beats the 16-bit one by 4 %" — turned out to be a ROUNDING
+  // MODE: the machine's exit rotation is `swap` + `rol.l #1`, an arithmetic
+  // shift and therefore a FLOOR, where the research model rounded toward zero
+  // and so always shortened. A flooring re-quantise and no re-quantise score the
+  // same to 0.05 %, and this port carries Q10 through a response and never
+  // rounds back to the machine's word, so it already behaves as the flooring
+  // one. C9 is answered, not open.
+  //
+  // NEITHER TERM CAN REVERSE THE TANGENTIAL DIRECTION, so there is no clamp here
+  // and none is wanted: `5q/8` is at most `|t|/136` of it (the largest `256/$3A`
+  // is 1/20 on rubber, times five eighths) and the fixed decay is
+  // `(|t|>>12)+1 <= |t|` for every `|t| >= 1`. The old `Math.min(tangentSpeed,
+  // drop)` was guarding against nothing.
   //
   // Both are confined to maps that HAVE a surface layer, because only there is
   // there a `$3A` to read; a synthetic-map contact keeps this port's own Coulomb
   // model bit-for-bit, which is what every physics unit test measures.
-  const slipDrop =
-    surface === null
-      ? 0
-      : Math.trunc((tangentSpeed * 160) / surface.constants.slipDivisor) +
-        (((tangentSpeed >> 13) + 1) << 1);
-  const drop =
-    surface !== null
-      ? Math.min(tangentSpeed, slipDrop)
-      : fires
-        ? Math.min(tangentSpeed, (tangentSpeed >> 4) + 1)
-        : resting
-          ? Math.max(1, Math.min(budget, q10Multiply(ROLLING_SLIP_FRICTION, tangentSpeed)))
-          : full;
-  // Friction opposes sliding; it cannot reverse it, so the loss stops at rest.
-  const keep =
-    tangentSpeed <= drop ? 0 : Math.trunc(((tangentSpeed - drop) * Q10_ONE) / tangentSpeed);
+  if (surface !== null) {
+    // The machine's tangent basis, +0x00B50A. The responder rotates by
+    // `$800 - $28(a4)`, so with `u = (cos b, sin b) = -n` its tangent is `u`
+    // turned a quarter turn: `t = (n_y, -n_x)`. `spin` lives in THIS basis and a
+    // flipped handedness would double the toll instead of removing it.
+    const tangentUnitX = normalY;
+    const tangentUnitY = -normalX;
+    const tangentSigned =
+      q10Multiply(kickedTangentX, tangentUnitX) + q10Multiply(kickedTangentY, tangentUnitY);
+    // Into responder units. `>>` is an arithmetic shift and therefore floors,
+    // which is what `swap` does to the doubled product at +0x00B524.
+    const tangentIn = tangentSigned >> 1;
 
-  ball.velocityX = clampVelocity(
-    q10Multiply(kickedTangentX, keep) + q10Multiply(normalSpeedOut, normalX),
-  );
-  ball.velocityY = clampVelocity(
-    q10Multiply(kickedTangentY, keep) + q10Multiply(normalSpeedOut, normalY),
-  );
-  // Too soft to bounce, measured on the UNPOWERED reflection so a coil that
-  // fired cannot make a resting contact look like an impact.
+    // +0x00B62A..+0x00B640. `divs.w` TRUNCATES toward zero — `q` is negative on
+    // essentially every real contact, so `>>` here would floor and be wrong.
+    const q = Math.trunc(((ball.spin - tangentIn) * 256) / surface.constants.slipDivisor);
+    // `asl.w #2 / add.w / asr.w #3` is `5q/8` with an arithmetic shift: FLOOR.
+    let toll = tangentIn + ((5 * q) >> 3);
+    ball.spin -= q;
+    // +0x00B644..+0x00B654, on the POST-slip speed. `rol.w #4` + `andi.w #$f`
+    // is the top four bits of the 16-bit word, i.e. `(|d2| >> 12) & 15`.
+    if (toll !== 0) {
+      const fixed = ((Math.abs(toll) >> 12) & 0xf) + 1;
+      toll += toll > 0 ? -fixed : fixed;
+    }
+    const tangentOut = toll * ORIGINAL_SPIN_UNIT_Q10;
+
+    ball.velocityX = clampVelocity(
+      q10Multiply(tangentOut, tangentUnitX) + q10Multiply(normalSpeedOut, normalX),
+    );
+    ball.velocityY = clampVelocity(
+      q10Multiply(tangentOut, tangentUnitY) + q10Multiply(normalSpeedOut, normalY),
+    );
+  } else {
+    const drop = fires
+      ? Math.min(tangentSpeed, (tangentSpeed >> 4) + 1)
+      : resting
+        ? Math.max(1, Math.min(budget, q10Multiply(ROLLING_SLIP_FRICTION, tangentSpeed)))
+        : full;
+    // Friction opposes sliding; it cannot reverse it, so the loss stops at rest.
+    const keep =
+      tangentSpeed <= drop ? 0 : Math.trunc(((tangentSpeed - drop) * Q10_ONE) / tangentSpeed);
+
+    ball.velocityX = clampVelocity(
+      q10Multiply(kickedTangentX, keep) + q10Multiply(normalSpeedOut, normalX),
+    );
+    ball.velocityY = clampVelocity(
+      q10Multiply(kickedTangentY, keep) + q10Multiply(normalSpeedOut, normalY),
+    );
+  }
+  // Too soft to bounce: the row's own `$38` where the map has a surface, the
+  // port's global threshold on the UNPOWERED reflection where it has not — so a
+  // coil that fired cannot make a resting contact look like an impact.
   return passiveDeflected === 0;
 }
 
@@ -1236,35 +1362,35 @@ function respondAt(
   log: ContactLog,
   options: ResolvedOptions,
   surfaceAt: ((x: number, y: number) => number) | null,
-): RingProbe | null {
+): void {
   const probe = probeRing(map, materials, passable, ring, ball.x, ball.y);
-  if (probe.contactIndex < 0) return null;
+  // Nothing under the ring means the machine never called the responder at all:
+  // `jsr $a7e0 / bmi.b` at +0x00A68E skips it when the collision blit came back
+  // empty, so no bounce, no spin charge and — since the ejector is the
+  // responder's own last instruction — no ejection either.
+  if (probe.contactIndex < 0) return;
   logContacts(log, probe, materials);
-  if (probe.dominant === null) return null;
+  if (probe.dominant === null) return;
 
   // +0x00B54E, the leaving gate. Taken about the exact normal rather than the
-  // ring entry, for the reason `outwardNormalOf` gives.
+  // ring entry, for the reason `outwardNormalOf` gives. A ball that is touching
+  // but not approaching is not charged at all — no bounce, no slip and no spin,
+  // because `ble.w $b662` is the one path in the whole responder that skips
+  // +0x00B640. It still falls through to the ejector, and so does this.
   const into =
     q10Multiply(ball.velocityX, probe.normalX) + q10Multiply(ball.velocityY, probe.normalY);
-  // Not approaching at all, but touching: the ball is LYING on the surface with
-  // no normal motion whatever, which is the rest contact in its purest form. The
-  // machine's gate returns here and so does this — nothing is reflected, nothing
-  // is scrubbed — but the surface is still holding the ball up, so the hold is
-  // reported. Without this the ball spends the two substeps to the next pass
-  // falling into the surface, and the pass after that throws the velocity away
-  // without giving the position back: a permanent 1 Q10 a tick of sink.
-  if (into > 0) return null;
-  if (into === 0) return probe;
+  if (into < 0) {
+    reflectVelocity(
+      ball,
+      materials.behaviourFor(probe.dominant),
+      probe.normalX,
+      probe.normalY,
+      options.restThreshold,
+      surfaceResponseOf(probe, surfaceAt, options.poweredKicksLive),
+    );
+  }
 
-  const resting = reflectVelocity(
-    ball,
-    materials.behaviourFor(probe.dominant),
-    probe.normalX,
-    probe.normalY,
-    options.restThreshold,
-    surfaceResponseOf(probe, surfaceAt, options.poweredKicksLive),
-  );
-  return resting ? probe : null;
+  ejectBuried(ball, map, passable, probe);
 }
 
 
@@ -1734,68 +1860,124 @@ const SUBSTEPS_PER_TICK = ORIGINAL_SUBSTEPS_PER_FRAME;
 const RESPOND_EVERY = ORIGINAL_SUBSTEPS_PER_FRAME / ORIGINAL_COLLISION_PASSES_PER_FRAME;
 
 /**
- * THE NORMAL REACTION OF A RESTING CONTACT — the one thing the machine's frame
- * needs that the machine itself does not have, and the reason is measurable.
+ * `cmpi.w #$6,$c(a4)` at +0x00B6BE: how many of the ball's forty-four ring
+ * points must be in solid material before the substep integrator shoves it out.
  *
- * Between two collision passes the ball is in free flight for two substeps, so a
- * ball LYING ON A SURFACE gains a quarter of a tick of gravity and moves into
- * that surface by `(g/8 >> 3) + (2g/8 >> 3)` = 2 Q10, four times a tick: a
- * steady 8 Q10 (1/128 px) of penetration per tick that the pass then throws away
- * as velocity without giving back as position.
- *
- * THE ORIGINAL DOES EXACTLY THIS, and session 4 measured it: its resting lane
- * ball descends 0.1328 px over the 16 frames between the +6.00 s and +6.32 s
- * cold launches, which is 8.5 Q10 a frame — this integrator's 8, to the
- * measurement's resolution. What the original then does, and what no part of the
- * decoded frame explains, is EJECT the ball back up about 0.4 px every ~40
- * frames, which is why its seat only ever bobs over cy 553.53..553.91 instead of
- * burying itself. That ejector is not in the responder (which never writes a
- * position), not in the integrator (fitted exactly on 693 of 703 free frames)
- * and not in the ring, so it is not decoded, and a port without it does not get
- * a bob: it gets an unbounded sink. Measured on this tree before this function
- * existed, a ball released at the machine's own lane seat descended 3.125 px in
- * 400 ticks with zero turning points and came to rest with its CENTRE against
- * the lane floor — cradles, saucer holds and the trough all go with it.
- *
- * So the port supplies the piece of physics the machine gets away without: a
- * surface a ball is RESTING on does not let it through. `restThreshold` already
- * names exactly that state — "a bounce smaller than this is no bounce" — and
- * `reflectVelocity` now reports it, so while a rest contact stands, the part of
- * a substep's MOVE that points INTO that surface is dropped and only the part
- * along it is taken.
- *
- * IT IS A POSITION CONSTRAINT AND NOT A FORCE, which matters twice over. The
- * velocity bookkeeping is untouched, so the ball still arrives at the next pass
- * with the approach the acceleration gave it, the responder still runs, and the
- * per-contact slip and decay are still charged FOUR TIMES A FRAME — the
- * machine's own rolling friction, which is the whole point of the four passes
- * and which cancelling the acceleration instead would have silently removed.
- * And it is the same family of rule as `advanceCentre`'s own clamp: the port
- * declines to put a ball somewhere, rather than inventing a force.
- *
- * It is confined to contacts too gentle to bounce: at any real impact
- * `passiveDeflected` is non-zero, no hold is taken, and the decoded response
- * runs untouched. For a ball that IS moving the constraint removes only what the
- * two substeps since the last pass added, which at this scale is nothing — the
- * whole 218-contact RAM corpus scores the same with it and without it.
- *
- * A ball on a SLOPE still accelerates down it: only the into-surface component
- * goes, and the along-surface component is what a slope is for.
+ * Six is a real depth rather than a touch. A ball sitting exactly on a flat
+ * floor puts FIVE points on it — the discrete radius-8 circle's bottom row is
+ * dx -2..+2 — so the count crosses six only once the ball is a whole pixel row
+ * into the surface, which is what "buried" means and what the sink between
+ * collision passes eventually produces.
  */
-function holdAgainst(
-  resting: RingProbe | null,
-  deltaX: Q10,
-  deltaY: Q10,
-): { readonly x: Q10; readonly y: Q10 } {
-  if (resting === null) return { x: deltaX, y: deltaY };
-  const along = q10Multiply(deltaX, resting.normalX) + q10Multiply(deltaY, resting.normalY);
-  // Only a move INTO the surface is held; one away from it is the ball leaving,
-  // which no surface resists.
-  if (along >= 0) return { x: deltaX, y: deltaY };
-  return {
-    x: deltaX - q10Multiply(along, resting.normalX),
-    y: deltaY - q10Multiply(along, resting.normalY),
-  };
+const EJECTOR_MIN_RING_HITS = 6;
+/** `move.w #$fe00,d0` at +0x00B6CA: half a pixel, per substep, along the normal. */
+const EJECTOR_PUSH_Q10: Q10 = Q10_ONE / 2;
+
+/**
+ * THE EJECTOR — main.seg00 +0x00B6BE, the machine's own answer to a buried ball,
+ * and the piece the arch round had to invent a stand-in for.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT THE DISK DOES
+ * ---------------------------------------------------------------------------
+ *     00b6b6  move.w  d2, $e(a4)      ; the responder stores the new velocity
+ *     00b6ba  move.w  d1, $10(a4)
+ *     00b6be  cmpi.w  #$6, $c(a4)     ; the RING HIT COUNT this pass just read
+ *     00b6c4  blt.b   $b6e6           ; fewer than six -> nothing at all
+ *     00b6c6  move.w  $28(a4), d4     ; the mean contact bearing
+ *     00b6ca  move.w  #$fe00, d0      ; -512, i.e. HALF A PIXEL
+ *     00b6d0  muls.w  (a0,d4.w*2), d0 ; the 16384-amplitude cos/sin tables
+ *     00b6d4  muls.w  (a1,d4.w*2), d1
+ *     00b6da  asr.l   d2, d0          ; d2 = 14
+ *     00b6dc  add.l   d0, $1e(a4)     ; and PUSH the Q10 position along it
+ *     00b6e0  asr.l   d2, d1
+ *     00b6e2  add.l   d1, $22(a4)
+ *     00b6e6  rts
+ *
+ * The bearing points from the ball centre INTO the surface, so `-512` along it
+ * is `+512` along the OUTWARD normal: half a pixel out, for as long as at least
+ * six of the forty-four ring points are in solid material. `$1e/$22` is the Q10
+ * position pair, so the machine's half pixel is this port's half pixel exactly.
+ *
+ * IT IS THE RESPONDER'S OWN LAST INSTRUCTION, ONCE PER COLLISION PASS —
+ * FOUR TIMES A FRAME, NOT EIGHT. `research/spin/SPIN_DECODE.md` §3.1 reports it
+ * as "once per substep, by the integrator — not by the responder, which still
+ * cannot move a ball", and the bytes say otherwise on both counts. There is an
+ * `rts` at +0x00B6E6, immediately before the integrator's entry at +0x00B6E8:
+ * the two routines are ADJACENT IN MEMORY AND SEPARATE `jsr` TARGETS, and the
+ * unrolled frame calls `$b4ba` four times (+0x00A64C/696/6E0/728) and `$b6e8`
+ * eight (+0x00A660/666, 6AA/6B0, 6F4/6FA, 73C/742). +0x00B6BE is reached by
+ * falling out of the exit rotation at +0x00B662 and the velocity store at
+ * +0x00B6B6, which EVERY path through the responder converges on — including
+ * the leaving gate, whose `ble.w $b662` at +0x00B54E jumps to the rotation and
+ * not to the return. So a ball that is touching but not approaching is not
+ * charged and IS still ejected. The one path that skips it is the one where the
+ * responder is never called at all: `jsr $a7e0 / bmi.b $a69c` at +0x00A68E,
+ * i.e. an empty collision blit.
+ *
+ * The correction is worth a factor of two in how hard the rule pushes, and it
+ * was measured as well as read: at eight a frame the physics gate scores 2166
+ * against the machine's own RAM and at four it scores 1498.
+ *
+ * `$c(a4)` IS THE RING HIT COUNT, independently of the disassembly: the spin
+ * round's own RAM traces record it, and over 30,929 frames it never exceeds 17
+ * of the ring's 44 and its single commonest value above 1 is exactly 5 — which
+ * is how many points a discrete radius-8 circle puts on a flat floor it is
+ * resting on (the bottom row is dx -2..+2). A count of anything else could not
+ * produce that spike.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT IT REPLACES, AND WHY THE REPLACEMENT IS THE POINT
+ * ---------------------------------------------------------------------------
+ * `78bed65` disclosed a deviation it could not avoid: between two collision
+ * passes a ball LYING on a surface gains a quarter tick of gravity and moves
+ * 2 Q10 into it, four times a tick, and the pass throws that away as velocity
+ * without giving it back as position. The original does exactly the same — its
+ * resting lane ball descends 8.5 Q10 a frame against this integrator's 8 — and
+ * then EJECTS about 0.4 px every ~40 frames, which is why its seat only ever
+ * bobs over cy 553.53..553.91 instead of burying itself. THIS IS THAT EJECTOR.
+ * Round 8 could not find it and shipped a position constraint instead: a surface
+ * a ball was resting on refused the into-surface part of every substep's move.
+ * That stand-in held the ball up, and it also held it STILL — a ball that can
+ * never move into a surface can never be pushed back out of one either, so a
+ * ball that crept to a stop stayed stopped for ever. The pathology sweep found
+ * the consequence and left it for this round: BabeWatch's right-hand level-1
+ * rail stops a ball DEAD at (327.15, 363.00)L1 from tick 529, 62 releases
+ * against 9 on the pre-substep control.
+ *
+ * The machine's rule is the opposite shape and that is the whole difference. It
+ * does not resist penetration; it lets the ball sink and then SHOVES it out,
+ * which unsticks a wedged ball as a side effect of doing the thing it is for.
+ * The sink is real and both machines have it — the original's resting lane ball
+ * descends 8.5 Q10 a frame against this integrator's 8 — and the bob is what
+ * bounds it.
+ *
+ * ---------------------------------------------------------------------------
+ * THE ONE PORT-SIDE CONDITION
+ * ---------------------------------------------------------------------------
+ * The push goes through `advanceCentre`, so the centre-in-solid invariant is
+ * kept. The machine writes `$1e/$22` raw, and it can afford to: it has no
+ * anti-tunnelling backstop at all. This port's is load-bearing and cheap here —
+ * half a pixel samples one point — and in the case the ejector exists for, a
+ * push straight out along the outward normal, it never clamps.
+ */
+function ejectBuried(
+  ball: BallState,
+  map: TableMap,
+  passable: readonly boolean[],
+  probe: RingProbe,
+): void {
+  if (probe.contacts.length < EJECTOR_MIN_RING_HITS) return;
+  // `asr.l #14` against a 16384-amplitude table is a FLOOR; `>> 10` against this
+  // port's own 1024-amplitude unit normal is the same operation at the same
+  // scale as everything else the contact model does.
+  advanceCentre(
+    ball,
+    map,
+    passable,
+    (EJECTOR_PUSH_Q10 * probe.normalX) >> 10,
+    (EJECTOR_PUSH_Q10 * probe.normalY) >> 10,
+  );
 }
 
 /**
@@ -1913,20 +2095,16 @@ function integrateBall(
   const startX = ball.x;
   const startY = ball.y;
   let advanced = false;
-  // The surface a RESTING contact is holding the ball against, kept between one
-  // pass and the next; null while nothing is holding it. See `holdAgainst`.
-  let resting: RingProbe | null = null;
 
   for (let substep = 0; substep < SUBSTEPS_PER_TICK; substep += 1) {
     const velocityX = ball.velocityX;
     const velocityY = ball.velocityY;
     if (substep % RESPOND_EVERY === 0) {
-      resting = respondAt(ball, map, materials, passable, ring, log, options, surfaceAt);
+      respondAt(ball, map, materials, passable, ring, log, options, surfaceAt);
     }
 
-    const step = holdAgainst(resting, ball.velocityX >> 3, ball.velocityY >> 3);
-    const stepX = step.x;
-    const stepY = step.y;
+    const stepX = ball.velocityX >> 3;
+    const stepY = ball.velocityY >> 3;
     const moved = advanceCentre(ball, map, passable, stepX, stepY);
     advanced = advanced || moved;
 
@@ -1956,6 +2134,19 @@ function integrateBall(
     ball.velocityY = clampVelocity(
       ball.velocityY + (last ? gravity.last : gravity.each) + (push === null ? 0 : push.y >> 3),
     );
+
+    // +0x00B770, the tail of the same routine: the spin bleeds ONE RESPONDER
+    // UNIT per substep toward zero, saturating there. Eight a frame, linear, no
+    // coefficient and no time constant — measured against the machine's own next
+    // spin word on 11,053 of 11,053 free-flight frames across three cold boots.
+    //
+    // It belongs HERE and not in `stepBalls`: a per-tick decay of one would
+    // leave seven eighths of the spin standing. And it is reached only for a
+    // ball that is `active` and not `heldBy`, which is exactly the machine's
+    // `tst.b $9(a4)` / `bmi $1(a4)` pair — so a locked ball's spin FREEZES for
+    // free, and comes back out of the saucer unchanged.
+    if (ball.spin > 0) ball.spin -= 1;
+    else if (ball.spin < 0) ball.spin += 1;
   }
 
   // The tick as a whole gets the same rule the individual substeps do, because a

@@ -85,18 +85,33 @@
  *   there is: on a synthetic map with no surface layer, which is what every
  *   physics unit test measures.
  *
- * NOT ADOPTED: $38, the minimum normal impact. Decoded and recorded as
- * `minImpact`; the branch is `cmp.w $38(a4),d0 / blt.b $b57a` at +0x00B56E and
- * its fall-through is `moveq #0,d0 / bra.w $b626`, i.e. a contact softer than
- * the row's minimum is killed exactly as a graze is — no bounce, no coil, slip
- * only. This port's `restThreshold` gates the same event on its own velocity
- * scale and carrying both would gate it twice. The two are not equivalent and
- * the difference is recorded rather than hidden: on the plain-wall row `$38` is
- * -800 responder units = 1.56 px/tick of approach, where `restThreshold`
- * (853 Q10 on the OUTGOING bounce, so 2.80 px/tick of approach at that row's
- * restitution) is nearly twice as strict; on the bumper row `$38` is 0, so the
- * original's pop bumper fires however gently it is touched. Adopting `$38`
- * needs a before-and-after census, not a patch.
+ * ADOPTED IN THE SPIN ROUND: $38, the minimum normal impact — the LAST of the
+ * four, so the row is now read whole. The branch is `cmp.w $38(a4),d0 /
+ * blt.b $b57a` at +0x00B56E and its fall-through is `moveq #0,d0 / bra.w $b626`,
+ * i.e. a contact softer than the row's minimum is killed exactly as a graze is
+ * — no bounce, no coil, slip only.
+ *
+ * IT IS TESTED ON THE RAW APPROACH, BEFORE THE RESTITUTION AND BEFORE THE
+ * COILS: `d0` at +0x00B56E is still the inward normal speed the rotation
+ * produced, and the `muls.w $36(a4),d0` that scales it is 178 bytes further on
+ * at +0x00B620. The port used to gate the same event with ONE GLOBAL
+ * `restThreshold` of 853 Q10 applied to the OUTGOING bounce, which is a
+ * different rule in two ways at once: it is global where the machine's is per
+ * surface, and it is post-restitution where the machine's is pre. On the
+ * plain-wall row `$38` is -800 responder units = 1.5625 px/tick of approach,
+ * where 853 Q10 out of that row's 76/256 restitution is 2.80 px/tick in — so
+ * the global rule was nearly twice as strict and killed bounces the machine
+ * takes. On rubber `$38` is -200 = 0.39 px/tick, seven times looser again; on
+ * the level-change ids it is -2000 = 3.9 px/tick, STRICTER than the global one
+ * (and irrelevant, because that row hands back 2/256 of anything it does
+ * bounce); and on the bumper row it is 0, so the original's pop bumper fires
+ * however gently it is touched — a case the global rule could not express at
+ * all.
+ *
+ * `restThreshold` survives where it is still the only rule there is: on a
+ * synthetic map with no surface layer, which is what every physics unit test
+ * measures, and as `integrateBall`'s own "this tick went nowhere" clamp, which
+ * is a different question from "was this contact an impact".
  *
  * ---------------------------------------------------------------------------
  * THE VELOCITY BRIDGE, WHICH WAS INHERITED, CIRCULAR AND WRONG
@@ -247,6 +262,37 @@ export function slingshotIndexOf(id: number): number {
 // One original velocity unit is still four Q10 per tick.
 export const RESPONDER_VELOCITY_SCALE = 2;
 
+/**
+ * Q10 per RESPONDER unit, and therefore per unit of `BallState.spin`.
+ *
+ * The ball's spin word `$26(a4)` lives inside the doubled contact frame — it is
+ * subtracted straight from `d2` at +0x00B62E — so one unit of it is one
+ * responder unit is `Q10_ONE / (4 * 2)` = two Q10 = 1/512 px per tick. The
+ * assertion is not decoration: everything below assumes the conversion is a
+ * whole number of Q10 in both directions, and a future re-measurement of the
+ * timebase that broke that would otherwise start truncating silently.
+ */
+export const ORIGINAL_SPIN_UNIT_Q10: Q10 = originalVelocityToQ10(1) / RESPONDER_VELOCITY_SCALE;
+
+if (!Number.isInteger(ORIGINAL_SPIN_UNIT_Q10) || 1024 % ORIGINAL_SPIN_UNIT_Q10 !== 0) {
+  throw new Error(
+    `the responder unit must divide Q10_ONE exactly: got ${ORIGINAL_SPIN_UNIT_Q10}`,
+  );
+}
+
+/**
+ * `$38`, the row's minimum normal impact, in Q10 — negative, because the word
+ * is compared against the INWARD normal speed and a ball approaching a surface
+ * has a negative one. A contact with `normalSpeedIn >= this` is too soft to
+ * bounce and is killed exactly as a graze is.
+ *
+ * The word is at responder scale, so a plain wall's -800 is -1600 Q10 =
+ * 1.5625 px/tick of approach.
+ */
+export function minimumImpactQ10(constants: SurfaceConstants): Q10 {
+  return constants.minImpact * ORIGINAL_SPIN_UNIT_Q10;
+}
+
 /** Inward normal speed a bumper needs before it fires, in Q10 per tick. */
 export const BUMPER_KICK_THRESHOLD: Q10 = originalVelocityToQ10(50 / RESPONDER_VELOCITY_SCALE);
 /** Added to the inward normal speed before restitution. */
@@ -282,12 +328,20 @@ export interface SurfaceConstants {
   readonly grazeLimit: number;
   /** `$36` restitution, 1/256ths. */
   readonly restitution: number;
-  /** `$38` minimum normal impact velocity, negative. Recorded, not applied. */
+  /**
+   * `$38` minimum normal impact velocity, negative, at responder scale. A
+   * contact whose RAW inward normal speed is not at least this fast is killed
+   * exactly as a graze is — no bounce, no coil, slip only. Applied by
+   * `reflectVelocity` on surface-mapped contacts since the spin round;
+   * `minimumImpactQ10` is the bridge.
+   */
   readonly minImpact: number;
   /**
-   * `$3A` spin/friction divisor: an impact takes `tangent * 160 / $3A` in the
-   * spinless limit. Applied by `reflectVelocity` on surface-mapped impacts
-   * since round 5 — see the header.
+   * `$3A` spin/friction divisor: a contact charges `(spin - vt) * 256 / $3A`,
+   * puts five eighths of it into the ball's along-surface speed and ALL of it
+   * out of the ball's spin. Applied by `reflectVelocity` on surface-mapped
+   * contacts since round 5, and against a real `BallState.spin` rather than in
+   * its spinless limit since the spin round — see the header.
    */
   readonly slipDivisor: number;
   /** Ids this row governs, as inclusive ranges. */

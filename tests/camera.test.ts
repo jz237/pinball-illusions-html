@@ -41,6 +41,7 @@ function ball(id: number, y: number, active = true, heldBy: string | null = null
     active,
     heldBy,
     level: 0,
+    spin: 0,
   };
 }
 
@@ -456,8 +457,14 @@ describe("initial state", () => {
     // part of the way through its approach by the time the ball reaches the rod.
     // The law is untouched: every step is still 0.85..0.96 of the one before,
     // and it still ends on SERVE_FRAMING_SCROLL, asserted above.
+    //
+    // RE-MEASURED AGAIN for the spin round: two of the thirteen steps move by
+    // one row (36 -> 37 and 12 -> 11). The camera rule is not touched at all;
+    // the BALL is, by one Q10 of chute position, and the follower is a function
+    // of where the ball is. The law below is what the test is for and it is
+    // unchanged.
     const nonZeroSteps = (rows: readonly number[]): number[] =>
       rows.map((row, i) => row - (i === 0 ? 0 : (rows[i - 1] ?? 0))).filter((step) => step !== 0);
-    expect(nonZeroSteps(second)).toEqual([45, 40, 36, 33, 30, 27, 25, 23, 21, 19, 17, 16, 12]);
+    expect(nonZeroSteps(second)).toEqual([45, 40, 37, 33, 30, 27, 25, 23, 21, 19, 17, 16, 11]);
   });
 });

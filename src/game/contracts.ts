@@ -336,6 +336,44 @@ export interface BallState {
    * for where a ball changes between them.
    */
   level: PlayfieldLevel;
+  /**
+   * THE BALL'S SPIN: the surface speed its rotation would give the contact
+   * point, signed in the contact tangent basis `t = (n_y, -n_x)`.
+   *
+   * The original's own `$26(a4)` — a signed 16-bit word at ball record offset
+   * +$26, the very next word after the Q10 position pair at +$1E/+$22 — found,
+   * decoded and measured against three cold boots of the machine's own RAM in
+   * `research/spin/SPIN_DECODE.md`. It is charged by the responder at
+   * +0x00B640 (`sub.w d4,$26(a4)`, the same `d4` that puts `5q/8` into the
+   * translation one instruction earlier) and bled one unit per SUBSTEP toward
+   * zero at +0x00B770. Nothing else in the whole segment writes it: all
+   * seventeen `$26(An)` accesses in main.seg00 were disassembled and classified,
+   * and the ten that are not these are other structures.
+   *
+   * RESPONDER UNITS — 1/512 px per tick, two Q10, half of one of the original's
+   * own velocity words — because `$26(a4)` is subtracted straight from the
+   * doubled tangential speed inside the contact rotation (see
+   * `surface-physics.ts`'s `RESPONDER_VELOCITY_SCALE`) and its decay quantum is
+   * exactly one of them.
+   *
+   * IT PERSISTS, and that is decoded rather than convenient: across frames,
+   * across free flight, across a serve, across a drain and across a lock.
+   * `+0x3E36`, the serve routine, re-seeds `$12/$14/$1E/$22/$0E/$10/$01` and
+   * NOT `$26`; the per-ball loops skip a held or drained ball entirely, so a
+   * ball released from a saucer comes out with the spin it went in with. A port
+   * that reset it at serve would be wrong in the code and almost right in
+   * effect, because eight units a frame empties any real spin in about a second
+   * — measured on the machine's own seated lane ball the spin is exactly 0 on
+   * 79-87 % of its frames, which is the equilibrium between the seat's own
+   * charge and the decay rather than an uncleared leftover.
+   *
+   * SIGN. The basis is derived from the outward normal by a fixed quarter turn,
+   * so the handedness is global and this is a genuine angular velocity about
+   * the axis out of the playfield rather than a per-contact convention. A port
+   * that flipped it would DOUBLE the tangential toll instead of removing it,
+   * which is why `tests/ball-physics.test.ts` asserts the handedness directly.
+   */
+  spin: number;
 }
 
 /** A contact detected between a ball's probe ring and a non-passable pixel. */

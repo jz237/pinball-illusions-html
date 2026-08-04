@@ -27,6 +27,7 @@ import type { TableId } from "../src/game/contracts.js";
 import { TABLE_IDS } from "../src/game/contracts.js";
 import { materialTableFor } from "../src/game/materials.js";
 import { createBallSet, spawnBall, stepBalls } from "../src/game/ball-physics.js";
+import { ballIsOnTheRod } from "../src/game/plunger.js";
 import { SIMULATION_GRAVITY } from "../src/game/timebase.js";
 import { freeCentre, levelViewsOf } from "../src/game/level-scan.js";
 import { flipperConfigsFor } from "../src/game/flippers.js";
@@ -106,7 +107,16 @@ describe("serving", () => {
     const after = laneBall(game);
 
     // A ball that drifts off the rod on its own would make the plunger useless.
-    expect(after?.pixelY).toBe(before?.pixelY);
+    //
+    // ON THE ROD is the claim, not ON THE PIXEL. A seated ball bobs — the
+    // ejector at +0x00B6BE, which is what the original does with its own lane
+    // ball (cy 553.53..553.91, never still) — and at tick 60 the serve is still
+    // arriving, so a pixel-equality between the two samples was pinning the
+    // arrival and not the hold. What matters is that 120 further ticks of doing
+    // nothing leave the ball where the plunger can still reach it.
+    expect(after).not.toBeNull();
+    expect(ballIsOnTheRod(after!)).toBe(true);
+    expect(Math.abs((after?.pixelY ?? 0) - (before?.pixelY ?? 0))).toBeLessThanOrEqual(2);
     expect(debugSnapshot(game).phase).toBe("in-play");
   });
 });

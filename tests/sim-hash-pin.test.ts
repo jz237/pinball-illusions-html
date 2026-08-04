@@ -36,6 +36,7 @@ import { describe, expect, it } from "vitest";
 import type { ControlSnapshot } from "../src/browser/input.js";
 import { InputRouter } from "../src/browser/input.js";
 import type { InputSource } from "../src/browser/game-loop.js";
+import type { Game } from "../src/browser/game-loop.js";
 import { createGame, debugSnapshot, runTicks, startGame } from "../src/browser/game-loop.js";
 import type { TableId } from "../src/game/contracts.js";
 import { mapFor } from "./table-fixtures.js";
@@ -442,11 +443,134 @@ const TICKS = 4000;
  *   law-n-justice   29c573580c2edd9cec313ebfe6c0c827157d121d87ad099e14635a2141652b00 (UNCHANGED)
  *   babewatch       d1358da0fef0abb2038238f211281072b2e4ce850c074fa23eebfd0489a4c9dc
  *   extreme-sports  05cf9bbd1334ff9fac6d5e26aa69708765f364db9678ed2eb064a2f18cb3c823 (UNCHANGED)
+ *
+ * RE-PIN, THE BALL'S SPIN, THE EJECTOR AND `$38` (the spin round). All three
+ * hashes move, and they move on the SAME tick of all three tables, which is the
+ * signature of a change in engine geometry rather than in table data.
+ *
+ * WHAT CHANGED. Three decodes out of `research/spin/SPIN_DECODE.md` and the
+ * bytes of `main.seg00`, plus one correction the bytes forced:
+ *
+ *   `$26(a4)`, THE BALL'S SPIN, is a real field. `BallState.spin` is charged by
+ *   `sub.w d4,$26(a4)` at +0x00B640 with the SAME `d4` that puts `5q/8` into
+ *   the translation one instruction earlier, and bled one unit per SUBSTEP —
+ *   eight a frame, linear, saturating — at +0x00B770. The port used to read it
+ *   as a permanent zero, which is the SPINLESS LIMIT and the most the rule can
+ *   ever take. Nothing resets it: not a serve, not a drain, not a lock.
+ *
+ *   THE EJECTOR at +0x00B6BE: six or more of the ring's forty-four points in
+ *   solid and the ball is shoved half a pixel out along the contact bearing.
+ *   This REPLACES `holdAgainst`, the position constraint `78bed65` had to
+ *   invent and disclosed as its deviation 1.
+ *
+ *   `$38(a4)`, THE TOO-SOFT GATE, is per surface and is tested on the RAW
+ *   approach at +0x00B56E: -800 / -200 / -2000 / -400 and ZERO for the bumpers,
+ *   where the port used one global 853 Q10 on the outgoing bounce.
+ *
+ *   AND THE TOLL IS APPLIED TO A SCALAR. The machine has no `keep` fraction; it
+ *   adds and subtracts whole units of a signed tangential speed. The port's
+ *   `trunc((vt - drop) * 1024 / vt)` lost up to one part in 1024 of the speed at
+ *   every contact, always in the slower direction. That, and a FLOORING rather
+ *   than truncating exit rotation, is the arch round's unexplained C9 — which is
+ *   therefore answered and struck off, not still open.
+ *
+ * A CORRECTION TO THE DECODE, found in the bytes while implementing it.
+ * SPIN_DECODE section 3.1 reports the ejector as running "once per substep, by
+ * the integrator — not by the responder, which still cannot move a ball". Both
+ * halves are wrong. There is an `rts` at +0x00B6E6, immediately before the
+ * integrator's entry at +0x00B6E8: the two are adjacent in memory and separate
+ * `jsr` targets, and the unrolled frame calls `$b4ba` FOUR times and `$b6e8`
+ * eight. +0x00B6BE is the responder's own last instruction, reached by falling
+ * out of the velocity store at +0x00B6B6 that every path converges on — the
+ * leaving gate included. So it is four a frame, and the responder can move a
+ * ball, at exactly this one instruction. The correction is worth a factor of
+ * two in how hard the rule pushes and it was measured as well as read: at eight
+ * a frame the physics gate scores 2166 and at four it scores 282.
+ *
+ * THE EVIDENCE. The physics gate — the shipped `stepBalls` against the
+ * machine's own per-frame RAM, one tick from each of its own exact start states:
+ *
+ *                                            errorSum  exact  <=4  posExact
+ *   ed5e01d                                      1790    466  517       464
+ *   + scalar tangent (no `keep` fraction)        1743    468  523       469
+ *   + the SPIN word                              1527    470  549       484
+ *   + per-surface `$38`                          1384    470  550       484
+ *   + the ejector at four a frame                 282    470  558       487
+ *
+ * 6.35x closer; worst single frame 366.17 -> 12.04; contact p90 4.10 -> 1.90.
+ * The middle row is a FORECAST THAT HELD: SPIN_DECODE section 7.5 predicted
+ * "roughly 1500-1560" for the two changes it modelled, and the port lands on
+ * 1527.
+ *
+ * THE DIVERGENCE IS THE EJECTOR, ON THE FIRST CONTACT OF THE GAME. Dumping all
+ * 4,000 per-tick snapshots on both trees, all three tables diverge at the SAME
+ * tick — index 25, ball 1, in the return chute at (294,520)L1 — with the
+ * velocity identical and the position exactly 724 Q10 further along on both
+ * axes. 724 is two ejector pushes of `(512 * 724) >> 10` = 362 along a
+ * 45-degree contact normal: the ball is six ring points into the chute wall and
+ * the machine shoves it out. The chute is engine geometry shared by all three
+ * tables, which is why the tick index is identical; the first differing PIXEL is
+ * two ticks later, at 27. 3,975 of 4,000 ticks differ afterwards on every table,
+ * which is what a physics change does to three whole games.
+ *
+ *   law-n-justice   final score 0 -> 420,000
+ *   babewatch       final score 2,090,000 -> 2,095,000
+ *   extreme-sports  final score 245,000 -> 310,000
+ *
+ * ONE FIELD IS PROJECTED OUT OF THE HASH and `hashedSnapshot` says why: the spin
+ * word itself, which differs from the first contact of every game and would turn
+ * "the first divergent tick" into a statement about when a field was added
+ * rather than about when the behaviour moved. It is dropped with a JSON replacer
+ * rather than by rebuilding the object, so the key order — and therefore every
+ * byte of every other field — is untouched, and the projection is a no-op on any
+ * tree without the field. VERIFIED: replaying the 4,000-tick script at `ed5e01d`
+ * through this exact harness reproduces all three of the digests it replaced.
+ *
+ * THE CENSUS, 90 games x 3 tables x 40,000 ticks, aggressive player, `ed5e01d`
+ * -> this tree. Every table still completes 90/90 with ZERO write-offs:
+ *
+ *   law-n-justice   ends 279; median 1,127,500 -> 1,612,500; min 0 -> 95,000;
+ *                   max 21,880,000 -> 25,355,000; zeros 1/90 -> 0/90;
+ *                   distinct 81 -> 86; BALL 1 median 295,000 -> 272,500.
+ *   babewatch       ends 270; median 1,896,170 -> 3,207,500; min 425,000 ->
+ *                   970,000; max 11,994,680 -> 10,800,000; distinct 87 -> 88;
+ *                   BALL 1 median 355,000 -> 732,500.
+ *   extreme-sports  ends 270; median 702,500 -> 682,500; min 150,000; max
+ *                   10,964,000 -> 11,737,000; distinct 75 -> 81; BALL 1 median
+ *                   120,000 -> 135,000.
+ *   worst write-off rate 0.0% -> 0.0%, zero stalls everywhere.
+ *
+ * THE PATHOLOGY SWEEP, 12 games x 3 tables x 3 profiles x 40,000 ticks:
+ * findings 6 -> 0. The four creeping, one oscillating and one dwell finding
+ * `ed5e01d` reported on Extreme Sports' (51.5,433.4)L0 chain are gone and
+ * nothing replaced them. The trap census at 4 px, 68,620 releases: balls that
+ * ended FULLY AT REST — dead, v = (0,0), for ever — fall from 12,481 to 1,558,
+ * and the BabeWatch level-1 rail site this round was handed drops from 66
+ * releases to 2. The two pre-existing map pockets stay, as they must: Law 'n
+ * Justice (24,304)L0 2 -> 2 and BabeWatch (252,57)L0 11 -> 8.
+ *
+ * THE FLIPPER PROBE, and this is the one figure that moved the wrong way.
+ * Roll-and-flip pass-under over the six lower bats: 9 -> 12 of 648, all of it on
+ * the lower-right outer blade, the known residual `ed5e01d` reduced from 159 to
+ * 9 and left. Ablated on the probe itself: the SCALAR TANGENT costs it (9 ->
+ * 15), because a ball that keeps the tangential speed the machine leaves it
+ * rolls further out the blade before the stroke starts, and the SPIN then wins
+ * half of that back (15 -> 12). Drop pass-under 14 -> 13 of 210, and the cradle
+ * holds on all six lower bats on both trees. The underlying defect is
+ * `flippers.ts` resolving bat contacts once per tick after `stepBalls` instead
+ * of inside the four passes — ARCH_NORMAL_DECODE section 9.4 and SPIN_DECODE
+ * section 7.4, disclosed and deferred by both — and this round makes the ball
+ * arrive at it more faithfully rather than making the bat worse.
+ *
+ * The digests this entry replaced, recorded so the move is auditable:
+ *   law-n-justice   29c573580c2edd9cec313ebfe6c0c827157d121d87ad099e14635a2141652b00
+ *   babewatch       6fe25c2e110feeb90805e9b1f75901387e5b70842b8805d9f0354c159aa4818a
+ *   extreme-sports  05cf9bbd1334ff9fac6d5e26aa69708765f364db9678ed2eb064a2f18cb3c823
  */
 const PINNED: Record<TableId, string> = {
-  "law-n-justice": "29c573580c2edd9cec313ebfe6c0c827157d121d87ad099e14635a2141652b00",
-  "babewatch": "6fe25c2e110feeb90805e9b1f75901387e5b70842b8805d9f0354c159aa4818a",
-  "extreme-sports": "05cf9bbd1334ff9fac6d5e26aa69708765f364db9678ed2eb064a2f18cb3c823",
+  "law-n-justice": "77b68e4309949efa46c658ecd734a3deaf4d14a5265db0c8989b3f9056e1ea20",
+  "babewatch": "14a0ed019849b31805b1ea44a04c78cabb05820e2d32701a16fa7f8738506a56",
+  "extreme-sports": "e62fdc9f1c4611960822e138114666965120247dc8e347e06f0a1927894abefd",
 };
 
 /** Same shape as the determinism harness's input: behaviour = f(tick index). */
@@ -474,6 +598,35 @@ class ScriptedInput implements InputSource {
   }
 }
 
+/**
+ * The snapshot as this pin hashes it: everything `debugSnapshot` reports EXCEPT
+ * the ball's spin word and the copy of it the trough record carries.
+ *
+ * WHY ONE FIELD IS PROJECTED OUT, and it is the only one. `BallState.spin` is
+ * the original's `$26(a4)` and it is real simulation state, so it belongs in a
+ * debug dump — but it is charged at the FIRST contact of every game and bled
+ * eight units a frame thereafter, so a tree that has it and a tree that does
+ * not differ on essentially every tick from the first bounce onward. Hashing it
+ * would make "the first divergent tick" a statement about when the field was
+ * introduced rather than about when the BEHAVIOUR moved, and that tick is the
+ * whole diagnostic value this pin has. Everything the spin actually DOES —
+ * every position, every velocity, every score that follows from it — is hashed
+ * exactly as before, so nothing about the rule escapes the pin.
+ *
+ * `research/spin/SPIN_DECODE.md` 7.1 asks for exactly this.
+ */
+export function hashedSnapshot(game: Game): string {
+  // A REPLACER and not a rebuilt object, deliberately: rebuilding would reorder
+  // the keys and move all three digests for a reason that is not behaviour,
+  // which is the exact failure this projection exists to avoid. Dropping the
+  // key in place leaves the JSON byte-for-byte what it was everywhere else —
+  // and at any tree without a spin field it is a no-op, so the pin's history
+  // stays comparable.
+  return JSON.stringify(debugSnapshot(game), (key, value: unknown) =>
+    key === "spin" ? undefined : value,
+  );
+}
+
 function simHash(tableId: TableId): string {
   const game = createGame(mapFor(tableId));
   startGame(game);
@@ -481,7 +634,7 @@ function simHash(tableId: TableId): string {
   const hash = createHash("sha256");
   for (let tick = 0; tick < TICKS; tick += 1) {
     runTicks(game, input, 1);
-    hash.update(JSON.stringify(debugSnapshot(game)));
+    hash.update(hashedSnapshot(game));
     hash.update("\n");
   }
   return hash.digest("hex");

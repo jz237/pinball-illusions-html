@@ -46,6 +46,7 @@ import { batRadiusAt, flipperAngle, flipperConfigsFor } from "../src/game/flippe
 import type { FlipperConfig } from "../src/game/flippers.js";
 import { BALL_RADIUS_PIXELS, cosineUnits, sineUnits } from "../src/game/collision-probe.js";
 import { Q10_ONE, pixelsToQ10, q10Multiply } from "../src/core/fixed-point.js";
+import { SUBSTEP_GRAVITY } from "../src/game/ball-physics.js";
 import type {
   FlipperBatsDocument,
   TableAccelDocument,
@@ -182,17 +183,40 @@ const BAT_CONTROL: Readonly<Record<string, Control>> = {
  * racing the machine — the project has an explicit note about exactly this
  * ("a port probe must let the served ball SETTLE before plunging or it invents
  * a defect"). Sixty ticks is more than twice the longest observed serve.
+ *
+ * SETTLED IS NOT DEAD STILL, and it never was on the machine. This used to wait
+ * for `v === (0, 0)` exactly, which was a statement about the position
+ * constraint `78bed65` shipped as a stand-in for the ejector at +0x00B6BE: that
+ * constraint refused the into-surface part of every move, so a seated ball
+ * stopped and never moved again. With the real ejector the seat BOBS, exactly
+ * as the original's does — the machine's own lane ball only ever sits between
+ * cy 553.53 and 553.91, and this port's now spans 0.492 px against that 0.38 —
+ * and a residual of one collision pass's worth of gravity is what a seated ball
+ * has for ever. Waiting for zero waits for something the machine never does.
+ *
+ * So the bar is the BOB and nothing more: `2 * SUBSTEP_GRAVITY` is the 32 Q10 a
+ * ball picks up in the two substeps between one pass and the next, i.e. 1/32 px
+ * per tick. A ball still travelling is orders of magnitude above it, and every
+ * scenario places its ball by hand afterwards anyway.
  */
 function servedGame(tableId: TableId): Game {
   const game = createGame(mapFor(tableId), { ballsPerGame: 3 });
   startGame(game);
   const idle = new ScriptedInput(() => []);
+  const seated = 2 * SUBSTEP_GRAVITY;
   for (let tick = 0; tick < 400; tick += 1) {
     runTicks(game, idle, 1);
     const ball = game.balls.balls.find((one) => one.active);
-    // Wait for it to be BOTH served and settled on the lane seat, so the
-    // starting velocity a scenario asks for is the only velocity it has.
-    if (ball !== undefined && ball.velocityX === 0 && ball.velocityY === 0 && tick > 4) return game;
+    // Wait for it to be BOTH served and seated, so the starting velocity a
+    // scenario asks for is the only velocity of any size it has.
+    if (
+      ball !== undefined &&
+      Math.abs(ball.velocityX) <= seated &&
+      Math.abs(ball.velocityY) <= seated &&
+      tick > 4
+    ) {
+      return game;
+    }
   }
   throw new Error(`${tableId}: the serve never settled`);
 }

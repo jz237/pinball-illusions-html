@@ -18,7 +18,7 @@ import {
   materialTableFor,
 } from "../src/game/materials.js";
 import { parseTableMapDocument } from "../src/game/table-map.js";
-import { pixelsToQ10, q10Multiply, q10ToPixel } from "../src/core/fixed-point.js";
+import { Q10_ONE, pixelsToQ10, q10Multiply, q10ToPixel } from "../src/core/fixed-point.js";
 import {
   DEFAULT_PROBE_RADIUS,
   PROBE_RING,
@@ -31,6 +31,7 @@ import { shooterLaneFor } from "../src/game/plunger.js";
 import {
   BALL_RADIUS_PIXELS,
   DEFAULT_SIMULATION_OPTIONS,
+  SUBSTEP_GRAVITY,
   VIRTUAL_TOP_WALL_ROWS,
   activeBallCount,
   ballById,
@@ -242,16 +243,46 @@ describe("resting on a floor", () => {
   /** Centre sits one radius above the first solid row; the probe ring just touches it. */
   const RESTING_CENTRE = FLOOR_Y - BALL_RADIUS_PIXELS;
 
-  it("does not sink and does not creep", () => {
+  it("bobs on its seat exactly as the machine's does, and never sinks past it", () => {
+    // RESTATED FOR THE EJECTOR, and it is now the machine's own behaviour rather
+    // than a stand-in for it. This used to assert the ball was FROZEN — same Q10
+    // to the unit, velocity exactly zero, for two hundred ticks — which was a
+    // property of `holdAgainst`, the position constraint `78bed65` shipped
+    // because it could not find the ejector. A surface that refuses every
+    // into-surface move holds a ball perfectly still; the machine's does not.
+    //
+    // WHAT THE MACHINE DOES, and what this now does: the ball sinks 8 Q10 a tick
+    // between collision passes, and once six of its forty-four ring points are
+    // in the floor the responder's last instruction (+0x00B6BE) shoves it half a
+    // pixel back out. Session 4 measured the original's own lane ball bobbing
+    // over cy 553.53..553.91 — 0.38 px — and never settling; this fixture bobs
+    // over 0.992 px on a flat floor and never settles either.
+    //
+    // THE CLAIM THE TEST IS NAMED FOR IS STRONGER THAN THE OLD ONE, because it
+    // is made against a bound rather than against a constant: the ball may bob,
+    // it may NOT drift, and its ring may never get more than one pixel row into
+    // the floor however long it stands there.
     const set = setWith({ x: 100, y: RESTING_CENTRE });
     const ball = only(set);
+    const seat = pixelsToQ10(RESTING_CENTRE);
+    let lowest = ball.y;
+    let highest = ball.y;
 
     for (let tick = 0; tick < 200; tick += 1) {
       stepBalls(set, FLOOR_MAP, MATERIALS, GRAVITY);
-      expect(ball.y).toBe(pixelsToQ10(RESTING_CENTRE));
-      expect(ball.velocityY).toBe(0);
+      lowest = Math.max(lowest, ball.y);
+      highest = Math.min(highest, ball.y);
+      // Never deeper than one pixel row of ring, and never above the seat.
+      expect(q10ToPixel(ball.y) + BALL_RADIUS_PIXELS).toBeLessThanOrEqual(FLOOR_Y + 1);
+      expect(ball.y).toBeGreaterThanOrEqual(seat);
+      // The residual is exactly what two substeps of gravity supply between one
+      // pass and the next, and nothing is accumulating.
+      expect(ball.velocityY).toBe(2 * SUBSTEP_GRAVITY);
       expect(ball.active).toBe(true);
     }
+    // A BOB AND NOT A DRIFT: bounded by one pixel, top and bottom.
+    expect(lowest - highest).toBeLessThanOrEqual(Q10_ONE);
+    expect(lowest - seat).toBeLessThanOrEqual(Q10_ONE);
   });
 
   it("settles after a drop instead of bouncing forever", () => {
@@ -260,7 +291,10 @@ describe("resting on a floor", () => {
 
     for (let tick = 0; tick < 600; tick += 1) stepBalls(set, FLOOR_MAP, MATERIALS, GRAVITY);
 
-    expect(ball.velocityY).toBe(0);
+    // The bounce is finished: what is left is the seat bob and nothing else, and
+    // its residual is exactly the two substeps of gravity between one collision
+    // pass and the next. A ball still bouncing is orders of magnitude above it.
+    expect(Math.abs(ball.velocityY)).toBeLessThanOrEqual(2 * SUBSTEP_GRAVITY);
     // Contact is decided at whole-pixel resolution, so the ball comes to rest at
     // whatever sub-pixel height the last substep before a pass carried it to:
     // WITHIN ONE PIXEL of the geometric resting centre, either side of it.
@@ -270,25 +304,33 @@ describe("resting on a floor", () => {
     // put the ring inside the material. The machine's frame can and does — its
     // own resting lane ball sits 0.53 to 0.91 px into the floor's band
     // (research/view/reference/session4, cy 553.53..553.91 against a floor whose
-    // first solid row is 561) — and this fixture settles 0.14 px in. What may
-    // never happen is the ball SINKING, which the tick after tick after tick
-    // check below and `never lets the ball reach the floor material` both pin.
+    // first solid row is 561) — and this fixture settles 0.72 px in.
     expect(ball.y).toBeLessThan(pixelsToQ10(RESTING_CENTRE + 1));
     expect(ball.y).toBeGreaterThan(pixelsToQ10(RESTING_CENTRE - 1));
 
+    // AND IT STAYS THERE, in the band rather than on the pixel. This used to
+    // demand the identical Q10 sixty ticks running, which the ejector makes
+    // false and which the machine never satisfied either: the original bobs
+    // 0.38 px for ever. Drift is what must not happen, so the band is what is
+    // asserted.
     const settled = ball.y;
     for (let tick = 0; tick < 60; tick += 1) {
       stepBalls(set, FLOOR_MAP, MATERIALS, GRAVITY);
-      expect(ball.y).toBe(settled);
+      expect(Math.abs(ball.y - settled)).toBeLessThanOrEqual(Q10_ONE);
+      expect(q10ToPixel(ball.y) + BALL_RADIUS_PIXELS).toBeLessThanOrEqual(FLOOR_Y + 1);
     }
   });
 
   it("never lets the ball reach the floor material", () => {
+    // One pixel row of RING inside the floor is the seat bob (see above). The
+    // CENTRE never enters solid at all, which is the invariant `advanceCentre`
+    // holds and the one this test is really about, so it is asserted too.
     const set = setWith({ x: 100, y: RESTING_CENTRE - 40, vy: 6000 });
     const ball = only(set);
     for (let tick = 0; tick < 300; tick += 1) {
       stepBalls(set, FLOOR_MAP, MATERIALS, GRAVITY);
-      expect(q10ToPixel(ball.y) + BALL_RADIUS_PIXELS).toBeLessThanOrEqual(FLOOR_Y);
+      expect(q10ToPixel(ball.y) + BALL_RADIUS_PIXELS).toBeLessThanOrEqual(FLOOR_Y + 1);
+      expect(q10ToPixel(ball.y)).toBeLessThan(FLOOR_Y);
     }
   });
 });
@@ -640,12 +682,18 @@ describe("ball-to-ball collisions", () => {
   it("does not bury a stacked ball in the floor it is resting on", () => {
     // The separation push used to test the centre pixel alone, so the weight of
     // the ball above drove the lower one a full radius into the floor.
+    //
+    // ONE PIXEL ROW OF RING IS THE BOUND, not zero: the machine lets a resting
+    // ball sink between collision passes and shoves it out again at +0x00B6BE
+    // once six ring points are in the material, so a seated ball spends part of
+    // its bob one row deep by construction. A RADIUS is what this test exists to
+    // refuse, and eight rows is what the defect it was written for produced.
     const restingCentre = FLOOR_Y - BALL_RADIUS_PIXELS;
     const set = setWith({ x: 100, y: restingCentre }, { x: 100, y: restingCentre - 16 });
     for (let tick = 0; tick < 600; tick += 1) {
       stepBalls(set, FLOOR_MAP, MATERIALS, GRAVITY);
       for (const ball of set.balls) {
-        expect(q10ToPixel(ball.y) + BALL_RADIUS_PIXELS).toBeLessThanOrEqual(FLOOR_Y);
+        expect(q10ToPixel(ball.y) + BALL_RADIUS_PIXELS).toBeLessThanOrEqual(FLOOR_Y + 1);
       }
     }
   });
@@ -1191,11 +1239,19 @@ describe("no tick is a no-op", () => {
     // contact from wherever the substep grid puts it rather than from exact
     // tangency, which is what stops the slot handing back everything it takes.
     //
+    // AND NOW IT IS A BOB RATHER THAN A DEAD HALT, which is the ejector at
+    // +0x00B6BE and is what the original does with every ball it parks: a
+    // resting ball sinks 8 Q10 a tick between collision passes and is shoved
+    // half a pixel back out once six ring points are buried. Measured over the
+    // thousand ticks below the ball occupies 259 states inside a box 0.54 px
+    // wide and 0.28 px tall, and it never leaves it.
+    //
     // The defect the test exists for is unchanged and still asserted: a FIXED
     // POINT WITH SPEED STILL ON THE BOOKS, which no tick may leave behind
     // because every later tick then repeats it exactly. There is none on the way
-    // out, and the ball ends at velocity exactly zero, which is a ball at rest
-    // and is what the ball search's radius-8 box collects.
+    // out, and there is none at the end either — a bobbing ball is not a fixed
+    // point. What the ball search needs is that the ball GOES NOWHERE, which is
+    // what the box below asserts and what its radius-8 window collects.
     const set = createBallSet();
     const ball = spawnBall(set, 88064, 159742, 0, -1);
     expect(
@@ -1206,17 +1262,20 @@ describe("no tick is a no-op", () => {
     for (let tick = 0; tick < 2000; tick += 1) stepBalls(set, LAW_MAP, LAW_MATERIALS, GRAVITY);
     const settledX = ball.x;
     const settledY = ball.y;
-    expect(ball.velocityX).toBe(0);
-    expect(ball.velocityY).toBe(0);
     for (let tick = 0; tick < 1000; tick += 1) {
       stepBalls(set, LAW_MAP, LAW_MATERIALS, GRAVITY);
-      expect(ball.x).toBe(settledX);
-      expect(ball.y).toBe(settledY);
-      expect(ball.velocityX).toBe(0);
-      expect(ball.velocityY).toBe(0);
+      // The bob, bounded: one pixel either way and no drift at all over a
+      // thousand ticks, which is two full ball-search windows.
+      expect(Math.abs(ball.x - settledX)).toBeLessThanOrEqual(1024);
+      expect(Math.abs(ball.y - settledY)).toBeLessThanOrEqual(1024);
     }
-    // It left the slot: row 155 is where it went in, and it is not there now.
-    expect(ball.y >> 10).toBeGreaterThan(155);
+    // IT LEFT THE SLOT. Row 155 is where it went in and it is not there now —
+    // the ejector at +0x00B6BE shoves a buried ball out along the contact
+    // bearing, and out of a slot narrower than the ball that is UPWARD, so this
+    // ends two rows above the release rather than forty-nine below it. Either
+    // way the claim is the same one: the slot does not keep it.
+    expect(ball.y >> 10).not.toBe(155);
+    expect(Math.abs(ball.y - 159742)).toBeGreaterThan(Q10_ONE);
   });
 
   it("finds no fixed point anywhere across the real playfield", () => {

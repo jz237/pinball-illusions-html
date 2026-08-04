@@ -490,6 +490,25 @@ export interface TroughRecord {
   readonly velocityX: number;
   /** `vy & 255`. */
   readonly velocityY: number;
+  /**
+   * The drained ball's SPIN, carried WHOLE and not masked.
+   *
+   * `$3E36` re-seeds `$12/$14/$1E/$22/$0E/$10/$01` of the record it is handed
+   * and does not write `$26` at all, so on the machine the spin simply survives
+   * the serve — it is the one field of the record that is neither re-seeded nor
+   * masked. This port spawns a new `BallState` where the machine re-uses one of
+   * its three fixed records, so the carry has to be explicit, and this is where
+   * every other "what the last drain left behind" field already lives.
+   *
+   * It is very nearly unobservable, and that is measured rather than assumed: a
+   * served ball spends 41 to 212 ticks rolling down the return chute before it
+   * can be launched, and the spin bleeds eight units a frame the whole way, so
+   * all but the largest spin any traced frame has ever carried is gone before
+   * the player sees the ball. The machine's own seated lane ball reads exactly
+   * zero on 79-87 % of its frames. It is carried because the machine carries it,
+   * not because it does anything.
+   */
+  readonly spin: number;
 }
 
 /**
@@ -515,6 +534,7 @@ export const CLEARED_TROUGH_RECORD: TroughRecord = Object.freeze({
   y: 0,
   velocityX: 0,
   velocityY: 0,
+  spin: 0,
 });
 
 /**
@@ -536,12 +556,15 @@ export function troughRecordOf(ball: {
   readonly y: Q10;
   readonly velocityX: Q10;
   readonly velocityY: Q10;
+  readonly spin?: number;
 }): TroughRecord {
   return {
     x: q10ToPixel(ball.x) & TROUGH_POSITION_MASK,
     y: q10ToPixel(ball.y) & TROUGH_POSITION_MASK,
     velocityX: originalVelocityWord(ball.velocityX) & TROUGH_VELOCITY_MASK,
     velocityY: originalVelocityWord(ball.velocityY) & TROUGH_VELOCITY_MASK,
+    // Unmasked: `$3E36` does not write `$26`, so the whole word survives.
+    spin: ball.spin ?? 0,
   };
 }
 
@@ -596,7 +619,10 @@ export function serveBall(
   record: TroughRecord = CLEARED_TROUGH_RECORD,
 ): BallState {
   const place = troughPlacement(record);
-  return spawnBall(set, place.x, place.y, place.velocityX, place.velocityY, place.level);
+  const ball = spawnBall(set, place.x, place.y, place.velocityX, place.velocityY, place.level);
+  // The record's own spin, untouched by the serve. See `TroughRecord.spin`.
+  ball.spin = record.spin;
+  return ball;
 }
 
 /**

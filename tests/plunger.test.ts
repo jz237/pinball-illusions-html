@@ -8,6 +8,7 @@ import { accelFor, devicesFor } from "./table-fixtures.js";
 import { parseTableMapDocument } from "../src/game/table-map.js";
 import { q10ToPixel } from "../src/core/fixed-point.js";
 import {
+  SUBSTEP_GRAVITY,
   VIRTUAL_TOP_WALL_ROWS,
   createBallSet,
   playfieldViewFor,
@@ -327,7 +328,10 @@ describe("serving and launching a ball", () => {
     const record = troughRecordOf(drained);
     // 185 & 7 = 1, 601 & 7 = 1; -1000 is $FC18 and $FC18 & $FF = $18 = 24;
     // 2313 is $0909 and $0909 & $FF = 9.
-    expect(record).toEqual({ x: 1, y: 1, velocityX: 24, velocityY: 9 });
+    // `spin` is carried WHOLE rather than masked: $3E36 re-seeds the record it
+    // is handed and never writes $26, so the drained ball's spin survives the
+    // serve. See `TroughRecord.spin`.
+    expect(record).toEqual({ x: 1, y: 1, velocityX: 24, velocityY: 9, spin: 0 });
 
     const place = troughPlacement(record);
     expect(place.x).toBe((TROUGH_CENTRE_X + 1) * 1024);
@@ -350,7 +354,9 @@ describe("serving and launching a ball", () => {
   });
 
   it("serves a cold machine from the cleared record", () => {
-    expect(CLEARED_TROUGH_RECORD).toEqual({ x: 0, y: 0, velocityX: 0, velocityY: 0 });
+    // `spin` is the fifth field and it is carried WHOLE rather than masked:
+    // `$3E36` re-seeds the record it is handed and never writes `$26`.
+    expect(CLEARED_TROUGH_RECORD).toEqual({ x: 0, y: 0, velocityX: 0, velocityY: 0, spin: 0 });
     expect(troughPlacement()).toEqual(troughPlacement(CLEARED_TROUGH_RECORD));
   });
 
@@ -462,11 +468,23 @@ describe("the trough and the rod switch are the same cabinet part on every table
               y: dy,
               velocityX: carry,
               velocityY: carry,
+              spin: 0,
             });
+            // ARRIVED, not FROZEN. The seat bobs — that is the ejector at
+            // +0x00B6BE and it is the machine's own behaviour, whose lane ball
+            // never comes to a dead stop either — so the bar is one collision
+            // pass's worth of gravity rather than exactly zero. See
+            // `SUBSTEP_GRAVITY`; a ball still rolling down the chute is orders
+            // of magnitude above it.
+            const seated = 2 * SUBSTEP_GRAVITY;
             let arrived = -1;
             for (let tick = 0; tick < 200 && arrived < 0; tick += 1) {
               stepBalls(set, map, materials, GRAVITY, { rampDrive: drive, surfaces });
-              if (ballIsOnTheRod(ball) && ball.velocityX === 0 && ball.velocityY === 0) {
+              if (
+                ballIsOnTheRod(ball) &&
+                Math.abs(ball.velocityX) <= seated &&
+                Math.abs(ball.velocityY) <= seated
+              ) {
                 arrived = tick;
               }
             }
