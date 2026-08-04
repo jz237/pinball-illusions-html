@@ -242,6 +242,7 @@ import {
   queueScript,
   resetModesForNewBall,
   restoreMultiplierLamps,
+  signalMultiballEnded,
   tickModes,
 } from "../game/mode-vm.js";
 import type { TableAcceleration } from "../game/table-accel.js";
@@ -1816,8 +1817,22 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
   // Multiball is over when it is back down to one ball, counting the ones still
   // queued for the lane. The original checks exactly this every frame at data
   // 0x5794: `move.w $d86(a5),d0 / add.w $d7e(a5),d0 / cmpi.w #$1,d0 / bhi`.
-  if (game.multiball && freeBallCount(game.balls) + game.pendingServes <= 1) {
+  //
+  // AND THE MISSION GOES WITH IT. The two instructions after that test are
+  // `0057A8 clr.b $d7a(a5)` and `0057AC st.b $d9d(a5)` — the multiball flag
+  // goes out and the teardown latch goes on, and the mission frame at
+  // `+0x0057B6` then diverts the running WAIT to its wind-up branch. Every one
+  // of the thirteen multiball missions in the game parks on a WAIT that has no
+  // clock, so without this the mission has NO WAY TO END: measured before this
+  // landed, Law 'n Justice's script 93 and BabeWatch's 179 sat suspended for
+  // every remaining tick of the ball, holding the one mission slot shut.
+  // And it counts the SAUCERS too, for the same reason the top-up does: `$d7e`
+  // is every ball the machine has out of the trough, held or rolling. A ball
+  // re-locked during a multiball does not end that multiball on the original —
+  // the saucer will spit it back — and it used to end it here.
+  if (game.multiball && freeBallCount(game.balls) + heldBallCount(game.locks) + game.pendingServes <= 1) {
     game.multiball = false;
+    if (game.modeState !== null) signalMultiballEnded(game.modeState);
   }
 
   // ---- camera ------------------------------------------------------------
@@ -2192,8 +2207,24 @@ function runModes(game: Game, awards: readonly Award[]): ModeTickReport {
   // `BALLS_UP_TO` is the multiball opcode and it is a TOP-UP with a ceiling of
   // three, which is what `oweServes` already implements. Which count each
   // multiball asks for is the script's own word — 2 or 3, per table, decoded.
+  //
+  // A BALL IN A SAUCER IS STILL A BALL IN PLAY. `$d7e(a5)` is what the top-up
+  // counts (`+0x005BD6  move.w $d7e(a5),d0 / add.w $d86(a5),d0`), and the lock
+  // capture handler at `+0x00552A..+0x005588` never decrements it: it sets the
+  // HELD flag (`ori.b #$80,$1(a4)`), bumps `$23e4` and queues the lock's
+  // script, and that is all. The only two decrements in the whole segment are
+  // the drain reaper's `+0x0052C8` and `BALL_REMOVE`'s `+0x005B78`.
+  //
+  // Passing only the ROLLING count here made a two-ball top-up ask for two
+  // while a saucer already held one, which is a ball more than the machine
+  // would have on the table. BabeWatch reaches it directly: its ladder is
+  // driven by a grid CAPTURE, so the ball that starts a `BALLS_UP_TO 2` is
+  // sitting in the saucer when it runs, and none of its 2-ball scripts does a
+  // `BALL_REMOVE` first. `oweServes`'s trough cap hid it whenever the script
+  // asked for the full three and nowhere else.
   if (report.ballsUpTo > 0) {
-    oweServes(game, ballsToTopUp(report.ballsUpTo, freeBallCount(game.balls), game.pendingServes));
+    const inPlay = freeBallCount(game.balls) + heldBallCount(game.locks);
+    oweServes(game, ballsToTopUp(report.ballsUpTo, inPlay, game.pendingServes));
     if (report.ballsUpTo > 1) game.multiball = true;
   }
   return report;

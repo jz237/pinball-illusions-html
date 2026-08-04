@@ -444,6 +444,62 @@ export interface ModeState {
   loop: number;
   resumePc: number;
   /**
+   * `$dae < 0`: this WAIT has NO clock and can only be broken by the shot it
+   * watches or by `abortWait`.
+   *
+   * DECODED at the WAIT handler, +0x005E2A:
+   *
+   *     005E2A  move.w  $6(a1),d0     the seconds operand
+   *     005E2E  bmi.b   $5e36         NEGATIVE -> store it AS IS, unmultiplied
+   *     005E30  beq.b   $5e3a         ZERO     -> do not touch $dae at all
+   *     005E32  mulu.w  $50(a5),d0    POSITIVE -> seconds x frames-per-second
+   *     005E36  move.w  d0,$dae(a5)
+   *
+   * and spent at the mission frame, +0x0057BC:
+   *
+   *     0057BC  move.w  $dae(a5),d1
+   *     0057C0  bmi.b   $57d4         NEGATIVE -> never decrement, never time out
+   *     0057C2  beq.b   $57fc         ZERO     -> take the timeout branch NOW
+   *
+   * So a negative operand is an INDEFINITE PARK, not "no clock, fall through".
+   * For the twelve `WAIT <element>, -1, <pc>` shot loops that is the same thing
+   * this port already did, because the element is what ends those. For the ONE
+   * site that has no element either — Extreme Sports script 166 pc 76, which is
+   * the entire body of that table's three-ball multiball — it is not: the
+   * machine sits there until the balls are gone. See `stepMission`.
+   */
+  waitIndefinite: boolean;
+  /**
+   * `$d9d`: TEAR THIS MISSION DOWN — whatever the WAIT was waiting for is over.
+   *
+   * DECODED, and it is the mechanism that ends every multiball mission in the
+   * game. `+0x005794` runs every frame:
+   *
+   *     005794  tst.b    $d7a(a5)      is a multiball live?
+   *     005798  beq.b    $57b0
+   *     00579A  move.w   $d86(a5),d0   balls queued for the lane
+   *     00579E  add.w    $d7e(a5),d0   + balls on the playfield
+   *     0057A2  cmpi.w   #$1,d0
+   *     0057A6  bhi.b    $57b0         more than one -> still a multiball
+   *     0057A8  clr.b    $d7a(a5)      MULTIBALL OVER
+   *     0057AC  st.b     $d9d(a5)      <- and tear the mission down
+   *
+   * and the mission frame reads it BEFORE the clock and BEFORE the element:
+   *
+   *     0057B0  tst.b    $d9c(a5)      parked on a WAIT?
+   *     0057B4  beq.b    $5810
+   *     0057B6  tst.b    $d9d(a5)
+   *     0057BA  bne.b    $57e4         -> resume at $db8, or $db6 when unset
+   *
+   * `+0x004EC0` sets the same latch when the LAST ball drains and then spins
+   * the frame loop until the script finishes; this port reaches that case by a
+   * different door (`resetModesForNewBall` on the drain that ends the ball) and
+   * the divergence is the one already recorded in `game-loop.ts`. The machine
+   * clears the latch on `MODE_START` (+0x005DAE) and when the script ends
+   * (+0x005864), so it lives exactly as long as one teardown.
+   */
+  abortWait: boolean;
+  /**
    * `$d8a(a5)`: the BALL-SAVE countdown, in ticks.
    *
    * DECODED, and it is not an "intro delay": opcode 11 (`main.seg00
@@ -511,6 +567,8 @@ export function createModeState(modes: TableModes): ModeState {
     waitTimeoutPc: -1,
     loop: 0,
     resumePc: -1,
+    waitIndefinite: false,
+    abortWait: false,
     ballSaveTicks: 0,
     selectorCursor: 0,
     played: new Uint8Array(modes.missions.length),
@@ -1064,6 +1122,29 @@ export function endMission(state: ModeState): void {
   state.waitTimeoutPc = -1;
   state.loop = 0;
   state.resumePc = -1;
+  // `+0x005864  clr.b $d9d(a5)`, on the same exit that clears `$d9c`, `$db2`,
+  // `$db6` and `$d9b`: the teardown latch dies with the script it tore down.
+  state.waitIndefinite = false;
+  state.abortWait = false;
+}
+
+/**
+ * MULTIBALL IS OVER — set the teardown latch, `+0x0057AC  st.b $d9d(a5)`.
+ *
+ * Called from the game layer on the tick the live-plus-queued count falls back
+ * to one, which is the same test `+0x00579A..+0x0057A6` makes. The running
+ * mission takes its wind-up branch on its next frame: ONE TICK LATER than the
+ * machine, whose reaper (`+0x00528C`, called at `+0x004DB8`) runs before the
+ * mission service (`+0x005794`) inside a single frame, where this port's drain
+ * section runs after `runModes`. Every multiball mission's wind-up is a straight
+ * run of `LAMP_OFF`s, a `MUSIC` restore and an `AWARD`, so a tick of latency
+ * costs nothing observable; it is recorded because it is a divergence.
+ *
+ * Idempotent: the machine's latch is a byte and setting it twice is setting it.
+ */
+export function signalMultiballEnded(state: ModeState): void {
+  if (state.mission < 0) return;
+  state.abortWait = true;
 }
 
 /** True while a mission is running. `MODE_START` refuses to start a second. */
@@ -1738,6 +1819,10 @@ function step(
       state.waitTimeoutPc = -1;
       state.loop = 0;
       state.resumePc = -1;
+      // `+0x005D86  clr.w $db8(a5)` and `+0x005DAE  clr.b $d9d(a5)`: a new
+      // mission starts with no wind-up vector and no teardown latch.
+      state.waitIndefinite = false;
+      state.abortWait = false;
       out.missionStarted = state.missionIndex;
       return next;
     }
@@ -1807,9 +1892,21 @@ function step(
       // `$db2` is only set when the element is still armed for this player: a
       // shot that went out before the wait was reached is not waited on.
       state.waitElement = index >= 0 && state.armed[index] === 1 ? index : -1;
-      if (seconds > 0) state.waitTicks = seconds * TICKS_PER_SECOND;
-      else if (seconds === 0) state.waitTicks = 0;
-      // seconds < 0 leaves `$dae` alone: the stage inherits the running timer.
+      // +0x005E2A. POSITIVE is seconds x frames-per-second; NEGATIVE is stored
+      // as-is and +0x0057C0's `bmi` then refuses to decrement it, which is an
+      // INDEFINITE park; ZERO does not touch `$dae` at all. This port keeps
+      // `waitTicks` unsigned and carries the negative case as its own flag, so
+      // that the twelve `WAIT <element>, -1, <pc>` shot loops behave exactly as
+      // they always did and only the one site with no element moves. The
+      // zero-inherits case is NOT modelled and never has been; it is a
+      // pre-existing divergence at 9 sites across the three tables, none of
+      // them a multiball script, and moving it would move the census.
+      state.waitIndefinite = seconds < 0;
+      // A negative operand OVERWRITES `$dae` with the negative value, so any
+      // time left on a stage that ended early is gone: `bmi.b $5e36` jumps
+      // straight to the `move.w d0,$dae(a5)`. Carrying a leftover countdown
+      // into an indefinite wait would time it out, which the machine cannot do.
+      state.waitTicks = seconds > 0 ? seconds * TICKS_PER_SECOND : 0;
       state.waitTimeoutPc = args[2] ?? -1;
       state.suspended = true;
       return next;
@@ -1869,6 +1966,36 @@ function stepMission(modes: TableModes, state: ModeState, out: Accumulator): voi
   }
 
   if (state.suspended) {
+    // THE TEARDOWN IS TESTED FIRST, before the clock and before the element:
+    // `0057B6 tst.b $d9d(a5) / 0057BA bne.b $57e4`. The multiball that this
+    // mission started is over, so whatever shot it was asking for no longer
+    // matters and the script jumps to its wind-up.
+    //
+    //     0057E4  move.w  $db8(a5),d1     the SET_RESUME operand
+    //     0057E8  beq.b   $57fc           unset -> fall to the timeout branch
+    //     0057F2  move.w  d1,$2(a0)       set   -> resume there
+    //     0057F6  clr.w   $db8(a5)
+    //     0057FC  move.w  $db6(a5),$2(a0) the WAIT's own timeout PC
+    //
+    // The latch is NOT cleared here — the machine clears it only at
+    // `MODE_START` and at the script's end — so every later WAIT in the
+    // wind-up aborts too, which is what makes a teardown run to `END`.
+    if (state.abortWait) {
+      state.suspended = false;
+      state.waitElement = -1;
+      state.waitIndefinite = false;
+      const resume = state.resumePc;
+      const target = resume >= 0 ? resume : state.waitTimeoutPc;
+      state.resumePc = -1;
+      state.waitTimeoutPc = -1;
+      if (target < 0) {
+        out.missionEnded = true;
+        endMission(state);
+        return;
+      }
+      state.missionPc = target;
+      return;
+    }
     // The clock is decremented FIRST and, only if it has run out, the timeout
     // branch is taken. If it has not, the watched element is tested in the same
     // frame — both tests happen every frame, which is the difference between a
@@ -1895,10 +2022,18 @@ function stepMission(modes: TableModes, state: ModeState, out: Accumulator): voi
       if (state.waitElement < 0) return;
     }
     if (state.waitElement >= 0 && state.armed[state.waitElement] === 1) return;
+    // A NEGATIVE seconds operand with no element is an indefinite park and the
+    // only thing that can end it is `abortWait`, tested above. DECODED: a
+    // negative `$dae` makes `0057C0 bmi.b $57d4` skip both the decrement and
+    // the timeout every frame, and `0057D8 beq.b $57e2` then returns because
+    // `$db2` is null. Extreme Sports script 166 pc 76 is the one site, and it
+    // is the whole body of that table's three-ball multiball.
+    if (state.waitIndefinite && state.waitElement < 0) return;
     // Either the shot was made, or the wait has neither an element nor a clock.
     // RECONSTRUCTION: the second case falls through rather than parking forever.
     state.suspended = false;
     state.waitElement = -1;
+    state.waitIndefinite = false;
     state.waitTimeoutPc = -1;
   }
 
