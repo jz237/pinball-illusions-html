@@ -1275,17 +1275,52 @@ function startElement(
   // by a branch that leaves on the OLD bit — a START on an element that is
   // already armed for this player is a COMPLETE no-op, with no timer rewrite
   // and no re-blink. The DONE test at +0x005A2C is the same shape.
-  if (state.armed[index] === 1 || state.done[index] === 1) return;
-  state.armed[index] = 1;
-  state.timers[index] = seconds > 0 ? seconds * TICKS_PER_SECOND : 0;
-  out.elementStarts.push(index);
-  pushMessage(modes, out, element.displayStart);
+  if (state.done[index] === 1) return;
+  const alreadyArmed = state.armed[index] === 1;
+  if (!alreadyArmed) {
+    state.armed[index] = 1;
+    state.timers[index] = seconds > 0 ? seconds * TICKS_PER_SECOND : 0;
+    out.elementStarts.push(index);
+    pushMessage(modes, out, element.displayStart);
+  }
 
-  // RECONSTRUCTION. Lighting a mode-arm shot while nothing is running starts the
+  // RECONSTRUCTION. TAKING a mode-arm shot while nothing is running starts the
   // selector's next mission. See `startSelectedMission` for the whole argument;
   // the short version is that Law 'n Justice's type-1 MODE device fires a script
   // whose only job is to arm one of these, and every mission consumes and
   // restores exactly them.
+  //
+  // THE SHOT, NOT THE STATE CHANGE — and that distinction is a defect fix, not
+  // a refinement.
+  //
+  // MEASURED (research\MULTIBALL_REACH.md): hung off the state change, this
+  // fired AT MOST ONCE A GAME on all three tables. The 90-game census starts
+  // mission #4 in 75 of 90 Law 'n Justice games, #7 in 44 of 90 BabeWatch games
+  // and #2 in 35 of 90 Extreme Sports games — always the selector's FIRST
+  // entry, never a second in the same game. Driven deliberately, an Extreme
+  // Sports game would start one mission and then refuse for ever, with arm
+  // elements 82/83/74 sitting at armed=1, done=0: the mission prologue's
+  // COMPLETE only clears the armed bit for an element some script armed with a
+  // live timer (the `bclr` at +0x005B9C is skipped otherwise — see OP_COMPLETE),
+  // and the epilogue's CLEAR_DONE only clears DONE. So the element stayed lit
+  // and every later START was a no-op.
+  //
+  // WHY THAT MATTERED: Law 'n Justice's ladder 8 needs EIGHT missions in a game
+  // and Extreme Sports' ladders 6 and 8 need FIVE and SIX, and Extreme Sports
+  // has no lock route to a multiball at all — so its multiball, the headline
+  // feature of this game, was structurally unreachable. Driven now, it starts on
+  // the fifth mission (script 166, `BALLS_UP_TO 3`) and again on the eleventh
+  // ("ARE YOU MAN ENOUGH FOR IRON MAN"), and the DECODED mission counter walks
+  // with it — counter 1 climbs 1,2,3,4,5 and wraps, which is what a ladder
+  // whose entries are the mission launchers is for.
+  //
+  // The machine's own START stays a no-op: the arm, the timer, the lamp and the
+  // display record above are all still skipped for an already-armed element.
+  // What moved is only the RECONSTRUCTION's trigger, from "the lamp lit" to
+  // "the lit shot was taken" — which is what a mode target does when a player
+  // hits it again. The census is unmoved by this (medians 3,247,500 /
+  // 4,531,170 / 935,000 and every write-off site identical), because a blind
+  // bot re-takes that shot with no mission running about once a game anyway.
   if (state.mission < 0 && modes.armElements.includes(index)) {
     startSelectedMission(modes, state);
   }

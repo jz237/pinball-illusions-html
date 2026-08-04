@@ -40,15 +40,30 @@
  *       ids MODE_START the four multiball modes (BALLS_UP_TO 2/3/2/3 — the
  *       FIRST lock of a fresh game starts a two-ball multiball) and whose
  *       intermediate ids print "n MORE TO START MODE"; Law 'n Justice's is
- *       tiers of 2/3/4/5 jail locks with multiball at ids 2/5/9/14 and every
- *       later multiball costing 5 locks. Only the scripted saucers feed it —
- *       BabeWatch's three level-0 grid saucers and Law 'n Justice's jail; the
+ *       tiers of 2/3/4/5 locks with multiball at ids 2/5/9/14 and every
+ *       later multiball costing 5 locks. Only the scripted saucers feed it; the
  *       other rectangles award and eject without counting. The whole mechanism
  *       lives in `mode-vm.ts` (effect 6, SET_COUNT, the AWARD relight) on the
  *       tables exported by `scripts/export-table-modes.mjs`; this module keeps
  *       the devices. The engine's own lock counters at device+$03 and
  *       `$23E4(a5)` are ornaments — written, never read — exactly as the
  *       earlier decode concluded; the live counter is in the table package.
+ *
+ *   WHICH SAUCERS FEED IT — CORRECTED 2026-08-04, and the correction matters
+ *     This header used to say "Law 'n Justice's jail". IT IS NOT THE JAIL. The
+ *     jail saucers `zone-0-5` and `zone-0-7` do award effect-6 elements — 96/95
+ *     on counter 8, 105/104 on counter 9, 120/119 on counter 15 — but none of
+ *     those three counters drives a ladder that ever reaches BALLS_UP_TO. The
+ *     ONLY Law 'n Justice lock on a multiball ladder is `zone-0-6`, the right
+ *     crater, through element 26 on counter 10 — which makes it that table's
+ *     single point of failure for a lock multiball, and it is the rectangle the
+ *     scoring census never once entered. BabeWatch's are its three level-0 grid
+ *     saucers (`zone-0-15/16/17`, elements 31/30/29 on counter 8). EXTREME
+ *     SPORTS HAS NONE AT ALL: its two saucers award elements on counters 4, 11
+ *     and 13, and both of its multiball routes are MISSION ladders. Walked out
+ *     of the shipped documents and pinned in `tests/multiball-reach.test.ts`;
+ *     the whole flow, and the RAM measurement of the original at `zone-0-6`,
+ *     are in `research\MULTIBALL_REACH.md`.
  *
  *   DECODED IN ROUND 7, and it retires a reconstruction
  *     - WHICH LAMPS ARE LIT AT GAME START. The gate was already measured (AWARD
@@ -237,19 +252,29 @@ function lock(
  * level-1 list the one containing type-3.
  *
  * Ten devices in all. Which of them a ball can actually get to is a separate
- * question and it was measured rather than assumed: driving the aggressive
- * census player through thirty games a table and counting distinct entries into
- * each rectangle gives
+ * question and it was measured rather than assumed. Re-measured 2026-08-04 over
+ * the FULL census — 90 games x 3 balls x 40,000 ticks a table — counting
+ * CAPTURES, which supersedes the thirty-game entry counts that used to be here:
  *
- *     law-n-justice  jail-top 31   jail-throat 7   right-crater 0
- *     babewatch      grid-top 38   grid-mid  29    top-lane  1   lower-bowl 0
- *                    upper-deck 0
- *     extreme-sports bowl 19       upper-orbit 0
+ *     law-n-justice  jail-top 65   jail-throat 72   right-crater 0
+ *     babewatch      grid-top 57   grid-mid  60     top-lane 177   lower-bowl 75
+ *                    upper-deck 3
+ *     extreme-sports bowl 36       upper-orbit 52
  *
- * so every table has at least one lock a rolling ball reaches on its own, and
- * two of the three have two. The zero-entry rectangles are kept: they are in the
- * shipped data, a better player reaches them, and deleting authored devices
- * because one scripted player missed them would be exactly the wrong trade.
+ * so nine of the ten are reached by a rolling ball, some of them constantly.
+ * `right-crater` is the exception and it is NOT walled off: its rectangle holds
+ * 231 free ball centres at radius 8, all in the played component, and a fan of
+ * 730 shots from the free centre (258,205) on level 0 — fifteen pixels under its
+ * mouth — puts 201 of them inside. The route in is UP from below, around the
+ * bottom of the wall at x 279..282 that is solid on BOTH collision lines, and
+ * the ORIGINAL agrees: driven in RAM from that same point the machine's ball
+ * enters and is captured 5 times out of 5, and dropped into the right-hand lane
+ * at (287,201) the machine falls past the lock exactly as this port does
+ * (closest approach 30.02 px against the port's 29.2). See
+ * `research\MULTIBALL_REACH.md`. The zero-entry rectangle is kept: it is in the
+ * shipped data, it is reachable, a better player reaches it, and deleting
+ * authored devices because one scripted player missed them would be exactly the
+ * wrong trade.
  */
 export const BALL_LOCKS_BY_TABLE: Readonly<Record<TableId, readonly BallLock[]>> = Object.freeze({
   // Law 'n Justice. The jail: "SHOOT JAIL", "PUT BACK IN JAIL", "JAILBREAK".
