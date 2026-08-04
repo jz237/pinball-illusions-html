@@ -318,10 +318,18 @@ export function createScoringState(): ScoringState {
 /**
  * Clears everything a new ball clears — which is the debounces and nothing else.
  *
- * The flag bytes are NOT cleared: they are per player and per game, which is
- * what makes a repeat award a repeat across the whole game rather than across
- * one ball. The score and bonus are not cleared either; `startGame` builds a
- * fresh state for that.
+ * The flag bytes are NOT cleared: they are per player and per game in this
+ * port. DECODED AND DELIBERATELY KEPT: on the machine the flag bytes of the
+ * GROUP-CHAINED lamps — Law 'n Justice's standups 32..36, BabeWatch's targets
+ * 32..40 and top lanes 0-7/8/9, Extreme Sports' 33..35 and upper lanes
+ * 1-7/8/9 — are cleared for every player at every ball start (`clr.b` in the
+ * soft reset $3F10, called at +0x0050B6), so exactly those first-hit awards
+ * re-arm per ball on the original. The fix is measured and waiting: the
+ * sim-hash pin's own scripted windows re-hit those ids across ball
+ * boundaries, so honouring the reset moves two of the three pinned hashes,
+ * and the pin outranks the fix until a re-pin round. Proof, sites and the
+ * would-be census deltas: research/MULTIPLAYER_DECODE.md §7. The score and
+ * bonus are not cleared either; `startGame` builds a fresh state for that.
  */
 export function resetScoringForNewBall(state: ScoringState): void {
   state.timers.clear();

@@ -384,7 +384,11 @@ export interface ModeState {
    * $6234 whenever a start-element of the lamp is disarmed, and by both group
    * resets. This is also why the steady bit resets EVERY BALL where the port's
    * scoring `flags` set is per game — the lamp layer, not the scoring layer,
-   * owns re-arming a group on a later ball.
+   * owns re-arming a group on a later ball. (The multiplayer round PROVED the
+   * machine resets the SCORING half per ball too — $3F10's `clr.b` hits the
+   * very byte the first-hit bset tests — and measured why the port still does
+   * not: the sim-hash pin's windows re-hit those ids across ball boundaries.
+   * research/MULTIPLAYER_DECODE.md §7.)
    */
   readonly groupLampLit: Uint8Array;
   /**
@@ -652,7 +656,8 @@ function groupJoins(modes: TableModes): GroupJoinIndex {
  * and it is the bset itself that distinguishes first from repeat, so the lamp
  * relights on the first hit of a NEW ball even though the port's per-game
  * scoring flags still call that hit a repeat (divergence documented on
- * `ModeState.groupLampLit`). A device award's trigger carries no level (`level`
+ * `ModeState.groupLampLit`, decode and pin-blocker on
+ * research/MULTIPLAYER_DECODE.md §7). A device award's trigger carries no level (`level`
  * -1); a device surface id is filed on exactly one level, so matching both is
  * the same join the engine makes through the level's own array.
  */
