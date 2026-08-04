@@ -520,20 +520,42 @@ export async function loadTableMusic(
   }
   if (parsed.tableId !== tableId) return null;
 
+  /**
+   * THE FIFTY WAVS GO OUT TOGETHER.
+   *
+   * Awaited one at a time this is fifty round trips between the table opening
+   * and its music existing — and the first ball is served TWENTY-FIVE TICKS
+   * after the table opens, because `openTable` starts this fetch and calls
+   * `shellTableLoaded` in the same synchronous turn. That gap is the window
+   * the controller's mailbox has to hold the ball-start cue across (see
+   * `src/browser/table-music.ts`), and it is a window in which this
+   * reconstruction is not the machine, which had the module in RAM. Issued
+   * together the same fifty are one round trip on any HTTP/2 connection and
+   * the window closes to about the length of the manifest.
+   *
+   * Order does not matter: the voices go into a map keyed by id, and the
+   * failure rule is unchanged — ANY file that will not fetch or decode makes
+   * the whole table silent rather than half-voiced.
+   */
+  const decoded = await Promise.all(
+    parsed.files.map(async (file): Promise<readonly [string, ChipInstrument] | null> => {
+      const descriptor = parsed.descriptors[file.bank]?.[file.instrument - 1];
+      if (descriptor === undefined) return null;
+      try {
+        const response = await fetcher(`${base}${file.file}`);
+        if (!response.ok) return null;
+        const id = tableVoiceId(file.bank, file.instrument);
+        const voice = chipInstrumentFromWav(id, await response.arrayBuffer(), descriptor);
+        return voice === null ? null : ([id, voice] as const);
+      } catch {
+        return null;
+      }
+    }),
+  );
   const instruments = new Map<string, ChipInstrument>();
-  for (const file of parsed.files) {
-    const descriptor = parsed.descriptors[file.bank]?.[file.instrument - 1];
-    if (descriptor === undefined) return null;
-    try {
-      const response = await fetcher(`${base}${file.file}`);
-      if (!response.ok) return null;
-      const id = tableVoiceId(file.bank, file.instrument);
-      const voice = chipInstrumentFromWav(id, await response.arrayBuffer(), descriptor);
-      if (voice === null) return null;
-      instruments.set(id, voice);
-    } catch {
-      return null;
-    }
+  for (const entry of decoded) {
+    if (entry === null) return null;
+    instruments.set(entry[0], entry[1]);
   }
   if (instruments.size === 0) return null;
 

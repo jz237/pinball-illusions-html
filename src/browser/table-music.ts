@@ -79,6 +79,41 @@
  * copy. Labelled here rather than hidden.
  *
  * ---------------------------------------------------------------------------
+ * THE MAILBOX IS A MAILBOX, AND THE ASSET ARRIVES OVER A NETWORK
+ * ---------------------------------------------------------------------------
+ * On the machine the module is in RAM before the first ball is served, so the
+ * engine's post at $6868 and the player's read at $7D66 are a frame apart and
+ * nobody has to think about the gap. Here the table's music is a 200 KB
+ * manifest and fifty WAVs, and the FIRST BALL IS SERVED 25 TICKS AFTER THE
+ * TABLE OPENS — `openTable` starts the fetch and calls `shellTableLoaded` in
+ * the same synchronous turn, and that returns `start-game`. Measured on a
+ * model of one request per frame, ball one's serve lands at request 27 of 51.
+ *
+ * This module used to answer that with `if (asset === null) return`, which
+ * threw the post away. Nothing re-armed when the asset landed, so the vamp
+ * never started, the launch's queue was never even posted, and the first thing
+ * a player heard was the END-OF-BALL STOP at the drain — the whole of ball one
+ * silent, the music arriving with ball two. That is the defect this note is
+ * attached to, and it was invisible to every existing test because every one
+ * of them awaited the asset before observing a single report.
+ *
+ * The fix is the machine's own structure. $6868 does not play anything: it
+ * writes {command, position, bank} to $2412/$2416/$2418 and returns, and the
+ * player executes whatever the mailbox holds when it next runs. So the ENGINE
+ * side — `observe`, driven by the tick reports — always posts, and the PLAYER
+ * side executes on the frame it can. What is held is the cue SITE rather than
+ * the record, because the record lives in the asset; last write wins, because
+ * the mailbox is three words and not a queue.
+ *
+ * WHAT DIVERGES, precisely: on the machine every frame's post is executed, so
+ * a ball-start followed by a launch plays the vamp and then hands over at its
+ * lap boundary. Here, if BOTH land before the asset does, only the launch's
+ * post survives and the main tune enters at once — the section the machine is
+ * on at that moment, entered without the lap it would have waited out, because
+ * the lap is a property of a vamp that never sounded. From the asset onward
+ * the two agree.
+ *
+ * ---------------------------------------------------------------------------
  * WHERE THE MODE SWITCHES COME FROM, AND WHAT IS NOT WIRED
  * ---------------------------------------------------------------------------
  * Each table carries 38-43 distinct kind-4 records reached by 81-88 relocated
@@ -165,7 +200,12 @@ import {
   loadTableMusic,
   modeCueKey,
 } from "../audio/table-music.js";
-import type { TableMusicAsset, TableMusicCue, TableMusicFetch } from "../audio/table-music.js";
+import type {
+  ElementCueField,
+  TableMusicAsset,
+  TableMusicCue,
+  TableMusicFetch,
+} from "../audio/table-music.js";
 
 /**
  * The phases the table music plays in: the ball, and the "REALLY QUIT
@@ -193,6 +233,29 @@ interface Sounding extends SectionRef {
   /** True while this is an override; false for the background. */
   readonly override: boolean;
 }
+
+/**
+ * The cue records this controller drives by name: the descriptor's ball-start
+ * and tilt, the launch's queue-main, and the bonus routine's end stop. The
+ * game-over and high-score records are decoded but not driven — those screens
+ * belong to the shell here and its own front-end module plays on them.
+ */
+type NamedCue = "ballStart" | "queueMain" | "tilt" | "endStop";
+
+/**
+ * ONE POST TO THE MAILBOX — a cue SITE, not a cue record.
+ *
+ * The record a site carries lives in the asset, and the asset arrives over the
+ * network after the ball has been served (see the header). What the tick
+ * report gives us is the site, and a site is enough: it resolves the instant
+ * the manifest is in hand.
+ */
+type CuePost =
+  | { readonly kind: "named"; readonly name: NamedCue }
+  /** A mission-VM opcode 19, keyed as the modes document keys it. */
+  | { readonly kind: "mode"; readonly script: number; readonly pc: number }
+  /** An element's +$0C / +$10 slot holding a music command. */
+  | { readonly kind: "element"; readonly field: ElementCueField; readonly element: number };
 
 export interface TableMusic {
   /** The output object, exposed for the host's resume plumbing and tests. */
@@ -271,6 +334,12 @@ export function createTableMusic(
    * restart the vamp over the main tune).
    */
   let ballsLive = 0;
+  /**
+   * THE MAILBOX ($2412/$2416/$2418), holding a post the player has not read
+   * yet. Only ever occupied while the asset is in flight: with a manifest in
+   * hand the player runs every frame and executes on the spot. See the header.
+   */
+  let mailbox: CuePost | null = null;
 
   const streamFor = (ref: SectionRef): TrackerCommandStream | null =>
     current === null ? null : current.section(ref.bank, ref.position);
@@ -320,6 +389,7 @@ export function createTableMusic(
     queued = null;
     ballsLive = 0;
     stopsAt = null;
+    mailbox = null;
     stopTracker(output);
   };
 
@@ -383,9 +453,67 @@ export function createTableMusic(
     }
   };
 
-  /** The cue at a mode-VM site, or null if that site carries none. */
-  const modeCue = (script: number, pc: number): TableMusicCue | null =>
-    current?.modeCues.get(modeCueKey(script, pc)) ?? null;
+  /** The record a post names, or null when this table's manifest has none. */
+  const resolve = (asset: TableMusicAsset, entry: CuePost): TableMusicCue | null => {
+    switch (entry.kind) {
+      case "named":
+        return asset.cues[entry.name];
+      case "mode":
+        return asset.modeCues.get(modeCueKey(entry.script, entry.pc)) ?? null;
+      case "element":
+        return asset.elementCues[entry.field].get(entry.element) ?? null;
+    }
+  };
+
+  /**
+   * $6868: the engine posts, and the player executes it when it next runs.
+   * With the manifest in hand that is the same frame, which is what every
+   * previous round of this module did directly. Without it the post waits in
+   * the mailbox — last write wins, three words, not a queue.
+   *
+   * A MODE OR ELEMENT SITE MADE BEFORE THE MANIFEST IS DROPPED rather than
+   * held. On the machine the poster is only reached when the site's record is
+   * KIND 4, and which records are kind 4 is exactly what the manifest says —
+   * so a site we cannot look up is a site we cannot know posts at all, and
+   * letting it into the mailbox would let a bumper that carries an EFFECT
+   * silently wipe the ball transition that certainly did post. The named cues
+   * are the descriptor's and the bonus routine's, and every table has them.
+   */
+  const post = (entry: CuePost): void => {
+    const asset = current;
+    if (asset === null) {
+      if (entry.kind === "named") mailbox = entry;
+      return;
+    }
+    const cue = resolve(asset, entry);
+    if (cue !== null) fire(cue);
+  };
+
+  /** $7D66's read, on the first frame the player is able to run. */
+  const readMailbox = (): void => {
+    const asset = current;
+    const entry = mailbox;
+    if (asset === null || entry === null) return;
+    mailbox = null;
+    const cue = resolve(asset, entry);
+    if (cue !== null) fire(cue);
+  };
+
+  /**
+   * Is the SERVE SECTION what the player is on? With a manifest that is a
+   * question about what is sounding. Without one it is a question about what
+   * the mailbox will make sound, which is the same question one frame earlier
+   * — and it is what decides whether a launch queues the main tune.
+   */
+  const serveSectionUp = (): boolean => {
+    const asset = current;
+    if (asset === null) return mailbox?.kind === "named" && mailbox.name === "ballStart";
+    return (
+      sounding !== null &&
+      sounding.bank === asset.cues.ballStart.bank &&
+      sounding.position === asset.cues.ballStart.position
+    );
+  };
 
   /**
    * The next Bxx of whatever is sounding, in context time — the boundary a
@@ -445,22 +573,23 @@ export function createTableMusic(
     },
 
     observe(report: GameTickReport): void {
-      const asset = current;
-      if (asset === null) return;
+      // THE ENGINE SIDE, and it runs whether or not the manifest has arrived:
+      // $6868 posts to the mailbox from the game code, and the player reads it
+      // when it can. An asset still in flight used to make this whole method a
+      // no-op, which lost ball one's serve and its launch outright — and lost
+      // the ball count with them, so the next add-a-ball serve would have
+      // restarted the vamp over the main tune. See the header.
 
       // The mission VM's own music opcodes, in the order it executed them.
       for (const site of report.musicCues) {
-        const cue = modeCue(site.script, site.pc);
-        if (cue !== null) fire(cue);
+        post({ kind: "mode", script: site.script, pc: site.pc });
       }
       // An element's START / AWARD sound slot holding a music command.
       for (const element of report.elementStarts) {
-        const cue = asset.elementCues.start.get(element);
-        if (cue !== undefined) fire(cue);
+        post({ kind: "element", field: "start", element });
       }
       for (const element of report.elementAwards) {
-        const cue = asset.elementCues.award.get(element);
-        if (cue !== undefined) fire(cue);
+        post({ kind: "element", field: "award", element });
       }
 
       // The ball-start cue fires when a ball arrives on an EMPTY playfield —
@@ -468,7 +597,7 @@ export function createTableMusic(
       // it also ends the post-tilt and post-bonus silence ($7DD2 clears the
       // stop flag $21C). A multiball add-a-ball serve fires no music cue.
       if (report.served) {
-        if (ballsLive === 0) fire(asset.cues.ballStart);
+        if (ballsLive === 0) post({ kind: "named", name: "ballStart" });
         ballsLive += 1;
       }
       // A ball ending runs the table's end-of-ball bonus routine ($51BE), and
@@ -486,7 +615,7 @@ export function createTableMusic(
       const ended = report.drained.length;
       if (ended > 0) {
         ballsLive = Math.max(0, ballsLive - ended);
-        if (ballsLive === 0) fire(asset.cues.endStop);
+        if (ballsLive === 0) post({ kind: "named", name: "endStop" });
       }
       // The launch queues the main tune (-1): the switch happens at the vamp's
       // lap boundary, which `update` executes when it comes close.
@@ -500,25 +629,31 @@ export function createTableMusic(
       // fired only while the SERVE SECTION is up, so a mission background that
       // is running when a ball is launched keeps playing, as the machine's own
       // background slot would.
-      if (
-        report.launched &&
-        sounding !== null &&
-        sounding.bank === asset.cues.ballStart.bank &&
-        sounding.position === asset.cues.ballStart.position
-      ) {
-        fire(asset.cues.queueMain);
-      }
+      if (report.launched && serveSectionUp()) post({ kind: "named", name: "queueMain" });
       // The tilt: its own cue, an override on two tables and a background set
       // on the third, and on all three a section ending in F00.
-      if (report.justTilted) fire(asset.cues.tilt);
+      if (report.justTilted) post({ kind: "named", name: "tilt" });
       if (report.gameOver) ballsLive = 0;
     },
 
     update(phase: ShellPhase, effects: AudioBank | null): void {
       if (!TABLE_MUSIC_PHASES.has(phase) || current === null) {
+        // A post the player never got to read belongs to the ball that made
+        // it: leaving the table throws it away with everything else, so a
+        // manifest that lands on the game-over card does not start a tune
+        // over a screen the shell's own module owns.
+        if (!TABLE_MUSIC_PHASES.has(phase)) mailbox = null;
         if (sounding !== null) silence();
         return;
       }
+      // $7D66's read, first thing: the player is running now, so whatever the
+      // engine posted while the manifest was in flight sounds from here. This
+      // is where ball one's music comes from on a cold table. It happens
+      // BEFORE the host is read because starting a section is what builds the
+      // context, and the channel-3 gate below wants it on this frame, not the
+      // next one.
+      readMailbox();
+
       const host = output.host;
       const now = host?.currentTime ?? 0;
 
