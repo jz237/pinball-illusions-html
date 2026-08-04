@@ -27,8 +27,9 @@ import {
   zoneKey,
 } from "../src/game/scoring.js";
 import type { ScoringState } from "../src/game/scoring.js";
+import { groupBackedFlagIds } from "../src/game/mode-vm.js";
 import type { TableDevices } from "../src/game/table-devices.js";
-import { devicesFor } from "./table-fixtures.js";
+import { devicesFor, modesFor } from "./table-fixtures.js";
 
 const LAW = devicesFor("law-n-justice");
 const BABEWATCH = devicesFor("babewatch");
@@ -261,19 +262,130 @@ describe("zone awards", () => {
 });
 
 describe("what a new ball clears and what it does not", () => {
-  it("clears the debounces and keeps the flag bytes, the score and the bonus", () => {
+  it("clears the debounces and keeps the score and the bonus", () => {
     const state = createScoringState();
     tick(state, LAW, [32]);
     expect(state.timers.size).toBeGreaterThan(0);
     expect(state.flags.size).toBeGreaterThan(0);
 
-    resetScoringForNewBall(state);
+    resetScoringForNewBall(state, groupBackedFlagIds(modesFor("law-n-justice")));
     expect(state.timers.size).toBe(0);
     expect(state.occupants.size).toBe(0);
-    // The flag byte is per PLAYER, so the target is still "already hit" and its
-    // next award is the repeat one.
-    expect(state.flags.size).toBeGreaterThan(0);
     expect(readBcdField(state.score)).toBe(50000);
+  });
+
+  it("re-arms a group-backed first hit, so the award pays again on ball 2", () => {
+    // Law 'n Justice standup 32: 50,000 first, 0 on a repeat. The machine's
+    // $3F10 `clr.b (a0)` at +0x003F56 clears the lamp byte the +0x0055F0 `bset`
+    // tests, so the SECOND ball's first hit is a first hit again.
+    const rearm = groupBackedFlagIds(modesFor("law-n-justice"));
+    const state = createScoringState();
+    expect(tick(state, LAW, [32]).map((a) => [a.repeat, a.score])).toEqual([[false, 50000]]);
+    tickScoring(state); // let the six-frame debounce expire before re-hitting
+    for (let i = 0; i < HIT_TIMER_FRAMES; i += 1) tickScoring(state);
+    expect(tick(state, LAW, [32]).map((a) => [a.repeat, a.score])).toEqual([[true, 0]]);
+    expect(readBcdField(state.score)).toBe(50000);
+
+    resetScoringForNewBall(state, rearm);
+    expect(state.flags.has("device-32")).toBe(false);
+    expect(tick(state, LAW, [32]).map((a) => [a.repeat, a.score])).toEqual([[false, 50000]]);
+    expect(readBcdField(state.score)).toBe(100000);
+
+    // And again on ball 3 — the walk is per ball, not once per game. (An EXTRA
+    // ball takes the same path: +0x005068 sets state 7 and branches into the
+    // chain two instructions above the `jsr $3F10` at +0x0050B6.)
+    resetScoringForNewBall(state, rearm);
+    expect(tick(state, LAW, [32]).map((a) => [a.repeat, a.score])).toEqual([[false, 50000]]);
+    expect(readBcdField(state.score)).toBe(150000);
+  });
+
+  it("re-arms a group-backed ZONE, the BabeWatch top lane the pin's window re-hits", () => {
+    // zone-0-7: 50,000 first, 5,000 repeat, and one of the two ids whose
+    // re-hits across ball boundaries moved the pinned hashes.
+    const rearm = groupBackedFlagIds(modesFor("babewatch"));
+    expect(rearm.has("zone-0-7")).toBe(true);
+    const state = createScoringState();
+    const inLane = [ball(1, 206, 90)];
+    const away = [ball(1, 5, 5)];
+    expect(tick(state, BABEWATCH, [], inLane).map((a) => [a.id, a.score])).toEqual([
+      ["zone-0-7", 50000],
+    ]);
+    tick(state, BABEWATCH, [], away); // leave the rectangle: release the occupancy
+    expect(tick(state, BABEWATCH, [], inLane).map((a) => [a.id, a.score])).toEqual([
+      ["zone-0-7", 5000],
+    ]);
+
+    tick(state, BABEWATCH, [], away);
+    resetScoringForNewBall(state, rearm);
+    expect(tick(state, BABEWATCH, [], inLane).map((a) => [a.id, a.score])).toEqual([
+      ["zone-0-7", 50000],
+    ]);
+  });
+
+  it("keeps a flag byte that is NOT in a lamp group — the walk never reaches it", () => {
+    // $3F10 only ever follows the chains hanging off the group table at $2326,
+    // so a flag byte outside every group is per GAME. Nothing on the three
+    // shipped tables is in that class (the next test proves the set is empty),
+    // so the rule is exercised here with the id held back from the re-arm set.
+    const state = createScoringState();
+    tick(state, LAW, [32]);
+    resetScoringForNewBall(state, new Set<string>());
+    expect(state.flags.has("device-32")).toBe(true);
     expect(tick(state, LAW, [32]).map((a) => a.repeat)).toEqual([true]);
+  });
+
+  it("has no per-game flag class left on the shipped data: repeatable IS group-backed", () => {
+    // The census behind the rule. On all three documents the set of records
+    // with a flag byte (`repeatable`, a non-NULL pointer at device +$04 or zone
+    // +$0A) and the set of records whose flag byte is a group-chained lamp are
+    // the SAME SET — so every first-hit award that exists re-arms every ball,
+    // and a future data change that broke that symmetry would fail here.
+    for (const tableId of ["law-n-justice", "babewatch", "extreme-sports"] as const) {
+      const devices = devicesFor(tableId);
+      const rearm = groupBackedFlagIds(modesFor(tableId));
+      const repeatable = new Set<string>();
+      for (const device of devices.devices) {
+        if (device.repeatable) repeatable.add(`device-${device.surfaceId}`);
+      }
+      for (const zone of devices.zones) {
+        if (zone.repeatable) repeatable.add(zoneKey(zone));
+      }
+      expect([...rearm].sort()).toEqual([...repeatable].sort());
+      expect(repeatable.size).toBeGreaterThan(0);
+    }
+  });
+
+  it("re-arms exactly the decoded ids, per table", () => {
+    const ids = (tableId: "law-n-justice" | "babewatch" | "extreme-sports") =>
+      [...groupBackedFlagIds(modesFor(tableId))].sort();
+    expect(ids("law-n-justice")).toEqual([
+      "device-32",
+      "device-33",
+      "device-34",
+      "device-35",
+      "device-36",
+    ]);
+    expect(ids("babewatch")).toEqual([
+      "device-32",
+      "device-33",
+      "device-34",
+      "device-35",
+      "device-36",
+      "device-37",
+      "device-38",
+      "device-39",
+      "device-40",
+      "zone-0-7",
+      "zone-0-8",
+      "zone-0-9",
+    ]);
+    expect(ids("extreme-sports")).toEqual([
+      "device-33",
+      "device-34",
+      "device-35",
+      "zone-1-7",
+      "zone-1-8",
+      "zone-1-9",
+    ]);
   });
 });

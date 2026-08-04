@@ -176,17 +176,34 @@ describe("the two-player rotation", () => {
     expect(snapshot.playerScores).toEqual([150_000, 25_000]);
   });
 
-  it("keeps the first-hit flag bytes per player, as the machine's bset per-player bits are", () => {
+  it("banks the first-hit flag bytes per player and re-arms the group-backed ones per ball", () => {
+    // The machine's flag byte is one byte with a bit per player, and the
+    // ball-start `clr.b` at +0x003F56 clears the WHOLE byte — every player's
+    // bit — on every group-chained lamp. This port banks a set per player and
+    // re-arms the incoming player's at their own serve, which is the same
+    // machine observed: a player's bits are only ever read on their own ball.
     const drv = twoPlayerGame();
     runOutBallEnd(drv); // P1 ball 1
+    // `device-33` is a Law 'n Justice standup: its flag byte IS a group lamp,
+    // so it is per BALL. `device-99` is nothing on this table, and stands in
+    // for the per-GAME class — a flag byte the group walk at +0x003F14 never
+    // reaches — which the shipped documents happen to have none of.
     drv.game.scoring.flags.add("device-33");
+    drv.game.scoring.flags.add("device-99");
+
     playOutBall(drv); // -> P2 ball 1
-    // Player 2's flag byte bit is their own: clear.
+    expect(drv.game.activePlayer).toBe(1);
+    // Player 2's bits are their own: both clear.
     expect(drv.game.scoring.flags.has("device-33")).toBe(false);
+    expect(drv.game.scoring.flags.has("device-99")).toBe(false);
+
     playOutBall(drv); // -> P1 ball 2
-    // Player 1's per-game flag survived their dormancy.
     expect(drv.game.activePlayer).toBe(0);
-    expect(drv.game.scoring.flags.has("device-33")).toBe(true);
+    // Player 1's group-backed bit re-armed with their new ball...
+    expect(drv.game.scoring.flags.has("device-33")).toBe(false);
+    // ...and the bit outside every lamp group survived both their dormancy
+    // and their own ball boundary.
+    expect(drv.game.scoring.flags.has("device-99")).toBe(true);
   });
 
   it("holds a held multiplier across the OTHER player's ball and re-seeds the ladder on rotation-in", () => {

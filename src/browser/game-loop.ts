@@ -227,6 +227,7 @@ import {
   EMPTY_MODE_TICK,
   comboCount,
   createModeState,
+  groupBackedFlagIds,
   lightGroupLampsForTrigger,
   litElements,
   missionSecondsLeft,
@@ -1357,17 +1358,18 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
           game.tilt = resetTiltForNewBall();
           game.ballsLocked = 0;
           game.searchPulses = BALL_SEARCH_PULSES;
-          // The hit timers and zone occupancies, and only those: the flag
-          // bytes that decide first-hit versus repeat are per game in this
-          // port. (DECODED AND DELIBERATELY KEPT: the machine's ball-start
-          // soft reset $3F10 does `clr.b` on every group-chained lamp — the
-          // very bytes the first-hit `bset` at +0x0055F0/+0x00543A tests — so
-          // the group-backed ids re-arm their first-hit award EVERY BALL on
-          // the original. research/MULTIPLAYER_DECODE.md §7 has the proof and
-          // the measured cost of fixing it: the sim-hash pin's own scripted
-          // windows re-hit those ids across ball boundaries, so the fix moves
-          // two of the three pinned hashes and waits for a re-pin round.)
-          resetScoringForNewBall(game.scoring);
+          // The hit timers, the zone occupancies, and the flag bytes that live
+          // inside a lamp group. The machine's ball-start soft reset $3F10
+          // (one caller, +0x0050B6; the EXTRA-BALL arm at +0x005068 sets state
+          // 7 and branches to +0x0050B0, two instructions above it, so an
+          // extra ball runs the same walk) does a whole-byte `clr.b` on every
+          // group-chained lamp — the very bytes the first-hit `bset` at
+          // +0x0055F0/+0x00543A tests — so the group-backed ids re-arm their
+          // first-hit award EVERY BALL. `game.scoring` is the ACTIVE player's
+          // bank, so the re-arm lands on whoever this serve is for; a flag
+          // byte outside every group would stay per game, and none of the
+          // shipped three have one. research/MULTIPLAYER_DECODE.md §7.
+          resetScoringForNewBall(game.scoring, groupBackedFlagIds(game.modes));
           // The charged serve is the original's state 5, whose panel announces
           // the incoming player until the launch takes the ball off the rod.
           game.announcingServe = true;

@@ -90,6 +90,7 @@
  * counted.
  */
 
+import { deviceFlagId, zoneFlagId } from "./scoring.js";
 import {
   COUNTER_FLAG_REBUILD_ACCUMULATOR,
   ELEMENT_FLAG_LIT_AT_GAME_START,
@@ -387,13 +388,12 @@ export interface ModeState {
    * device's +$04 "flag byte" IS the lamp) and by a trigger zone's pass
    * (+0x00543A), through `lightGroupLampsForTrigger`; cleared by the force-off
    * $6234 whenever a start-element of the lamp is disarmed, and by both group
-   * resets. This is also why the steady bit resets EVERY BALL where the port's
-   * scoring `flags` set is per game — the lamp layer, not the scoring layer,
-   * owns re-arming a group on a later ball. (The multiplayer round PROVED the
-   * machine resets the SCORING half per ball too — $3F10's `clr.b` hits the
-   * very byte the first-hit bset tests — and measured why the port still does
-   * not: the sim-hash pin's windows re-hit those ids across ball boundaries.
-   * research/MULTIPLAYER_DECODE.md §7.)
+   * resets. The steady bit resets EVERY BALL, and since the first-hit round so
+   * does the scoring `flags` entry that shares the byte with it: $3F10's
+   * whole-byte `clr.b (a0)` at +0x003F56 is one instruction serving both, and
+   * this port runs it as two — the lamp half here, the scoring half in
+   * `resetScoringForNewBall` off `groupBackedFlagIds`.
+   * research/MULTIPLAYER_DECODE.md §7.
    */
   readonly groupLampLit: Uint8Array;
   /**
@@ -610,6 +610,11 @@ interface GroupJoinIndex {
   readonly awardByElement: ReadonlyMap<number, readonly number[]>;
   /** Elements whose armed state blinks each flat lamp: the inverse of start. */
   readonly startElementsOfLamp: readonly (readonly number[])[];
+  /**
+   * The scoring layer's flag ids whose flag byte is one of these chained lamps
+   * — i.e. every id the ball-start `clr.b` re-arms. See `groupBackedFlagIds`.
+   */
+  readonly flagIds: ReadonlySet<string>;
 }
 
 const JOIN_INDEX = new WeakMap<TableModes, GroupJoinIndex>();
@@ -628,12 +633,19 @@ function groupJoins(modes: TableModes): GroupJoinIndex {
     if (list === undefined) map.set(k, [value]);
     else list.push(value);
   };
+  const flagIds = new Set<string>();
   let at = 0;
   for (const group of modes.lampGroups) {
     groupBase[group.index] = at;
     for (const lamp of group.lamps) {
-      for (const device of lamp.devices) push(byDevice, `${device.level}:${device.surfaceId}`, at);
-      for (const zone of lamp.zones) push(byZone, `${zone.level}:${zone.index}`, at);
+      for (const device of lamp.devices) {
+        push(byDevice, `${device.level}:${device.surfaceId}`, at);
+        flagIds.add(deviceFlagId(device.surfaceId));
+      }
+      for (const zone of lamp.zones) {
+        push(byZone, `${zone.level}:${zone.index}`, at);
+        flagIds.add(zoneFlagId(zone.level, zone.index));
+      }
       for (const element of lamp.startElements) push(startByElement, element, at);
       for (const element of lamp.awardElements) push(awardByElement, element, at);
       startElementsOfLamp.push(lamp.startElements);
@@ -648,23 +660,46 @@ function groupJoins(modes: TableModes): GroupJoinIndex {
     startByElement,
     awardByElement,
     startElementsOfLamp,
+    flagIds,
   };
   JOIN_INDEX.set(modes, built);
   return built;
 }
 
 /**
+ * The scoring-layer flag ids whose flag byte is a group-chained lamp: the ids
+ * the ball-start soft reset $3F10 re-arms, for `resetScoringForNewBall`.
+ *
+ * It is the same join `lightGroupLampsForTrigger` lights through, read the
+ * other way round, and that is the point — the pointer at a device's +$04 or a
+ * zone object's +$0A is ONE byte that the lamp scan reads and the first-hit
+ * `bset` writes, so "which ids does the clr.b reach" and "which ids light a
+ * group lamp" are the same question. Ids outside every group keep their flag
+ * for the whole game, because the walk at +0x003F14 only ever follows the
+ * group table's chains.
+ *
+ * Null modes yields the empty set: a table with no mission document has no
+ * groups, hence no group-backed flag byte, hence nothing to re-arm.
+ */
+export function groupBackedFlagIds(modes: TableModes | null): ReadonlySet<string> {
+  return modes === null ? NO_FLAG_IDS : groupJoins(modes).flagIds;
+}
+
+const NO_FLAG_IDS: ReadonlySet<string> = new Set<string>();
+
+/**
  * A device hit or a zone pass lights its flag lamp — `bset.b d0,(a2)` at
  * +0x0055F0 (device +$04) and +0x00543A (zone object +$0A).
  *
  * Called for EVERY hit, not only the first: the machine's bset is idempotent
- * and it is the bset itself that distinguishes first from repeat, so the lamp
- * relights on the first hit of a NEW ball even though the port's per-game
- * scoring flags still call that hit a repeat (divergence documented on
- * `ModeState.groupLampLit`, decode and pin-blocker on
- * research/MULTIPLAYER_DECODE.md §7). A device award's trigger carries no level (`level`
- * -1); a device surface id is filed on exactly one level, so matching both is
- * the same join the engine makes through the level's own array.
+ * and it is the bset itself that distinguishes first from repeat. The lamp
+ * relights on the first hit of a NEW ball, and since the first-hit round the
+ * scoring layer agrees with it — the same ids re-arm through
+ * `groupBackedFlagIds` above, which is the divergence this comment used to
+ * record closing (research/MULTIPLAYER_DECODE.md §7). A device award's trigger
+ * carries no level (`level` -1); a device surface id is filed on exactly one
+ * level, so matching both is the same join the engine makes through the level's
+ * own array.
  */
 export function lightGroupLampsForTrigger(
   modes: TableModes,

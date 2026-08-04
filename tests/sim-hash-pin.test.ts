@@ -175,11 +175,107 @@ const TICKS = 4000;
  * round-5 INDEX already records as parity artefacts. Tip-flip sweep
  * BYTE-IDENTICAL to HEAD, pass-under 0/1044. Film side-by-side unchanged at
  * 98.4508/99.8645/99.1322 with byte-identical rasters.
+ *
+ * RE-PIN, THE PER-BALL FIRST-HIT RE-ARM (the first-hit round). Two of the three
+ * hashes moved, and this is the one entry above where the ARGUMENT is the table
+ * that did NOT move.
+ *
+ * WHAT CHANGED. The first/repeat split is the lamp byte, and the machine clears
+ * it every ball. Three sites in main.seg00, re-read for this round straight out
+ * of `research/seg_clean/main.bin.seg00.bin` (the file carries the hunk-size
+ * longword, so file offset = address + 4):
+ *
+ *   +0x0055F0  302D 0DBE   move.w $dbe(a5),d0     ; the PLAYER index
+ *   +0x0055F4  01D2        bset.b d0,(a2)         ; a2 = long at device +$04
+ *              -> beq taken (bit was CLEAR) = FIRST, lea $12(a1),a3 / jsr $6b96
+ *              -> fall through (bit was SET)  = REPEAT, lea $1a(a1),a3 / jsr $6bcc
+ *   +0x00543A  302D 0DBE / 01D2 at +0x00543E, a2 = long at zone object +$0A,
+ *              first lea $1e(a1),a3 -> $6b96, repeat lea $26(a1),a3 -> $6bcc
+ *   +0x003F14  266d 2326   movea.l $2326(a5),a3   ; $3F10, the lamp-group table
+ *   +0x003F5A  4210        clr.b (a0)             ; +$3F56: the WHOLE byte,
+ *              all eight players, on every group-chained lamp
+ *
+ * `$3F10` has exactly ONE caller in the segment, the ball-start chain's
+ * `4EB9 0000 3F10` at +0x0050B6 — and the EXTRA-BALL arm reaches it too: the
+ * `subq.b #1,$10(a0) / move.w #$0007,$8e(a5)` at +0x005064 branches to
+ * +0x0050B0, two instructions above the call. So every ball start, extra balls
+ * included, re-arms every first-hit award whose flag byte hangs off a lamp
+ * group. This port did that for the LAMPS and not for the SCORES; now it does
+ * both (`resetScoringForNewBall`, `groupBackedFlagIds`).
+ *
+ * THE CONTROL. Law 'n Justice's hash is UNCHANGED, and it had to be: the
+ * affected ids are Law 'n Justice devices 32..36, BabeWatch devices 32..40 and
+ * zones 0-7/0-8/0-9, Extreme Sports devices 33..35 and zones 1-7/1-8/1-9, and
+ * this script's Law 'n Justice window re-hits none of them across a ball
+ * boundary while the other two do. A moved Law 'n Justice hash would have meant
+ * something else changed as well.
+ *
+ * THE DIVERGENCE IS THE PREDICTED EVENT AND NOTHING ELSE. Dumping all 4,000
+ * per-tick snapshots on both trees:
+ *
+ *   law-n-justice   0 of 4,000 ticks differ
+ *   babewatch       first differing tick index 1087, ball 2, ball 1 at
+ *                   (205,85) L0 — inside zone-0-7 (201..211 x 85..95), the top
+ *                   lane: HEAD pays the 5,000 repeat, this tree the 50,000
+ *                   first. Again at index 1887 on ball 3. Final score
+ *                   525,000 -> 615,000 = +2 x 45,000.
+ *   extreme-sports  first differing tick index 1028, ball 2, ball 1 at
+ *                   (194,80) L1 — inside zone-1-7: HEAD pays 0, this tree
+ *                   50,000. Again at index 1828 on ball 3. Final score
+ *                   75,000 -> 175,000 = +2 x 50,000.
+ *
+ * Across all 12,000 tick-pairs the ONLY field that ever differs is `score` —
+ * no ball position, velocity, level, lock, mission, bonus, phase or camera —
+ * and zero ticks of BALL ONE differ on any table. The hashes move because a
+ * score moved, at the tick the re-armed lane was re-entered, and nowhere else.
+ *
+ * THE CENSUS, 90 games x 3 tables x 40,000 ticks, aggressive player, HEAD
+ * 98e166a -> this tree. Ball-1 medians and every completion and write-off
+ * figure are IDENTICAL, which is the signature of a change confined to ball
+ * boundaries:
+ *
+ *   law-n-justice   completed 90/90 -> 90/90, ends 271, drained 271,
+ *                   write-offs 0 (0.0%); score median 607,500 -> 635,000,
+ *                   min 0 -> 0, max 8,945,000 -> 8,945,000, zeros 3/90 -> 3/90,
+ *                   distinct 77 -> 76; BALL 1 median 100,000 -> 100,000,
+ *                   zeros 26/90 -> 26/90.
+ *   babewatch       completed 90/90 -> 90/90, ends 270, drained 270,
+ *                   write-offs 0 (0.0%); score median 917,500 -> 985,000,
+ *                   min 680,000 -> 770,000, max 3,770,000 -> 3,840,000,
+ *                   zeros 0/90, distinct 71 -> 71; BALL 1 median 410,000 ->
+ *                   410,000, zeros 0/90 -> 0/90.
+ *   extreme-sports  completed 90/90 -> 90/90, ends 270, drained 268,
+ *                   write-offs 2 (0.7%) at the one known site (238,588)L0 on
+ *                   both trees; score median 325,000 -> 425,000, min 65,000 ->
+ *                   165,000 (+100,000 exactly: the two upper lanes re-arming on
+ *                   balls 2 and 3), max 7,550,000 -> 7,700,000, zeros 0/90,
+ *                   distinct 70 -> 69; BALL 1 median 92,500 -> 92,500,
+ *                   zeros 0/90 -> 0/90.
+ *   worst write-off rate 0.7% -> 0.7%.
+ *
+ * Law 'n Justice's census median moves while its pinned hash does not, and the
+ * two are consistent: the table's group-backed ids are its five standups, which
+ * the aggressive census player re-hits on later balls and this script's
+ * scripted window never does.
+ *
+ * The other gates: full suite green, `npx tsc --noEmit` clean, public-build
+ * guard 286 gated, tip-flip sweep pass-under 0/1044, and the film side-by-side
+ * BYTE-IDENTICAL at 98.4508/99.8645/99.1322 — which is its own check here,
+ * because the film windows are all ball ONE and a leak into ball one would
+ * have moved them.
+ *
+ * The digests this entry replaced, recorded so the move is auditable:
+ *   law-n-justice   6eadefa2a35b3a57cfb5b470096dc237626c082f08f7df537985cfa1dc286955 (UNCHANGED)
+ *   babewatch       dd969b9ddcd84edfe046ba8fd6dc2e9663f0ab150e6c3e919fb4784dfcbde2de
+ *   extreme-sports  c5e54dfbf1e35ff2def60535c00ba679ce33e1662a0e9db0cb07f9e1b06feef1
+ *
+ * Nothing else about this pin moved: same 4,000 ticks, same three tables, same
+ * scripted input, same `debugSnapshot` fields.
  */
 const PINNED: Record<TableId, string> = {
   "law-n-justice": "6eadefa2a35b3a57cfb5b470096dc237626c082f08f7df537985cfa1dc286955",
-  "babewatch": "dd969b9ddcd84edfe046ba8fd6dc2e9663f0ab150e6c3e919fb4784dfcbde2de",
-  "extreme-sports": "c5e54dfbf1e35ff2def60535c00ba679ce33e1662a0e9db0cb07f9e1b06feef1",
+  "babewatch": "685756c8b1dffff7b177b7673574d39be6b04b346a16df66261691a1fc5829aa",
+  "extreme-sports": "63896e08d578ebda9e141f78682f982353251ad9b65a8b248046156cc3a62b51",
 };
 
 /** Same shape as the determinism harness's input: behaviour = f(tick index). */

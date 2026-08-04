@@ -319,24 +319,74 @@ export function createScoringState(): ScoringState {
 }
 
 /**
- * Clears everything a new ball clears — which is the debounces and nothing else.
+ * THE FLAG NAMESPACE. One id per flag byte, and the same string is the key of
+ * the record's own six-frame debounce, because on the machine they are two
+ * fields of one record.
  *
- * The flag bytes are NOT cleared: they are per player and per game in this
- * port. DECODED AND DELIBERATELY KEPT: on the machine the flag bytes of the
- * GROUP-CHAINED lamps — Law 'n Justice's standups 32..36, BabeWatch's targets
- * 32..40 and top lanes 0-7/8/9, Extreme Sports' 33..35 and upper lanes
- * 1-7/8/9 — are cleared for every player at every ball start (`clr.b` in the
- * soft reset $3F10, called at +0x0050B6), so exactly those first-hit awards
- * re-arm per ball on the original. The fix is measured and waiting: the
- * sim-hash pin's own scripted windows re-hit those ids across ball
- * boundaries, so honouring the reset moves two of the three pinned hashes,
- * and the pin outranks the fix until a re-pin round. Proof, sites and the
- * would-be census deltas: research/MULTIPLAYER_DECODE.md §7. The score and
- * bonus are not cleared either; `startGame` builds a fresh state for that.
+ * A device is keyed by SURFACE ID alone: the shipped data files each surface id
+ * under exactly one level, so the level adds nothing to the key. A zone is
+ * keyed by level and list index, because the two levels have independent zone
+ * lists and both start at 0.
  */
-export function resetScoringForNewBall(state: ScoringState): void {
+export function deviceFlagId(surfaceId: number): string {
+  return `device-${surfaceId}`;
+}
+
+/** Stable key for one zone, unique across both levels. */
+export function zoneFlagId(level: PlayfieldLevel | number, index: number): string {
+  return `zone-${level}-${index}`;
+}
+
+/**
+ * Clears everything a new ball clears: the debounces, and the flag bytes that
+ * live inside a LAMP GROUP.
+ *
+ * THE MACHINE DOES BOTH IN ONE INSTRUCTION. The first/repeat split is the lamp
+ * byte itself — a type-0 device's `bset.b d0,(a2)` at +0x0055F0 takes A2 from
+ * the device's +$04 and a trigger zone's at +0x00543A takes it from the zone
+ * object's +$0A, with d0 = the player index out of `$dbe(a5)`, so the bit's
+ * value BEFORE the set is what picks repeat (award+$1A / zone +$26, through
+ * $6BCC) from first (award+$12 / zone +$1E, through $6B96). And the ball-start
+ * soft reset $3F10 walks the lamp-group table at `$2326` and does a whole-byte
+ * `clr.b (a0)` at +0x003F56 on every chained lamp — all eight players at once,
+ * the very byte the bset tests. $3F10 has exactly one caller, +0x0050B6, and
+ * the extra-ball arm of the ball-start chain (+0x005068 sets state 7 and
+ * branches to +0x0050B0) lands two instructions above it, so an extra ball
+ * re-arms as surely as a fresh one.
+ *
+ * So a flag byte that is a group-chained lamp is per BALL, and this port's
+ * `flags` set now says so: `rearm` is the ids whose flag byte is such a lamp
+ * (`groupBackedFlagIds`, mode-vm.ts, off the same join `lightGroupLampsForTrigger`
+ * lights). On the three shipped tables that set is exactly Law 'n Justice's
+ * standups 32/33 (50,000) and 34..36 (75,000), BabeWatch's targets 32..40
+ * (25,000) and top lanes `zone-0-7/8/9` (50,000 first, 5,000 repeat), and
+ * Extreme Sports' 33..35 and upper lanes `zone-1-7/8/9` (50,000 first, 0
+ * repeat) — and, measured over all three documents, it is exactly the set of
+ * records that HAVE a flag byte at all. No shipped record with a non-NULL flag
+ * pointer sits outside a group, and no group-bound record has a flag-bit-1
+ * start element that could pre-set a bit at ball start, so on this data the
+ * rule needs no exceptions. A flag byte outside every group would still be per
+ * game — $3F10 never reaches it — which is why this takes a SET rather than
+ * clearing the lot.
+ *
+ * The machine clears every player's bit at every ball start; this port keeps a
+ * `ScoringState` per player and clears the incoming player's at their own ball
+ * start. Same observable machine: a player's flags are read only during that
+ * player's ball, and they are clear at the top of every one of them.
+ *
+ * The one thing the port splits that the machine fuses is WHEN. `clr.b (a0)`
+ * serves the lamp layer and the scoring layer at once; here the lamp half is
+ * `resetModesForNewBall` (run on the drain and on the rotation) and this is the
+ * scoring half (run on the serve). Nothing can score in between — the table is
+ * empty — so the two sites bracket the same dead interval.
+ *
+ * The score and bonus are not cleared; `startGame` builds a fresh state for
+ * that. Full decode: research/MULTIPLAYER_DECODE.md §7.
+ */
+export function resetScoringForNewBall(state: ScoringState, rearm: ReadonlySet<string>): void {
   state.timers.clear();
   state.occupants.clear();
+  for (const id of rearm) state.flags.delete(id);
 }
 
 /**
@@ -463,7 +513,7 @@ export function scoreSurfaces(
 
     const device = devices.deviceFor(level, id);
     if (device === null) continue;
-    const key = `device-${id}`;
+    const key = deviceFlagId(id);
     // The engine's own exemption: index 32 and up skips the debounce.
     if (device.index < UNDEBOUNCED_DEVICE_INDEX && debounced(state, key)) continue;
     awards.push(awardFor(state, "device", key, device));
@@ -512,7 +562,7 @@ export function isPoweredSurfaceId(id: number): boolean {
 
 /** Stable key for one zone, unique across both levels. */
 export function zoneKey(zone: ZoneRecord): string {
-  return `zone-${zone.level}-${zone.index}`;
+  return zoneFlagId(zone.level, zone.index);
 }
 
 /** True when a ball centre in whole pixels is inside a zone's rectangle. */
