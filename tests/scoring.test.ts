@@ -14,6 +14,7 @@ import {
   addPackedBcd,
   addToBcdField,
   applyAward,
+  clearScoringFlags,
   createScoringState,
   formatBcdField,
   isPoweredSurfaceId,
@@ -27,7 +28,13 @@ import {
   zoneKey,
 } from "../src/game/scoring.js";
 import type { ScoringState } from "../src/game/scoring.js";
-import { groupBackedFlagIds } from "../src/game/mode-vm.js";
+import {
+  GROUP_FLASH_FRAMES,
+  createModeState,
+  groupBackedFlagIds,
+  lightGroupLampsForTrigger,
+  tickModes,
+} from "../src/game/mode-vm.js";
 import type { TableDevices } from "../src/game/table-devices.js";
 import { devicesFor, modesFor } from "./table-fixtures.js";
 
@@ -387,5 +394,125 @@ describe("what a new ball clears and what it does not", () => {
       "zone-1-8",
       "zone-1-9",
     ]);
+  });
+});
+
+describe("the completion clear: a group that fires puts its own lamps out", () => {
+  // The other writer of the flag byte, and the one the film caught. The
+  // lamp-group scan's tail takes `jsr $64AA` unconditionally (+0x0065A4),
+  // which queues a sixteen-frame flash; the service at +0x006430 ends it with
+  // `bclr.b #0,$04(group)` and `and.b ~$dc0(a5)` on every lamp of the chain —
+  // the FIRED latch released and this player's bit cleared in the very byte the
+  // first-hit `bset` tests. See `serviceGroupFlash` in mode-vm.ts.
+
+  function lnj() {
+    const modes = modesFor("law-n-justice");
+    return { modes, state: createModeState(modes) };
+  }
+
+  it("clears the flag ids of a completed group, sixteen frames later", () => {
+    const { modes, state } = lnj();
+    // Law 'n Justice group 14 is ONE lamp with ONE device on it — drop target
+    // 35 — and no event script, so a single hit completes it.
+    lightGroupLampsForTrigger(modes, state, "device", -1, 35);
+    let cleared: readonly string[] = [];
+    let firedOnceAtLeast = false;
+    for (let tick = 0; tick < 32; tick += 1) {
+      const report = tickModes(modes, state);
+      if (state.groupFired[14] === 1) firedOnceAtLeast = true;
+      if (report.clearedFlagIds.length > 0) {
+        cleared = report.clearedFlagIds;
+        expect(tick).toBeGreaterThanOrEqual(GROUP_FLASH_FRAMES);
+        break;
+      }
+    }
+    expect(firedOnceAtLeast).toBe(true);
+    expect(cleared).toEqual(["device-35"]);
+    // And the group is back the way it was: lamp out, latch released.
+    expect(state.groupFired[14]).toBe(0);
+  });
+
+  it("pays drop target 35 its full 75,000 twice in one ball, as the film does", () => {
+    // THE FILMED CASE. In `lawnjustice-fullgame-3balls-...mkv` the ball contacts
+    // surface 35 at f2017 and again at f2175 on BALL 2, and the score goes
+    // 1,200,000 -> 1,275,000 and 1,350,000 -> 1,425,000: 75,000 both times,
+    // where the record's repeat award is zero. 158 frames apart, so the flash
+    // has long since ended. research/SCORING_LEDGER.md carries the ledger.
+    const { modes, state } = lnj();
+    const scoring = createScoringState();
+
+    const hit = () => {
+      const awards = scoreSurfaces(scoring, LAW, 0, [35]);
+      for (const award of awards) applyAward(scoring, award);
+      if (awards.length > 0) lightGroupLampsForTrigger(modes, state, "device", -1, 35);
+      const report = tickModes(modes, state);
+      clearScoringFlags(scoring, report.clearedFlagIds);
+      return awards;
+    };
+    const idle = (frames: number) => {
+      for (let i = 0; i < frames; i += 1) {
+        tickScoring(scoring);
+        clearScoringFlags(scoring, tickModes(modes, state).clearedFlagIds);
+      }
+    };
+
+    expect(hit().map((a) => [a.repeat, a.score])).toEqual([[false, 75000]]);
+    idle(158);
+    expect(hit().map((a) => [a.repeat, a.score])).toEqual([[false, 75000]]);
+    expect(readBcdField(scoring.score)).toBe(150000);
+  });
+
+  it("still pays nothing for a re-hit DURING the flash", () => {
+    // The clear is deferred, not immediate: for the sixteen frames the group is
+    // flashing the bit is still set, so a target the ball is resting against
+    // does not pay on every debounce window.
+    const { modes, state } = lnj();
+    const scoring = createScoringState();
+    const hit = () => {
+      const awards = scoreSurfaces(scoring, LAW, 0, [35]);
+      for (const award of awards) applyAward(scoring, award);
+      if (awards.length > 0) lightGroupLampsForTrigger(modes, state, "device", -1, 35);
+      clearScoringFlags(scoring, tickModes(modes, state).clearedFlagIds);
+      return awards;
+    };
+    expect(hit().map((a) => a.score)).toEqual([75000]);
+    for (let i = 0; i < HIT_TIMER_FRAMES + 1; i += 1) {
+      tickScoring(scoring);
+      clearScoringFlags(scoring, tickModes(modes, state).clearedFlagIds);
+    }
+    expect(hit().map((a) => [a.repeat, a.score])).toEqual([[true, 0]]);
+  });
+
+  it("leaves a SUPPRESSED group alone — the multiplier ladder never completes", () => {
+    // Law 'n Justice's X2..X10 chain is group 1 and it carries flags bit 1
+    // (`btst #1,$4(a4)` at +0x006582), so the scan never fires it and the clear
+    // never reaches it. A ladder that reset itself would un-earn the multiplier.
+    const modes = modesFor("law-n-justice");
+    const ladder = modes.lampGroups[1];
+    expect(ladder?.index).toBe(1);
+    expect((ladder?.flags ?? 0) & 2).toBe(2);
+    expect(modes.multiplierRestore?.group).toBe(1);
+    // And the only groups on this table that can fire AND carry a scoring flag
+    // byte are the two standups and the three drop targets — group 12 (32, 33)
+    // and the one-lamp groups 13, 14, 15 — which is why nothing else moved.
+    const scoringGroups = modes.lampGroups
+      .filter((g) => (g.flags & 2) === 0)
+      .filter((g) => g.lamps.some((l) => l.devices.length > 0 || l.zones.length > 0))
+      .map((g) => g.index);
+    expect(scoringGroups).toEqual([12, 13, 14, 15]);
+  });
+
+  it("clearScoringFlags is a bclr: deleting a bit that is not set is a no-op", () => {
+    const state = createScoringState();
+    clearScoringFlags(state, ["device-35"]);
+    expect(state.flags.size).toBe(0);
+    tick(state, LAW, [35]);
+    expect(state.flags.has("device-35")).toBe(true);
+    clearScoringFlags(state, ["device-34"]);
+    expect(state.flags.has("device-35")).toBe(true);
+    clearScoringFlags(state, ["device-35"]);
+    expect(state.flags.has("device-35")).toBe(false);
+    // The debounce is a different field and the clear must not touch it.
+    expect(state.timers.size).toBeGreaterThan(0);
   });
 });

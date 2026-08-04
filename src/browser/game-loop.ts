@@ -196,6 +196,7 @@ import {
   applyAward,
   awardTrigger,
   clearBonusForNewBall,
+  clearScoringFlags,
   createScoringState,
   formatBcdField,
   readBcdField,
@@ -2096,6 +2097,12 @@ function runModes(game: Game, awards: readonly Award[]): ModeTickReport {
   if (report.bonusMultiplier >= 0) game.scoring.multiplier = report.bonusMultiplier;
   if (report.holdBonus) game.scoring.holdBonus = true;
   if (report.holdMultiplier) game.scoring.holdMultiplier = true;
+  // And the fourth: the force-off's `bclr` on an element's start lamp is a
+  // `bclr` on a device's or a zone's first-hit flag byte, because on the
+  // shipped data they are the same byte. The mission machine names the ids; the
+  // scoring layer owns the set. See `clearScoringFlags` and, for the film that
+  // caught this, `forceStartLampsOff` in mode-vm.ts.
+  clearScoringFlags(game.scoring, report.clearedFlagIds);
 
   // The banner is the last thing the mission said, and it goes away with the
   // mission: a display left showing "SHOOT ALL TERRORISTS" after the mode has

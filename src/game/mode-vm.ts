@@ -408,6 +408,16 @@ export interface ModeState {
    * once per ball.
    */
   readonly groupFired: Uint8Array;
+  /**
+   * THE COMPLETION FLASH QUEUE, `$1264/$1268/$126A(a5)`.
+   *
+   * `flashGroup` is the group flashing right now (-1 for none) and
+   * `flashTicks` its countdown; `flashQueue` is the LIFO behind it. See
+   * `serviceGroupFlash`, which is where the whole routine is written out.
+   */
+  flashGroup: number;
+  flashTicks: number;
+  readonly flashQueue: number[];
 
   /** The background ring at `$2396(a5)`; -1 is an empty slot. */
   readonly queue: Int32Array;
@@ -484,6 +494,9 @@ export function createModeState(modes: TableModes): ModeState {
     groupLampLit: new Uint8Array(lampCount),
     groupLampAlways: new Uint8Array(lampCount),
     groupFired: new Uint8Array(modes.lampGroups.length),
+    flashGroup: -1,
+    flashTicks: 0,
+    flashQueue: [],
     queue: new Int32Array(MODE_QUEUE_SLOTS).fill(-1),
     queueWrite: 0,
     queueRead: 0,
@@ -567,6 +580,12 @@ export function resetModesForNewBall(modes: TableModes, state: ModeState): void 
   }
   state.groupLampLit.fill(0);
   state.groupFired.fill(0);
+  // The flash queue dies with the ball: `$1264` is cleared by the reset's own
+  // `clr.l` and a group that was mid-flash has just had its lamps cleared
+  // wholesale by the ball-start walk anyway.
+  state.flashGroup = -1;
+  state.flashTicks = 0;
+  state.flashQueue.length = 0;
   let lampAt = 0;
   for (const group of modes.lampGroups) {
     const keep = (group.flags & GROUP_FLAG_KEEP_ALWAYS_ON) !== 0;
@@ -615,6 +634,13 @@ interface GroupJoinIndex {
    * — i.e. every id the ball-start `clr.b` re-arms. See `groupBackedFlagIds`.
    */
   readonly flagIds: ReadonlySet<string>;
+  /**
+   * The same ids PER FLAT LAMP: the scoring flag ids whose flag byte is this
+   * exact lamp. The force-off's `bclr.b d6,(a1)` clears the player's bit in one
+   * lamp byte, so it re-arms these ids and no others — where the ball-start
+   * `clr.b` walks the whole chain and re-arms `flagIds` entire.
+   */
+  readonly flagIdsOfLamp: readonly (readonly string[])[];
 }
 
 const JOIN_INDEX = new WeakMap<TableModes, GroupJoinIndex>();
@@ -634,21 +660,26 @@ function groupJoins(modes: TableModes): GroupJoinIndex {
     else list.push(value);
   };
   const flagIds = new Set<string>();
+  const flagIdsOfLamp: (readonly string[])[] = [];
   let at = 0;
   for (const group of modes.lampGroups) {
     groupBase[group.index] = at;
     for (const lamp of group.lamps) {
+      const mine: string[] = [];
       for (const device of lamp.devices) {
         push(byDevice, `${device.level}:${device.surfaceId}`, at);
         flagIds.add(deviceFlagId(device.surfaceId));
+        mine.push(deviceFlagId(device.surfaceId));
       }
       for (const zone of lamp.zones) {
         push(byZone, `${zone.level}:${zone.index}`, at);
         flagIds.add(zoneFlagId(zone.level, zone.index));
+        mine.push(zoneFlagId(zone.level, zone.index));
       }
       for (const element of lamp.startElements) push(startByElement, element, at);
       for (const element of lamp.awardElements) push(awardByElement, element, at);
       startElementsOfLamp.push(lamp.startElements);
+      flagIdsOfLamp.push(mine);
       at += 1;
     }
   }
@@ -661,6 +692,7 @@ function groupJoins(modes: TableModes): GroupJoinIndex {
     awardByElement,
     startElementsOfLamp,
     flagIds,
+    flagIdsOfLamp,
   };
   JOIN_INDEX.set(modes, built);
   return built;
@@ -725,10 +757,63 @@ export function lightGroupLampsForTrigger(
  * player's STEADY bit off the element's +$04 start lamp and stops its blink.
  * The always-on mask at +$05 is NOT touched — only LAMP_OFF's own handler
  * reaches that.
+ *
+ * ---------------------------------------------------------------------------
+ * AND THAT `bclr` RE-ARMS THE FIRST-HIT AWARD, BECAUSE IT IS THE SAME BIT
+ * ---------------------------------------------------------------------------
+ * The bit this clears is the bit the first-hit test SETS. Re-read for the
+ * scoring round straight out of `research/seg_clean/main.bin.seg00.bin` (file
+ * offset = address + 4):
+ *
+ *   +0x006238  20 2A 00 04    move.l  $04(a2),d0    ; a2 = the ELEMENT
+ *   +0x00623E  22 40          movea.l d0,a1         ; a1 = its +$04 START LAMP
+ *   +0x006240  0D 91          bclr.b  d6,(a1)       ; d6 = the player index
+ *
+ *   +0x0055E4  20 28 00 04    move.l  $04(a0),d0    ; a0 = the DEVICE
+ *   +0x0055EA  24 40          movea.l d0,a2         ; a2 = its +$04 FLAG BYTE
+ *   +0x0055EC  30 2D 0D BE    move.w  $dbe(a5),d0   ; the player index
+ *   +0x0055F0  01 D2          bset.b  d0,(a2)       ; first/repeat, on that byte
+ *
+ *   +0x005430  20 29 00 0A    move.l  $0A(a1),d0    ; the ZONE object's +$0A
+ *   +0x005436  24 40          movea.l d0,a2
+ *   +0x00543A  30 2D 0D BE / 01 D2                  ; the same two instructions
+ *
+ * `(a1)` at +0x006240 and `(a2)` at +0x0055F0 are ONE byte whenever a device's
+ * +$04 and an element's +$04 resolve to the same lamp object — and the shipped
+ * lamp-group documents say WHICH, because `lampGroups` in
+ * `scripts/export-table-modes.mjs` builds each lamp's `startElements` and
+ * `devices`/`zones` lists by keying both pointers on that object's ADDRESS.
+ * A lamp that lists device 35 and elements 45/50/87 is the statement that all
+ * four pointers are that one byte.
+ *
+ * So a disarm re-arms the first-hit award of every device and zone filed on the
+ * lamp it puts out, exactly as the ball-start `clr.b` re-arms the whole chain.
+ * This port used to model only the lamp half of the instruction, and the film
+ * caught it: in the Law 'n Justice full-game capture the ball hits drop target
+ * 35 twice on BALL 2, at f2018 and f2176, and the original pays **75,000 both
+ * times** — where a flag that survived the ball would have paid the record's
+ * repeat award of zero the second time. Script 74, which surface 35's own
+ * binding queues, is `AWARD 50 / AWARD 87 / AWARD 45`, and all three of those
+ * elements are start-lamps of the very lamp that is surface 35's flag byte;
+ * each `AWARD` of an unarmed element falls into this routine. See
+ * `research/SCORING_LEDGER.md` for the frame-by-frame ledger and the
+ * measurement that identified the target.
+ *
+ * The ids are REPORTED rather than cleared here: the flag set is the scoring
+ * layer's (`ScoringState.flags`), and the mission machine does not reach into
+ * it — `runModes` in game-loop.ts applies them through `clearScoringFlags`,
+ * the same shape as every other player-record field this VM reports.
  */
-function forceStartLampsOff(modes: TableModes, state: ModeState, element: number): void {
-  for (const lamp of groupJoins(modes).startByElement.get(element) ?? []) {
+function forceStartLampsOff(
+  modes: TableModes,
+  state: ModeState,
+  out: Accumulator,
+  element: number,
+): void {
+  const joins = groupJoins(modes);
+  for (const lamp of joins.startByElement.get(element) ?? []) {
     state.groupLampLit[lamp] = 0;
+    for (const id of joins.flagIdsOfLamp[lamp] ?? []) out.clearedFlagIds.push(id);
   }
 }
 
@@ -772,8 +857,104 @@ function scanLampGroups(modes: TableModes, state: ModeState): void {
     if (state.groupFired[group.index] === 1) continue;
     state.groupFired[group.index] = 1;
     if (group.script >= 0) queueScript(state, group.script);
+    // AND THE FLASH, `jsr $64AA` at +0x0065A4 — taken unconditionally, past the
+    // `beq` that skips a NULL event script, so a group with no script at all
+    // still gets here. See `serviceGroupFlash`.
+    state.flashQueue.push(group.index);
   }
 }
+
+/**
+ * THE COMPLETION FLASH AND THE CLEAR BEHIND IT — the routine at +0x006430,
+ * one frame of it, and the reason a drop target scores more than once a ball.
+ *
+ * Read straight out of `research/seg_clean/main.bin.seg00.bin` for the scoring
+ * round (file offset = address + 4). The lamp-group scan's tail:
+ *
+ *   +0x00658A  08 EC 00 00 00 04  bset.b #0,$0004(a4)   ; the FIRED latch
+ *   +0x006594  20 2C 00 06        move.l $0006(a4),d0   ; the event script
+ *   +0x006598  67 08              beq    +0x0065A2      ; NULL -> skip the jsr
+ *   +0x00659C  4E B9 0000 6C10    jsr    $6C10          ; queue it
+ *   +0x0065A4  4E B9 0000 64AA    jsr    $64AA          ; ALWAYS, script or not
+ *
+ * `$64AA` pushes `{ word $0010, long group }` on the stack at `$126A(a5)` and
+ * sets bit 0 of `+$02` on every lamp of the chain. The per-frame service:
+ *
+ *   +0x006430  20 2D 12 64   move.l $1264(a5),d0   ; the group flashing now
+ *   +0x006434  67 32         beq    +0x006468      ; none -> pop the next
+ *   +0x006438  30 2D 12 68   move.w $1268(a5),d0   ; its countdown
+ *   +0x00643C  67 44         beq    +0x006482      ; ZERO -> THE CLEAR
+ *   +0x006440  02 40 00 02   andi.w #$0002,d0      ; bit 1 picks the phase:
+ *   +0x006446  42 2A 00 01   clr.b  $0001(a2)      ;   two frames dark
+ *   +0x006454  50 EA 00 01   addq.b #8,$0001(a2)   ;   two frames bright
+ *   +0x006462  53 6D 12 68   subq.w #1,$1268(a5)   ; tick
+ *
+ * and the clear it falls into:
+ *
+ *   +0x006486  08 A9 00 00 00 04  bclr.b #0,$0004(a1) ; RELEASE THE LATCH
+ *   +0x00648E  32 2D 0D C0        move.w $dc0(a5),d1  ; the one-hot PLAYER mask
+ *   +0x006492  46 41              not.w  d1
+ *   +0x006494  C3 12              and.b  d1,(a2)      ; lamp byte 0, THIS PLAYER
+ *   +0x006496  C3 2A 00 05        and.b  d1,$0005(a2) ; and the always-on mask
+ *   +0x0064A0  20 2A 00 10        move.l $0010(a2),d0 ; next lamp, loop
+ *
+ * `$dc0(a5)` is one-hot: `move.w #$0001,$dc0(a5)` at +0x005084 and `lsl.w` at
+ * +0x00507A on each player advance.
+ *
+ * SIXTEEN FRAMES, THEN THE GROUP IS PUT BACK THE WAY IT WAS. Three things come
+ * off that, and this port had none of them:
+ *
+ *  1. The lamps go out. The insert is not a permanent record of a hit.
+ *  2. The FIRED latch is released, so the group can complete — and fire its
+ *     event script — again, as many times as the player relights it.
+ *  3. **The first-hit awards on those lamps re-arm.** Lamp byte 0 is the byte
+ *     a device's +$04 and a trigger zone's +$0A point at, and the byte the
+ *     first-hit `bset.b d0,(a2)` (+0x0055F0 / +0x00543A) tests; `and.b d1,(a2)`
+ *     clears this player's bit in it. Law 'n Justice files drop targets 34, 35
+ *     and 36 in one-lamp groups of their own with no event script, so each
+ *     completes on its own hit, flashes, and re-arms 0.32 s later.
+ *
+ * THE FILM SAYS SO. In the Law 'n Justice full-game capture the ball contacts
+ * surface 35 twice on BALL 2 — at f2017 (ball centre 195.6,341.5, 6.9 px from
+ * the target's pixels) and at f2175 (185.6,336.5, 7.1 px) — and the score goes
+ * 1,200,000 -> 1,275,000 -> ... -> 1,425,000, i.e. the original pays the FULL
+ * 75,000 both times where the record's repeat award is zero. Lamp 27, the
+ * group-14 insert over that target, blinks from f2017, is dark by f2164, and
+ * blinks again from f2176. Frame numbers, positions and the camera registration
+ * behind them are in `research/SCORING_LEDGER.md`.
+ *
+ * The flash phase itself is lamp byte +$01, a brightness the port's lamp layer
+ * does not have; byte 0 is untouched for the whole sixteen frames, so the lamps
+ * stay LIT here until the clear and no blink is modelled.
+ */
+function serviceGroupFlash(modes: TableModes, state: ModeState, out: Accumulator): void {
+  if (state.flashGroup < 0) {
+    const next = state.flashQueue.pop();
+    if (next === undefined) return;
+    state.flashGroup = next;
+    state.flashTicks = GROUP_FLASH_FRAMES;
+    return;
+  }
+  if (state.flashTicks > 0) {
+    state.flashTicks -= 1;
+    return;
+  }
+  const group = modes.lampGroups[state.flashGroup];
+  state.groupFired[state.flashGroup] = 0;
+  state.flashGroup = -1;
+  if (group === undefined) return;
+  const joins = groupJoins(modes);
+  const base = joins.groupBase[group.index] ?? 0;
+  for (let i = 0; i < group.lamps.length; i += 1) {
+    const lamp = base + i;
+    state.groupLampLit[lamp] = 0;
+    state.groupLampAlways[lamp] = 0;
+    for (const id of joins.flagIdsOfLamp[lamp] ?? []) out.clearedFlagIds.push(id);
+  }
+}
+
+/** The word `$64AA` pushes beside the group: sixteen frames of flash. */
+export const GROUP_FLASH_FRAMES = 0x10;
 
 /**
  * Descriptor HOOK 2's ball-start restore, `jsr ([$94,a5],$A4)` at +0x005116:
@@ -1002,6 +1183,13 @@ export interface ModeTickReport {
    * the same reason the multiplier is — the score is the scoring state's.
    */
   readonly comboPaid: number;
+  /**
+   * Scoring-layer flag ids the force-off `bclr`ed this tick, in the order it
+   * cleared them: the first-hit awards a disarm re-armed. Reported rather than
+   * applied because `ScoringState.flags` is the scoring layer's, exactly as the
+   * multiplier and the two holds above are. See `forceStartLampsOff`.
+   */
+  readonly clearedFlagIds: readonly string[];
   /** Opcodes executed whose behaviour is not decoded. See the header. */
   readonly unimplemented: number;
 }
@@ -1029,6 +1217,7 @@ export const EMPTY_MODE_TICK: ModeTickReport = Object.freeze({
   holdBonus: false,
   holdMultiplier: false,
   comboPaid: 0,
+  clearedFlagIds: Object.freeze([]),
   unimplemented: 0,
 });
 
@@ -1048,6 +1237,12 @@ interface Accumulator {
   holdBonus: boolean;
   holdMultiplier: boolean;
   comboPaid: number;
+  /**
+   * Scoring-layer flag ids the force-off's `bclr` re-armed this tick, in the
+   * order it cleared them. Reported rather than applied: the flag set belongs
+   * to `ScoringState`. See `forceStartLampsOff`.
+   */
+  clearedFlagIds: string[];
   unimplemented: number;
 }
 
@@ -1132,7 +1327,7 @@ function awardElement(
   if ((element.flags & FLAGS_RELIGHT) !== 0) state.armed[index] = 1;
   // A disarm the active-element service observes runs the force-off $6234 on
   // the element's START lamp; a relit element never goes out, so never does.
-  if (state.armed[index] === 0) forceStartLampsOff(modes, state, index);
+  if (state.armed[index] === 0) forceStartLampsOff(modes, state, out, index);
 
   out.awards.push({
     element: index,
@@ -1422,7 +1617,7 @@ function step(
         if (!permanent && state.timers[index] !== 0) {
           state.armed[index] = 0;
           state.timers[index] = 0;
-          forceStartLampsOff(modes, state, index);
+          forceStartLampsOff(modes, state, out, index);
         }
       }
       return next;
@@ -1453,7 +1648,7 @@ function step(
         // relight latch goes with it — on both its per-element view and the
         // group's own always-on mask for the element's +$08 lamp.
         state.awardLit[index] = 0;
-        forceStartLampsOff(modes, state, index);
+        forceStartLampsOff(modes, state, out, index);
         for (const lamp of groupJoins(modes).awardByElement.get(index) ?? []) {
           state.groupLampAlways[lamp] = 0;
         }
@@ -1487,7 +1682,7 @@ function step(
         if (index >= 0) {
           state.armed[index] = 0;
           state.timers[index] = 0;
-          forceStartLampsOff(modes, state, index);
+          forceStartLampsOff(modes, state, out, index);
         }
         return next;
       }
@@ -1728,6 +1923,7 @@ export function tickModes(modes: TableModes, state: ModeState): ModeTickReport {
     holdBonus: false,
     holdMultiplier: false,
     comboPaid: 0,
+    clearedFlagIds: [],
     unimplemented: 0,
   };
 
@@ -1739,7 +1935,7 @@ export function tickModes(modes: TableModes, state: ModeState): ModeTickReport {
       state.armed[index] = 0;
       // The active-element service's own expiry path: `bclr.b d6,$1(a0)` at
       // +0x006292 falls into the force-off at +0x006296.
-      forceStartLampsOff(modes, state, index);
+      forceStartLampsOff(modes, state, out, index);
     }
   }
 
@@ -1749,6 +1945,10 @@ export function tickModes(modes: TableModes, state: ModeState): ModeTickReport {
   // original; here it runs after the interpreters so a lamp lit by this tick's
   // physics is seen this tick, and the fired script queues for the next.
   scanLampGroups(modes, state);
+  // The completion flash and the clear it ends in, +0x006430. It runs AFTER the
+  // scan so a group completed this tick starts its sixteen frames on the next
+  // one, which is the order the frame chain has them in.
+  serviceGroupFlash(modes, state, out);
   // THE WINDOW SERVICE, 0x56D4: every record's +$26 counts down and, on the
   // tick it reaches zero, the accumulator is cleared. Its slot in the frame
   // chain at +0x004B46 is AFTER both interpreters (`jsr $58BC .. $5786 ..
@@ -1779,6 +1979,7 @@ export function tickModes(modes: TableModes, state: ModeState): ModeTickReport {
     !out.holdBonus &&
     !out.holdMultiplier &&
     out.comboPaid === 0 &&
+    out.clearedFlagIds.length === 0 &&
     out.unimplemented === 0
   ) {
     return EMPTY_MODE_TICK;
@@ -1799,6 +2000,7 @@ export function tickModes(modes: TableModes, state: ModeState): ModeTickReport {
     holdBonus: out.holdBonus,
     holdMultiplier: out.holdMultiplier,
     comboPaid: out.comboPaid,
+    clearedFlagIds: out.clearedFlagIds,
     unimplemented: out.unimplemented,
   };
 }

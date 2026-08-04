@@ -390,6 +390,30 @@ export function resetScoringForNewBall(state: ScoringState, rearm: ReadonlySet<s
 }
 
 /**
+ * Re-arms the first-hit awards a MID-BALL disarm re-armed: the other half of
+ * `bclr.b d6,(a1)`.
+ *
+ * The ball-start `clr.b` above is not the only instruction that writes a flag
+ * byte. The active-element force-off at $6234 clears the PLAYER'S BIT in the
+ * element's +$04 start lamp on every disarm — award, timeout, `COMPLETE`,
+ * `LAMP_OFF`, `PUSH` — and on the shipped data that lamp IS a device's +$04 or
+ * a trigger zone's +$0A on every table. One byte, one bit, two meanings: the
+ * insert goes dark and the shot's first-hit award comes back.
+ *
+ * The ids are decided in `mode-vm.ts` (`forceStartLampsOff`, where the three
+ * instruction sites are written out and the film that caught the divergence is
+ * cited) and arrive here through `ModeTickReport.clearedFlagIds`. Deleting an
+ * id that is not set is a no-op, which is what a `bclr` of a clear bit is.
+ *
+ * The debounce timers are NOT touched: they are the device record's own +$02
+ * countdown at data 0x572C, a different field that the force-off never reaches,
+ * and leaving them is what stops a re-armed target paying fifty times a second.
+ */
+export function clearScoringFlags(state: ScoringState, ids: readonly string[]): void {
+  for (const id of ids) state.flags.delete(id);
+}
+
+/**
  * Empties the bonus accumulator and the multiplier for the next ball — unless
  * this ball earned the right to keep them.
  *
