@@ -40,10 +40,12 @@ import {
   GameLoop,
   ballInLane,
   createGame,
-  currentScore,
   debugSnapshot,
   framingRows,
+  playerCountAdjustable,
+  playerScoresOf,
   renderGame,
+  setPlayerCount,
   startGame,
   tickGame,
 } from "./browser/game-loop.js";
@@ -88,6 +90,7 @@ import {
   shellKey,
   shellKeyFor,
   shellPlayTable,
+  shellSetPlayers,
   shellTableFailed,
   shellTableLoaded,
   shellTick,
@@ -571,8 +574,11 @@ async function boot(): Promise<void> {
   /** The logical rows the canvas was last fitted for. See the frame loop. */
   let fittedRows = canvasRows();
   let table: LoadedTable | null = null;
-  /** Set by the tick hook the moment a game reports its last ball gone. */
-  let endedWithScore: number | null = null;
+  /**
+   * Set by the tick hook the moment a game reports its last ball gone: every
+   * player's final score in player order, for the shell's high-score walk.
+   */
+  let endedWithScores: readonly number[] | null = null;
 
   /**
    * The decoded `menudata.bin` presentation — fonts, backdrop strips, palette.
@@ -797,11 +803,13 @@ async function boot(): Promise<void> {
       // debug handle's `tick` goes through this hook too, so a scripted game
       // queues exactly the animations a played one does.
       panel?.observe(report);
-      // The score is read here rather than after the frame because the game's
-      // own phase has already moved to `game-over` and nothing further will
-      // change it — but reading it at the tick keeps the two in step even if
-      // that ever stops being true.
-      if (report.gameOver) endedWithScore = currentScore(game);
+      // The scores are read here rather than after the frame because the
+      // game's own phase has already moved to `game-over` and nothing further
+      // will change them — but reading at the tick keeps the two in step even
+      // if that ever stops being true. Every player's, in player order: the
+      // shell's high-score walk visits each exactly as the machine's state-2
+      // loop walks the player records.
+      if (report.gameOver) endedWithScores = playerScoresOf(game);
     };
     const loop = new GameLoop({
       game,
@@ -874,7 +882,7 @@ async function boot(): Promise<void> {
           if (table !== null) {
             flushInput();
             table.loop.scheduler.resume();
-            startGame(table.game);
+            startGame(table.game, effect.players);
             // The display ring's contents belong to the game that queued
             // them; a fresh game opens on the score view.
             table.panel?.reset();
@@ -993,6 +1001,18 @@ async function boot(): Promise<void> {
         keyEvent.preventDefault?.();
         return;
       }
+      // F1..F8 WHILE BALL 1 WAITS ON THE ROD: the original's state-5 scan
+      // (`$d7c` window, main.seg00 +0x004AD6) lets latecomers join — Fn sets
+      // the player count outright, clamp eight. The shell's sticky selection
+      // follows so the next game keeps the choice. Outside the window the
+      // keys fall through to the router, which binds none of them.
+      if (key !== null && key.kind === "table" && table !== null && playerCountAdjustable(table.game)) {
+        if (setPlayerCount(table.game, key.index + 1)) {
+          shellSetPlayers(shell, key.index + 1);
+        }
+        keyEvent.preventDefault?.();
+        return;
+      }
       if (router.handleKeyDown(keyEvent) !== null) keyEvent.preventDefault?.();
       return;
     }
@@ -1059,6 +1079,11 @@ async function boot(): Promise<void> {
       ladder: (tableId) => store.load(tableId),
       gesture: unlockAudio,
       version: () => BUILD_VERSION,
+      // The stepper reads and writes the shell's sticky player selection —
+      // the same field the table attract's F1..F8 sets — so a card click
+      // starts the game the stepper shows.
+      players: () => shell.players,
+      setPlayers: (players) => shellSetPlayers(shell, players),
     });
   }
 
@@ -1257,9 +1282,9 @@ async function boot(): Promise<void> {
       if (!shellClock.paused) shellClock.pause();
       const ticks = table.loop.frame(timeMs);
       apply(shellTick(shell, store, ticks));
-      if (endedWithScore !== null) {
-        shellGameEnded(shell, endedWithScore);
-        endedWithScore = null;
+      if (endedWithScores !== null) {
+        shellGameEnded(shell, endedWithScores);
+        endedWithScores = null;
         flushInput();
       }
       // The shell draws nothing over a live table, but a card raised on this
@@ -1309,9 +1334,9 @@ async function boot(): Promise<void> {
         // Through the same hook the loop uses, so a scripted game reaches the
         // game-over card and the high-score entry exactly as a played one does.
         current.onTick(tickGame(current.game, router.sample()));
-        if (endedWithScore !== null) {
-          shellGameEnded(shell, endedWithScore);
-          endedWithScore = null;
+        if (endedWithScores !== null) {
+          shellGameEnded(shell, endedWithScores);
+          endedWithScores = null;
           break;
         }
       }

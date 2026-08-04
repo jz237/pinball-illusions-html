@@ -71,6 +71,15 @@ export interface FrontDoorHost {
   gesture(): void;
   /** The build's version string, for the footer. */
   version(): string;
+  /**
+   * The sticky player-count selection, read and written by the door's
+   * stepper. The value itself lives in the shell (`ShellState.players`) so a
+   * card click, the table attract's ENTER and the decoded F1..F8 all start
+   * the same game; the host clamps to the machine's 1..8. Optional so a host
+   * without the stepper markup — or an older fixture — wires nothing.
+   */
+  players?(): number;
+  setPlayers?(players: number): number;
 }
 
 /**
@@ -181,6 +190,41 @@ export function attachFrontDoor(door: HTMLElement, host: FrontDoorHost): FrontDo
   };
   paintChampions();
 
+  // -- the player stepper ---------------------------------------------------
+  //
+  // The Fantasies-style face of the decoded F1..F8 row: minus and plus walk
+  // the shell's sticky selection 1..8, and the count cell mirrors it. All
+  // three are optional in the markup and the host alike, so a page without
+  // the row — or a fixture predating it — changes nothing.
+  const playersCount = door.querySelector("[data-door-players-count]");
+  const paintPlayers = (): void => {
+    if (!(playersCount instanceof HTMLElement)) return;
+    const value = String(host.players?.() ?? 1);
+    if (playersCount.textContent !== value) playersCount.textContent = value;
+  };
+  const stepPlayers = (delta: number): void => {
+    if (host.players === undefined || host.setPlayers === undefined) return;
+    host.setPlayers(host.players() + delta);
+    paintPlayers();
+  };
+  const playersMinus = door.querySelector("[data-door-players-minus]");
+  if (playersMinus instanceof HTMLElement) {
+    on(playersMinus, "click", (event) => {
+      event.preventDefault();
+      host.gesture();
+      stepPlayers(-1);
+    });
+  }
+  const playersPlus = door.querySelector("[data-door-players-plus]");
+  if (playersPlus instanceof HTMLElement) {
+    on(playersPlus, "click", (event) => {
+      event.preventDefault();
+      host.gesture();
+      stepPlayers(1);
+    });
+  }
+  paintPlayers();
+
   const version = door.querySelector("[data-door-version]");
   if (version instanceof HTMLElement) version.textContent = host.version();
 
@@ -205,7 +249,12 @@ export function attachFrontDoor(door: HTMLElement, host: FrontDoorHost): FrontDo
       painted = mode;
       door.hidden = mode !== "door";
       root.dataset["doorMode"] = mode;
-      if (mode === "door") paintChampions();
+      if (mode === "door") {
+        paintChampions();
+        // The selection may have moved while the door was away — the table
+        // attract's F1..F8 writes the same shell field the stepper does.
+        paintPlayers();
+      }
     }
     if (tableId !== currentTable) {
       currentTable = tableId;

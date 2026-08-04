@@ -1288,8 +1288,12 @@ function drawGameOver(ctx: ShellContext, scale: number, state: ShellState, skin:
 }
 
 function drawFanfare(ctx: ShellContext, scale: number, state: ShellState, skin: ShellSkin | null): void {
+  // The player digit is the original's own patch: `move.b d0,$48DB` writes
+  // the player number into "PLAYER n GOT A" (main.seg00 +0x0046B4), counting
+  // 1 up across the game-over walk. One player is the "PLAYER 1" this card
+  // always printed.
   card(ctx, scale, skin, 80, 96, [
-    { value: "PLAYER 1 GOT A", colour: SHELL_TEXT, size: FONT_SMALL, font: "font2" },
+    { value: `PLAYER ${state.scoringPlayer} GOT A`, colour: SHELL_TEXT, size: FONT_SMALL, font: "font2" },
     { value: "HIGHSCORE", colour: SHELL_HIGHLIGHT, size: FONT_BIG, font: "font1" },
     { value: `${state.place + 1}${["ST", "ND", "RD", "TH", "TH"][state.place] ?? "TH"} PLACE`, colour: SHELL_TEXT, size: FONT_SMALL, font: "font2" },
   ]);
@@ -1312,7 +1316,8 @@ function drawInitials(ctx: ShellContext, scale: number, state: ShellState, skin:
     .map((c, i) => (caret && i === state.initials.length ? "_" : c))
     .join(" ");
   card(ctx, scale, skin, 76, 104, [
-    { value: "PLAYER 1", colour: SHELL_TEXT, size: FONT_SMALL, font: "font2" },
+    // The same patched digit over the name box: `move.b d0,$4905` (+0x0046BA).
+    { value: `PLAYER ${state.scoringPlayer}`, colour: SHELL_TEXT, size: FONT_SMALL, font: "font2" },
     { value: "ENTER YOUR NAME", colour: SHELL_TEXT, size: FONT_SMALL, font: "font2" },
     { value: `( ${shown} )`, colour: SHELL_HIGHLIGHT, size: FONT_BIG, font: "font1" },
     { value: "BACKSPACE DELETES - RETURN ACCEPTS", colour: SHELL_DIM, size: FONT_TINY, font: "font2", skinColour: SKIN_DIM },

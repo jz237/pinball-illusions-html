@@ -650,6 +650,8 @@ export interface DoorMarkup {
   readonly hrefs: readonly (readonly [string, string])[];
   readonly hasVersion: boolean;
   readonly hasBarTitle: boolean;
+  /** True when the door ships the player stepper (`data-door-players-*`). */
+  readonly hasPlayerStepper: boolean;
   /** The footer key legend's text, whitespace-collapsed. */
   readonly keyLegend: string;
 }
@@ -672,6 +674,10 @@ export function readDoorMarkup(html = shippedHtml()): DoorMarkup {
     hrefs,
     hasVersion: /data-door-version/.test(html),
     hasBarTitle: /data-bar-title/.test(html),
+    hasPlayerStepper:
+      /data-door-players-minus/.test(html) &&
+      /data-door-players-plus/.test(html) &&
+      /data-door-players-count/.test(html),
     keyLegend: (legend?.[1] ?? "").replace(/\s+/g, " ").trim(),
   };
 }
@@ -821,6 +827,20 @@ export function createTouchHarness(options: HarnessOptions = {}): TouchHarness {
   if (doorMarkup.hasVersion) {
     const version = door.append(document.createElement("p"));
     version.setAttribute("data-door-version", "");
+  }
+  if (doorMarkup.hasPlayerStepper) {
+    // The stepper row, exactly the shipped shape: minus, count, plus.
+    const players = door.append(document.createElement("div"));
+    players.setAttribute("data-door-players", "");
+    const minus = players.append(document.createElement("button")) as FakeButtonElement;
+    minus.setAttribute("data-door-players-minus", "");
+    minus.setAttribute("class", "door__players-step");
+    const count = players.append(document.createElement("span"));
+    count.setAttribute("data-door-players-count", "");
+    count.textContent = "1";
+    const plus = players.append(document.createElement("button")) as FakeButtonElement;
+    plus.setAttribute("data-door-players-plus", "");
+    plus.setAttribute("class", "door__players-step");
   }
 
   const cabinet = document.body.append(document.createElement("main"));

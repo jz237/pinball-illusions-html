@@ -37,14 +37,20 @@
  *   - the qualifying rule: beat the fifth entry of THAT TABLE's own ladder.
  *     There is no separate threshold constant in the binary.
  *
+ * From the disk too, since the multiplayer round settled it:
+ *   - MULTIPLE PLAYERS. The in-game attract's F1..F8 start one to eight
+ *     players (the scan at main.seg00 +0x00446E — `$dbc` := n, clamp 8;
+ *     keypad ENTER one player), the rotation alternates them per ball, and
+ *     the game-over state walks every player through the high-score check in
+ *     order (+0x00462E). The game side lives in `game-loop.ts`
+ *     (`PlayerBank`); this module carries the selection, the F-key split
+ *     (tables in the shell's menus, players on the table's own attract) and
+ *     the per-player entry walk. research/MULTIPLAYER_DECODE.md is the
+ *     decode. One divergence, recorded on `ShellState.players`: the
+ *     selection is sticky, so ENTER restarts with the last chosen count
+ *     where the machine's keypad ENTER always meant one.
+ *
  * Reconstructed, because the disk did not settle it:
- *   - MULTIPLE PLAYERS. The original scans F1..F8 for one to eight players
- *     (0x42A2) and alternates them per ball. This reconstruction is one player:
- *     the simulation in `game-loop.ts` holds a single score, ball count and
- *     mission machine, and giving it eight would mean saving and restoring all
- *     of that across every ball end. That is a change to the game, not to the
- *     shell, and it is not one this brief asked for. ENTER starts a one-player
- *     game, which is exactly what the original's keypad ENTER does.
  *   - "Exit" returns to the attract screen. The original exits to Workbench;
  *     a browser tab has nowhere to go, and a page that blanks itself is worse
  *     than one that goes back to the title.
@@ -303,8 +309,29 @@ export interface ShellState {
   tableId: TableId | null;
   /** The ladder of whichever table the current screen is about. */
   ladder: readonly HighScoreEntry[];
-  /** The score the finished game ended on. */
+  /**
+   * Players the next game starts with, 1..8 — the port's sticky selection
+   * behind the original's `$dbc(a5)`. Set by F1..F8 on the table attract and
+   * by the front door's stepper; `select` (ENTER) starts with whatever it
+   * holds. (The machine's keypad ENTER always meant one player; the sticky
+   * selection is this port's, so the stepper's choice survives a card click
+   * into every replay. Recorded as a divergence, not an oversight.)
+   */
+  players: number;
+  /** The score the finished game ended on — the LAST player's, as the machine's game-over screen shows. */
   finalScore: number;
+  /**
+   * Every player's final score in player order, from the game that just
+   * ended. The high-score check walks these exactly as the original's state-2
+   * loop walks the player records (main.seg00 +0x00463E..+0x00484A): in
+   * order, inserting as it goes, so a later player is placed against the
+   * ladder an earlier one already moved.
+   */
+  finalScores: readonly number[];
+  /** Next index into `finalScores` the high-score walk will consider. */
+  scoreCursor: number;
+  /** 1-based player number the fanfare/initials cards name. The original patches `$48DB`/`$4905`. */
+  scoringPlayer: number;
   /** Zero-based place that score earns, or -1 when it earns none. */
   place: number;
   /** The initials typed so far, at most three. The original's 0x4929 buffer. */
@@ -322,7 +349,7 @@ export interface ShellState {
  */
 export type ShellEffect =
   | { readonly kind: "load-table"; readonly tableId: TableId }
-  | { readonly kind: "start-game" }
+  | { readonly kind: "start-game"; readonly players: number }
   | { readonly kind: "leave-table" };
 
 /**
@@ -367,11 +394,27 @@ export function createShell(store: ScoreStore): ShellState {
     ticks: 0,
     tableId: null,
     ladder: store.load(first.id),
+    players: 1,
     finalScore: 0,
+    finalScores: [],
+    scoreCursor: 0,
+    scoringPlayer: 1,
     place: -1,
     initials: "",
     error: null,
   };
+}
+
+/** Clamps a requested player count to the machine's own 1..8. */
+export function clampPlayers(players: number): number {
+  if (!Number.isInteger(players)) return 1;
+  return Math.min(SHELL_MAX_PLAYERS, Math.max(1, players));
+}
+
+/** Sets the sticky player-count selection. The front door's stepper calls it. */
+export function shellSetPlayers(state: ShellState, players: number): number {
+  state.players = clampPlayers(players);
+  return state.players;
 }
 
 /** The table the cursor is on. Never undefined: the cursor is always clamped. */
@@ -521,12 +564,34 @@ export function isInitialsCharacter(value: string): boolean {
   return value.length === 1 && INITIALS_ALPHABET.includes(value);
 }
 
-/** Direct-to-table function keys: F1..F3, the original's 0x50..0x59 range. */
+/**
+ * The function-key row, F1..F8 — one key kind, TWO decoded meanings, split by
+ * phase exactly as the original splits them between its two state machines:
+ *
+ *   - in the SHELL's menu states (attract / menu / select), Fn picks a TABLE
+ *     straight into the game — the menu machine's 0x1128 scan (rawkeys
+ *     0x50..). Three tables exist, so F4..F8 pick nothing there.
+ *   - on the TABLE'S OWN attract (the `ladder` phase), Fn starts a game with
+ *     n PLAYERS — the in-game machine's scan at main.seg00 +0x00446E
+ *     (`$ee2..$ee9`, Fn -> `$dbc` := n, clamp 8; keypad ENTER starts one).
+ *     See research/MULTIPLAYER_DECODE.md §4.
+ *
+ * `index` is the zero-based key number; each phase reads it as what its
+ * machine reads it as.
+ */
 const TABLE_KEYS: Readonly<Record<string, number>> = Object.freeze({
   F1: 0,
   F2: 1,
   F3: 2,
+  F4: 3,
+  F5: 4,
+  F6: 5,
+  F7: 6,
+  F8: 7,
 });
+
+/** Players a shell selection can ask for: the machine's own clamp at eight. */
+export const SHELL_MAX_PLAYERS = 8;
 
 const NAVIGATION_KEYS: Readonly<Record<string, ShellKey["kind"]>> = Object.freeze({
   ArrowUp: "up",
@@ -618,6 +683,9 @@ function leaveTable(state: ShellState, store: ScoreStore): ShellEffect[] {
   state.attractTicks = 0;
   state.tableId = null;
   state.finalScore = 0;
+  state.finalScores = [];
+  state.scoreCursor = 0;
+  state.scoringPlayer = 1;
   state.place = -1;
   state.initials = "";
   state.ladder = store.load(highlightedTable(state).id);
@@ -748,12 +816,20 @@ export function shellKey(state: ShellState, store: ScoreStore, key: ShellKey): S
     }
 
     case "ladder":
-      // The table's own attract screen. The original starts a game here on
-      // F1..F8 (players) or keypad ENTER (one player), and leaves the table on
-      // ESC -> "REALLY QUIT TABLE?".
+      // The table's own attract screen — the in-game machine's state 0. The
+      // original starts a game here on F1..F8 (Fn = n PLAYERS, the scan at
+      // main.seg00 +0x00446E) or keypad ENTER, and leaves the table on
+      // ESC -> "REALLY QUIT TABLE?". Fn sets the sticky selection and starts;
+      // ENTER starts with whatever the selection holds (see
+      // `ShellState.players` for the one divergence that is).
+      if (key.kind === "table") {
+        state.players = clampPlayers(key.index + 1);
+        state.phase = "play";
+        return [{ kind: "start-game", players: state.players }];
+      }
       if (key.kind === "select") {
         state.phase = "play";
-        return [{ kind: "start-game" }];
+        return [{ kind: "start-game", players: state.players }];
       }
       if (key.kind === "back") state.phase = "quit-confirm";
       return [];
@@ -848,9 +924,11 @@ export function shellPlayTable(
   state: ShellState,
   store: ScoreStore,
   tableId: TableId,
+  players?: number,
 ): ShellEffect[] {
   const index = SHELL_TABLES.findIndex((table) => table.id === tableId);
   if (index < 0) throw new RangeError(`unknown table: ${tableId}`);
+  if (players !== undefined) state.players = clampPlayers(players);
   const leaving = state.tableId !== null && state.tableId !== tableId ? [leaveEffect()] : [];
   return [...leaving, ...beginLoad(state, store, index)];
 }
@@ -863,7 +941,7 @@ function leaveEffect(): ShellEffect {
 export function shellTableLoaded(state: ShellState): ShellEffect[] {
   if (state.phase !== "loading") return [];
   state.phase = "play";
-  return [{ kind: "start-game" }];
+  return [{ kind: "start-game", players: state.players }];
 }
 
 /** The host reporting that a table would not load. */
@@ -880,10 +958,20 @@ export function shellTableFailed(state: ShellState, message: string): void {
  * game into its own `game-over` phase; the shell takes it from there and the
  * host stops ticking, so the simulation never sees the start press that would
  * otherwise restart it behind the shell's back.
+ *
+ * `score` is every player's final score in player order — or one number, the
+ * shape every one-player caller already has. The GAME OVER card shows the last
+ * player's, which is what the machine's own game-over screen draws (the state-2
+ * entry at +0x004612 prints the record `$dc2` still points at — the last
+ * rotated-in player).
  */
-export function shellGameEnded(state: ShellState, score: number): void {
+export function shellGameEnded(state: ShellState, score: number | readonly number[]): void {
+  const scores = typeof score === "number" ? [score] : [...score];
   state.phase = "game-over";
-  state.finalScore = score;
+  state.finalScores = scores;
+  state.finalScore = scores.length === 0 ? 0 : (scores[scores.length - 1] ?? 0);
+  state.scoreCursor = 0;
+  state.scoringPlayer = 1;
   state.holdTicks = GAME_OVER_TICKS;
   state.initials = "";
   state.place = -1;
@@ -892,27 +980,52 @@ export function shellGameEnded(state: ShellState, score: number): void {
 /**
  * The high-score check: in-game state 2, at 0x45FE.
  *
- * The rule is the whole of it — the player's score is compared against this
+ * The rule is the whole of it — each player's score is compared against this
  * table's own five entries and the first one it beats is the insertion rank.
  * There is no threshold constant anywhere in the binary; on a virgin install the
  * bar is simply the factory ladder's fifth entry.
+ *
+ * WITH SEVERAL PLAYERS the machine WALKS THEM IN ORDER (+0x00462E `d7 :=
+ * $dbc - 1`, the record stepping at +0x004846, the caption digit from `$dbe`
+ * counting 1 up), inserting each qualifier as it goes — so a later player is
+ * placed against the ladder an earlier one already moved, and every qualifier
+ * gets the fanfare and the name box in turn. `advanceScoreEntry` is that walk;
+ * `finishGameOver` starts it and `commitInitials` re-enters it.
  */
-function finishGameOver(state: ShellState, store: ScoreStore): ShellEffect[] {
-  const tableId = state.tableId;
-  state.ladder = tableId === null ? state.ladder : store.load(tableId);
-  state.place = placeFor(state.ladder, state.finalScore);
+function advanceScoreEntry(state: ShellState): ShellEffect[] {
   state.holdTicks = 0;
-  if (state.place < 0) {
-    state.phase = "ladder";
+  while (state.scoreCursor < state.finalScores.length) {
+    const player = state.scoreCursor;
+    const score = state.finalScores[player] ?? 0;
+    state.scoreCursor += 1;
+    const place = placeFor(state.ladder, score);
+    if (place < 0) continue;
+    state.place = place;
+    state.scoringPlayer = player + 1;
+    state.finalScore = score;
+    // "PLAYER n GOT A / HIGHSCORE" for three seconds, then the name box.
+    state.phase = "fanfare";
+    state.holdTicks = HIGHSCORE_FANFARE_TICKS;
     return [];
   }
-  // "PLAYER 1 GOT A / HIGHSCORE" for three seconds, then the name box.
-  state.phase = "fanfare";
-  state.holdTicks = HIGHSCORE_FANFARE_TICKS;
+  state.phase = "ladder";
   return [];
 }
 
-/** Writes the typed initials into the ladder and persists it. */
+function finishGameOver(state: ShellState, store: ScoreStore): ShellEffect[] {
+  const tableId = state.tableId;
+  state.ladder = tableId === null ? state.ladder : store.load(tableId);
+  // The one-player callers that predate the walk seeded no list; the last
+  // score stands in for it, which is exactly what they meant.
+  if (state.finalScores.length === 0) {
+    state.finalScores = [state.finalScore];
+    state.scoreCursor = 0;
+  }
+  state.place = -1;
+  return advanceScoreEntry(state);
+}
+
+/** Writes the typed initials into the ladder, persists it, and walks on. */
 function commitInitials(state: ShellState, store: ScoreStore): ShellEffect[] {
   const tableId = state.tableId;
   const initials = state.initials.trim().length === 0 ? "AAA" : state.initials;
@@ -924,7 +1037,8 @@ function commitInitials(state: ShellState, store: ScoreStore): ShellEffect[] {
     // tab closed on the score screen — which the Amiga's teardown would not.
     store.save(tableId, state.ladder);
   }
-  state.phase = "ladder";
-  state.holdTicks = 0;
-  return [];
+  state.initials = "";
+  // The machine's walk moves to the next player's record (+0x004842); with
+  // every player checked it falls out to the attract. Same walk, same order.
+  return advanceScoreEntry(state);
 }

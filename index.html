@@ -73,10 +73,25 @@
         </a>
       </div>
 
+      <!--
+        The PLAYER STEPPER - the Fantasies-style control the decoded F1..F8
+        row backs: pick how many players the next game deals in, one to
+        eight, hot-seat. Wired by front-door.ts; the value lives in the
+        shell's sticky selection so a card click, the ladder's ENTER and the
+        F-keys all start the same game.
+      -->
+      <div class="door__players" data-door-players>
+        <span class="door__players-label">Players</span>
+        <button type="button" class="door__players-step" data-door-players-minus aria-label="fewer players">&#8722;</button>
+        <span class="door__players-count" data-door-players-count>1</span>
+        <button type="button" class="door__players-step" data-door-players-plus aria-label="more players">+</button>
+        <span class="door__players-hint">hot-seat &#183; F1&#8211;F8 on the table</span>
+      </div>
+
       <footer class="door__foot">
         <p class="door__keys">
           Z/← left flipper · //→ right flipper · Space launch · X/↑ nudge ·
-          A/; upper flipper · P pause · F1–F3 tables · F9 view
+          A/; upper flipper · P pause · F1–F3 tables · F1–F8 players on the table · F9 view
         </p>
         <p class="door__tribute">
           A personal reconstruction. Original game © 1995 Digital Illusions /

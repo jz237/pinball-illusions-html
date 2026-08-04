@@ -481,6 +481,31 @@ export const BALL_SEARCH_PULSE: Q10 = SLINGSHOT_KICK;
  */
 export const AUTO_LAUNCH_DELAY_TICKS = 25;
 
+/**
+ * Most players a game can hold: the size of the original's player-record array.
+ *
+ * Eight 22-byte records at `$dc6(a5)`, and the first-serve count adjust clamps
+ * at exactly eight (`cmpi.w #$8,$dbc(a5)` at main.seg00 +0x004B10). The count
+ * itself lives in `$dbc(a5)`; F1..F8 in the table attract set it 1..8
+ * (+0x00446E..+0x00449C) and keypad ENTER starts one player.
+ */
+export const MAX_PLAYERS = 8;
+
+/**
+ * Ticks the multi-player end-of-ball "PL n" card is held — `move.w #$4b,d0 /
+ * jsr $5230` at main.seg00 +0x005224, run only when the player count is above
+ * one (`cmpi.w #$1,$dbc(a5)` at +0x00521C). A one-player game skips the hold
+ * entirely, which is why no single-player film ever shows it.
+ */
+export const END_OF_BALL_HOLD_TICKS = 75;
+
+/**
+ * Unskippable ticks at the front of that hold: `move.w #$19,$528A` at
+ * +0x005238 — the same 25-frame grace shape the end-of-ball bonus panels use
+ * (`BONUS_ABORT_GRACE_FRAMES`); after it, any key-down ends the hold.
+ */
+export const END_OF_BALL_HOLD_GRACE_TICKS = 25;
+
 export interface GameOptions {
   readonly ballsPerGame: number;
   /**
@@ -545,6 +570,32 @@ function resolveGameOptions(options?: Partial<GameOptions>): GameOptions {
  */
 export type GamePhase = "attract" | "in-play" | "game-over";
 
+/**
+ * ONE PLAYER'S WHOLE PRIVATE MACHINE.
+ *
+ * The original does not bank anything: it keeps ONE copy of every record and
+ * gives each per-player field a bit or a word slot per player, selected by the
+ * player index at `$dbe(a5)` — element ARMED/DONE are 8-bit masks (`bset.b d6`),
+ * counter records carry eight word slots (`$6(a1,d1.w)`), the lamp masks and
+ * the first-hit flag bytes are 8-bit masks, and the 22-byte player records at
+ * `$dc6(a5)` hold score/bonus/multiplier/holds. See
+ * research/MULTIPLAYER_DECODE.md §1.
+ *
+ * This port's `ScoringState`/`ModeState` are one-player views of those records
+ * (a byte where the machine has a bit), so a player switch here is a BANK swap
+ * where the machine's is three globals (`$dbe/$dc0/$dc2`). The two are
+ * observationally equivalent: every runtime reader in the machine indexes the
+ * CURRENT player's bit, and every cross-player write it makes is a ball-start
+ * walk this port re-runs on each player's own rotation-in
+ * (`endBallAfterBonus`). A one-player game has one bank, aliased by
+ * `Game.scoring`/`Game.modeState`, and runs exactly the code it always did —
+ * `tests/sim-hash-pin.test.ts` is the proof.
+ */
+export interface PlayerBank {
+  readonly scoring: ScoringState;
+  readonly modeState: ModeState | null;
+}
+
 export interface Game {
   readonly map: TableMap;
   readonly materials: MaterialTable;
@@ -592,8 +643,48 @@ export interface Game {
   /** Ticks the loop has run, including paused ones. Never resets. */
   tick: number;
   balls: BallSet;
-  /** Balls served so far this game; `ballsPerGame` of them ends it. */
+  /**
+   * Balls served so far this game — CHARGED serves, every player's together.
+   * `ballsPerGame * playerCount` of them ends it; `ballNumber` derives the
+   * machine's `$d84` from it, which works because charged serves are strictly
+   * round-robin (the port has no extra balls, the one thing that would decouple
+   * them).
+   */
   ballsServed: number;
+  /**
+   * One bank per player, `playerCount` of them. `scoring` and `modeState`
+   * below ALIAS the active player's bank — the whole tick path reads those two
+   * fields exactly as it did when there was one player, which is what keeps
+   * the one-player game byte-identical. See `PlayerBank`.
+   */
+  banks: PlayerBank[];
+  /** 0-based player whose ball is up — the original's `$dbe(a5)`. */
+  activePlayer: number;
+  /** Players in this game, 1..8 — the original's `$dbc(a5)`. */
+  playerCount: number;
+  /**
+   * True from the game's first launch. The original lets F1..F8 / keypad ENTER
+   * change the player count while ball 1 waits on the rod (`$d7c(a5)`, the
+   * state-5 scan at +0x004AD6); the window effectively closes at the first
+   * launch, because the scan only runs in the serve state. See
+   * `setPlayerCount`.
+   */
+  playersLocked: boolean;
+  /**
+   * Ticks left on the multi-player end-of-ball "PL n" hold, 0 outside it.
+   * `$5136`'s tail draws the card and `$5230` holds it 75 frames with a
+   * 25-frame unskippable grace — only when `$dbc > 1`, so a one-player game
+   * never sets this and its ball ends are untouched.
+   */
+  endHoldTicks: number;
+  /**
+   * True while the charged serve's PLAYER/BALL panel is up: from the serve
+   * that costs the player a ball until the launch takes it off the rod — the
+   * original's state 5, whose panel shows "PLAYER n" (or "PLAYERS n" while
+   * the first-serve count window is open) and "BALL m". Machine-owed serves
+   * never set it, exactly as they never pass through state 5.
+   */
+  announcingServe: boolean;
   /** Which saucer is holding which ball. See `ball-locks.ts`. */
   locks: LockBank;
   /**
@@ -860,6 +951,8 @@ export function createGame(map: TableMap, options?: Partial<GameOptions>): Game 
     );
   }
   const modes = tableModesFor(map.tableId);
+  const scoring = createScoringState();
+  const modeState = modes === null ? null : createModeState(modes);
   return {
     map,
     materials: materialTableFor(map.tableId),
@@ -874,6 +967,12 @@ export function createGame(map: TableMap, options?: Partial<GameOptions>): Game 
     tick: 0,
     balls: createBallSet(),
     ballsServed: 0,
+    banks: [{ scoring, modeState }],
+    activePlayer: 0,
+    playerCount: 1,
+    playersLocked: false,
+    endHoldTicks: 0,
+    announcingServe: false,
     locks: createLockBank(map.tableId),
     pendingServes: 0,
     multiball: false,
@@ -882,9 +981,9 @@ export function createGame(map: TableMap, options?: Partial<GameOptions>): Game 
     pushClamp: null,
     autoLaunchCountdown: 0,
     ballsLocked: 0,
-    scoring: createScoringState(),
+    scoring,
     bonus: null,
-    modeState: modes === null ? null : createModeState(modes),
+    modeState,
     modeMessages: [],
     laneBallId: null,
     serveCountdown: 0,
@@ -901,14 +1000,24 @@ export function createGame(map: TableMap, options?: Partial<GameOptions>): Game 
 }
 
 /**
- * Starts a fresh game.
+ * Starts a fresh game, for `players` players (1..8, default one).
  *
  * The ball set is replaced rather than emptied so ids restart at 0, which makes
  * a debug dump of two games comparable. Nothing is served here: the serve goes
  * through the same countdown the rest of the game uses, so there is exactly one
  * code path that puts a ball in the lane.
+ *
+ * THE PLAYER COUNT is the original's `$dbc(a5)`, set by the table attract's
+ * F1..F8 scan (main.seg00 +0x00446E: Fn = n players, keypad ENTER = one) and
+ * adjustable while ball 1 waits on the rod (`setPlayerCount`). The new-game
+ * init at +0x004558 clears ALL EIGHT player records whatever the count; here a
+ * bank simply does not exist until the count asks for it, which is the same
+ * machine because a fresh bank IS the cleared record.
  */
-export function startGame(game: Game): void {
+export function startGame(game: Game, players: number = 1): void {
+  if (!Number.isInteger(players) || players < 1 || players > MAX_PLAYERS) {
+    throw new RangeError(`players must be a whole number from 1 to ${MAX_PLAYERS}: ${players}`);
+  }
   game.phase = "in-play";
   game.balls = createBallSet();
   game.ballsServed = 0;
@@ -921,17 +1030,35 @@ export function startGame(game: Game): void {
   game.lockEjecting = null;
   game.autoLaunchCountdown = 0;
   game.ballsLocked = 0;
-  // A fresh board rather than a cleared one: the flag bytes that decide whether
-  // an award is a first hit or a repeat are per GAME, and a new game must not
-  // inherit the last one's.
-  game.scoring = createScoringState();
+  // Fresh per-player banks rather than cleared ones — the machine's own new
+  // game clears every player record and every per-player bit (+0x004558's
+  // record loop, the hard reset $3EA8 and the game walks $40CA/$4052 clear
+  // ALL EIGHT slots at once). The flag bytes that decide whether an award is
+  // a first hit or a repeat are per GAME, and a new game must not inherit the
+  // last one's; the DONE bits that say which shots a player has already
+  // finished are per game the same way. Player 0's bank is built first and
+  // aliased by `scoring`/`modeState`, so a one-player game holds exactly the
+  // two objects it always held.
+  game.playerCount = players;
+  game.activePlayer = 0;
+  game.playersLocked = false;
+  game.endHoldTicks = 0;
+  game.announcingServe = false;
+  const banks: PlayerBank[] = [];
+  for (let index = 0; index < players; index += 1) {
+    banks.push({
+      scoring: createScoringState(),
+      modeState: game.modes === null ? null : createModeState(game.modes),
+    });
+  }
+  game.banks = banks;
+  const first = banks[0];
+  if (first === undefined) throw new Error("startGame built no player banks");
+  game.scoring = first.scoring;
   // Whatever the last game's final ball was still counting out, it is not this
   // game's: the accumulator behind it has just been replaced.
   game.bonus = null;
-  // A fresh mission machine for the same reason: the DONE bits that say which
-  // shots a player has already finished are per game, so a new game must not
-  // start with half the table already completed.
-  game.modeState = game.modes === null ? null : createModeState(game.modes);
+  game.modeState = first.modeState;
   game.modeMessages = [];
   game.laneBallId = null;
   game.serveCountdown = game.options.firstServeDelayTicks;
@@ -962,12 +1089,61 @@ export function startGame(game: Game): void {
 
 /** Balls left after the one in play, for the presentation. */
 export function ballsRemaining(game: Game): number {
-  return Math.max(0, game.options.ballsPerGame - game.ballsServed);
+  return Math.max(0, game.options.ballsPerGame * game.playerCount - game.ballsServed);
 }
 
-/** 1-based number of the ball in play; 0 before the first serve. */
+/**
+ * 1-based number of the ball in play; 0 before the first serve.
+ *
+ * The original's `$d84(a5)` advances only when the rotation wraps
+ * (+0x005094), so every player plays ball k before anyone plays ball k+1;
+ * with charged serves strictly round-robin the same number falls out of the
+ * serve count. One player is the identity it always was.
+ */
 export function ballNumber(game: Game): number {
-  return game.ballsServed;
+  if (game.playerCount <= 1) return game.ballsServed;
+  if (game.ballsServed === 0) return 0;
+  return Math.floor((game.ballsServed - 1) / game.playerCount) + 1;
+}
+
+/** Every player's score in player order, read out of the packed-BCD fields. */
+export function playerScoresOf(game: Game): number[] {
+  if (game.banks.length === 0) return [readBcdField(game.scoring.score)];
+  return game.banks.map((bank) => readBcdField(bank.scoring.score));
+}
+
+/**
+ * True while the player count may still change: the original's `$d7c(a5)`
+ * window — a new game until ball 1 leaves the rod. The scan lives in the
+ * serve state (+0x004AD6) and the flag dies at the first rotation, so the
+ * launch is the effective edge.
+ */
+export function playerCountAdjustable(game: Game): boolean {
+  return game.phase === "in-play" && !game.playersLocked && game.ballsServed <= 1;
+}
+
+/**
+ * Changes the player count while the first-serve window is open — the
+ * original's F1..F8 SETTING `$dbc` outright (+0x004B04) with the same clamp
+ * at eight. Growing mints fresh banks (the machine's records were cleared at
+ * new game and untouched since, so a fresh bank is the same bytes); shrinking
+ * drops the tail. Player 1's bank — the one already in play — is never
+ * rebuilt. Answers whether the count changed.
+ */
+export function setPlayerCount(game: Game, players: number): boolean {
+  if (!Number.isInteger(players) || players < 1 || players > MAX_PLAYERS) return false;
+  if (!playerCountAdjustable(game)) return false;
+  if (players === game.playerCount) return true;
+  const banks = game.banks.slice(0, players);
+  while (banks.length < players) {
+    banks.push({
+      scoring: createScoringState(),
+      modeState: game.modes === null ? null : createModeState(game.modes),
+    });
+  }
+  game.banks = banks;
+  game.playerCount = players;
+  return true;
 }
 
 function ballRadiusOf(game: Game): Q10 {
@@ -1088,8 +1264,27 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
       // `$51DA`: one `ABCD` chain, once, after the display and not during it.
       addPackedBcd(game.scoring.score, game.bonus.total);
       game.bonus = null;
-      gameOver = endBallAfterBonus(game);
+      // With more than one player the machine now holds the "PL n" card 75
+      // frames (`$521C`: `cmpi.w #$1,$dbc / beq` skips it for one player)
+      // BEFORE the rotation; the rotation itself runs when the hold ends.
+      if (game.playerCount > 1) game.endHoldTicks = END_OF_BALL_HOLD_TICKS;
+      else gameOver = endBallAfterBonus(game);
     }
+  }
+
+  // ---- the multi-player end-of-ball hold ---------------------------------
+  //
+  // `$5230`, exactly: 75 frames of the outgoing player's "PL n" card, the
+  // first 25 unskippable (`move.w #$19,$528A` at +0x005238), any key-down
+  // after that cuts it. Zero in every one-player game — the branch never
+  // runs, and the ball end is the tick sequence it always was.
+  if (game.endHoldTicks > 0 && game.bonus === null) {
+    const elapsed = END_OF_BALL_HOLD_TICKS - game.endHoldTicks;
+    game.endHoldTicks =
+      elapsed >= END_OF_BALL_HOLD_GRACE_TICKS && anyControlPressed(snapshot)
+        ? 0
+        : game.endHoldTicks - 1;
+    if (game.endHoldTicks === 0) gameOver = endBallAfterBonus(game);
   }
 
   // ---- serve -------------------------------------------------------------
@@ -1106,7 +1301,10 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
   if (game.tilt.tilted) game.pendingServes = 0;
 
   let served = false;
-  if (game.laneBallId === null && game.bonus === null) {
+  // `endHoldTicks` shuts the lane exactly as the bonus does: the machine is
+  // still inside its ball-end state, and the rotation that would arm the next
+  // serve has not happened yet.
+  if (game.laneBallId === null && game.bonus === null && game.endHoldTicks === 0) {
     const owed = game.pendingServes > 0;
     // A SAUCER THAT IS ABOUT TO SPIT THE BALL BACK IS NOT AN EMPTY TABLE.
     //
@@ -1159,9 +1357,20 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
           game.tilt = resetTiltForNewBall();
           game.ballsLocked = 0;
           game.searchPulses = BALL_SEARCH_PULSES;
-          // The hit timers and zone occupancies, and only those: the flag bytes
-          // that decide first-hit versus repeat are per game, not per ball.
+          // The hit timers and zone occupancies, and only those: the flag
+          // bytes that decide first-hit versus repeat are per game in this
+          // port. (DECODED AND DELIBERATELY KEPT: the machine's ball-start
+          // soft reset $3F10 does `clr.b` on every group-chained lamp — the
+          // very bytes the first-hit `bset` at +0x0055F0/+0x00543A tests — so
+          // the group-backed ids re-arm their first-hit award EVERY BALL on
+          // the original. research/MULTIPLAYER_DECODE.md §7 has the proof and
+          // the measured cost of fixing it: the sim-hash pin's own scripted
+          // windows re-hit those ids across ball boundaries, so the fix moves
+          // two of the three pinned hashes and waits for a re-pin round.)
           resetScoringForNewBall(game.scoring);
+          // The charged serve is the original's state 5, whose panel announces
+          // the incoming player until the launch takes the ball off the rod.
+          game.announcingServe = true;
         }
         served = true;
       }
@@ -1220,6 +1429,10 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
       game.laneBallId = null;
       game.autoLaunchCountdown = 0;
       launched = true;
+      // The launch ends the serve announcement and closes the first-serve
+      // player-count window (the state-5 scan never runs again this game).
+      game.announcingServe = false;
+      game.playersLocked = true;
     }
   }
 
@@ -1242,6 +1455,8 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
         if (launchBall(waiting, autoLaunchOutcome(game.plungerConfig))) {
           game.laneBallId = null;
           launched = true;
+          game.announcingServe = false;
+          game.playersLocked = true;
         }
       }
     }
@@ -1462,6 +1677,7 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
   if (drained.length > 0) {
     if (game.laneBallId !== null && drained.includes(game.laneBallId)) {
       game.laneBallId = null;
+      game.announcingServe = false;
     }
     pruneInactiveBalls(game.balls);
     // "Nothing in play and nothing owed", not "no active balls": a held ball is
@@ -1502,7 +1718,12 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
       game.tilt = resetTiltForNewBall();
       // A tilted ball forfeits and the machine goes straight on — no multiply,
       // no panel, not even "NO BONUS". Everything else waits for the count.
-      if (game.bonus === null) gameOver = endBallAfterBonus(game);
+      // ($5136's tilt branch still lands on the `$521C` hold, so a tilted end
+      // in a multi-player game holds the "PL n" card exactly as a paid one.)
+      if (game.bonus === null) {
+        if (game.playerCount > 1) game.endHoldTicks = END_OF_BALL_HOLD_TICKS;
+        else gameOver = endBallAfterBonus(game);
+      }
     }
   }
 
@@ -1560,31 +1781,83 @@ function anyControlPressed(snapshot: ControlSnapshot): boolean {
 }
 
 /**
- * Everything the ball-end chain does once the bonus has been paid.
+ * Everything the ball-end chain does once the bonus has been paid — INCLUDING
+ * THE PLAYER ROTATION, which is exactly here on the machine too.
  *
- * The order is `$5044`'s: the bonus first (its caller), then `$427C` clearing
- * the accumulator and the multiplier unless the holds veto them (+0x0050D4),
- * then the next ball. The game-over test is `$5090`, and it too is downstream of
- * the bonus — the last ball's bonus is paid before the game ends, which is what
- * the film shows when "NO BONUS" is followed by "GAME OVER".
+ * The order is `$5044`'s: the bonus first (its caller), then the rotation at
+ * +0x005070..+0x0050AA — next player, same ball number until the wrap, then
+ * `$d82` (balls remaining) down one and `$d84` (ball number) up one — then the
+ * incoming player's ball-start walks, then `$427C` clearing that player's
+ * accumulator and multiplier unless the holds veto them (+0x0050D4), then
+ * hook 2 (+0x005116) re-seeding the incoming player's held multiplier ladder.
+ * The game-over test is `$5090`, taken AT THE WRAP and downstream of the bonus
+ * — the last ball's bonus is paid before the game ends, which is what the film
+ * shows when "NO BONUS" is followed by "GAME OVER" — and its branch to `$5124`
+ * skips the walks entirely.
+ *
+ * ONE PLAYER RUNS THE EXACT SEQUENCE IT ALWAYS DID — the first branch below is
+ * the pre-multiplayer body, line for line, because with one bank the rotation
+ * is the identity and the pin (`tests/sim-hash-pin.test.ts`) holds by
+ * construction rather than by care.
  *
  * Answers whether the game ended.
  */
 function endBallAfterBonus(game: Game): boolean {
-  clearBonusForNewBall(game.scoring);
-  // Descriptor HOOK 2, `jsr ([$94,a5],$A4)` at +0x005116, runs on the machine's
-  // every ball start AFTER `$427C` has settled the holds: it re-seeds the
-  // multiplier ladder's counter to multiplier/2 and relights that many X2..X10
-  // chain lamps for the incoming player. With no hold the multiplier is now
-  // zero and the hook's own `beq` makes this a no-op, exactly as here; Extreme
-  // Sports' hook is a plain `rts` and its document ships no restore at all.
-  if (game.modes !== null && game.modeState !== null) {
-    restoreMultiplierLamps(game.modes, game.modeState, game.scoring.multiplier);
+  if (game.playerCount <= 1) {
+    clearBonusForNewBall(game.scoring);
+    // Descriptor HOOK 2, `jsr ([$94,a5],$A4)` at +0x005116, runs on the
+    // machine's every ball start AFTER `$427C` has settled the holds: it
+    // re-seeds the multiplier ladder's counter to multiplier/2 and relights
+    // that many X2..X10 chain lamps for the incoming player. With no hold the
+    // multiplier is now zero and the hook's own `beq` makes this a no-op,
+    // exactly as here; Extreme Sports' hook is a plain `rts` and its document
+    // ships no restore at all.
+    if (game.modes !== null && game.modeState !== null) {
+      restoreMultiplierLamps(game.modes, game.modeState, game.scoring.multiplier);
+    }
+    game.serveCountdown = game.options.serveDelayTicks;
+    if (game.ballsServed >= game.options.ballsPerGame) {
+      game.phase = "game-over";
+      return true;
+    }
+    return false;
   }
+
+  // THE ROTATION. Charged serves are strictly round-robin, so "the wrap" is
+  // the serve count reaching a multiple of the player count; the last ball of
+  // the game is the wrap that finds every serve spent. The machine's game-over
+  // branch (`beq $5124`) runs no walks, so neither does this one — the last
+  // player's record keeps its final state for the game-over screens. The
+  // serve countdown is armed BEFORE the test exactly as the one-player branch
+  // arms it, and that is load-bearing on both: the serve gate runs later in
+  // this same tick, and a spent countdown would hand out — and charge — a
+  // seventh ball on the game-over tick.
   game.serveCountdown = game.options.serveDelayTicks;
-  if (game.ballsServed >= game.options.ballsPerGame) {
+  const next = (game.activePlayer + 1) % game.playerCount;
+  if (next === 0 && game.ballsServed >= game.options.ballsPerGame * game.playerCount) {
     game.phase = "game-over";
     return true;
+  }
+  game.activePlayer = next;
+  const bank = game.banks[next];
+  if (bank !== undefined) {
+    game.scoring = bank.scoring;
+    game.modeState = bank.modeState;
+  }
+  // The incoming player's ball-start walks, the machine's own order
+  // (+0x0050B6..+0x005116): the lamp/counter/element walks ($3F10/$412C/$3F80
+  // — `resetModesForNewBall` is this port's reading of all three), then $427C
+  // on the rotated-in record, then hook 2 reading the SAME record's held
+  // multiplier. Running the walk again when this player next rotates OUT (the
+  // drain site) is idempotent — every write is set-to-value or keep — and the
+  // bank is dormant in between, so the double application cannot be observed.
+  if (game.modes !== null && game.modeState !== null) {
+    resetModesForNewBall(game.modes, game.modeState);
+  }
+  game.modeMessages = [];
+  clearBonusForNewBall(game.scoring);
+  if (game.modes !== null && game.modeState !== null) {
+    restoreMultiplierLamps(game.modes, game.modeState, game.scoring.multiplier);
   }
   return false;
 }
@@ -2564,6 +2837,18 @@ export interface GameDebugState {
   readonly forceFullTable: boolean;
   readonly balls: readonly BallDebugState[];
   readonly flippers: readonly { readonly id: string; readonly stroke: number }[];
+  /**
+   * MULTI-PLAYER FIELDS, present only when the game holds more than one
+   * player. Conditional ON PURPOSE and appended at the end: the one-player
+   * snapshot must serialise byte-for-byte as it always did, because
+   * `tests/sim-hash-pin.test.ts` hashes the JSON and that pin does not move.
+   */
+  readonly playerCount?: number;
+  readonly activePlayer?: number;
+  /** Every player's score in player order, active one included. */
+  readonly playerScores?: readonly number[];
+  /** Ticks left on the end-of-ball "PL n" hold. */
+  readonly endHoldTicks?: number;
 }
 
 /**
@@ -2645,6 +2930,16 @@ export function debugSnapshot(game: Game): GameDebugState {
       id: config.id,
       stroke: (game.flippers.states.get(config.id) ?? { stroke: 0 }).stroke,
     })),
+    // The multi-player tail. Spread so a one-player snapshot has exactly the
+    // keys — and therefore exactly the JSON — it had before players arrived.
+    ...(game.playerCount > 1
+      ? {
+          playerCount: game.playerCount,
+          activePlayer: game.activePlayer,
+          playerScores: playerScoresOf(game),
+          endHoldTicks: game.endHoldTicks,
+        }
+      : {}),
   };
 }
 
@@ -2770,7 +3065,10 @@ function statusLine(game: Game, scoreOnPanel: boolean): string {
   const times = game.scoring.multiplier >= 2 ? ` X${game.scoring.multiplier}` : "";
   const bonusText = bonus === 0 ? "" : `  BONUS ${formatBcdField(game.scoring.bonus)}${times}`;
   const scoreText = scoreOnPanel ? "" : `  ${formatBcdField(game.scoring.score)}`;
-  return `BALL ${ball} OF ${game.options.ballsPerGame}${scoreText}${bonusText}${plunger}`;
+  // The active player, named only when there is more than one — a one-player
+  // line is the byte-identical line it always was.
+  const player = game.playerCount > 1 ? `PLAYER ${game.activePlayer + 1}  ` : "";
+  return `${player}BALL ${ball} OF ${game.options.ballsPerGame}${scoreText}${bonusText}${plunger}`;
 }
 
 /**
@@ -2789,6 +3087,51 @@ function missionLine(game: Game): string {
 }
 
 /**
+ * A PLAYER/BALL card for the panel strip — the original's serve announcement
+ * and the multi-player end-of-ball card, both drawn by `$73D0` display lists
+ * on the same 320 x 16 strip (research/MULTIPLAYER_DECODE.md §5):
+ *
+ *   serve (state 5, +0x0049FE..+0x004A5E): "PLAYER  n" left at x=0 on the top
+ *   text row — or "PLAYERS  n", the COUNT, while the first-serve adjust window
+ *   is open (`$d7c`) — "BALL  m" left at x=0 on the bottom row, and the
+ *   incoming player's score right-aligned at x=320 (`$7198`).
+ *
+ *   ball end (`$5136`'s tail, +0x0051E6..+0x005216): "PL n" and the outgoing
+ *   score at the same x=320, held 75 frames when more than one player is in
+ *   the game.
+ *
+ * Plain data, derived from the game by `panelCardOf` and handed to the panel
+ * presenter by the renderer, exactly as the bonus view travels.
+ */
+export interface PanelCard {
+  /** "PLAYER  n", "PLAYERS  n" or "PL n" — the top text row, left at x=0. */
+  readonly top: string;
+  /** "BALL  m", or null for the end-of-ball card's single line. */
+  readonly bottom: string | null;
+  /** The score right-aligned at x=320 — `move.w #$140,d3`, both routines. */
+  readonly score: number;
+}
+
+/** The card the panel should carry this frame, or null for the normal views. */
+export function panelCardOf(game: Game): PanelCard | null {
+  if (game.phase !== "in-play") return null;
+  if (game.endHoldTicks > 0) {
+    return {
+      top: `PL ${game.activePlayer + 1}`,
+      bottom: null,
+      score: readBcdField(game.scoring.score),
+    };
+  }
+  if (!game.announcingServe || game.laneBallId === null) return null;
+  const adjusting = !game.playersLocked && game.ballsServed <= 1;
+  return {
+    top: adjusting ? `PLAYERS  ${game.playerCount}` : `PLAYER  ${game.activePlayer + 1}`,
+    bottom: `BALL  ${Math.max(1, ballNumber(game))}`,
+    score: readBcdField(game.scoring.score),
+  };
+}
+
+/**
  * The score panel, as the drawing code sees it.
  *
  * An interface rather than the concrete `PanelDisplay` so this module never
@@ -2797,6 +3140,7 @@ function missionLine(game: Game): string {
  * composes the whole 16-row panel band across the top of a `viewWidth`-wide
  * view and returns whether it did; false — no decoded heap, or the shell font
  * not yet fetched — leaves the caller on the text score exactly as before.
+ * `card` is the PLAYER/BALL announcement above, when one is up.
  */
 export interface PanelPresenter {
   draw(
@@ -2804,6 +3148,7 @@ export interface PanelPresenter {
     score: number,
     scale: number,
     viewWidth: number,
+    card?: PanelCard | null,
   ): boolean;
 }
 
@@ -2890,7 +3235,7 @@ export function renderGame(
   // under the top of the window passes behind the panel, not through it.
   const panelDrawn =
     panel !== undefined && panel !== null &&
-    panel.draw(context, currentScore(game), scale, PLAYFIELD_WIDTH);
+    panel.draw(context, currentScore(game), scale, PLAYFIELD_WIDTH, panelCardOf(game));
 
   // The overlay is drawn at device resolution rather than magnified: scaled-up
   // text at 3x is unreadable mush, and this is instrumentation, not artwork.

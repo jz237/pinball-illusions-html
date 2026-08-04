@@ -290,13 +290,18 @@ const FLAGS_RELIGHT = 0x0a;
 // ---------------------------------------------------------------------------
 
 /**
- * The whole mission machine, for one player.
+ * The whole mission machine, for ONE player.
  *
  * Typed arrays indexed by element, and integers everywhere else: no map
  * iteration order and no floating point, so two runs of the same input produce
  * the same state. The original's per-player fields are bitmasks indexed by
- * `d6`; this reconstruction has one player, so a bit is a byte here and nothing
- * else changes when a second one arrives.
+ * `d6`; here a bit is a byte, and the second player arrived exactly as this
+ * sentence always promised: the game layer keeps one `ModeState` per player
+ * (`PlayerBank`, game-loop.ts) and rotates the active one, with
+ * `resetModesForNewBall` run on each player's own rotation-in — which is
+ * observationally the machine's per-player bits, because every runtime reader
+ * indexes the current player and every cross-player write is a ball-start
+ * walk. research/MULTIPLAYER_DECODE.md §1/§3.
  */
 export interface ModeState {
   /** Per-element ARMED byte, the original's `+$01` bit: the shot is lit. */

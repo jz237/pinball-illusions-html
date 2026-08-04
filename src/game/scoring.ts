@@ -280,10 +280,13 @@ export const UNDEBOUNCED_DEVICE_INDEX = 32;
  * The mutable half of the scoring layer: the score, the bonus, and the three
  * debounces.
  *
- * One player, because this reconstruction has one. The original's flag bytes are
- * per player and its `bset` picks the bit out of `$dbe(a5)`; here a set is a set
- * of ids and the player bit is implied. When a second player exists, every
- * `Set` below becomes one set per player and nothing else changes.
+ * ONE PLAYER'S VIEW, and since the multiplayer round that is exactly what it
+ * is: the original's flag bytes are per player and its `bset` picks the bit
+ * out of `$dbe(a5)`; here a set is a set of ids and the player bit is implied
+ * — because the game layer keeps one of these per player (`PlayerBank`,
+ * game-loop.ts) and swaps the active one at the rotation, which is the same
+ * machine with the indexing turned inside out. See
+ * research/MULTIPLAYER_DECODE.md §1.
  */
 export interface ScoringState {
   readonly score: Uint8Array;

@@ -38,7 +38,7 @@
  * method, and node tests use `renderInto` instead.
  */
 
-import type { GameTickReport, PanelPresenter } from "./game-loop.js";
+import type { GameTickReport, PanelCard, PanelPresenter } from "./game-loop.js";
 import {
   PANEL_HEIGHT,
   PANEL_WIDTH,
@@ -48,7 +48,7 @@ import {
   renderPanelInto,
   stepPanel,
 } from "./panel-renderer.js";
-import type { PanelAnimation, PanelBonusView, PanelState } from "./panel-renderer.js";
+import type { PanelAnimation, PanelBonusView, PanelCardView, PanelState } from "./panel-renderer.js";
 import { createPixelTarget } from "./playfield-renderer.js";
 import type { PixelTarget } from "./playfield-renderer.js";
 import { PANEL_UNLIT } from "./palette.js";
@@ -194,10 +194,16 @@ export class PanelDisplay implements PanelPresenter {
   /**
    * Rasterises the current strip into a caller-supplied 320 x 16 target with
    * the caller's font. The headless entry point — everything `draw` shows, a
-   * node test can assert byte for byte through here.
+   * node test can assert byte for byte through here. `card` is the
+   * PLAYER/BALL announcement, when one is up.
    */
-  renderInto(target: PixelTarget, score: number, font: ShellFont): PixelTarget {
-    return renderPanelInto(this.#state, score, font, target, this.#bonus);
+  renderInto(
+    target: PixelTarget,
+    score: number,
+    font: ShellFont,
+    card?: PanelCardView | null,
+  ): PixelTarget {
+    return renderPanelInto(this.#state, score, font, target, this.#bonus, card);
   }
 
   /**
@@ -211,11 +217,12 @@ export class PanelDisplay implements PanelPresenter {
     score: number,
     scale: number,
     viewWidth: number,
+    card?: PanelCard | null,
   ): boolean {
     const font = this.#font();
     if (font === null) return false;
 
-    renderPanelInto(this.#state, score, font, this.#target, this.#bonus);
+    renderPanelInto(this.#state, score, font, this.#target, this.#bonus, card);
 
     if (this.#surface === null) {
       this.#surface = this.#createSurface(PANEL_WIDTH, PANEL_HEIGHT);

@@ -20,6 +20,7 @@ import {
   shellKey,
   shellKeyFor,
   shellPlayTable,
+  shellSetPlayers,
   shellTableFailed,
   shellTableLoaded,
   shellTick,
@@ -237,7 +238,7 @@ describe("the function keys", () => {
       { kind: "load-table", tableId: "babewatch" },
     ]);
     expect(state.phase).toBe("loading");
-    expect(shellTableLoaded(state)).toEqual([{ kind: "start-game" }]);
+    expect(shellTableLoaded(state)).toEqual([{ kind: "start-game", players: 1 }]);
     expect(state.phase).toBe("play");
   });
 
@@ -263,7 +264,7 @@ describe("loading", () => {
     const store = fakeStore();
     const state = createShell(store);
     press(state, store, key("table", null, 0));
-    expect(shellTableLoaded(state)).toEqual([{ kind: "start-game" }]);
+    expect(shellTableLoaded(state)).toEqual([{ kind: "start-game", players: 1 }]);
   });
 
   it("shows the failure and lets ESC out of it", () => {
@@ -428,7 +429,7 @@ describe("the table's own attract screen", () => {
     shellGameEnded(state, 1);
     shellTick(state, store, GAME_OVER_TICKS);
     expect(state.phase).toBe("ladder");
-    expect(press(state, store, SELECT)).toEqual([{ kind: "start-game" }]);
+    expect(press(state, store, SELECT)).toEqual([{ kind: "start-game", players: 1 }]);
     expect(state.phase).toBe("play");
     expect(state.tableId).toBe("extreme-sports");
   });
@@ -612,7 +613,10 @@ describe("the key map", () => {
   });
 
   it("ignores everything else", () => {
-    expect(shellKeyFor({ code: "F5", key: "F5" })).toBeNull();
+    // F5 stopped being "everything else" when the F-row grew to eight — the
+    // in-game machine's player scan (main.seg00 +0x00446E) claims F1..F8, so
+    // the first genuinely unmapped function key is now F9's row.
+    expect(shellKeyFor({ code: "F12", key: "F12" })).toBeNull();
     expect(shellKeyFor({})).toBeNull();
   });
 
@@ -796,6 +800,155 @@ describe("the shell, driven entirely by touch", () => {
       effects.push(...shellKey(state, store, item));
     }
     expect(state.phase).toBe("play");
-    expect(effects).toEqual([{ kind: "start-game" }]);
+    expect(effects).toEqual([{ kind: "start-game", players: 1 }]);
+  });
+});
+
+describe("the player count through the shell", () => {
+  // The decoded split (research/MULTIPLAYER_DECODE.md §4): the SHELL machine's
+  // F-keys pick tables; the IN-GAME machine's F1..F8, live on the table's own
+  // attract, pick 1..8 PLAYERS (main.seg00 +0x00446E, `$dbc` := n, clamp 8).
+
+  function intoLadder(tableId: TableId): { state: ShellState; store: ReturnType<typeof fakeStore> } {
+    const fixture = intoPlay(tableId);
+    shellGameEnded(fixture.state, 0); // no qualification: 0 beats nothing
+    press(fixture.state, fixture.store, SELECT); // cut the card, run the check
+    expect(fixture.state.phase).toBe("ladder");
+    return fixture;
+  }
+
+  it("maps the whole F row: F1..F8 to indices 0..7", () => {
+    for (let n = 1; n <= 8; n += 1) {
+      const mapped = shellKeyFor({ code: `F${n}` });
+      expect(mapped?.kind).toBe("table");
+      expect(mapped?.index).toBe(n - 1);
+    }
+  });
+
+  it("starts n players from the table attract on Fn", () => {
+    const { state, store } = intoLadder("law-n-justice");
+    const effects = press(state, store, key("table", null, 2)); // F3
+    expect(state.phase).toBe("play");
+    expect(state.players).toBe(3);
+    expect(effects).toEqual([{ kind: "start-game", players: 3 }]);
+  });
+
+  it("clamps the ladder's F-keys at the machine's eight", () => {
+    const { state, store } = intoLadder("law-n-justice");
+    const effects = press(state, store, key("table", null, 7)); // F8
+    expect(effects).toEqual([{ kind: "start-game", players: 8 }]);
+  });
+
+  it("keeps the selection sticky: ENTER restarts with the last chosen count", () => {
+    const { state, store } = intoLadder("law-n-justice");
+    press(state, store, key("table", null, 3)); // F4: four players
+    shellGameEnded(state, [0, 0, 0, 0]);
+    press(state, store, SELECT); // through the card to the ladder
+    expect(state.phase).toBe("ladder");
+    const effects = press(state, store, SELECT);
+    expect(effects).toEqual([{ kind: "start-game", players: 4 }]);
+  });
+
+  it("still picks TABLES with the F keys in the shell's own menus", () => {
+    const store = fakeStore();
+    const state = createShell(store);
+    // F5 in the attract names no table — three exist — and does nothing.
+    expect(press(state, store, key("table", null, 4))).toEqual([]);
+    expect(state.phase).toBe("attract");
+    // F2 still boots BabeWatch, one player by default.
+    const effects = press(state, store, key("table", null, 1));
+    expect(effects).toEqual([{ kind: "load-table", tableId: "babewatch" }]);
+    shellTableLoaded(state);
+    expect(state.players).toBe(1);
+  });
+
+  it("shellSetPlayers clamps into 1..8 and shellPlayTable carries a requested count", () => {
+    const store = fakeStore();
+    const state = createShell(store);
+    expect(shellSetPlayers(state, 12)).toBe(8);
+    expect(shellSetPlayers(state, 0)).toBe(1);
+    expect(shellSetPlayers(state, 2.5)).toBe(1);
+    shellPlayTable(state, store, "babewatch", 5);
+    expect(state.players).toBe(5);
+    const effects = shellTableLoaded(state);
+    expect(effects).toEqual([{ kind: "start-game", players: 5 }]);
+  });
+});
+
+describe("the multi-player high-score walk", () => {
+  // The original's state-2 loop (main.seg00 +0x00462E..+0x00484A): every
+  // player IN ORDER, each qualifier through the fanfare and the name box,
+  // inserted as the walk goes so a later player is placed against the ladder
+  // an earlier one already moved.
+
+  function type(state: ShellState, store: ScoreStore, initials: string): void {
+    for (const character of initials) {
+      shellKey(state, store, key("text", character));
+    }
+  }
+
+  it("walks every qualifying player in order, naming each on the cards", () => {
+    const { state, store } = intoPlay("law-n-justice");
+    const top = state.ladder[0]?.score ?? 0;
+    // Players 1 and 3 qualify — 3 against the ladder 1 already moved, so the
+    // score must clear the factory table's upper slots too; player 2's zero
+    // does not. (The factory ladder is the 20:10:5:2:1 ratio, so a score a
+    // hair over the fifth slot stops qualifying the moment one insert shifts
+    // the table — the sibling test below pins exactly that.)
+    shellGameEnded(state, [top + 2_000_000, 0, top + 1_000_000]);
+    press(state, store, SELECT); // cut the game-over card
+    expect(state.phase).toBe("fanfare");
+    expect(state.scoringPlayer).toBe(1);
+    press(state, store, SELECT); // cut the fanfare
+    expect(state.phase).toBe("initials");
+    type(state, store, "ABC");
+    // Player 2's zero is skipped; player 3 is next.
+    expect(state.phase).toBe("fanfare");
+    expect(state.scoringPlayer).toBe(3);
+    press(state, store, SELECT);
+    type(state, store, "DEF");
+    expect(state.phase).toBe("ladder");
+    // Both entries landed, higher score above.
+    const initials = state.ladder.map((entry) => entry.initials);
+    expect(initials).toContain("ABC");
+    expect(initials).toContain("DEF");
+    expect(initials.indexOf("ABC")).toBeLessThan(initials.indexOf("DEF"));
+  });
+
+  it("places a later player against the ladder an earlier one already moved", () => {
+    const { state, store } = intoPlay("law-n-justice");
+    const bar = state.ladder[HIGH_SCORE_SLOTS - 1]?.score ?? 0;
+    // Both players beat only the fifth slot; the first player's entry then
+    // occupies it, and the second must beat THE FIRST PLAYER'S score to get
+    // in — it does not, so exactly one name is written. The machine's walk
+    // compares against the updated table the same way.
+    shellGameEnded(state, [bar + 2, bar + 1]);
+    press(state, store, SELECT);
+    expect(state.scoringPlayer).toBe(1);
+    press(state, store, SELECT);
+    type(state, store, "AAB");
+    expect(state.phase).toBe("ladder");
+    expect(state.ladder.map((entry) => entry.initials)).toContain("AAB");
+    expect(state.ladder.filter((entry) => entry.initials === "AAB")).toHaveLength(1);
+  });
+
+  it("one player is the walk of one: the exact flow the shell always had", () => {
+    const { state, store } = intoPlay("babewatch");
+    const bar = state.ladder[HIGH_SCORE_SLOTS - 1]?.score ?? 0;
+    shellGameEnded(state, bar + 500_000); // the scalar form every old caller uses
+    press(state, store, SELECT);
+    expect(state.phase).toBe("fanfare");
+    expect(state.scoringPlayer).toBe(1);
+    press(state, store, SELECT);
+    type(state, store, "JEZ");
+    expect(state.phase).toBe("ladder");
+    expect(state.ladder.map((entry) => entry.initials)).toContain("JEZ");
+  });
+
+  it("no qualifier among four players drops straight to the ladder", () => {
+    const { state, store } = intoPlay("extreme-sports");
+    shellGameEnded(state, [0, 0, 0, 0]);
+    press(state, store, SELECT);
+    expect(state.phase).toBe("ladder");
   });
 });

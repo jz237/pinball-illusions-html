@@ -33,7 +33,7 @@ import {
   doorThumbUrl,
 } from "../src/browser/front-door.js";
 import type { FrontDoor, FrontDoorHost } from "../src/browser/front-door.js";
-import { SHELL_TABLES } from "../src/browser/shell.js";
+import { SHELL_TABLES, clampPlayers } from "../src/browser/shell.js";
 import { FACTORY_HIGH_SCORES } from "../src/game/high-scores.js";
 import { TABLE_IDS } from "../src/game/contracts.js";
 import type { TableId } from "../src/game/contracts.js";
@@ -295,4 +295,82 @@ describe("the shipped thumbnails", () => {
       expect(bytes.subarray(8, 12).toString("latin1")).toBe("WEBP");
     });
   }
+});
+
+// ---------------------------------------------------------------------------
+// The player stepper — the decoded F1..F8 row's touch/click face
+// ---------------------------------------------------------------------------
+
+describe("the player stepper", () => {
+  it("ships in the door markup: minus, count, plus", () => {
+    expect(readDoorMarkup().hasPlayerStepper).toBe(true);
+  });
+
+  function stepperFixture(): Fixture & { count: () => string } {
+    let players = 1;
+    const f = fixture({
+      players: () => players,
+      setPlayers: (next) => {
+        // The host clamps exactly as the shell does (`shellSetPlayers`,
+        // the machine's own 1..8 at +0x004B10).
+        players = clampPlayers(next);
+        return players;
+      },
+    });
+    const count = (): string => {
+      const cell = f.h.door.querySelector("[data-door-players-count]");
+      if (cell === null) throw new Error("no player count cell");
+      return cell.textContent;
+    };
+    return Object.assign(f, { count });
+  }
+
+  it("walks the count with plus and minus through the host, painting the cell", () => {
+    const f = stepperFixture();
+    expect(f.count()).toBe("1");
+    const plus = f.h.door.querySelector("[data-door-players-plus]");
+    const minus = f.h.door.querySelector("[data-door-players-minus]");
+    if (plus === null || minus === null) throw new Error("stepper buttons missing");
+    f.h.dispatch(plus, "click");
+    f.h.dispatch(plus, "click");
+    expect(f.count()).toBe("3");
+    f.h.dispatch(minus, "click");
+    expect(f.count()).toBe("2");
+    // Every step is a gesture — the audio unlock rides them all.
+    expect(f.gestures).toBe(3);
+  });
+
+  it("clamps at the machine's 1..8 at both ends", () => {
+    const f = stepperFixture();
+    const plus = f.h.door.querySelector("[data-door-players-plus]");
+    const minus = f.h.door.querySelector("[data-door-players-minus]");
+    if (plus === null || minus === null) throw new Error("stepper buttons missing");
+    for (let i = 0; i < 12; i += 1) f.h.dispatch(plus, "click");
+    expect(f.count()).toBe("8");
+    for (let i = 0; i < 12; i += 1) f.h.dispatch(minus, "click");
+    expect(f.count()).toBe("1");
+  });
+
+  it("a host without the accessors leaves the stepper inert", () => {
+    const f = fixture();
+    const plus = f.h.door.querySelector("[data-door-players-plus]");
+    if (plus === null) throw new Error("stepper buttons missing");
+    f.h.dispatch(plus, "click");
+    const cell = f.h.door.querySelector("[data-door-players-count]");
+    expect(cell?.textContent).toBe("1");
+  });
+
+  it("repaints the count when the door comes back — the F keys may have moved it", () => {
+    let players = 1;
+    const f = fixture({
+      players: () => players,
+      setPlayers: (next) => (players = clampPlayers(next)),
+    });
+    // The shell's own F-key path changes the selection while the door is away.
+    f.door.refresh("play", "babewatch" as TableId, 0);
+    players = 6;
+    f.door.refresh("attract", null, 1);
+    const cell = f.h.door.querySelector("[data-door-players-count]");
+    expect(cell?.textContent).toBe("6");
+  });
 });

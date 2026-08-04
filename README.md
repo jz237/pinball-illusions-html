@@ -336,17 +336,19 @@ button, iOS gates motion behind a permission prompt, a real shake is
 indistinguishable from walking, and this table's tilt is a measured mechanism
 that a noisy continuous signal would trip for players who did nothing.
 
-### Not started, and one thing deliberately not fitted
+### Formerly not started, both since fitted
 
-MULTIPLE PLAYERS. The original scans F1..F8 for one to eight and alternates them
-per ball; this is one player, because the simulation holds a single score, ball
-count and mission machine, and giving it eight is a change to the game rather
-than to the shell.
+MULTIPLE PLAYERS shipped in the hot-seat round: the original scans F1..F8 for
+one to eight and alternates them per ball, and so does this — the rotation,
+the per-player state banks, the PLAYER/BALL panel cards, the per-player
+high-score walk and the front door's stepper are all decoded from main.seg00's
+ball-end state and documented in `research/MULTIPLAYER_DECODE.md`. A
+one-player game is byte-identical to what it was, which `tests/sim-hash-pin.
+test.ts` proves rather than promises.
 
-The INTRO ANIMATION. `intro.bin` is a FreeAnim animation whose frame format is
-still undecoded — though its SNT! tune is decoded and shipped, because it turned
-out to be the front-end music the menus play, which this project spent a round
-attributing to the wrong file entirely.
+The INTRO ANIMATION shipped the round before: `intro.bin`'s FreeAnim stream is
+decoded (`research/INTRO_DECODE.md`) and plays on every cold load, and its
+SNT! tune had already shipped as the front-end music the menus play.
 
 The BONUS LADDER count-up.
 

@@ -41,7 +41,7 @@ import {
 } from "../src/browser/panel-renderer.js";
 import type {
   PanelAnimation,
-  PanelBonusView,
+  PanelBonusView, PanelCardView,
   PanelFrame,
   PanelState,
 } from "../src/browser/panel-renderer.js";
@@ -573,5 +573,81 @@ describe.skipIf(!exported)("the score view in the shipped small font", () => {
     const art = await loadShellArt(diskFetch, SHELL_ART_BASE_PATH);
     const target = renderPanel(createPanelState(), 12345670, art.font2);
     expect(hashOf(target)).toBe("e99c6be14b74f0af55a7c667c5e3dc6748af9c1bbd09babd342a8d630ea622d4");
+  });
+});
+
+describe("the PLAYER/BALL card", () => {
+  // The serve announcement and the multi-player end card — the display lists
+  // at main.seg00 0x4AA2/0x4AB4/0x4AC6/0x453C and the score draw's
+  // `move.w #$140,d3` (research/MULTIPLAYER_DECODE.md §5): captions LEFT at
+  // x=0 on the two text rows, the score right-aligned at x=320.
+
+  function renderCard(card: PanelCardView, state = createPanelState()): PixelTarget {
+    return renderPanelInto(
+      state,
+      777_777,
+      FONT,
+      createPixelTarget(PANEL_WIDTH, PANEL_HEIGHT),
+      null,
+      card,
+    );
+  }
+
+  const SERVE: PanelCardView = { top: "PLAYER  2", bottom: "BALL  1", score: 150_000 };
+
+  it("draws the captions from the left edge — the lists' own x=0", () => {
+    const target = renderCard(SERVE);
+    // Both halves carry text starting at column 0.
+    let topLit = false;
+    let bottomLit = false;
+    for (let y = 0; y < PANEL_HEIGHT; y += 1) {
+      if (isUnlit(target, 0, y)) continue;
+      if (y < PANEL_HEIGHT / 2) topLit = true;
+      else bottomLit = true;
+    }
+    expect(topLit).toBe(true);
+    expect(bottomLit).toBe(true);
+  });
+
+  it("right-aligns the score at the card's own x=320, not the score view's 300", () => {
+    const target = renderCard(SERVE);
+    // The rightmost lit column of the top half is the score's last pixel:
+    // 319, where the idle score view's is 299. Session 5 measured the
+    // machine's card edge at panel x319.
+    let max = -1;
+    for (let y = 0; y < PANEL_HEIGHT / 2; y += 1) {
+      for (let x = 0; x < PANEL_WIDTH; x += 1) {
+        if (!isUnlit(target, x, y) && x > max) max = x;
+      }
+    }
+    expect(max).toBe(PANEL_WIDTH - 1);
+  });
+
+  it("a single-line card leaves the bottom half dark", () => {
+    const target = renderCard({ top: "PL 1", bottom: null, score: 0 });
+    for (let y = Math.floor(PANEL_HEIGHT / 2) + 1; y < PANEL_HEIGHT; y += 1) {
+      for (let x = 0; x < PANEL_WIDTH; x += 1) {
+        expect(isUnlit(target, x, y)).toBe(true);
+      }
+    }
+  });
+
+  it("outranks a queued animation, exactly as the serve state's per-frame clear does", () => {
+    const state = queued(animationOf(1, solidFrame(PANEL_WIDTH, PANEL_HEIGHT, 1)));
+    const target = renderCard(SERVE, state);
+    expect(isUnlit(target, PANEL_WIDTH - 1, PANEL_HEIGHT - 1)).toBe(true);
+  });
+
+  it("is outranked by the bonus, which cannot coexist with a serve", () => {
+    const target = renderPanelInto(
+      createPanelState(),
+      0,
+      FONT,
+      createPixelTarget(PANEL_WIDTH, PANEL_HEIGHT),
+      { caption: "NO BONUS", value: null, multiplier: "", multiplierLit: false },
+      SERVE,
+    );
+    // The card's left-edge caption is absent; the centred bonus is up.
+    expect(isUnlit(target, 0, 3)).toBe(true);
   });
 });

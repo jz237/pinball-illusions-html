@@ -442,6 +442,44 @@ const BONUS_CENTRE_X = 160;
 const BONUS_MULTIPLIER_LEFT_X = 40;
 const BONUS_MULTIPLIER_RIGHT_X = 280;
 
+/**
+ * The PLAYER/BALL card — the serve announcement (state 5) and the
+ * multi-player end-of-ball "PL n" card. Structurally `game-loop.ts`'s
+ * `PanelCard`, declared here the way `PanelBonusView` twins `BonusView`, so
+ * the renderer never imports the loop.
+ */
+export interface PanelCardView {
+  readonly top: string;
+  readonly bottom: string | null;
+  readonly score: number;
+}
+
+/**
+ * The card's columns, the machine's own display lists
+ * (research/MULTIPLAYER_DECODE.md §5): both captions LEFT-aligned at x=0
+ * ("PLAYER  n" / "PLAYERS  n" on the top text row, "BALL  m" on the bottom
+ * one — y=2 and y=8 of the machine's five-row panel font, mapped onto this
+ * font's two halves exactly as the bonus rows are), and the score
+ * RIGHT-ALIGNED AT X=320: `move.w #$140,d3` in both `$7198` (the serve view)
+ * and the ball-end draw at +0x005206 — the edge session 5 measured at panel
+ * x319. Deliberately not `PANEL_SCORE_RIGHT_X` (300): that column is the
+ * ladder template's, and this card is the one place the machine's own x is
+ * decoded for the strip.
+ */
+const CARD_LEFT_X = 0;
+const CARD_SCORE_RIGHT_X = 320;
+
+function drawCard(target: PixelTarget, font: ShellFont, card: PanelCardView): void {
+  const top = bonusPenY(font, 0);
+  drawText(target, font, card.top, CARD_LEFT_X, top, PANEL_AMBER, PANEL_WHITE);
+  if (card.bottom !== null && card.bottom.length > 0) {
+    drawText(target, font, card.bottom, CARD_LEFT_X, bonusPenY(font, 1), PANEL_AMBER, PANEL_WHITE);
+  }
+  const text = formatPanelScore(card.score);
+  const penX = alignShellText(font, text, CARD_SCORE_RIGHT_X, "right");
+  drawText(target, font, text, penX, top, PANEL_AMBER, PANEL_WHITE);
+}
+
 function drawBonus(target: PixelTarget, font: ShellFont, bonus: PanelBonusView): void {
   const caption = bonusPenY(font, 0);
   const figure = bonusPenY(font, 1);
@@ -477,6 +515,11 @@ function drawBonus(target: PixelTarget, font: ShellFont, bonus: PanelBonusView):
  * table's routine (+0x0051AC, +0x0051C4), and the routine clears it again ahead
  * of every panel it puts up. Nothing queued survives an end-of-ball bonus on
  * screen, and the score does not show through it either.
+ *
+ * `card` — the PLAYER/BALL announcement — outranks the queue and the score the
+ * same way for the same reason: the serve state's loop calls `$6B06` and
+ * redraws the card every frame (+0x0049F8), so nothing queued shows through it
+ * either; only the bonus, which cannot coexist with a serve, sits above it.
  */
 export function renderPanelInto(
   state: PanelState,
@@ -484,6 +527,7 @@ export function renderPanelInto(
   font: ShellFont,
   target: PixelTarget,
   bonus?: PanelBonusView | null,
+  card?: PanelCardView | null,
 ): PixelTarget {
   if (target.width !== PANEL_WIDTH || target.height !== PANEL_HEIGHT) {
     throw new RangeError(
@@ -500,6 +544,10 @@ export function renderPanelInto(
   clearPanel(target);
   if (bonus !== undefined && bonus !== null) {
     drawBonus(target, font, bonus);
+    return target;
+  }
+  if (card !== undefined && card !== null) {
+    drawCard(target, font, card);
     return target;
   }
   const frame = currentPanelFrame(state);

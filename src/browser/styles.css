@@ -291,6 +291,55 @@ html[data-door-mode="door"] .cabinet {
   text-transform: uppercase;
 }
 
+/* The player stepper: one row between the cards and the footer, the same
+ * amber accent the Play pill wears. The count is a fixed-width slot so
+ * stepping never reflows the row. */
+.door__players {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin: 14px 0 4px;
+  font-size: 13px;
+  color: var(--ink);
+}
+
+.door__players-label {
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-size: 12px;
+}
+
+.door__players-step {
+  width: 30px;
+  height: 30px;
+  border: 1px solid rgba(255, 171, 61, 0.55);
+  border-radius: 999px;
+  background: rgba(255, 171, 61, 0.12);
+  color: #ffab3d;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.door__players-step:hover {
+  background: rgba(255, 171, 61, 0.28);
+}
+
+.door__players-count {
+  min-width: 1.6em;
+  text-align: center;
+  font-weight: 700;
+  font-size: 16px;
+  color: #ffab3d;
+}
+
+.door__players-hint {
+  color: var(--ink-dim);
+  font-size: 11px;
+}
+
 .door__foot {
   text-align: center;
   color: var(--ink-dim);
