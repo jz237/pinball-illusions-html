@@ -10,11 +10,30 @@
  *   front of substeps 0, 2, 4 and 6, the 44-direction ring read WHERE THE BALL
  *   STANDS, and no walk of any kind.
  *
- * The acceptance instrument lives at `research/arch/tools/port-corpus.mts` and
- * scores the SHIPPED `stepBalls` against the machine's own velocity words. This
- * file is what the suite can check without the research tree: the frame's own
- * arithmetic, and the one place on a shipped table where the decode makes a
- * falsifiable, previously unobserved prediction.
+ * THIS FILE PINS BEHAVIOUR. `tests/physics-gate.test.ts` MEASURES ERROR AGAINST
+ * THE MACHINE. They are not duplicates and neither replaces the other:
+ *
+ *   here                    the SHAPE of the rule — eight substeps, four passes,
+ *                           the staircase answering 10.79 and 14.13 either side
+ *                           of a computed boundary, the decode's own unobserved
+ *                           17.24 forecast landing at 17.25. Needs no research
+ *                           tree; would still be meaningful if every trace on
+ *                           earth were lost.
+ *   physics-gate.test.ts    the SIZE of what is left — one number, 1790 units of
+ *                           1/256 px per frame over 576 traced frames of the
+ *                           original's own RAM, which a physics round must move
+ *                           in the right direction or leave alone. Skips where
+ *                           the operator's traces are absent.
+ *
+ * A change can get the staircase right at one site and the slip wrong everywhere
+ * (passes here, fails the gate), or score well on average while losing the phase
+ * response (passes the gate, fails here). Run both. And note that NEITHER is the
+ * film gate, which renders a fresh `createGame` at tick 0 and cannot move on a
+ * trajectory change at all — `research/physics-gate/README.md` has the table of
+ * which gate proves what.
+ *
+ * The operator's copy of the error measurement, with a per-frame CSV and a
+ * non-zero exit on drift, is `research/physics-gate/run.cmd`.
  *
  * WHY THE ARCH. Session 4 measured the original turning 14.13 degrees at the
  * first top-right arch contact on cold runs A and B and 10.78 on cold run D —

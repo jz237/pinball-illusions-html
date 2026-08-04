@@ -18,6 +18,16 @@
  * The harness is deliberately the same shape as the determinism suite in
  * `game-loop.test.ts`: a `ScriptedInput` whose behaviour is a pure function of
  * the tick index, driving the real maps, the real physics and the real mode VM.
+ *
+ * WHAT THIS PIN DOES NOT DO. A moved hash is not a failure and an unmoved hash
+ * is not a success: this is a tripwire that forces a round to STATE what it
+ * changed, and the statement is what gets checked — by the physics gate
+ * (`tests/physics-gate.test.ts`, the shipped tick against the original's own
+ * per-frame RAM), by the census, by the tip-flip sweep, and by the film compare
+ * for anything about the picture. `research/FIDELITY_DOSSIER.md` carries the
+ * table of which gate proves what; read it before quoting one of them as
+ * general reassurance, which is the mistake the film figures below were used to
+ * make for several rounds running.
  */
 
 import { createHash } from "node:crypto";

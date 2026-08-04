@@ -1865,8 +1865,9 @@ function substepAcceleration(whole: Q10): { readonly each: Q10; readonly last: Q
  * and reproducing the machine's answers means reproducing its grid.
  *
  * Both halves were measured against the original's own RAM (research/
- * ARCH_NORMAL_DECODE.md, and `research/arch/tools/port-corpus.mts` drives this
- * exact code): summed per-frame velocity error 21089 for the old rule against
+ * ARCH_NORMAL_DECODE.md; `research/physics-gate/` is the standing instrument and
+ * `tests/physics-gate.test.ts` is the suite's copy of it, both driving this exact
+ * code): summed per-frame velocity error 21089 for the old rule against
  * 1790 for this one on the same 576 frames, exact on 436 against 466, and
  * per-tick POSITION exact on 464 of the 576 against 0 for every variant of the
  * old structure. The decode's own Python model of this rule scores 1850 with the

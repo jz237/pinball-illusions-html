@@ -25,8 +25,12 @@ Some numbers that are checkable rather than adjectival: the three playfields
 agree with filmed frames of the original at **98.45 / 99.86 / 99.13 percent** of
 pixels; the twelve credit pages match at **27,400 of 27,400** ink pixels; the
 front-end music correlates with the filmed audio at **0.72 waveform and 0.98
-envelope** and loops at exactly the machine's own 8077 PAL frames. 1465 tests,
-strict `tsc`, and a build that refuses to ship any asset nothing accounts for.
+envelope** and loops at exactly the machine's own 8077 PAL frames. And because
+the first three of those are all about the PICTURE: driven one frame at a time
+from the original's own RAM, this port's ball reproduces the machine's velocity
+word exactly on **466 of 576** traced frames and its position on **464**, with
+every remaining unit of error on a contact frame. 1652 tests, strict `tsc`, and
+a build that refuses to ship any asset nothing accounts for.
 
 The geometry everything else rests on:
 
