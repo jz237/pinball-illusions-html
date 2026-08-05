@@ -28,8 +28,8 @@ front-end music correlates with the filmed audio at **0.72 waveform and 0.98
 envelope** and loops at exactly the machine's own 8077 PAL frames. And because
 the first three of those are all about the PICTURE: driven one frame at a time
 from the original's own RAM, this port's ball reproduces the machine's velocity
-word exactly on **466 of 576** traced frames and its position on **464**, with
-every remaining unit of error on a contact frame. 1652 tests, strict `tsc`, and
+word exactly on **470 of 576** traced frames and its position on **487**, with
+every remaining unit of error on a contact frame. 1870 tests, strict `tsc`, and
 a build that refuses to ship any asset nothing accounts for.
 
 The geometry everything else rests on:
