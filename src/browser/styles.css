@@ -473,18 +473,29 @@ html[data-touch="on"] .deck {
  * delay, which is all a button that is tapped rather than held wants.
  */
 /*
- * Generously sized, on purpose.
+ * Sized like Pinball Fantasies', at the operator's request.
  *
- * The window's aspect is 1.3125 — wide and short — so on a portrait phone the
- * picture is width-bound and leaves several hundred pixels underneath. That
- * surplus cannot be spent on the picture (`VIEWPORT_HEIGHT` is inside the
- * hashed simulation state and is not negotiable), so it is spent here. 44 px is
- * the minimum comfortable target; this affords two to three times that.
+ * This deck used to be `max(48px, 11svh)` / `max(56px, 15svh)`, sized on the
+ * reasoning that the window's aspect (1.3125 — wide and short) leaves a portrait
+ * phone several hundred spare pixels under a width-bound picture, and that the
+ * surplus could not be spent on the picture (`VIEWPORT_HEIGHT` is inside the
+ * hashed simulation state and is not negotiable) so it may as well be spent
+ * here. On a 390 x 844 phone that came out at 93 px and 127 px — a 225 px deck.
+ *
+ * The sibling build the operator asked this to match ships flat rem heights
+ * instead (`pinball-fantasies-hd/src/styles.css`: 2.55rem secondary, 3rem
+ * primary) — about 95 px of deck all told, and the same two-thirds smaller.
+ * Matching it is a presentation choice, not a fidelity one: the original had no
+ * touchscreen, so there is nothing to be faithful TO here and the sibling is the
+ * only reference that matters. The surplus simply stays empty page, as it does
+ * in Fantasies.
+ *
+ * The landscape block below already sat at 44 px and is unchanged.
  */
 .deck__button {
   touch-action: none;
-  min-height: max(48px, 11svh);
-  font-size: clamp(11px, 3.4vw, 16px);
+  min-height: 2.55rem;
+  font-size: clamp(10px, 2.6vw, 13px);
 }
 
 .topbar__button {
@@ -496,7 +507,9 @@ html[data-touch="on"] .deck {
 
 .deck__button--left,
 .deck__button--right {
-  min-height: max(56px, 15svh);
+  /* The bats stay the tallest thing in the deck, as they are in Fantasies —
+     they are the two buttons held rather than tapped. */
+  min-height: 3rem;
   background: linear-gradient(180deg, #223046 0%, #131a26 100%);
   color: #cfe0f5;
 }
