@@ -314,6 +314,31 @@ const ELEMENT_COUNTER = 0x34;
  */
 const EFFECT_SET_MULTIPLIER = 5;
 /**
+ * THE THIRD READING OF +$34 — award effect 17's CHAIN SCRIPT.
+ *
+ * Effect 17's handler is the whole of main.seg00 +0x00613A, twelve bytes, read
+ * out of the package rather than out of Capstone:
+ *
+ *     00613A  206a 0034            movea.l $34(a2),a0
+ *     00613E  4eb9 0000 6c10       jsr     $6C10
+ *     006144  4e75                 rts
+ *
+ * `$6C10` is the background QUEUE poster — `movea.l $2396(a5),a1 /
+ * move.w $2392(a5),d2 / move.l a0,(a1,d2.w*4) / clr.l $4(a1,d2.w*4) /
+ * addq.w #1,$2392(a5) / andi.w #$3F,$2392(a5)`, a 64-slot ring taking its
+ * record in A0 — the same routine the lamp-group completion (+0x006594), the
+ * counter continuation (+0x005E88) and the ladder launch (+0x005EA2) all post
+ * to. So an effect-17 award QUEUES THE ELEMENT'S +$34 AS A SCRIPT: no counter,
+ * no accumulator, no score beyond the element's own — one follow-on record.
+ *
+ * That is why `counterList` refuses to gather counters from element +$34
+ * fields, and it is exported here as the edge the shipped document could not
+ * express: for these elements `counter` is -1 because their +$34 is a SCRIPT,
+ * and until this field existed the chain went nowhere in the port. Thirty-four
+ * elements carry it (Law 'n Justice 5, BabeWatch 17, Extreme Sports 12).
+ */
+const EFFECT_QUEUE_SCRIPT = 17;
+/**
  * Award effect 20's WINDOW SECONDS, the element's +$38 read as a WORD:
  * `move.w $38(a2),d0 / mulu.w $50(a5),d0 / move.w d0,$26(a0)` at +0x006212
  * arms the counter record's +$26 countdown with seconds x ticks-per-second.
@@ -531,7 +556,13 @@ const OPCODES = [
   { index: 22, name: "SET_COUNT_SELF", length: 6, args: "o" },
   { index: 23, name: "JMP_IF_UNLIT", length: 8, args: "ec" },
   { index: 24, name: "PUSH_LINKED", length: 10, args: "ee" },
-  { index: 25, name: "IF_TWO_PLAYER", length: 2, args: "" },
+  // VIEW_WIDE, not IF_TWO_PLAYER. +0x005A26 is `cmpi.w #2,$e90(a5) / bne rts /
+  // jsr $3c52` — $E90 is OPTION RECORD 6 (the view mode) and $3C52 is the
+  // wide-screen setup, so the test is on a display option and not on the player
+  // count. The old name came from the shape of the handler alone; `mode-vm.ts`
+  // renamed it on the measurement and this document had kept the stale label.
+  // Dispatch is by number, so this is a document label only.
+  { index: 25, name: "VIEW_WIDE", length: 2, args: "" },
   { index: 26, name: "BALL_REMOVE", length: 6, args: "e" },
   { index: 27, name: "BALLS_UP_TO", length: 4, args: "w" },
   { index: 28, name: "WAIT", length: 10, args: "ewc" },
@@ -1685,6 +1716,27 @@ function decode(pkg, table) {
   const elementCounter = elementList.map((at) => counterIndexOf(follow(pkg, at, ELEMENT_COUNTER)));
   const comboCounter = comboCounterOf(pkg, counterIndexOf);
 
+  // AWARD EFFECT 17's CHAIN SCRIPT — the third reading of +$34, resolved through
+  // the script index this pass already owns. See `EFFECT_QUEUE_SCRIPT`.
+  //
+  // Refused rather than silently dropped: an effect-17 element whose +$34 is not
+  // a decoded script record would mean the handler's `jsr $6C10` posts something
+  // the queue would then try to interpret as bytecode, which is exactly the
+  // "a PROGRAM read as a data record" failure this exporter's preamble is about.
+  const elementChainScript = elementList.map((at) => {
+    if (readU16(pkg, at, ELEMENT_EFFECT) !== EFFECT_QUEUE_SCRIPT) return -1;
+    const target = follow(pkg, at, ELEMENT_COUNTER);
+    const found = target === null ? undefined : scriptIndex.get(key(target));
+    if (found === undefined) {
+      throw new Error(
+        `${pkg.stem}: effect-17 element at ${key(at)} points its +$34 at ` +
+          `${target === null ? "nothing" : key(target)}, which is not a script record; ` +
+          "award effect 17 queues that pointer through $6C10",
+      );
+    }
+    return found;
+  });
+
   // THE RAMPS, off the descriptor's list at +$68. Pooled the same way the
   // counters are, and indexed two ways: by the record itself (opcodes 15 and 16
   // name the base) and by BASE PLUS TWO (award effect 27's element +$38 names
@@ -1741,6 +1793,8 @@ function decode(pkg, table) {
     displayAward: messageIndex.get(keyOrNull(follow(pkg, at, ELEMENT_DISPLAY_AWARD))) ?? -1,
     counter: elementCounter[index],
     ladder: elementLadder[index],
+    // Award effect 17's follow-on record: the SAME +$34, as a script.
+    chainScript: elementChainScript[index],
     // THE RUNNING-STEP MACHINE. `stepAddend` is what effects 15 and 25 add to
     // and subtract from the counter's running step; `stepRamp` is the ramp
     // effect 27 harvests instead; `payCount` is effect 10's ask.

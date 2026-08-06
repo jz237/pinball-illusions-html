@@ -303,6 +303,82 @@ const EFFECT_COUNT_AND_PAY = 16;
 const EFFECT_COUNT_AND_ADD = 18;
 const EFFECT_ARM_WINDOW = 20;
 const EFFECT_ADVANCE_LADDER = 21;
+/**
+ * Award effect 17, handler 0x613A — QUEUE THE ELEMENT'S +$34 AS A SCRIPT.
+ *
+ * Twelve bytes, read out of the package rather than out of Capstone:
+ *
+ *     00613A  206a 0034            movea.l $34(a2),a0
+ *     00613E  4eb9 0000 6c10       jsr     $6C10
+ *     006144  4e75                 rts
+ *
+ * $6C10 is the same background-queue poster the lamp-group completion, the
+ * counter continuation and the ladder launch all use, so this is `queueScript`
+ * and nothing else — no counter, no accumulator, no extra score. The element's
+ * `counter` is -1 by construction (its +$34 is a script, not on the
+ * descriptor's counter list), which is why the exporter carries the target as
+ * `chainScript`.
+ */
+const EFFECT_QUEUE_SCRIPT = 17;
+/**
+ * Award effect 22, handler 0x6146 — LAUNCH THE LADDER ENTRY THE COUNT IS ON.
+ *
+ * Decoded here for the first time, from the raw words (Capstone drops the
+ * `d6.w*2` scale on both index reads and would show them as `$16(a0,d6.w)`):
+ *
+ *     006146  206a 0034            movea.l $34(a2),a0        ; the counter record
+ *     00614A  3030 6216            move.w  ($16,a0,d6.w*2),d0 ; the player's TOTAL
+ *     00614E  43e8 0050            lea     $50(a0),a1        ; the ladder table
+ *     006152  3211            L:   move.w  (a1),d1
+ *     006154  6b42                 bmi.s   $6198             ; $FFFE/$FFFF: nothing
+ *     006156  b041                 cmp.w   d1,d0
+ *     006158  653e                 bcs.s   $6198             ; total below this id
+ *     00615A  6706                 beq.s   $6162             ; EXACT MATCH
+ *     00615C  d2fc 000c            adda.w  #$C,a1            ; next 12-byte entry
+ *     006160  60f0                 bra.s   L
+ *     006162  0810 0002       HIT: btst    #$2,(a0)          ; flags bit 2
+ *     006166  6704                 beq.s   $616C
+ *     006168  8f29 0002            or.b    d7,$2(a1)         ; entry done for player
+ *     00616C  0810 0001            btst    #$1,(a0)          ; flags bit 1
+ *     006170  671c                 beq.s   $618E
+ *     006172  2029 0008            move.l  $8(a1),d0         ; the entry's LAMP
+ *     006176  6716                 beq.s   $618E
+ *     006178  2440                 movea.l d0,a2
+ *     00617A  0d92                 bclr    d6,(a2)
+ *     00617C  022a 00fd 0002       andi.b  #$FD,$2(a2)
+ *     006182  50ea 0001            st      $1(a2)
+ *     006186  422a 0003            clr.b   $3(a2)
+ *     00618A  422a 0004            clr.b   $4(a2)
+ *     00618E  2069 0004            movea.l $4(a1),a0         ; the entry's SCRIPT
+ *     006192  4eb9 0000 6c10       jsr     $6C10
+ *     006198  4e75                 rts
+ *
+ * It is the count dispatch's tail WITHOUT the count. Effect 6's body at 0x5E5A
+ * bumps and then walks (0x5EAA) and its own tail at 0x5E94..0x5EA6 is these
+ * same two acts — `btst #2,(a0) / or.b d7,$2(a1)` then `movea.l $4(a1),a0 /
+ * jsr $6C10` — and the lamp block at 0x6172 is the walk's own "entry already
+ * passed" body from 0x5ECE, byte for byte. So effect 22 READS the record and
+ * fires; it writes no count, no step and no accumulator.
+ *
+ * THREE THINGS IT IS NOT, all load-bearing:
+ *   - it does NOT bump. The pairing on every table is effect 21 (bump + walk,
+ *     result discarded) on one arm element and effect 22 (fire) on the other.
+ *   - it does NOT wrap. Running off the terminator is a plain `bmi` to `rts`;
+ *     only the shared walk at 0x5F26 subtracts the wrap word. Hence the
+ *     separate loop below instead of a `walkLadder` call.
+ *   - it does not consult the per-entry DONE flag before firing, though it may
+ *     set it (flags bit 2). This port models neither the flag nor the lamp
+ *     block — the same omission `walkLadder` already records — and neither can
+ *     change which script is queued on the firing award.
+ *
+ * The scope rule on the running-step OPCODES ("in iff its handler writes the
+ * step or the accumulator", `OP_LINK_RESTORE`) is untouched: that is about
+ * script opcode 22, a different dispatch. This is award effect 22, which was
+ * not excluded by any rule — it simply had no case and fell through to plain
+ * scoring, and the consequence was that the mission-milestone ladders (Law 'n
+ * Justice 8, BabeWatch 10, Extreme Sports 8) had no feeder at all.
+ */
+const EFFECT_LAUNCH_AT_COUNT = 22;
 const EFFECT_COUNT_DOWN = 24;
 const EFFECT_HOLD_MULTIPLIER = 8;
 const EFFECT_ADD_TIME = 23;
@@ -1572,6 +1648,30 @@ function walkLadder(modes: TableModes, state: ModeState, counterIndex: number, l
 }
 
 /**
+ * AWARD EFFECT 22's OWN WALK, main.seg00 0x6146 — fire, do not count.
+ *
+ * The loop the handler spells out: read the player's total, walk the ascending
+ * ids, stop on the terminator or on the first id ABOVE the total, and queue the
+ * script of an id that equals it exactly. Deliberately NOT `walkLadder`: that
+ * one is 0x5EAA, which subtracts the wrap word when it runs off the end, and
+ * this handler's `bmi.s $6198` just returns — a total past the last rung fires
+ * nothing rather than firing rung one again. See `EFFECT_LAUNCH_AT_COUNT`.
+ */
+function launchLadderAtCount(modes: TableModes, state: ModeState, counterIndex: number): void {
+  const counter = modes.counters[counterIndex];
+  const ladder = counter === undefined || counter.ladder < 0 ? undefined : modes.ladders[counter.ladder];
+  if (ladder === undefined) return;
+  const total = state.counterTotals[counterIndex] ?? 0;
+  for (const entry of ladder.entries) {
+    if (entry.id > total) return;
+    if (entry.id === total) {
+      queueScript(state, entry.script);
+      return;
+    }
+  }
+}
+
+/**
  * The body 0x5E5A and 0x5FA8 share, byte for byte down to their last branch.
  *
  *     movea.l $34(a2),a0
@@ -1699,9 +1799,9 @@ function payStep(state: ModeState, out: Accumulator, counterIndex: number): void
 }
 
 /**
- * The award-effect table at 0x5D0E. Six of its entries are decoded well
- * enough to run and all six matter — three for progression, three for the
- * end-of-ball bonus; the rest are left alone.
+ * The award-effect table at 0x5D0E, twenty-eight longwords. The entries below
+ * are decoded well enough to run and every one of them matters — progression,
+ * the chain, the end-of-ball bonus; the rest are left alone.
  *
  *    2, handler 0x6086 — HOLD BONUS. Its tail is `st.b $11(a0)` on the current
  *       player record (+0x00609E), and +$11 is the byte `$427C` tests before
@@ -1734,9 +1834,18 @@ function payStep(state: ModeState, out: Accumulator, counterIndex: number): void
  *       element's +$38 seconds. See the `EFFECT_COUNT_*` note for the whole
  *       machine and for the unwired remainder (10, 14 and the running-step
  *       mutators 15/25/27).
+ *   17, handler 0x613A — the CHAIN. `movea.l $34(a2),a0 / jsr $6C10`: the
+ *       element's +$34 read as a SCRIPT and posted to the background queue, so
+ *       the award pays and then runs a follow-on record. Thirty-four elements
+ *       across the three tables; see `EFFECT_QUEUE_SCRIPT`.
  *   21, handler 0x5FA8 — the LADDER. Steps the record and, when the count
- *       reaches the record's cap, queues its +$48 continuation ONCE. This is how
- *       a mission's later shots get armed at all.
+ *       reaches the record's cap, queues its +$48 continuation ONCE. Its tail
+ *       (0x5FDE) calls the walk and discards the result, so it moves the count
+ *       and the ladder's lamps but launches nothing.
+ *   22, handler 0x6146 — the LAUNCH. The walk WITHOUT the count: the entry
+ *       whose id equals the record's current total has its script queued. It is
+ *       effect 21's partner on every mission ARM pair, and it is what fires the
+ *       three mission-milestone ladders. See `EFFECT_LAUNCH_AT_COUNT`.
  *   24, handler 0x6220 — steps the same record BACK, and Law 'n Justice's
  *       element 82 is the corpus's one user: its counter 14 runs 3 up to 6.
  *   23, handler 0x6024 — ADD TIME to the running mode timer. Law 'n Justice's
@@ -1763,6 +1872,14 @@ function applyAwardEffect(
   }
   if (element.effect === EFFECT_HOLD_MULTIPLIER) {
     out.holdMultiplier = true;
+    return;
+  }
+  // 0x613A: the element's +$34 read as a SCRIPT and posted to the background
+  // queue. Outside the `counter >= 0` block on purpose — an effect-17 element's
+  // +$34 is not on the descriptor's counter list, so its `counter` is always -1
+  // and the chain would never be reached from in there.
+  if (element.effect === EFFECT_QUEUE_SCRIPT) {
+    if (element.chainScript >= 0) queueScript(state, element.chainScript);
     return;
   }
   // The counting and accumulator effects, all on the record the element's
@@ -1839,6 +1956,11 @@ function applyAwardEffect(
     }
     if (element.effect === EFFECT_ADVANCE_LADDER) {
       bumpCounter(modes, state, element.counter, false);
+      return;
+    }
+    if (element.effect === EFFECT_LAUNCH_AT_COUNT) {
+      // 0x6146: the count dispatch's tail without the count. See its constant.
+      launchLadderAtCount(modes, state, element.counter);
       return;
     }
     if (element.effect === EFFECT_COUNT_DOWN) {

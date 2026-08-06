@@ -717,10 +717,51 @@ const TICKS = 4000;
  * and this script never starts a mission, so no element carrying one is ever
  * awarded and no ramp is ever started. `tests/growing-jackpots.test.ts` is where
  * that half is measured.
+ *
+ * RE-PIN, AWARD EFFECTS 17 AND 22 (the chain-and-milestone round). ONE hash
+ * moved and the argument is again the two that did not.
+ *
+ * WHAT CHANGED. Two entries of the award-effect table at 0x5D0E that this port
+ * dispatched on and had no case for. Both were read out of
+ * `research/seg_clean/main.bin.seg00.bin` (file offset = address + 4) because
+ * Capstone drops the `d6.w*2` scale of a brief extension word and would have
+ * shown effect 22's two index reads as `$16(a0,d6.w)`:
+ *
+ *   17 @0x613A  206a 0034 / 4eb9 0000 6c10 / 4e75 — the element's +$34 QUEUED
+ *               as a script. Twelve bytes; thirty-four elements carry it.
+ *   22 @0x6146  the count dispatch's tail WITHOUT the count: read the player's
+ *               total at +$16, walk the ladder at +$50, queue the entry whose
+ *               id equals the total. No bump, no wrap.
+ *
+ * THE DIVERGENCE IS ONE EVENT AND ITS CONSEQUENCES. All 4,000 per-tick
+ * snapshots were dumped on this tree and on c622581 and compared field by
+ * field:
+ *
+ *   law-n-justice   0 of 4,000 ticks differ — hash UNMOVED.
+ *   extreme-sports  0 of 4,000 ticks differ — hash UNMOVED.
+ *   babewatch       FIRST DIVERGENT TICK 923, and on that tick the ONLY field
+ *                   that differs in the whole snapshot is `modeMessages`:
+ *                   `[]` -> `["GYM MODE ENABLED"]`. That is BabeWatch message
+ *                   1, the first instruction of script 82 — ladder 10 rung one,
+ *                   fired by the effect-22 award of element 15 when the ball
+ *                   reached the lock. Script 82 then `START`s element 21, the
+ *                   5,000,000 gym shot that could not be armed at all before.
+ *                   Tick 2148 is the first SCORE divergence and it is exactly
+ *                   that element: 2,282,340 -> 7,282,340, +5,000,000. Tick 2153
+ *                   is the first MISSION divergence: element 21's own effect-6
+ *                   award steps counter 4 to one, ladder 1 rung one launches
+ *                   script 120, and "JACKPOT VALUE TIME" runs for the first
+ *                   time in this port. Final score 3,532,340 -> 8,632,340.
+ *
+ * The two unmoved tables had to be unmoved: this script never reaches Law 'n
+ * Justice's jail lock (the only site that awards its effect-22 element 10) nor
+ * Extreme Sports' element 83, and neither table's effect-17 elements are
+ * awarded inside its window. A moved hash on either would have meant something
+ * else changed with them.
  */
 const PINNED: Record<TableId, string> = {
   "law-n-justice": "9038d64e08bd11116334e6e4e3f77009cad5968b64e585e952dcf7029afac3b9",
-  "babewatch": "3a34ce15ca448917b2a554bddc6ca725b3699a18badb95b388fe3064eebcd3b7",
+  "babewatch": "16e02ba974870dd3c768e5e687d1ad879e3a5a67107f575710f7b5585a3fd325",
   "extreme-sports": "88834d88e7b19b6d443d558bd840df8110c97dbf00573155b14a77f57922bf78",
 };
 

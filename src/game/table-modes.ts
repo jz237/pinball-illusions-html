@@ -176,6 +176,22 @@ export interface ModeElement {
    */
   readonly ladder: number;
   /**
+   * Award effect 17's CHAIN SCRIPT: an index into `TableModes.scripts`, or -1.
+   *
+   * The THIRD reading of +$34, and the one the shipped document could not
+   * express before. Effect 17's handler is twelve bytes at main.seg00
+   * +0x00613A — `movea.l $34(a2),a0 / jsr $6C10 / rts` — and $6C10 is the
+   * background queue poster, so the award pays the element's own score and then
+   * QUEUES ANOTHER SCRIPT. Nothing else: no counter, no accumulator.
+   *
+   * `counter` is -1 on every element that carries one, because the pointer is a
+   * script and not on the descriptor's counter list; that is the same overload
+   * `multiplier` documents for effect 5. Thirty-four elements across the three
+   * tables use it, and their targets are most of the substantive scripts the
+   * static audit could find no referrer for.
+   */
+  readonly chainScript: number;
+  /**
    * Award effects 15 and 25: the element's OWN six packed-BCD bytes at
    * +$3A..$3F, which +0x0060DC adds into and +0x0060B2 subtracts from the
    * counter record's RUNNING STEP. Zero for every other effect.
@@ -741,6 +757,9 @@ export function parseTableModesDocument(doc: TableModesDocument): TableModes {
         displayAward,
         counter: requireWholeNumber(item["counter"] ?? -1, `${where} counter`, -1, counters.length - 1),
         ladder: requireWholeNumber(item["ladder"] ?? -1, `${where} ladder`, -1, ladders.length - 1),
+        // Award effect 17's follow-on record. Bounded by `scriptCount` rather
+        // than by a parsed pool: the scripts are parsed below this loop.
+        chainScript: requireWholeNumber(item["chainScript"] ?? -1, `${where} chainScript`, -1, scriptCount - 1),
         stepAddend: requireWholeNumber(
           item["stepAddend"] ?? 0,
           `${where} stepAddend`,
