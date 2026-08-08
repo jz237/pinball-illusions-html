@@ -190,11 +190,15 @@ describe("a drain inside the window gives the ball back", () => {
       expect(saved.ballsServed, `${tableId} charged`).toBe(1);
       expect(saved.phase).toBe("in-play");
 
-      // The card is the display list at +0x004FAC, and it outranks the score.
+      // The card is the display list at +0x004FAC, four words and all:
+      // `00A0 0002 0001 0002` — CENTRED on x=160, row 2, the twelve-row face.
+      // And it carries NO SCORE: +0x004F50 clears the plane, prints its one
+      // record and returns without ever reaching `$71BA`. Film frame 545 of the
+      // full-game capture shows exactly that — the callout and no digit
+      // anywhere on the strip.
       expect(panelCardOf(game)).toEqual({
-        top: "DON'T MOVE",
-        bottom: null,
-        score: saved.score,
+        lines: [{ x: 160, row: 2, font: 1, align: 2, text: "DON'T MOVE" }],
+        score: null,
       });
 
       // And the ball really comes back and gets played again.

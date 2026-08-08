@@ -439,7 +439,13 @@ describe("the panel draws the machine's captions", () => {
       createPixelTarget(PANEL_WIDTH, PANEL_HEIGHT),
       0,
       FONT,
-      { top: "PLAYER 1", bottom: "BALL 1", score: 0 },
+      {
+        lines: [
+          { x: 0, row: 2, font: 4, align: 0, text: "PLAYER 1" },
+          { x: 0, row: 8, font: 4, align: 0, text: "BALL 1" },
+        ],
+        score: 0,
+      },
     );
     // The card's own top line starts at x=0 too, so the check is that the
     // BOTTOM half is written — the caption never writes there — which only the

@@ -307,8 +307,10 @@ describe("the end-of-ball PL card hold", () => {
     reachHold(drv);
     const card = panelCardOf(drv.game);
     expect(card).not.toBeNull();
-    expect(card?.top).toBe("PL 1");
-    expect(card?.bottom).toBeNull();
+    // The record at main.seg00 0x453C, geometry and all: `0000 0002 0001 0000`
+    // then "PL 0", whose '0' +0x0051EE patches with the player number — the
+    // TWELVE-row face, not the five-row caption one.
+    expect(card?.lines).toEqual([{ x: 0, row: 2, font: 1, align: 0, text: "PL 1" }]);
   });
 
   it("does not exist in a one-player game", () => {
@@ -368,19 +370,20 @@ describe("the first-serve player-count window", () => {
 
 describe("the PLAYER/BALL serve card", () => {
   it("says PLAYERS n while the count window is open, then PLAYER n / BALL m", () => {
+    // The records at 0x4AA2/0x4AB4/0x4AC6, whose four words are `X=0 ROW=2
+    // FONT=4 ALIGN=0` and `X=0 ROW=8 FONT=4 ALIGN=0`. ONE space before the
+    // digit, not two: `$6DD0` writes right-to-left from `-(a0)` and the digit
+    // lands on the record's last blank. Film measures the '1' of "PLAYER 1" at
+    // panel x=90, one blank advance past the R, and the '3' of "BALL 3" at 60.
+    const caption = (text: string) => ({ x: 0, row: 2, font: 4, align: 0, text });
+    const ball = (text: string) => ({ x: 0, row: 8, font: 4, align: 0, text });
     const drv = twoPlayerGame();
     runOutBallEnd(drv); // ball 1 served — window open
-    const first = panelCardOf(drv.game);
-    expect(first?.top).toBe("PLAYERS  2");
-    expect(first?.bottom).toBe("BALL  1");
+    expect(panelCardOf(drv.game)?.lines).toEqual([caption("PLAYERS 2"), ball("BALL 1")]);
     playOutBall(drv); // -> P2 ball 1
-    const second = panelCardOf(drv.game);
-    expect(second?.top).toBe("PLAYER  2");
-    expect(second?.bottom).toBe("BALL  1");
+    expect(panelCardOf(drv.game)?.lines).toEqual([caption("PLAYER 2"), ball("BALL 1")]);
     playOutBall(drv); // -> P1 ball 2
-    const third = panelCardOf(drv.game);
-    expect(third?.top).toBe("PLAYER  1");
-    expect(third?.bottom).toBe("BALL  2");
+    expect(panelCardOf(drv.game)?.lines).toEqual([caption("PLAYER 1"), ball("BALL 2")]);
   });
 
   it("goes away with the launch", () => {

@@ -593,10 +593,11 @@ async function boot(): Promise<void> {
    */
   let skin: ShellSkin | null = null;
   /**
-   * The small shell font (`font2`), for the score panel's score view — the
-   * font whose comma and digit advances are the 3 and 7 the original's own
-   * `300 - (3*commas + 7*digits)` column arithmetic sums. Read per frame by
-   * each table's `PanelDisplay`, which draws nothing until it arrives.
+   * The small shell font (`font2`), the score panel's FALLBACK face. The strip
+   * sets its score and its captions in the machine's own faces below; this is
+   * what a build with no derived assets draws instead, and the panel still
+   * draws nothing at all until it arrives, so the two arrive independently and
+   * neither blocks the other. Read per frame by each table's `PanelDisplay`.
    */
   let panelFont: ShellFont | null = null;
   /**

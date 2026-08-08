@@ -3559,29 +3559,77 @@ function missionLine(game: Game): string {
 }
 
 /**
- * A PLAYER/BALL card for the panel strip — the original's serve announcement
- * and the multi-player end-of-ball card, both drawn by `$73D0` display lists
- * on the same 320 x 16 strip (research/MULTIPLAYER_DECODE.md §5):
+ * One line of a card, as the machine's own print record spells it: the four
+ * words `$73D0` reads at +$0..+$6 and the ASCIIZ text behind them. Structurally
+ * `panel-renderer.ts`'s `PanelMessageLine`, declared here so the loop and the
+ * renderer stay independent — the same twinning as `BonusView`.
+ */
+export interface PanelCardLine {
+  readonly x: number;
+  readonly row: number;
+  readonly font: number;
+  readonly align: number;
+  readonly text: string;
+}
+
+/**
+ * A CARD for the panel strip — the serve announcement, the multi-player
+ * end-of-ball card and the ball-save callout, all three `$73D0` display lists
+ * on the same 320 x 16 strip (research/MULTIPLAYER_DECODE.md §5). The records
+ * are read out of main.seg00 and carried verbatim, geometry and all:
  *
- *   serve (state 5, +0x0049FE..+0x004A5E): "PLAYER  n" left at x=0 on the top
- *   text row — or "PLAYERS  n", the COUNT, while the first-serve adjust window
- *   is open (`$d7c`) — "BALL  m" left at x=0 on the bottom row, and the
- *   incoming player's score right-aligned at x=320 (`$7198`).
+ *   serve (state 5, +0x0049FE..+0x004A5E): 0x4AA2 `0000 0002 0004 0000
+ *   "PLAYER  "` — left at x=0, ROW 2, the FIVE-ROW face — or 0x4AB4
+ *   `"PLAYERS  "`, the COUNT, while the first-serve adjust window is open
+ *   (`$d7c`); 0x4AC6 `"BALL  "` at ROW 8; and the incoming player's score
+ *   through `$7198`.
  *
- *   ball end (`$5136`'s tail, +0x0051E6..+0x005216): "PL n" and the outgoing
- *   score at the same x=320, held 75 frames when more than one player is in
- *   the game.
+ *   ball end (`$5136`'s tail, +0x0051E6..+0x005216): 0x453C `0000 0002 0001
+ *   0000 "PL 0"` — the TWELVE-ROW face, its digit patched in at +0x0051EE —
+ *   and the outgoing score through the same six words inlined at +0x005206.
+ *   Held 75 frames when more than one player is in the game.
+ *
+ *   ball save (state 6, +0x004F50..+0x004F8C): 0x4FAC `00A0 0002 0001 0002
+ *   "DON'T MOVE"` — CENTRED on x=160, twelve-row face — and NOTHING ELSE. That
+ *   state prints its record and returns; it never reaches `$71BA`, so there is
+ *   no score on the strip while it is up, which is what film frame 545 of the
+ *   full-game capture shows.
  *
  * Plain data, derived from the game by `panelCardOf` and handed to the panel
  * presenter by the renderer, exactly as the bonus view travels.
  */
 export interface PanelCard {
-  /** "PLAYER  n", "PLAYERS  n" or "PL n" — the top text row, left at x=0. */
-  readonly top: string;
-  /** "BALL  m", or null for the end-of-ball card's single line. */
-  readonly bottom: string | null;
-  /** The score right-aligned at x=320 — `move.w #$140,d3`, both routines. */
-  readonly score: number;
+  /** The card's print records, in the order the machine draws them. */
+  readonly lines: readonly PanelCardLine[];
+  /** The score `$7198` prints for this card, or null for a card that has none. */
+  readonly score: number | null;
+}
+
+/** ROW 2 and ROW 8: the two text rows every card record names. */
+const CARD_TOP_ROW = 2;
+const CARD_BOTTOM_ROW = 8;
+/** FONT 4 is the five-row caption face; FONT 1 the twelve-row one. */
+const CARD_CAPTION_FONT = 4;
+const CARD_LARGE_FONT = 1;
+
+/**
+ * The machine's own `$6DD0`, which is what decides how many spaces a caption
+ * really has.
+ *
+ * It writes the decimal digits RIGHT TO LEFT — `move.b d1,-(a0)` at 0x6E2A,
+ * 0x6E38 and 0x6E46 — so the pointer it is handed is ONE PAST the last digit
+ * and the digits EAT the record's trailing blanks. `lea $4AB2,a0` is index 8 of
+ * `"PLAYER  "`, so a one-digit player number lands on the SECOND space and the
+ * strip reads "PLAYER 1", not "PLAYER  1". Film confirms it twice over: on the
+ * session-5 still the '1' is at panel x=90 and the '3' of "BALL 3" at x=60,
+ * which is one blank advance (8 px) past each caption's last letter and not
+ * two. Reproduced by overwriting the record's tail rather than by hard-coding
+ * one space, so a two-digit value eats both blanks exactly as the machine's
+ * does.
+ */
+function cardCaption(record: string, value: number): string {
+  const digits = String(value);
+  return record.slice(0, Math.max(0, record.length - digits.length)) + digits;
 }
 
 /** The card the panel should carry this frame, or null for the normal views. */
@@ -3593,20 +3641,46 @@ export function panelCardOf(game: Game): PanelCard | null {
   // "DON'T MOVE". It outranks the score for the same reason the PLAYER/BALL
   // card does: `jsr $6B06` wipes the plane ahead of it every frame.
   if (game.ballSaving) {
-    return { top: "DON'T MOVE", bottom: null, score: readBcdField(game.scoring.score) };
+    return {
+      lines: [{ x: 160, row: CARD_TOP_ROW, font: CARD_LARGE_FONT, align: 2, text: "DON'T MOVE" }],
+      score: null,
+    };
   }
   if (game.endHoldTicks > 0) {
     return {
-      top: `PL ${game.activePlayer + 1}`,
-      bottom: null,
+      lines: [
+        {
+          x: 0,
+          row: CARD_TOP_ROW,
+          font: CARD_LARGE_FONT,
+          align: 0,
+          text: cardCaption("PL 0", game.activePlayer + 1),
+        },
+      ],
       score: readBcdField(game.scoring.score),
     };
   }
   if (!game.announcingServe || game.laneBallId === null) return null;
   const adjusting = !game.playersLocked && game.ballsServed <= 1;
   return {
-    top: adjusting ? `PLAYERS  ${game.playerCount}` : `PLAYER  ${game.activePlayer + 1}`,
-    bottom: `BALL  ${Math.max(1, ballNumber(game))}`,
+    lines: [
+      {
+        x: 0,
+        row: CARD_TOP_ROW,
+        font: CARD_CAPTION_FONT,
+        align: 0,
+        text: adjusting
+          ? cardCaption("PLAYERS  ", game.playerCount)
+          : cardCaption("PLAYER  ", game.activePlayer + 1),
+      },
+      {
+        x: 0,
+        row: CARD_BOTTOM_ROW,
+        font: CARD_CAPTION_FONT,
+        align: 0,
+        text: cardCaption("BALL  ", Math.max(1, ballNumber(game))),
+      },
+    ],
     score: readBcdField(game.scoring.score),
   };
 }

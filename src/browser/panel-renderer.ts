@@ -37,14 +37,40 @@
  * integrator wires it into `game-loop.ts`.
  *
  * ---------------------------------------------------------------------------
- * THE SCORE COLUMN AND GROUPING ARE THE ORIGINAL'S OWN ARITHMETIC
+ * THE SCORE VIEW IS ONE ROUTINE, `$7198`, AND IT IS FULLY DECODED
  * ---------------------------------------------------------------------------
- * The high-score template at main hunk-0 0x1836 computes its score column as
- * `300 - (3*commas + 7*digits)` — right-aligned at x = 300, digits grouped in
- * threes with commas, 3 and 7 being the small font's comma and digit
- * advances. `PANEL_SCORE_RIGHT_X` and `formatPanelScore` reproduce that sum
- * (via `alignShellText`, which sums the same advance table), so the score
- * sits where the original's own layout arithmetic puts it.
+ * Four rounds carried the score view on the shell font at x = 300 because the
+ * only score column anyone had decoded was the HIGH-SCORE LADDER's — the
+ * template at main hunk-0 0x1836, whose `300 - (3*commas + 7*digits)` sum
+ * belongs to a shell screen and never touched this strip. The strip's own
+ * routine is `$7198` and it sets every field of the print itself:
+ *
+ *     007198  move.w #$140,d3   ; X          = 320, the strip's right edge
+ *     00719E  move.w #$2,d4     ; ROW        = 2
+ *     0071A2  move.w #$1,d5     ; FONT       = 1, the twelve-row face
+ *     0071A6  move.w #$1,d6     ; ALIGN      = 1, RIGHT
+ *     0071AA  movea.l $DC2(a5),a0 / addq.w #$8,a0
+ *     0071B0  tst.w -$6(a0) / beq / addq.w #$2,d5   ; FONT 3 when the score's
+ *     0071BA  ...                                   ; top BCD word is set
+ *
+ * and falls into the number printer at `$71BA`. Its two callers are the whole
+ * story: `+0x006744`, the display interpreter's idle branch — no record, no
+ * animation, so the strip shows the score — and `+0x004A5E`, the serve card.
+ * The end-of-ball card at `+0x005206` is the same six words inlined. There is
+ * no second alignment on this strip and never was: **both views right-align at
+ * 320**, and the "different routines, worth a look" note that has been on the
+ * record since session 5 resolves to one routine called twice.
+ *
+ * MEASURED, NOT INFERRED. `panel_bits` over the native 752x574 captures reads
+ * the machine's own 320x16 bitmap back out (panel column c is screen columns
+ * 94+2c, panel row r is screen rows 26+4r), and this port's face table plus
+ * these coordinates reproduce FIVE independent frames with ZERO differing
+ * pixels of 5,120: the session-5 PLAYER/BALL still (score 2,375,000), two
+ * serve frames whose score is a single `0` at x 304..319, and film frames 700
+ * and 3240 of the full-game capture (675,000 and 1,425,000). Frame 3240 is the
+ * film-compare gate's own law-n-justice reference frame — whose crop starts at
+ * screen row 94, below the panel band, which is why THAT gate cannot see any
+ * of this.
  */
 
 import { PANEL_AMBER, PANEL_UNLIT, PANEL_WHITE } from "./palette.js";
@@ -75,10 +101,37 @@ export const PANEL_HEIGHT = 16;
 export const PANEL_QUEUE_CAPACITY = 64;
 
 /**
- * Where the score's right edge sits: the hunk-0 0x1836 template's own
- * column, `300 - width` on a 320-px line.
+ * Where the score's right edge sits: `move.w #$140,d3` — the strip's own right
+ * edge, in `$7198` (idle and serve) and in the end-of-ball copy at +0x005206
+ * alike. Film: the last set column of a right-aligned score is 318 on every
+ * frame measured, which is 320 with the face's own `#.` dither.
  */
-export const PANEL_SCORE_RIGHT_X = 300;
+export const PANEL_SCORE_RIGHT_X = 320;
+
+/** `move.w #$2,d4`: the score's top scanline on the sixteen-row strip. */
+export const PANEL_SCORE_ROW = 2;
+
+/**
+ * `move.w #$1,d5`: the twelve-row face, and `addq.w #$2,d5` at 0x71B6 makes it
+ * face 3 — twelve rows on a twelve-pixel cell instead of sixteen — when
+ * `tst.w -$6(a0)` finds the score's TOP BCD word set. That word carries digits
+ * nine and up, so the machine narrows the face exactly when the number stops
+ * fitting. The inlined end-of-ball copy skips the test and is always face 1.
+ */
+export const PANEL_SCORE_FONT = 1;
+export const PANEL_SCORE_NARROW_FONT = 3;
+
+/** The score at which `tst.w -$6(a0)` first sees a digit: 1e8, the ninth. */
+export const PANEL_SCORE_NARROW_FROM = 100_000_000;
+
+/**
+ * `$73D0`'s alignment word, 0x740A-0x7416: it tests 0, then 1, then falls
+ * through, so anything else centres. `$71BA`'s test at 0x71EE is written back to
+ * front — its `d3` is the pen's RIGHT edge — and lands on the same three
+ * meanings; see `PanelMessageFigure`.
+ */
+export const PANEL_ALIGN_LEFT = 0;
+export const PANEL_ALIGN_RIGHT = 1;
 
 // ---------------------------------------------------------------------------
 // The data a decoder hands us
@@ -257,17 +310,23 @@ export function panelIsIdle(state: PanelState): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Score formatting — the ladder template's grouping
+// Score formatting — `$71BA`'s own grouping
 // ---------------------------------------------------------------------------
 
 /**
  * The score as the panel prints it: decimal digits grouped in threes with
- * commas, the exact string shape the 0x1836 template's
- * `3*commas + 7*digits` width sum implies. The score is stored packed-BCD in
- * the original and in `scoring.ts`; it arrives here already read out as a
- * number (`currentScore`), so grouping decimal digits IS grouping the BCD
- * digits. Negative and fractional inputs are a caller bug, refused rather
- * than rounded into a plausible-looking lie.
+ * commas, which is `$71BA`'s own shape. It emits digits right to left off the
+ * BCD field's low nibble and inserts glyph $0C — a comma, the map being indexed
+ * by `ASCII - $20` — on every mask bit of `0x24924924`, whose set bits are 2, 5,
+ * 8 ... so a comma falls between groups of three and never leads. 0x723A stops
+ * the loop the moment the shifted value is zero, so there are no leading zeros
+ * and a score of zero is the single digit `0` — which is what the two filmed
+ * serve frames show.
+ *
+ * The score is stored packed-BCD in the original and in `scoring.ts`; it
+ * arrives here already read out as a number (`currentScore`), so grouping
+ * decimal digits IS grouping the BCD digits. Negative and fractional inputs are
+ * a caller bug, refused rather than rounded into a plausible-looking lie.
  */
 export function formatPanelScore(score: number): string {
   if (!Number.isSafeInteger(score) || score < 0) {
@@ -377,17 +436,21 @@ function drawText(
 }
 
 /**
- * The glyph-box top that centres the font's digit block in the 16 panel
- * rows. Computed from the '0' glyph — the score view is digits and commas,
- * and every digit shares one metric row — rather than hard-coded, so the
- * same arithmetic holds for the shipped font and for any test double.
+ * The glyph-box top for the score in the SHELL-FONT FALLBACK.
+ *
+ * The machine's own row, used literally, which is the one place in the fallback
+ * that is possible: `move.w #$2,d4` puts the score's top row at 2, and an
+ * eight-row font at row 2 ends at row 9 and FITS the sixteen-row strip. A
+ * caption at the machine's row 9 would not — that is why `messagePenY` maps
+ * captions onto halves and the score does not need to be mapped at all.
+ *
+ * Computed off the '0' glyph's own y-offset — the score is digits and commas
+ * and every digit shares one metric row — rather than hard-coded, so the same
+ * arithmetic holds for the shipped font and for any test double.
  */
 function scorePenY(font: ShellFont): number {
   const zero = font.glyphs["0".charCodeAt(0)];
-  if (zero === undefined || zero.height === 0) {
-    return 0;
-  }
-  return Math.floor((PANEL_HEIGHT - zero.height) / 2) - zero.yOffset;
+  return PANEL_SCORE_ROW - (zero?.yOffset ?? 0);
 }
 
 /**
@@ -566,8 +629,8 @@ function messagePenY(font: ShellFont, row: number): number {
  * tests `0`, then `1`, then falls through, so anything else centres.
  */
 function messageAlign(align: number): "left" | "right" | "center" {
-  if (align === 0) return "left";
-  if (align === 1) return "right";
+  if (align === PANEL_ALIGN_LEFT) return "left";
+  if (align === PANEL_ALIGN_RIGHT) return "right";
   return "center";
 }
 
@@ -605,13 +668,32 @@ function drawPanelLine(
 }
 
 /**
- * A record's text and figures.
+ * ONE PRINT RECORD'S LINE, in the machine's face when there is one.
  *
  * `panelFont` is the machine's own six-face table and is used when it has
  * arrived; until then — and in any build that ships no derived assets — the
- * caption falls back to the shell font on the two halves `messagePenY` picks,
+ * line falls back to the shell font on the two halves `messagePenY` picks,
  * which is exactly what this port drew before the face table was extracted.
+ * Shared by the display records, the PLAYER/BALL card and the ball-save
+ * callout, because on the machine all three are the same `$73D0` call on the
+ * same four words.
  */
+function drawRecordLine(
+  target: PixelTarget,
+  font: ShellFont,
+  panelFont: PanelFont | null,
+  line: PanelMessageLine,
+): void {
+  if (line.text.length === 0) return;
+  if (panelFont !== null) {
+    drawPanelLine(target, panelFace(panelFont, line.font), line.text, line.x, line.row, line.align);
+    return;
+  }
+  const penX = alignShellText(font, line.text, line.x, messageAlign(line.align));
+  drawText(target, font, line.text, penX, messagePenY(font, line.row), PANEL_AMBER, PANEL_WHITE);
+}
+
+/** A record's text and figures. */
 function drawMessage(
   target: PixelTarget,
   font: ShellFont,
@@ -619,68 +701,85 @@ function drawMessage(
   panelFont: PanelFont | null,
 ): void {
   for (const line of message.lines) {
-    if (line.text.length === 0) continue;
-    if (panelFont !== null) {
-      drawPanelLine(target, panelFace(panelFont, line.font), line.text, line.x, line.row, line.align);
-      continue;
-    }
-    const penX = alignShellText(font, line.text, line.x, messageAlign(line.align));
-    drawText(target, font, line.text, penX, messagePenY(font, line.row), PANEL_AMBER, PANEL_WHITE);
+    drawRecordLine(target, font, panelFont, line);
   }
   for (const figure of message.figures ?? []) {
-    const text = formatPanelFigure(figure.value);
-    if (panelFont !== null) {
-      drawPanelLine(
-        target,
-        panelFace(panelFont, figure.font),
-        text,
-        figure.x,
-        figure.row,
-        figure.align,
-      );
-      continue;
-    }
-    const penX = alignShellText(font, text, figure.x, messageAlign(figure.align));
-    drawText(target, font, text, penX, messagePenY(font, figure.row), PANEL_AMBER, PANEL_WHITE);
+    drawRecordLine(target, font, panelFont, { ...figure, text: formatPanelFigure(figure.value) });
   }
 }
 
 /**
- * The PLAYER/BALL card — the serve announcement (state 5) and the
- * multi-player end-of-ball "PL n" card. Structurally `game-loop.ts`'s
- * `PanelCard`, declared here the way `PanelBonusView` twins `BonusView`, so
- * the renderer never imports the loop.
+ * THE SCORE VIEW — `$7198`, and the six words inlined at +0x005206.
+ *
+ * Face 1 (or face 3 once the top BCD word carries a digit), top row 2,
+ * right-aligned on the strip's own edge at 320. See the file header for the
+ * register-by-register decode and the five frames it reproduces exactly.
+ *
+ * The fallback is the shell font on `scorePenY`'s centred rows at the same
+ * x = 320: the EDGE is a property of the routine and not of the face, so a
+ * build with no derived assets gets the machine's column even though it cannot
+ * get the machine's alphabet.
+ */
+function drawScoreView(
+  target: PixelTarget,
+  font: ShellFont,
+  panelFont: PanelFont | null,
+  score: number,
+): void {
+  const text = formatPanelScore(score);
+  if (panelFont !== null) {
+    const face = score >= PANEL_SCORE_NARROW_FROM ? PANEL_SCORE_NARROW_FONT : PANEL_SCORE_FONT;
+    drawPanelLine(
+      target,
+      panelFace(panelFont, face),
+      text,
+      PANEL_SCORE_RIGHT_X,
+      PANEL_SCORE_ROW,
+      PANEL_ALIGN_RIGHT,
+    );
+    return;
+  }
+  const penX = alignShellText(font, text, PANEL_SCORE_RIGHT_X, "right");
+  drawText(target, font, text, penX, scorePenY(font), PANEL_AMBER, PANEL_WHITE);
+}
+
+/**
+ * A CARD — the serve announcement, the end-of-ball "PL n" and the ball-save
+ * callout. Structurally `game-loop.ts`'s `PanelCard`, declared here the way
+ * `PanelBonusView` twins `BonusView`, so the renderer never imports the loop.
+ *
+ * `lines` are the machine's own print records, geometry and all, because all
+ * three cards ARE print records and their four words differ:
+ *
+ *     0x4AA2  X=0    ROW=2  FONT=4  ALIGN=0   "PLAYER  "   +0x0049FE serve
+ *     0x4AB4  X=0    ROW=2  FONT=4  ALIGN=0   "PLAYERS  "  the count window
+ *     0x4AC6  X=0    ROW=8  FONT=4  ALIGN=0   "BALL  "
+ *     0x453C  X=0    ROW=2  FONT=1  ALIGN=0   "PL 0"       +0x0051F4 ball end
+ *     0x4FAC  X=160  ROW=2  FONT=1  ALIGN=2   "DON'T MOVE" +0x004F86 ball save
+ *
+ * — three faces, two rows and two alignments between them, which is why the
+ * geometry travels with the text instead of being assumed here.
+ *
+ * `score` is null on a card that draws none: the ball-save state at +0x004F50
+ * clears the plane, prints its one record and returns without ever reaching
+ * `$71BA`, and film frame 545 of the full-game capture shows exactly that —
+ * "DON'T MOVE" centred on row 2 and no digit anywhere on the strip.
  */
 export interface PanelCardView {
-  readonly top: string;
-  readonly bottom: string | null;
-  readonly score: number;
+  readonly lines: readonly PanelMessageLine[];
+  readonly score: number | null;
 }
 
-/**
- * The card's columns, the machine's own display lists
- * (research/MULTIPLAYER_DECODE.md §5): both captions LEFT-aligned at x=0
- * ("PLAYER  n" / "PLAYERS  n" on the top text row, "BALL  m" on the bottom
- * one — y=2 and y=8 of the machine's five-row panel font, mapped onto this
- * font's two halves exactly as the bonus rows are), and the score
- * RIGHT-ALIGNED AT X=320: `move.w #$140,d3` in both `$7198` (the serve view)
- * and the ball-end draw at +0x005206 — the edge session 5 measured at panel
- * x319. Deliberately not `PANEL_SCORE_RIGHT_X` (300): that column is the
- * ladder template's, and this card is the one place the machine's own x is
- * decoded for the strip.
- */
-const CARD_LEFT_X = 0;
-const CARD_SCORE_RIGHT_X = 320;
-
-function drawCard(target: PixelTarget, font: ShellFont, card: PanelCardView): void {
-  const top = bonusPenY(font, 0);
-  drawText(target, font, card.top, CARD_LEFT_X, top, PANEL_AMBER, PANEL_WHITE);
-  if (card.bottom !== null && card.bottom.length > 0) {
-    drawText(target, font, card.bottom, CARD_LEFT_X, bonusPenY(font, 1), PANEL_AMBER, PANEL_WHITE);
+function drawCard(
+  target: PixelTarget,
+  font: ShellFont,
+  panelFont: PanelFont | null,
+  card: PanelCardView,
+): void {
+  for (const line of card.lines) {
+    drawRecordLine(target, font, panelFont, line);
   }
-  const text = formatPanelScore(card.score);
-  const penX = alignShellText(font, text, CARD_SCORE_RIGHT_X, "right");
-  drawText(target, font, text, penX, top, PANEL_AMBER, PANEL_WHITE);
+  if (card.score !== null) drawScoreView(target, font, panelFont, card.score);
 }
 
 function drawBonus(target: PixelTarget, font: ShellFont, bonus: PanelBonusView): void {
@@ -707,11 +806,11 @@ function drawBonus(target: PixelTarget, font: ShellFont, bonus: PanelBonusView):
  * Renders the panel for a playback state into a 320 x 16 target.
  *
  * An animation on screen draws its current frame's two planes; an idle queue
- * draws the score view — the plane-2 equivalent: `formatPanelScore(score)`
- * right-aligned at the template's x = 300 column in the given shell font,
- * amber fill over white outline on the unlit glass. The target must be
- * exactly panel-sized, the same 1:1 contract as `renderPlayfieldInto`, and
- * nothing is ever written outside it. Returns the target for convenience.
+ * draws the score view — `$7198`: `formatPanelScore(score)` in the machine's
+ * twelve-row face, top row 2, right-aligned on the strip's own edge at 320.
+ * The target must be exactly panel-sized, the same 1:1 contract as
+ * `renderPlayfieldInto`, and nothing is ever written outside it. Returns the
+ * target for convenience.
  *
  * `bonus` OUTRANKS BOTH OF THEM, because the machine's does: `$5136` calls
  * `$6B06` — which zeroes the whole text plane — immediately before and after the
@@ -752,7 +851,7 @@ export function renderPanelInto(
     return target;
   }
   if (card !== undefined && card !== null) {
-    drawCard(target, font, card);
+    drawCard(target, font, panelFont ?? null, card);
     return target;
   }
   const frame = currentPanelFrame(state);
@@ -785,13 +884,25 @@ export function renderPanelInto(
     return target;
   }
 
-  const text = formatPanelScore(score);
-  const penX = alignShellText(font, text, PANEL_SCORE_RIGHT_X, "right");
-  drawText(target, font, text, penX, scorePenY(font), PANEL_AMBER, PANEL_WHITE);
+  drawScoreView(target, font, panelFont ?? null, score);
   return target;
 }
 
 /** Renders into a freshly allocated panel-sized target. */
-export function renderPanel(state: PanelState, score: number, font: ShellFont): PixelTarget {
-  return renderPanelInto(state, score, font, createPixelTarget(PANEL_WIDTH, PANEL_HEIGHT));
+export function renderPanel(
+  state: PanelState,
+  score: number,
+  font: ShellFont,
+  panelFont?: PanelFont | null,
+): PixelTarget {
+  return renderPanelInto(
+    state,
+    score,
+    font,
+    createPixelTarget(PANEL_WIDTH, PANEL_HEIGHT),
+    null,
+    null,
+    null,
+    panelFont ?? null,
+  );
 }
