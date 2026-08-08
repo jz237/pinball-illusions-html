@@ -30,20 +30,28 @@ import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { PanelDisplay } from "../src/browser/panel-display.js";
-import { PANEL_HEIGHT, PANEL_WIDTH, currentPanelFrame } from "../src/browser/panel-renderer.js";
+import {
+  PANEL_HEIGHT,
+  PANEL_WIDTH,
+  currentPanelFrame,
+  formatPanelFigure,
+} from "../src/browser/panel-renderer.js";
 import { createPixelTarget } from "../src/browser/playfield-renderer.js";
 import { parseTablePanelDocument } from "../src/game/table-panel.js";
 import type { TablePanel, TablePanelDocument } from "../src/game/table-panel.js";
 import { FONT_ATLAS_WIDTH, shellFontFrom } from "../src/game/shell-art.js";
 import type { ShellFont } from "../src/game/shell-art.js";
 import type { IndexedImage } from "../src/game/table-art.js";
-import type { GameTickReport } from "../src/browser/game-loop.js";
+import type { DisplayValues, GameTickReport } from "../src/browser/game-loop.js";
 import type { ModeMessage } from "../src/game/table-modes.js";
 import { TABLE_IDS } from "../src/game/contracts.js";
 import type { TableId } from "../src/game/contracts.js";
 import { modesFor } from "./table-fixtures.js";
+import { parsePanelFontDocument } from "../src/game/panel-font.js";
+import type { PanelFont, PanelFontDocument } from "../src/game/panel-font.js";
 
 const TABLES_DIR = fileURLToPath(new URL("../public/generated/tables/", import.meta.url));
+const GENERATED_DIR = fileURLToPath(new URL("../public/generated/", import.meta.url));
 
 const PANEL: TablePanel = parseTablePanelDocument(
   JSON.parse(readFileSync(`${TABLES_DIR}law-n-justice.panel.json`, "utf8")) as TablePanelDocument,
@@ -93,6 +101,7 @@ function reportAt(tick: number, over: Partial<GameTickReport> = {}): GameTickRep
     bonus: null,
     flipperRaised: [],
     flipperRested: [],
+    displayValues: live(),
     ...over,
   };
 }
@@ -104,8 +113,33 @@ function message(
   holdTicks: number,
   priority = 64,
   priority2 = 0,
+  over: Partial<ModeMessage> = {},
 ): ModeMessage {
-  return { index, lines, layout, holdTicks, priority, priority2 };
+  return {
+    index,
+    lines,
+    layout,
+    values: [],
+    latched: false,
+    holdTicks,
+    priority,
+    priority2,
+    ...over,
+  };
+}
+
+/** A live-value channel with the fields a test wants and zeros elsewhere. */
+function live(over: Partial<DisplayValues> = {}): DisplayValues {
+  return {
+    score: 0,
+    missionSeconds: 0,
+    counterAccumulators: [],
+    counterSteps: [],
+    counterCounts: [],
+    rampValues: [],
+    rampPaid: [],
+    ...over,
+  };
 }
 
 /**
@@ -381,9 +415,10 @@ describe("the panel draws the machine's captions", () => {
 
   it("shows nothing for a record with no text and nothing for a zero hold", () => {
     // 114 of the 288 records print no words at all — they are the pure
-    // animation and live-value programs — and 35 more print and END on the same
-    // frame, which is the machine re-posting a status screen by a route this
-    // port has not decoded. Neither takes the strip.
+    // animation programs — and a record whose hold is zero and whose latch bit
+    // is clear prints and ENDs on the same frame with nothing to re-post it.
+    // Neither takes the caption channel. (Every zero-hold record in the SHIPPED
+    // corpus does carry the latch bit; see the latch tests below.)
     const [a, b] = QUIET_THREE;
     const records = blanks(Math.max(a, b) + 1);
     records[a] = message(a, [], [], 100);
@@ -417,5 +452,299 @@ describe("the panel draws the machine's captions", () => {
       }
     }
     expect(bottom).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// THE LIVE-VALUE OPCODES
+// ---------------------------------------------------------------------------
+
+describe("the figures a display record prints", () => {
+  it("names a decoded field for every live-value opcode but two, and says which", () => {
+    // Six of the 26 display opcodes print a figure. Which field each one reads
+    // is the address it points at, because both number printers read BACKWARDS
+    // from the pointer: `$71BA` takes the six BCD bytes below it (0x72CA tests
+    // `-$6(a0)`, 0x72D0 loads `-$4(a0)`) and `$716E` the word at `-$2(a0)`. So a
+    // pointer is always one past the end of a record's value slot, and the
+    // classification is exact rather than a guess.
+    //
+    // Counted off the packages by research/display-text/probe-values.mjs.
+    const expected: Record<TableId, Record<string, number>> = {
+      "law-n-justice": {
+        counterAccumulator: 13,
+        counterCount: 3,
+        counterStep: 1,
+        missionSeconds: 11,
+        rampPaid: 6,
+        rampValue: 2,
+        score: 10,
+        unknown: 2,
+      },
+      "babewatch": {
+        counterStep: 13,
+        elementScore: 5,
+        missionSeconds: 10,
+        rampPaid: 5,
+        rampValue: 1,
+        score: 7,
+      },
+      "extreme-sports": {
+        counterAccumulator: 1,
+        counterCount: 1,
+        counterStep: 12,
+        elementScore: 6,
+        missionSeconds: 17,
+        rampPaid: 6,
+        rampValue: 8,
+        score: 8,
+      },
+    };
+    let unknown = 0;
+    for (const tableId of TABLE_IDS) {
+      const modes = modesFor(tableId);
+      const histogram: Record<string, number> = {};
+      for (const record of modes.messages) {
+        for (const value of record.values) {
+          histogram[value.source] = (histogram[value.source] ?? 0) + 1;
+          if (value.source === "unknown") unknown += 1;
+          // Every source that needs an index has one that reaches its pool.
+          if (value.source === "counterAccumulator" || value.source === "counterStep") {
+            expect(modes.counters[value.index]).toBeDefined();
+          }
+          if (value.source === "rampValue" || value.source === "rampPaid") {
+            expect(modes.ramps[value.index]).toBeDefined();
+          }
+          if (value.source === "elementScore") {
+            expect(modes.elements[value.index]?.score).toBe(value.value);
+          }
+        }
+      }
+      expect(histogram).toEqual(expected[tableId]);
+    }
+    // THE ONLY TWO THIS DECODE REFUSES, and they are the same field twice: Law
+    // 'n Justice's "YOU SHOT 00 BAD GUYS" and "EXCELLENT" records print six
+    // bytes of a NATIVE scratch record at h4+0x8900 that the table's own 68000
+    // code at h4+0x85F8 clears and this port does not run. Approximating them
+    // would be inventing a figure, so nothing is drawn for them.
+    expect(unknown).toBe(2);
+  });
+
+  it("puts the figure the caption is about on the strip beside it", () => {
+    // A "BUMPER VALUE"-shaped record: the caption on the machine's row 2 and
+    // `counterAccumulator` on its row 9. The value's own x/row/font/align are
+    // the four words after the opcode — `movem.w $6(a1),d3-d6`.
+    const [a] = QUIET_THREE;
+    const records = blanks(a + 1);
+    records[a] = message(a, ["BUMPER VALUE"], [{ x: 160, row: 2, font: 4, align: 2 }], 100, 64, 0, {
+      values: [
+        { source: "counterAccumulator", index: 3, value: 0, x: 160, row: 9, font: 4, align: 2 },
+      ],
+    });
+    const display = new PanelDisplay(PANEL, () => FONT, undefined, records);
+    const counters = [0, 0, 0, 750_000];
+    display.observe(
+      reportAt(0, { messagesShown: [a], displayValues: live({ counterAccumulators: counters }) }),
+    );
+    const { rows } = marks(display);
+    expect(rows.some((row) => row < 8), "the caption is on the top half").toBe(true);
+    expect(rows.some((row) => row >= 8), "the figure is on the bottom half").toBe(true);
+  });
+
+  it("groups a figure in threes the way the machine's own comma does", () => {
+    // 0x72E0's `lsr.l #$1,d7` on 0x24924924 sets the carry every third digit,
+    // and glyph $0C is a COMMA because the character map at 0x743C is indexed
+    // by `ASCII - $20`. The loop stops the moment the shifted value is zero
+    // (0x72DE), so nothing is zero-padded and zero itself is one digit.
+    expect(formatPanelFigure(0)).toBe("0");
+    expect(formatPanelFigure(5)).toBe("5");
+    expect(formatPanelFigure(999)).toBe("999");
+    expect(formatPanelFigure(1_000)).toBe("1,000");
+    expect(formatPanelFigure(3_197_500)).toBe("3,197,500");
+    expect(formatPanelFigure(100_000_000)).toBe("100,000,000");
+  });
+
+  it("leaves an undecoded figure off the strip rather than drawing a zero", () => {
+    const [a] = QUIET_THREE;
+    const records = blanks(a + 1);
+    records[a] = message(a, [], [], 100, 64, 0, {
+      values: [{ source: "unknown", index: -1, value: 0, x: 160, row: 2, font: 4, align: 2 }],
+    });
+    const display = new PanelDisplay(PANEL, () => FONT, undefined, records);
+    display.observe(reportAt(0, { messagesShown: [a] }));
+    // Nothing but the idle score view, which lives at the right-hand edge.
+    expect(marks(display).columns[0]).toBeGreaterThan(200);
+  });
+
+  it("reads a ring record's figure once and a latched record's every tick", () => {
+    // The interpreter advances a ring record ONE INSTRUCTION A FRAME (0x66AC)
+    // and what it drew stays in the bitplane; a LATCHED record's whole program
+    // re-runs every frame (`bra 0x6700` at 0x6728, PC reset at 0x672A), so its
+    // figures are live. Same value, two records, different answers.
+    const [a, b] = QUIET_THREE;
+    const value = { source: "counterStep" as const, index: 0, value: 0, x: 160, row: 2, font: 4, align: 1 };
+    const records = blanks(Math.max(a, b) + 1);
+    records[a] = message(a, [], [], 100, 64, 0, { values: [value] });
+    records[b] = message(b, [], [], 0, 64, 0, { values: [value], latched: true });
+
+    const steps = [1];
+    const ring = new PanelDisplay(PANEL, () => FONT, undefined, records);
+    ring.observe(reportAt(0, { messagesShown: [a], displayValues: live({ counterSteps: steps }) }));
+    const ringBefore = marks(ring).columns.length;
+    steps[0] = 1_000_000;
+    ring.observe(reportAt(1, { displayValues: live({ counterSteps: steps }) }));
+    expect(marks(ring).columns.length, "the ring record's figure is frozen").toBe(ringBefore);
+
+    steps[0] = 1;
+    const latched = new PanelDisplay(PANEL, () => FONT, undefined, records);
+    latched.observe(
+      reportAt(0, { messagesShown: [b], displayValues: live({ counterSteps: steps }) }),
+    );
+    const latchedBefore = marks(latched).columns.length;
+    steps[0] = 1_000_000;
+    latched.observe(reportAt(1, { displayValues: live({ counterSteps: steps }) }));
+    expect(marks(latched).columns.length, "the latched record's figure is live").toBeGreaterThan(
+      latchedBefore,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// THE LATCH — what re-posts a record whose hold is zero
+// ---------------------------------------------------------------------------
+
+describe("the latched record", () => {
+  it("is exactly the set of shipped records whose hold is zero", () => {
+    // MEASURED both ways over all three tables: of the records carrying words,
+    // every one with a hold of zero has the latch bit and every one with the
+    // latch bit has a hold of zero. Not one disagreement, which is what makes
+    // "a hold of zero" a decoded fact rather than a shrug.
+    // research/display-text/probe-latched.mjs.
+    const expected: Record<TableId, { withWords: number; zero: number }> = {
+      "law-n-justice": { withWords: 51, zero: 12 },
+      "babewatch": { withWords: 63, zero: 6 },
+      "extreme-sports": { withWords: 46, zero: 12 },
+    };
+    let zero = 0;
+    for (const tableId of TABLE_IDS) {
+      let withWords = 0;
+      let zeroHold = 0;
+      for (const record of modesFor(tableId).messages) {
+        if (record.lines.length === 0) continue;
+        withWords += 1;
+        if (record.holdTicks === 0) zeroHold += 1;
+        expect(
+          record.holdTicks === 0,
+          `${tableId} message ${record.index} [${record.lines.join(" | ")}]`,
+        ).toBe(record.latched);
+      }
+      expect({ withWords, zero: zeroHold }).toEqual(expected[tableId]);
+      zero += zeroHold;
+    }
+    expect(zero).toBe(30);
+  });
+
+  it("holds the strip until a ring record covers it, then comes back", () => {
+    // 0x66E8: the latched path is reached only on a frame the ring has DRAINED,
+    // so a message covers the status screen for its hold and the screen returns
+    // when the hold runs out.
+    const [a, b] = QUIET_THREE;
+    const records = blanks(Math.max(a, b) + 1);
+    records[a] = message(a, ["STATUS"], [{ x: 8, row: 2, font: 4, align: 0 }], 0, 64, 0, {
+      latched: true,
+    });
+    records[b] = message(b, ["OVER"], [{ x: 260, row: 2, font: 4, align: 0 }], 3);
+    const display = new PanelDisplay(PANEL, () => FONT, undefined, records);
+    display.observe(reportAt(0, { messagesShown: [a] }));
+    expect(marks(display).columns[0], "the status screen is up").toBe(8);
+    display.observe(reportAt(1, { messagesShown: [b] }));
+    expect(marks(display).columns[0], "the message covers it").toBe(260);
+    for (let tick = 2; tick < 8; tick += 1) display.observe(reportAt(tick));
+    expect(marks(display).columns[0], "and the status screen comes back").toBe(8);
+  });
+
+  it("goes away with the mode that put it up", () => {
+    // `clr.l $23D0(a5)` at 0x584C and 0x5DB6, the two mission teardowns; the
+    // other two are new game (0x404C) and ball start (0x41DE), which `reset` is.
+    const [a] = QUIET_THREE;
+    const records = blanks(a + 1);
+    records[a] = message(a, ["STATUS"], [{ x: 8, row: 2, font: 4, align: 0 }], 0, 64, 0, {
+      latched: true,
+    });
+    const display = new PanelDisplay(PANEL, () => FONT, undefined, records);
+    display.observe(reportAt(0, { messagesShown: [a] }));
+    expect(marks(display).columns[0]).toBe(8);
+    display.observe(reportAt(1, { missionEnded: true }));
+    expect(marks(display).columns[0]).toBeGreaterThan(200);
+
+    display.observe(reportAt(2, { messagesShown: [a] }));
+    expect(marks(display).columns[0]).toBe(8);
+    display.reset();
+    expect(marks(display).columns[0]).toBeGreaterThan(200);
+  });
+
+  it("never takes part in the caption channel's arbitration", () => {
+    // 0x6C2C tests the latch bit BEFORE it loads either priority byte, so a
+    // status screen neither drops a message nor is dropped by one.
+    const [a, b] = QUIET_THREE;
+    const records = blanks(Math.max(a, b) + 1);
+    records[a] = message(a, ["MESSAGE"], [{ x: 260, row: 2, font: 4, align: 0 }], 100, 128);
+    records[b] = message(b, ["STATUS"], [{ x: 8, row: 2, font: 4, align: 0 }], 0, 0, 0, {
+      latched: true,
+    });
+    const display = new PanelDisplay(PANEL, () => FONT, undefined, records);
+    display.observe(reportAt(0, { messagesShown: [a] }));
+    // A primary of 0 against one of 128 would be dropped outright as a message.
+    display.observe(reportAt(1, { messagesShown: [b] }));
+    expect(marks(display).columns[0], "the message still owns the strip").toBe(260);
+    for (let tick = 2; tick < 110; tick += 1) display.observe(reportAt(tick));
+    expect(marks(display).columns[0], "and the status screen was latched anyway").toBe(8);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// THE MACHINE'S OWN FACE ON THE MACHINE'S OWN ROWS
+// ---------------------------------------------------------------------------
+
+describe("the panel drawing captions in the machine's own font", () => {
+  const PANEL_FONT: PanelFont = parsePanelFontDocument(
+    JSON.parse(readFileSync(`${GENERATED_DIR}panel-font.json`, "utf8")) as PanelFontDocument,
+    new Uint8Array(readFileSync(`${GENERATED_DIR}panel-font.bin`)),
+  );
+
+  function withFace(records: ModeMessage[]): PanelDisplay {
+    const display = new PanelDisplay(PANEL, () => FONT, undefined, records);
+    display.usePanelFont(() => PANEL_FONT);
+    return display;
+  }
+
+  it("puts a row-2 caption on rows 2..6 and a row-9 figure on 9..13", () => {
+    // The whole of item 3. The rows are the print record's own, `mulu.w #$28,d4`
+    // multiplying them by the strip's 40-byte stride, and they land where they
+    // land because font 4 is five rows tall rather than eight.
+    const [a] = QUIET_THREE;
+    const records = blanks(a + 1);
+    records[a] = message(a, ["BUMPER VALUE"], [{ x: 160, row: 2, font: 4, align: 2 }], 100, 64, 0, {
+      values: [
+        { source: "counterAccumulator", index: 0, value: 0, x: 160, row: 9, font: 4, align: 2 },
+      ],
+    });
+    const display = withFace(records);
+    display.observe(
+      reportAt(0, { messagesShown: [a], displayValues: live({ counterAccumulators: [750_000] }) }),
+    );
+    expect(marks(display).rows).toEqual([2, 3, 4, 5, 6, 9, 10, 11, 12, 13]);
+  });
+
+  it("still draws in the shell font when the face table has not arrived", () => {
+    // A build that ships no derived assets has no panel font to fetch, and the
+    // panel falls back to what it drew before: the shell face on the two halves.
+    const [a] = QUIET_THREE;
+    const records = blanks(a + 1);
+    records[a] = message(a, ["BUMPER VALUE"], [{ x: 160, row: 2, font: 4, align: 2 }], 100);
+    const display = new PanelDisplay(PANEL, () => FONT, undefined, records);
+    display.observe(reportAt(0, { messagesShown: [a] }));
+    const rows = marks(display).rows;
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.every((row) => row < 8)).toBe(true);
   });
 });

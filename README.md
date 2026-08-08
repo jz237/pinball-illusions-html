@@ -29,8 +29,13 @@ envelope** and loops at exactly the machine's own 8077 PAL frames. And because
 the first three of those are all about the PICTURE: driven one frame at a time
 from the original's own RAM, this port's ball reproduces the machine's velocity
 word exactly on **470 of 576** traced frames and its position on **487**, with
-every remaining unit of error on a contact frame. 1870 tests, strict `tsc`, and
-a build that refuses to ship any asset nothing accounts for.
+every remaining unit of error on a contact frame. The score panel is set in the
+machine's **own six bitmap faces**, read out of `main` hunk 5 — the caption one
+is **five rows** tall, which is why a caption now lands on the strip's dot rows
+2..6, exactly where it was counted on native-resolution film — and every figure
+beside a caption ("BUMPER VALUE", "JACKPOT") is the field the machine's own
+number opcode reads, comma-grouped by its own `0x24924924` mask. 1943 tests,
+strict `tsc`, and a build that refuses to ship any asset nothing accounts for.
 
 The geometry everything else rests on:
 

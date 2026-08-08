@@ -38,7 +38,7 @@
  * method, and node tests use `renderInto` instead.
  */
 
-import type { GameTickReport, PanelCard, PanelPresenter } from "./game-loop.js";
+import type { DisplayValues, GameTickReport, PanelCard, PanelPresenter } from "./game-loop.js";
 import {
   PANEL_HEIGHT,
   PANEL_WIDTH,
@@ -52,6 +52,7 @@ import type {
   PanelAnimation,
   PanelBonusView,
   PanelCardView,
+  PanelMessageFigure,
   PanelMessageView,
   PanelState,
 } from "./panel-renderer.js";
@@ -63,7 +64,43 @@ import { PANEL_UNLIT } from "./palette.js";
 import { decodePanelObjectFrames, panelFramePixels } from "../game/table-panel.js";
 import type { TablePanel } from "../game/table-panel.js";
 import type { ShellFont } from "../game/shell-art.js";
-import type { ModeMessage } from "../game/table-modes.js";
+import type { PanelFont } from "../game/panel-font.js";
+import type { ModeMessage, ModeMessageValue } from "../game/table-modes.js";
+
+/**
+ * ONE LIVE-VALUE OPCODE, resolved against this tick's fields — or null when its
+ * source is not one this port keeps.
+ *
+ * `unknown` is two sites in the whole corpus and both read a native scratch
+ * record in Law 'n Justice's own hunk 4 that nothing here runs; drawing a zero
+ * there would be inventing a figure, so nothing is drawn. Anything the arrays
+ * do not reach (an index past the end) is the same case and answers null for
+ * the same reason. See `ModeMessageValue`.
+ */
+export function resolveDisplayValue(value: ModeMessageValue, live: DisplayValues): number | null {
+  switch (value.source) {
+    case "score":
+      return live.score;
+    case "missionSeconds":
+      return live.missionSeconds;
+    case "counterAccumulator":
+      return live.counterAccumulators[value.index] ?? null;
+    case "counterStep":
+      return live.counterSteps[value.index] ?? null;
+    case "counterCount":
+      return live.counterCounts[value.index] ?? null;
+    case "rampValue":
+      return live.rampValues[value.index] ?? null;
+    case "rampPaid":
+      return live.rampPaid[value.index] ?? null;
+    // The element's own +$1E..$23, which is configuration and not state, so the
+    // exporter resolved it and it travels in the document. See `ModeMessageValue`.
+    case "elementScore":
+      return value.value;
+    default:
+      return null;
+  }
+}
 
 /** A canvas the blit path can draw to; injectable so nothing here assumes DOM. */
 export type PanelSurfaceFactory = (
@@ -79,6 +116,14 @@ export class PanelDisplay implements PanelPresenter {
    * ready" to drawing the moment it lands, with no callback plumbing.
    */
   readonly #font: () => ShellFont | null;
+  /**
+   * THE MACHINE'S OWN PANEL FACES, polled like the shell font for the same
+   * reason: the asset arrives over the network after boot. Until it does — and
+   * in any build that ships no derived assets — captions fall back to the shell
+   * font on the two halves, which is what this port drew before the six-face
+   * table at h0+0x7136 was extracted.
+   */
+  #panelFont: (() => PanelFont | null) | null = null;
   readonly #startsByElement = new Map<number, readonly number[]>();
   readonly #awardsByElement = new Map<number, readonly number[]>();
   readonly #objectsByMessage = new Map<number, readonly number[]>();
@@ -106,6 +151,21 @@ export class PanelDisplay implements PanelPresenter {
   #messageTicks = 0;
   #messagePriority = 0;
   #messagePriority2 = 0;
+  /**
+   * THE LATCHED RECORD — `$23D0(a5)`, the running mode's status screen.
+   *
+   * A record whose `+$00` bit 0 is set never joins the ring: 0x6C2C tests the
+   * bit first and 0x6C34 puts the record here instead. The interpreter runs it
+   * on every frame the ring is EMPTY, all of it in one frame (`bra 0x6700` at
+   * 0x6728), and resets its PC at END (0x672A) so the next frame draws it again.
+   * That is why these records' holds are zero: they are not messages, they are
+   * the screen the mode leaves up between messages, and their figures are LIVE.
+   *
+   * Held as the record index rather than a view, because the figures are
+   * re-resolved every tick — which is what re-running the program does.
+   */
+  #latched = -1;
+  #latchedView: PanelMessageView | null = null;
   /** The display records: their text, geometry, hold and priority. */
   readonly #messages: readonly ModeMessage[];
 
@@ -168,6 +228,15 @@ export class PanelDisplay implements PanelPresenter {
     }
   }
 
+  /**
+   * Hands the panel the machine's own face table once it has loaded. Separate
+   * from the constructor because the asset is fetched after boot, and optional
+   * because a build without it still draws captions in the shell font.
+   */
+  usePanelFont(font: () => PanelFont | null): void {
+    this.#panelFont = font;
+  }
+
   /** The playback state, for tests and instrumentation. Never mutate it. */
   get state(): PanelState {
     return this.#state;
@@ -196,8 +265,47 @@ export class PanelDisplay implements PanelPresenter {
     }
     for (const message of report.messagesShown) {
       this.#enqueue(this.#objectsByMessage.get(message));
-      this.#offerMessage(message);
+      this.#offerMessage(message, report.displayValues);
     }
+    // 0x584C and 0x5DB6: both mission teardowns clear `$23D0`, so the status
+    // screen goes away with the mode that put it up. Ball start (0x41DE) and
+    // new game (0x404C) are the other two, and `reset` is where those land.
+    if (report.missionEnded) {
+      this.#latched = -1;
+      this.#latchedView = null;
+    }
+    // 0x6700: the latched record's whole program re-runs every frame the ring
+    // is empty, so its figures are resampled every tick and not held.
+    this.#latchedView =
+      this.#latched < 0 ? null : this.#viewOf(this.#latched, report.displayValues);
+  }
+
+  /**
+   * One record's text and its resolved figures, in the machine's own geometry.
+   *
+   * The figures are read at the instant the record's instruction would run, and
+   * a figure whose source this port has not decoded is LEFT OFF THE STRIP rather
+   * than drawn as a zero. See `ModeMessageValue`.
+   */
+  #viewOf(index: number, values: DisplayValues): PanelMessageView | null {
+    const record = this.#messages[index];
+    if (record === undefined) return null;
+    const figures: PanelMessageFigure[] = [];
+    for (const value of record.values) {
+      const resolved = resolveDisplayValue(value, values);
+      if (resolved === null) continue;
+      figures.push({
+        x: value.x,
+        row: value.row,
+        font: value.font,
+        align: value.align,
+        value: resolved,
+      });
+    }
+    return {
+      lines: record.lines.map((text, line) => ({ ...record.layout[line]!, text })),
+      figures,
+    };
   }
 
   /**
@@ -249,18 +357,30 @@ export class PanelDisplay implements PanelPresenter {
    * neither does one whose own decoded hold is zero, which is the machine
    * saying it prints and ends on the same frame.
    */
-  #offerMessage(index: number): void {
+  #offerMessage(index: number, values: DisplayValues): void {
     const record = this.#messages[index];
-    if (record === undefined || record.lines.length === 0 || record.holdTicks === 0) return;
+    if (record === undefined) return;
+    // 0x6C2C's FIRST test, before the priorities are even loaded: a record with
+    // the latch bit is not a message. It replaces the status screen and takes no
+    // part in the arbitration. `clr.l $23D4(a5)` beside it is the ANIM_BG slot,
+    // which this port does not keep separately.
+    if (record.latched) {
+      this.#latched = index;
+      this.#latchedView = this.#viewOf(index, values);
+      return;
+    }
+    if (record.lines.length === 0 && record.values.length === 0) return;
+    if (record.holdTicks === 0) return;
     if (this.#message !== null) {
       if (record.priority < this.#messagePriority) return;
       if (record.priority === this.#messagePriority && record.priority2 < this.#messagePriority2) {
         return;
       }
     }
-    this.#message = {
-      lines: record.lines.map((text, line) => ({ ...record.layout[line]!, text })),
-    };
+    // A ring record's figures are read ONCE, on the frame its instruction runs:
+    // the interpreter advances one instruction a frame (0x66AC) and what it drew
+    // stays in the strip's bitplane until something clears it.
+    this.#message = this.#viewOf(index, values);
     this.#messageTicks = record.holdTicks;
     this.#messagePriority = record.priority;
     this.#messagePriority2 = record.priority2;
@@ -278,6 +398,18 @@ export class PanelDisplay implements PanelPresenter {
     this.#messageTicks = 0;
     this.#messagePriority = 0;
     this.#messagePriority2 = 0;
+    // `clr.l $23D0(a5)` at 0x404C (new game) and 0x41DE (ball start).
+    this.#latched = -1;
+    this.#latchedView = null;
+  }
+
+  /**
+   * What the strip shows: the ring's record while one is up, otherwise the
+   * latched status screen. 0x66E8 reaches the latched path only when the ring
+   * has drained, which is exactly this order.
+   */
+  get #shown(): PanelMessageView | null {
+    return this.#message ?? this.#latchedView;
   }
 
   #enqueue(objects: readonly number[] | undefined): void {
@@ -327,7 +459,16 @@ export class PanelDisplay implements PanelPresenter {
     font: ShellFont,
     card?: PanelCardView | null,
   ): PixelTarget {
-    return renderPanelInto(this.#state, score, font, target, this.#bonus, card, this.#message);
+    return renderPanelInto(
+      this.#state,
+      score,
+      font,
+      target,
+      this.#bonus,
+      card,
+      this.#shown,
+      this.#panelFont?.() ?? null,
+    );
   }
 
   /**
@@ -351,7 +492,16 @@ export class PanelDisplay implements PanelPresenter {
     const font = this.#font();
     if (font === null) return false;
 
-    renderPanelInto(this.#state, score, font, this.#target, this.#bonus, card, this.#message);
+    renderPanelInto(
+      this.#state,
+      score,
+      font,
+      this.#target,
+      this.#bonus,
+      card,
+      this.#shown,
+      this.#panelFont?.() ?? null,
+    );
 
     const geometry = dmdGeometryFor(scale);
     if (geometry !== null) return this.#drawDotMatrix(context, geometry, viewWidth);

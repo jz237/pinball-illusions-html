@@ -516,6 +516,62 @@ describe("award effect 19", () => {
     expect(award(modes, fresh, 113)).toBe(0);
   });
 
+  it("leaves the paid value in the ramp's tail, which the display prints", () => {
+    // THE OTHER HALF OF 0x61F6, and it is not decoration:
+    //
+    //     0061FA  lea     $2(a0),a3      ; the ramp's eight-byte value slot
+    //     0061FE  move.l  (a3)+,$22(a0)  ; +$02..$05 -> +$22..$25
+    //     006202  move.l  (a3)+,$26(a0)  ; +$06..$09 -> +$26..$29
+    //     006206  jsr     $6BCC          ; and pay the same six bytes
+    //
+    // EFFECTS_TAIL.md section 9 listed the copy under "what is NOT established"
+    // and was right on both halves: no relocated pointer in any package lands on
+    // ramp +$22, and it left open whether something read it anyway - "e.g. to
+    // print LAST JACKPOT on the panel". It does. The display's number printer
+    // reads BACKWARDS from its pointer, so what reads the copy is a pointer to
+    // +$2A, one past the 42-byte record, and there are seventeen of them.
+    const modes = modesFor("law-n-justice");
+    const state = createModeState(modes);
+    // Nothing has been paid, so the tail holds the machine's own zero.
+    expect([...state.rampPaid]).toEqual(modes.ramps.map(() => 0));
+
+    state.rampValues[0] = 20_000_000;
+    state.rampRunning[0] = 0;
+    expect(award(modes, state, 113)).toBe(20_000_000);
+    expect(state.rampPaid[0], "the tail carries what was just paid").toBe(20_000_000);
+
+    // It is the value at the moment of the AWARD and not the ramp's live value:
+    // the countdown goes on falling and the copy does not follow it.
+    state.rampValues[0] = 11_357_000;
+    expect(state.rampPaid[0], "and does not follow the ramp down").toBe(20_000_000);
+    expect(award(modes, state, 115)).toBe(11_357_000);
+    expect(state.rampPaid[0], "until the next collect overwrites it").toBe(11_357_000);
+
+    // Only effect 19 writes it. The ramp SERVICE moves +$04..$09 and never
+    // +$22..$29 (0x634C's `lea $A(a1),a2` is the value slot's end, not the
+    // tail's), so a hundred ticks of countdown leave the copy alone.
+    state.rampRunning[0] = 1;
+    for (let tick = 0; tick < 100; tick += 1) tickModes(modes, state);
+    expect(state.rampValues[0], "the ramp has moved").not.toBe(11_357_000);
+    expect(state.rampPaid[0], "the copy has not").toBe(11_357_000);
+
+    // AND THE SHIPPED DOCUMENTS ASK FOR IT: seventeen live-value sites across
+    // the three tables name `rampPaid`, and every one of them names a ramp the
+    // table actually has. Law 'n Justice's are the six on its two ramps.
+    let sites = 0;
+    for (const tableId of TABLE_IDS) {
+      const table = modesFor(tableId);
+      for (const record of table.messages) {
+        for (const value of record.values) {
+          if (value.source !== "rampPaid") continue;
+          sites += 1;
+          expect(table.ramps[value.index], `${tableId} message ${record.index}`).toBeDefined();
+        }
+      }
+    }
+    expect(sites).toBe(17);
+  });
+
   it("collects the hostage mission's own countdown, driven out of script 194", () => {
     // THE SHIPPED MISSION, END TO END. Script 194 is "SHOOT ALL TERRORISTS TO
     // FREE HOSTAGES", selector 0 entry 7 - a SELECTED mission, so it is a mode

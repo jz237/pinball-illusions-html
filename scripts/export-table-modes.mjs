@@ -1592,7 +1592,15 @@ function displayProgram(pkg, at) {
     if (!inBounds(pkg, ip, 2)) return null;
     const opcode = readU16(pkg, ip, 0);
     if (opcode === 0) {
-      return { priority: readU8(pkg, at, 2), priority2: readU8(pkg, at, 3), ops };
+      return {
+        // +$00 bit 0 is the LATCH: 0x6C2C tests it before anything else and
+        // 0x6C34 puts the record in `$23D0` instead of the ring. See
+        // `messageDisplay`'s `latched`.
+        flags: readU16(pkg, at, 0),
+        priority: readU8(pkg, at, 2),
+        priority2: readU8(pkg, at, 3),
+        ops,
+      };
     }
     const spec = DISPLAY_OPS[opcode];
     if (spec === undefined || !inBounds(pkg, ip, spec.len)) return null;
@@ -1618,6 +1626,111 @@ function displayProgram(pkg, at) {
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// THE LIVE-VALUE OPCODES
+// ---------------------------------------------------------------------------
+/**
+ * THE FIVE NUMBER OPCODES AND THE TWO PRINTERS BEHIND THEM.
+ *
+ * Six of the 26 display opcodes put a FIGURE on the strip rather than a string,
+ * and every one of them ends in one of two routines:
+ *
+ *     0067E2  NUM           movea.l $2(a1),a0 / movem.w $6(a1),d3-d6 / jsr $71BA
+ *     0067F4  NUM_PLAYER_C  movea.l $DC2(a5),a0 / lea $10(a0),a0     / jsr $71BA
+ *     006916  NUM_SCORE     movea.l $DC2(a5),a0 / addq.w #$8,a0      / jsr $71BA
+ *     006958  NUM_WORD      movea.l $2(a1),a0                        / jsr $716E
+ *     006852  NUM_WORD_IDX  movea.l $2(a1),a0 / lea (a0,d6.w*2),a0   / jsr $716E
+ *     0068C2  NUM_SCRATCH   lea $23E8(a5),a0                         / jsr $716E
+ *
+ * `$71BA` prints a PACKED-BCD field that ENDS at `a0`: 0x72CA tests the word at
+ * `-$6(a0)` and 0x72D0 takes the longword at `-$4(a0)`, low nibble first, with
+ * glyph $0C — a COMMA, because the map is indexed by `ASCII - $20` (0x743C) —
+ * inserted every third digit off the 0x24924924 mask at 0x72E0. So the field is
+ * the SIX BYTES BELOW THE POINTER, twelve decimal digits, and a pointer is
+ * always one past the end of a record's eight-byte value slot.
+ *
+ * `$716E` prints a plain binary WORD: 0x7170 reads `-$2(a0)`, masks it to twelve
+ * bits and hands it to the decimaliser at `$6EAE`, which builds four BCD digits
+ * out of three `abcd` table lookups (`lea (base,d2.w*2),a1` — CAPSTONE DROPS THE
+ * `*2`; the tables at 0x6E4E/0x6E6E/0x6E8E hold 0..15, 16..240 and 256..3840).
+ *
+ * Both printers take the ROW through `$20EE(a5,d4.w*2)` (0x71CA) rather than
+ * `mulu.w #$28,d4`, and THAT TABLE IS THE SAME MULTIPLY: 0x0998 fills 264 words
+ * from `$20DE(a5)` with `-320 + 40k`, and `$20EE` is `$20DE + $10`, entry eight,
+ * so `$20EE(a5,d4*2)` is exactly `40 * d4`. A NUM's `row` is the same direct
+ * panel scanline a TEXT's is, and the table exists only so negative rows work
+ * without a multiply.
+ *
+ * @typedef {"score"|"missionSeconds"|"counterAccumulator"|"counterStep"
+ *   |"counterCount"|"rampValue"|"rampPaid"|"elementScore"|"unknown"} LiveValueSource
+ */
+const DISPLAY_VALUE_OPS = new Set([
+  "NUM",
+  "NUM_SCORE",
+  "NUM_WORD",
+  "NUM_WORD_IDX",
+  "NUM_SCRATCH",
+  "NUM_PLAYER_C",
+]);
+/** `lea $8(a4),a0` at 0x6BD4: the score's slot ends at player +$08. */
+const COUNTER_ACCUMULATOR_END = 0x40;
+/** The running step's slot ends at counter +$38; its BCD is +$32..$37. */
+const COUNTER_STEP_END = 0x38;
+/** `lea (a0,d6.w*2),a0` with d6 = `$DBE(a5)`, the PLAYER INDEX (0x66A6). */
+const COUNTER_COUNT_BASE = 0x08;
+/** `lea $A(a1),a2` at 0x634C: the ramp's live value ends at ramp +$0A. */
+const RAMP_VALUE_END = 0x0a;
+/** Effect 19's copy (0x61FE) fills ramp +$22..$29, so its BCD ends at +$2A. */
+const RAMP_PAID_END = RAMP_STRIDE;
+/** `ELEMENT_SCORE` is +$1E..$23, so the pointer that prints it is +$24. */
+const ELEMENT_SCORE_END = ELEMENT_SCORE + BCD_BYTES;
+
+/**
+ * Which decoded field a live-value pointer names, or `unknown`.
+ *
+ * Built once per package and closed over by `messageDisplay`. Every entry is a
+ * POINTER VALUE, because the printer reads backwards from the pointer: the same
+ * six bytes can be described as `ramp i + $24` or as `ramp i+1 + $00` when two
+ * ramp records are adjacent, and they are the same bytes either way.
+ */
+function liveValueSources(pkg, counterRecords, rampRecords, elementList) {
+  const byKey = new Map();
+  const put = (at, delta, source, index, value = 0) => {
+    if (at === null) return;
+    const k = key({ hunk: at.hunk, offset: at.offset + delta });
+    if (!byKey.has(k)) byKey.set(k, { source, index, value });
+  };
+  // Ramps first: a ramp's own +$2A outranks the next ramp's +$00, which is the
+  // same address when the records are adjacent and describes the same bytes.
+  rampRecords.forEach((at, index) => put(at, RAMP_PAID_END, "rampPaid", index));
+  rampRecords.forEach((at, index) => put(at, RAMP_VALUE_END, "rampValue", index));
+  counterRecords.forEach((at, index) => {
+    put(at, COUNTER_ACCUMULATOR_END, "counterAccumulator", index);
+    put(at, COUNTER_STEP_END, "counterStep", index);
+    put(at, COUNTER_COUNT_BASE, "counterCount", index);
+  });
+  // An element's own +$1E..$23 is CONFIGURATION rather than state — nothing in
+  // the decoded corpus writes it, and the port already carries it as
+  // `ModeElement.score` — so it is resolved here and travels as a constant.
+  elementList.forEach((at, index) => {
+    let value = 0;
+    try {
+      value = readBcd(pkg, at, ELEMENT_SCORE, "element display score");
+    } catch {
+      return; // Not packed BCD, so not this field; falls through to `unknown`.
+    }
+    put(at, ELEMENT_SCORE_END, "elementScore", index, value);
+  });
+  return (op) => {
+    if (op.name === "NUM_SCORE") return { source: "score", index: -1, value: 0 };
+    if (op.name === "NUM_SCRATCH") return { source: "missionSeconds", index: -1, value: 0 };
+    if (op.pointer === null || op.pointer === undefined) {
+      return { source: "unknown", index: -1, value: 0 };
+    }
+    return byKey.get(key(op.pointer)) ?? { source: "unknown", index: -1, value: 0 };
+  };
+}
+
 /**
  * What one display record puts on the strip, and for how long.
  *
@@ -1632,7 +1745,7 @@ function displayProgram(pkg, at) {
  * age `$23B6` while `$23C8` holds an animation, so an animation's own length
  * is what delays the program and the panel layer already owns that queue.
  */
-function messageDisplay(pkg, at) {
+function messageDisplay(pkg, at, sourceOf) {
   const program = displayProgram(pkg, at);
   if (program === null) {
     throw new Error(
@@ -1642,6 +1755,8 @@ function messageDisplay(pkg, at) {
   }
   const lines = [];
   const layout = [];
+  const values = [];
+  const seenValue = new Set();
   const seen = new Set();
   const byPc = new Map(program.ops.map((op) => [op.pc, op]));
   let pc = 0;
@@ -1671,13 +1786,56 @@ function messageDisplay(pkg, at) {
         lines.push(text);
         layout.push({ x, row, font, align });
       }
+    } else if (DISPLAY_VALUE_OPS.has(op.name)) {
+      // The four geometry words are the last four operands in every one of the
+      // six handlers — `movem.w $6(a1),d3-d6` after a pointer, `movem.w $2(a1)`
+      // without one — so d3 = X, d4 = ROW, d5 = FONT, d6 = ALIGN in that order.
+      // NOTE the alignments are the OTHER WAY ROUND from `$73D0`'s: 0x71EE
+      // tests d6 == 1 and draws at X, and adds the measured width for 0 and half
+      // of it for 2, because the digits are emitted right to left. Exported as
+      // the machine's own number so the runtime keeps that test in one place.
+      const [x, row, font, align] = op.words;
+      const { source, index, value } = sourceOf(op);
+      const tag = `${source}:${index}:${x}:${row}`;
+      if (!seenValue.has(tag)) {
+        seenValue.add(tag);
+        values.push({ source, index, value, x, row, font, align });
+      }
     }
     pc += op.len;
   }
   return {
     lines,
     layout,
+    values,
     holdTicks: firstText === null ? 0 : ticks - firstText,
+    /**
+     * THE LATCH — record flags bit 0, and the answer to "what re-posts a
+     * record whose hold is zero".
+     *
+     *     006C2C  move.w (a0),d0 / andi.w #$1,d0 / beq 0x6C4C   ; not a message
+     *     006C34  ... move.l (a7)+,$23D0(a5) / clr.l $23D4(a5)  ; THE LATCH
+     *
+     * and the interpreter, on the frame the RING DRAINS (0x667A beq 0x66E8):
+     *
+     *     0066F0  tst.l  $23C8(a5) / bne 0x674A   ; unless art owns the strip
+     *     0066F8  move.l $23D0(a5),d0 / beq 0x6730
+     *     006700  ... one instruction ...
+     *     006728  bra 0x6700                      ; ALL OF THEM, THIS FRAME
+     *     00672A  clr.w $4(a0) / rts              ; END -> PC BACK TO ZERO
+     *
+     * so a latched record runs its whole program to END every frame the ring is
+     * empty, and is redrawn from the top the next frame. Its hold of zero is not
+     * a duration at all: it is a record that is not a message but a STATUS
+     * SCREEN, and it holds the strip until a ring record covers it or one of the
+     * four `clr.l $23D0` sites — new game (0x404C), ball start (0x41DE) and the
+     * two mission teardowns (0x584C, 0x5DB6) — takes it away.
+     *
+     * MEASURED AND EXACT over the corpus: of the 160 records carrying words, the
+     * 30 with a hold of zero are the 30 with this bit and there is not one
+     * disagreement either way (research/display-text/probe-latched.mjs).
+     */
+    latched: (program.flags & 1) !== 0,
     // THE RECORD'S OWN TWO PRIORITY BYTES, which are the whole of the display
     // poster's arbitration at 0x6C4C:
     //
@@ -2184,7 +2342,11 @@ function decode(pkg, table) {
     payCount: elementPayCount(pkg, at),
   }));
 
-  const messages = messageList.map((at, index) => ({ index, ...messageDisplay(pkg, at) }));
+  const sourceOf = liveValueSources(pkg, counterRecords, rampRecords, elementList);
+  const messages = messageList.map((at, index) => ({
+    index,
+    ...messageDisplay(pkg, at, sourceOf),
+  }));
 
   let dangled = 0;
   const scriptDocs = scriptList.map((script, index) => {

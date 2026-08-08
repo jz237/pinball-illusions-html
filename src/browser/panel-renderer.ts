@@ -53,6 +53,8 @@ import { BYTES_PER_PIXEL, createPixelTarget } from "./playfield-renderer.js";
 import type { PixelTarget } from "./playfield-renderer.js";
 import { FONT_ATLAS_WIDTH, alignShellText } from "../game/shell-art.js";
 import type { ShellFont } from "../game/shell-art.js";
+import { panelFace, panelGlyphPixel, panelTextPen, panelTextRun } from "../game/panel-font.js";
+import type { PanelFont, PanelFontFace } from "../game/panel-font.js";
 
 // ---------------------------------------------------------------------------
 // Geometry — measured constants, not choices
@@ -484,8 +486,68 @@ export interface PanelMessageLine {
   readonly text: string;
 }
 
+/**
+ * ONE LIVE FIGURE ON THE STRIP, already resolved to a number.
+ *
+ * The machine's number printer `$71BA` is a different routine from its text
+ * printer `$73D0` and differs from it in exactly two ways, both reproduced here.
+ *
+ * ONE: it emits digits RIGHT TO LEFT off the packed-BCD field's low nibble
+ * (0x72D4-0x72EA), inserting glyph $0C — a COMMA, since the character map at
+ * 0x743C is indexed by `ASCII - $20` — every third digit off the 0x24924924
+ * mask. So a figure is grouped in threes and this port formats it that way.
+ *
+ * TWO: its alignment test is written BACK TO FRONT, because `d3` is the pen's
+ * RIGHT edge rather than its left:
+ *
+ *     0071EE  cmpi.w #$1,d6 / beq 0x72C4      ; 1: the right edge IS x
+ *     0071F6  cmpi.w #$2,d6 / beq 0x7204
+ *     0071FC  bsr measure / add.w d2,d3       ; 0: the right edge is x + width
+ *     007204  bsr measure / ... / add.w d2,d3 ; 2: x + width/2, rounded even
+ *
+ * AND IT LANDS IN EXACTLY THE SAME PLACE. 1 puts the string in [x-w, x], which
+ * is the text printer's RIGHT; 0 puts it in [x, x+w], which is LEFT; and the two
+ * centring roundings — `((w>>1)+1) & ~1` subtracted at 0x7418 against
+ * `(((w-1)>>1)+1) & ~1` added at 0x7206 — agree for every EVEN width and differ
+ * by one pixel only for odd ones, and no width in this corpus is odd (every
+ * glyph width and every blank advance in all six faces is even, and the two
+ * pixels of tracking keep it that way). So the three cases mean the same three
+ * things on a figure as on a line, and `messageAlign` serves both. That was
+ * worth checking rather than assuming: the two routines look like mirrors.
+ *
+ * The machine's own idle score view is `move.w #$140,d3 / move.w #$1,d6` at
+ * 0x719A/0x71A6 — right-aligned at 320, the strip's right edge.
+ */
+export interface PanelMessageFigure {
+  readonly x: number;
+  readonly row: number;
+  readonly font: number;
+  readonly align: number;
+  readonly value: number;
+}
+
 export interface PanelMessageView {
   readonly lines: readonly PanelMessageLine[];
+  /** The record's live-value opcodes, resolved. Empty on a record with none. */
+  readonly figures?: readonly PanelMessageFigure[];
+}
+
+/**
+ * A packed-BCD figure the way `$71BA` lays it out: digits with a comma every
+ * three. Twelve digits is the field's whole width and the machine prints no
+ * leading zeros — 0x72DE stops the loop the moment the shifted value is zero —
+ * so a value of zero prints as the single digit `0`.
+ */
+export function formatPanelFigure(value: number): string {
+  const digits = String(Math.max(0, Math.floor(value)));
+  let out = "";
+  for (let i = 0; i < digits.length; i += 1) {
+    // 0x72E0's mask has bits 2, 5, 8 ... set and the shift happens AFTER the
+    // digit, so a comma falls between groups of three and never leads.
+    if (i > 0 && (digits.length - i) % 3 === 0) out += ",";
+    out += digits[i];
+  }
+  return out;
 }
 
 /**
@@ -509,11 +571,77 @@ function messageAlign(align: number): "left" | "right" | "center" {
   return "center";
 }
 
-function drawMessage(target: PixelTarget, font: ShellFont, message: PanelMessageView): void {
+/**
+ * ONE LINE IN THE MACHINE'S OWN FACE, ON THE MACHINE'S OWN SCANLINE.
+ *
+ * The blit at 0x7474 ORs a single-bitplane glyph into the text plane at
+ * $6000A00 + `row * 40`, so a caption is one colour and its top row is the print
+ * record's `row` exactly. Nothing is centred vertically and nothing is mapped
+ * onto halves: with a five-row face, rows 2 and 9 are rows 2 and 9.
+ */
+function drawPanelLine(
+  target: PixelTarget,
+  face: PanelFontFace,
+  text: string,
+  x: number,
+  row: number,
+  align: number,
+): void {
+  const pen = panelTextPen(face, text, x, align);
+  // 0x7422 / 0x742A: a negative pen bails and the machine draws nothing.
+  if (pen === null) return;
+  for (const run of panelTextRun(face, text, pen)) {
+    for (let line = 0; line < face.height; line += 1) {
+      const y = row + line;
+      if (y < 0 || y >= PANEL_HEIGHT) continue;
+      for (let column = 0; column < run.width; column += 1) {
+        const px = run.pen + column;
+        if (px < 0 || px >= PANEL_WIDTH) continue;
+        if (!panelGlyphPixel(face, run.glyph, column, line)) continue;
+        writePixel(target, px, y, PANEL_AMBER);
+      }
+    }
+  }
+}
+
+/**
+ * A record's text and figures.
+ *
+ * `panelFont` is the machine's own six-face table and is used when it has
+ * arrived; until then — and in any build that ships no derived assets — the
+ * caption falls back to the shell font on the two halves `messagePenY` picks,
+ * which is exactly what this port drew before the face table was extracted.
+ */
+function drawMessage(
+  target: PixelTarget,
+  font: ShellFont,
+  message: PanelMessageView,
+  panelFont: PanelFont | null,
+): void {
   for (const line of message.lines) {
     if (line.text.length === 0) continue;
+    if (panelFont !== null) {
+      drawPanelLine(target, panelFace(panelFont, line.font), line.text, line.x, line.row, line.align);
+      continue;
+    }
     const penX = alignShellText(font, line.text, line.x, messageAlign(line.align));
     drawText(target, font, line.text, penX, messagePenY(font, line.row), PANEL_AMBER, PANEL_WHITE);
+  }
+  for (const figure of message.figures ?? []) {
+    const text = formatPanelFigure(figure.value);
+    if (panelFont !== null) {
+      drawPanelLine(
+        target,
+        panelFace(panelFont, figure.font),
+        text,
+        figure.x,
+        figure.row,
+        figure.align,
+      );
+      continue;
+    }
+    const penX = alignShellText(font, text, figure.x, messageAlign(figure.align));
+    drawText(target, font, text, penX, messagePenY(font, figure.row), PANEL_AMBER, PANEL_WHITE);
   }
 }
 
@@ -604,6 +732,7 @@ export function renderPanelInto(
   bonus?: PanelBonusView | null,
   card?: PanelCardView | null,
   message?: PanelMessageView | null,
+  panelFont?: PanelFont | null,
 ): PixelTarget {
   if (target.width !== PANEL_WIDTH || target.height !== PANEL_HEIGHT) {
     throw new RangeError(
@@ -643,8 +772,16 @@ export function renderPanelInto(
   // so within one record the animation plays first and the caption follows,
   // which is exactly this order with the port's own queue standing in for
   // `$23C8`. See `PanelDisplay` for the hold and the priority gate.
-  if (message !== undefined && message !== null && message.lines.length > 0) {
-    drawMessage(target, font, message);
+  // A record with no words but a live-value opcode owns the strip too: 54 of
+  // the 288 print a figure and nothing else — a bare jackpot total, a bare
+  // countdown — and the machine's `CLEAR_1` before it takes the score off just
+  // the same.
+  if (
+    message !== undefined &&
+    message !== null &&
+    (message.lines.length > 0 || (message.figures?.length ?? 0) > 0)
+  ) {
+    drawMessage(target, font, message, panelFont ?? null);
     return target;
   }
 

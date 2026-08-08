@@ -104,6 +104,15 @@ function reportWith(over: Partial<GameTickReport> = {}): GameTickReport {
     bonus: null,
     flipperRaised: [],
     flipperRested: [],
+    displayValues: {
+      score: 0,
+      missionSeconds: 0,
+      counterAccumulators: [],
+      counterSteps: [],
+      counterCounts: [],
+      rampValues: [],
+      rampPaid: [],
+    },
     ...over,
   };
 }

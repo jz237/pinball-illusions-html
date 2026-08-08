@@ -94,6 +94,15 @@ function reportAt(tick: number, over: Partial<GameTickReport> = {}): GameTickRep
     bonus: null,
     flipperRaised: [],
     flipperRested: [],
+    displayValues: {
+      score: 0,
+      missionSeconds: 0,
+      counterAccumulators: [],
+      counterSteps: [],
+      counterCounts: [],
+      rampValues: [],
+      rampPaid: [],
+    },
     ...over,
   };
 }

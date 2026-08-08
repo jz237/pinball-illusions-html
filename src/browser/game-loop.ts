@@ -1022,7 +1022,51 @@ export interface GameTickReport {
   readonly flipperRaised: readonly FlipperSide[];
   /** The FF->0 edges of the same flags: the side left full raise ($A79A). */
   readonly flipperRested: readonly FlipperSide[];
+  /**
+   * THE FIGURES A DISPLAY RECORD'S NUMBER OPCODES READ, this tick.
+   *
+   * Six of the 26 display opcodes print a live value rather than a string —
+   * "BUMPER VALUE" and the figure under it are one record — and every one of
+   * them reads a field this simulation already keeps. `ModeMessageValue` has the
+   * decode of which pointer names which field; this is that set, sampled once a
+   * tick so the panel layer stays a pure function of the tick stream and never
+   * reaches into `ModeState`.
+   *
+   * The arrays are the live `ModeState` ones and MUST NOT be retained past the
+   * call: the panel resolves its figures inside `observe`, which is exactly when
+   * the machine's own interpreter executes the record's instruction.
+   */
+  readonly displayValues: DisplayValues;
 }
+
+/**
+ * The live fields the display's number opcodes read. See `GameTickReport`.
+ *
+ * `score` and `missionSeconds` are plain numbers because the machine reads them
+ * from single locations (player +$02..$07 and `$23E6(a5)`, which 0x57D0 sets to
+ * the mission countdown divided by VBlankFrequency); the rest are the per-record
+ * arrays, indexed by the record index the modes document carries.
+ */
+export interface DisplayValues {
+  readonly score: number;
+  readonly missionSeconds: number;
+  readonly counterAccumulators: ArrayLike<number>;
+  readonly counterSteps: ArrayLike<number>;
+  readonly counterCounts: ArrayLike<number>;
+  readonly rampValues: ArrayLike<number>;
+  readonly rampPaid: ArrayLike<number>;
+}
+
+/** The empty channel, for the ticks with no simulation behind them. */
+const NO_DISPLAY_VALUES: DisplayValues = Object.freeze({
+  score: 0,
+  missionSeconds: 0,
+  counterAccumulators: Object.freeze([]),
+  counterSteps: Object.freeze([]),
+  counterCounts: Object.freeze([]),
+  rampValues: Object.freeze([]),
+  rampPaid: Object.freeze([]),
+});
 
 /** The two flipper flag bytes the original keeps, `$23F5` and `$23F6`. */
 export type FlipperSide = "left" | "right";
@@ -1395,6 +1439,7 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     bonus: null,
     flipperRaised: [],
     flipperRested: [],
+    displayValues: NO_DISPLAY_VALUES,
   };
 
   if (game.phase !== "in-play" || game.paused) return idle;
@@ -2077,6 +2122,30 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     bonus: bonusViewOf(game),
     flipperRaised,
     flipperRested,
+    displayValues: displayValuesOf(game),
+  };
+}
+
+/**
+ * This tick's live figures, for the display records that print one.
+ *
+ * Sampled AFTER `runModes` has paid the tick's awards, which is where the
+ * machine samples them too: the caption and its figure come out of one display
+ * record, and the record is posted by the same award that moved the score.
+ */
+function displayValuesOf(game: Game): DisplayValues {
+  const state = game.modeState;
+  if (state === null) {
+    return { ...NO_DISPLAY_VALUES, score: readBcdField(game.scoring.score) };
+  }
+  return {
+    score: readBcdField(game.scoring.score),
+    missionSeconds: missionSecondsLeft(state),
+    counterAccumulators: state.counterAccumulators,
+    counterSteps: state.counterSteps,
+    counterCounts: state.counterCounts,
+    rampValues: state.rampValues,
+    rampPaid: state.rampPaid,
   };
 }
 

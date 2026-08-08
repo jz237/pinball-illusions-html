@@ -102,6 +102,8 @@ import type { ShellArtworkSource } from "./browser/shell-screens.js";
 import { createShellSkin } from "./browser/shell-skin.js";
 import type { ShellSkin } from "./browser/shell-skin.js";
 import { loadShellArt } from "./game/shell-art.js";
+import { loadPanelFont } from "./game/panel-font.js";
+import type { PanelFont } from "./game/panel-font.js";
 import { loadLoadingLogoHd, loadShellArtHd } from "./game/shell-art-hd.js";
 import { loadLoadingLogo } from "./game/loading-logo.js";
 import { loadShellMusic } from "./audio/shell-music.js";
@@ -597,6 +599,18 @@ async function boot(): Promise<void> {
    * each table's `PanelDisplay`, which draws nothing until it arrives.
    */
   let panelFont: ShellFont | null = null;
+  /**
+   * THE MACHINE'S OWN SIX PANEL FACES (`panel-font.ts`), fetched beside the
+   * shell art and polled the same way. Optional with a silent fallback for the
+   * same reason the loading logo is: a build without the authorized assets has
+   * no font to fetch, and the panel then sets its captions in the shell font on
+   * the two halves, which is what it did before the table at h0+0x7136 was
+   * extracted. `loadPanelFont` answers null rather than throwing.
+   */
+  let machinePanelFont: PanelFont | null = null;
+  void loadPanelFont().then((font) => {
+    machinePanelFont = font;
+  });
   void loadShellArt()
     .then(async (art) => {
       panelFont = art.font2;
@@ -823,6 +837,7 @@ async function boot(): Promise<void> {
       heap === null
         ? null
         : new PanelDisplay(heap, () => panelFont, undefined, tableModesFor(tableId)?.messages ?? []);
+    panel?.usePanelFont(() => machinePanelFont);
     // The loop's animation frames are never used: the single driver below calls
     // `frame()` by hand. What the loop is here for is its SCHEDULER — the fixed
     // step and the catch-up clamp — and keeping one per table means a table

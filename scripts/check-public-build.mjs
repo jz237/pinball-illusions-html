@@ -189,6 +189,13 @@ const DERIVED_MARKERS = [
   // runtime — so its media are the binaries themselves, claimed through the
   // data[] branch below and digest-checked like any picture.
   { class: "disk-derived-intro", noun: "intro animation" },
+  // The SCORE PANEL'S OWN FONTS (scripts/export-panel-font.mjs): the six
+  // {bitmap, metrics} faces at main hunk 0 +0x7136, with the single-plane glyph
+  // strips copied verbatim out of hunk 5 and the character maps, widths and
+  // blank advances reduced to numbers. Like the intro it ships no raster — the
+  // panel blits the bits at runtime — so its medium is one `.bin`, claimed
+  // through the same data[] branch and digest-checked the same way.
+  { class: "disk-derived-panel-font", noun: "score panel font" },
 ];
 
 /** Manifest classes that must account for the binary files they ship beside. */
@@ -207,6 +214,7 @@ const MEDIA_MARKERS = new Map([
   ["disk-derived-loading-logo-hd", { noun: "HD loading logo", extensions: IMAGE_EXT }],
   ["disk-derived-table-thumbnail", { noun: "table thumbnail", extensions: IMAGE_EXT }],
   ["disk-derived-intro", { noun: "intro animation", extensions: DATA_EXT }],
+  ["disk-derived-panel-font", { noun: "score panel font", extensions: DATA_EXT }],
 ]);
 
 /** Classes whose manifest claims exactly one raster through an `image` field. */
@@ -220,6 +228,9 @@ const SINGLE_IMAGE_CLASSES = new Set([
   "disk-derived-loading-logo-hd",
   "disk-derived-table-thumbnail",
 ]);
+
+/** Manifest classes whose media are BINARY BLOCKS, claimed through `data: []`. */
+const DATA_ARRAY_CLASSES = new Set(["disk-derived-intro", "disk-derived-panel-font"]);
 
 /** Manifest classes that claim SEVERAL rasters through an `images: []` array. */
 const IMAGE_ARRAY_CLASSES = new Set([
@@ -292,18 +303,18 @@ for await (const file of walk(root)) {
     }
     continue;
   }
-  if (marker.class === "disk-derived-intro") {
-    // The intro's media are binary blocks, not rasters: a `data` array of
+  if (DATA_ARRAY_CLASSES.has(marker.class)) {
+    // These media are binary blocks, not rasters: a `data` array of
     // {file, sha256}, claimed exactly as an images[] would be. `.bin` is in
     // the scan set above, so an unclaimed or tampered block refuses the
     // build the same way an unclaimed picture does.
     const dataFiles = Array.isArray(doc?.data) ? doc.data : null;
     if (dataFiles === null) {
-      violations.push(`${rel}: intro manifest carries no data array`);
+      violations.push(`${rel}: ${media_marker.noun} manifest carries no data array`);
       continue;
     }
     for (const entry of dataFiles) {
-      claim(rel, entry?.file, entry?.sha256, media_marker.noun, "intro manifest");
+      claim(rel, entry?.file, entry?.sha256, media_marker.noun, `${media_marker.noun} manifest`);
     }
     continue;
   }

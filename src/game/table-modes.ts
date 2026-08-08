@@ -501,12 +501,101 @@ export interface ModeMessageLine {
   readonly align: number;
 }
 
+/**
+ * WHICH LIVE FIGURE A DISPLAY RECORD'S NUMBER OPCODE READS.
+ *
+ * Six of the 26 display opcodes print a figure rather than a string, and all six
+ * end in one of two routines: `$71BA` prints the SIX BYTES BELOW its pointer as
+ * packed BCD (0x72CA/0x72D0, comma-grouped off the 0x24924924 mask — glyph $0C
+ * is a comma, because the map at 0x743C is indexed by `ASCII - $20`), and
+ * `$716E` prints the plain word at `-$2(a0)` through the decimaliser at `$6EAE`.
+ * So a live-value pointer is always ONE PAST the end of a record's value slot,
+ * and naming the field is a matter of matching the address:
+ *
+ * | source               | pointer         | the bytes it prints        |
+ * |----------------------|-----------------|----------------------------|
+ * | `score`              | player +$08     | player +$02..$07           |
+ * | `missionSeconds`     | `$23E8(a5)`     | `$23E6(a5)`, set at 0x57D0 |
+ * | `counterAccumulator` | counter +$40    | counter +$3A..$3F          |
+ * | `counterStep`        | counter +$38    | counter +$32..$37          |
+ * | `counterCount`       | counter +$08    | counter +$06 + 2 x player  |
+ * | `rampValue`          | ramp +$0A       | ramp +$04..$09             |
+ * | `rampPaid`           | ramp +$2A       | ramp +$24..$29             |
+ * | `elementScore`       | element +$24    | element +$1E..$23          |
+ * | `unknown`            | anything else   | not drawn                  |
+ *
+ * `unknown` is TWO SITES IN THE WHOLE CORPUS and both are the same field: Law
+ * 'n Justice's "YOU SHOT 00 BAD GUYS" and "EXCELLENT" records print six bytes
+ * inside a native scratch record at h4+0x8900, which the table's own 68000 code
+ * at h4+0x85F8 clears (`lea $8900.l,a1 / clr.l $A(a1) / clr.l $E(a1)`) and this
+ * port does not run. A figure whose source is not decoded is left off the strip
+ * rather than approximated. `tests/display-text.test.ts` pins the count at two.
+ */
+export type ModeMessageValueSource =
+  | "score"
+  | "missionSeconds"
+  | "counterAccumulator"
+  | "counterStep"
+  | "counterCount"
+  | "rampValue"
+  | "rampPaid"
+  | "elementScore"
+  | "unknown";
+
+/** Every source a document may name, for the parser's own check. */
+export const MODE_MESSAGE_VALUE_SOURCES: readonly ModeMessageValueSource[] = Object.freeze([
+  "score",
+  "missionSeconds",
+  "counterAccumulator",
+  "counterStep",
+  "counterCount",
+  "rampValue",
+  "rampPaid",
+  "elementScore",
+  "unknown",
+]);
+
+/**
+ * One live figure a record prints, with the machine's own geometry.
+ *
+ * `align` is the NUMBER printer's, which is written back to front — 0x71EE
+ * tests `d6 == 1` and leaves `d3` alone, then ADDS the measured width for 0 and
+ * half of it for 2, because `$71BA` emits digits right to left and `d3` is the
+ * RIGHT edge — and lands in exactly the same three places as the text
+ * printer's. 1 is [x-w, x], 0 is [x, x+w], 2 is centred; the two centring
+ * roundings agree for every even width, and no width in this corpus is odd.
+ *
+ * `row` is the same direct panel scanline a line's is. The number printer takes
+ * it through `adda.w $20EE(a5,d4.w*2),a3` (0x71CA) rather than `mulu.w #$28,d4`,
+ * and that table IS the same multiply: 0x0998 fills 264 words from `$20DE(a5)`
+ * with `-320 + 40k` and `$20EE` is entry eight, so the lookup is `40 * row`.
+ */
+export interface ModeMessageValue {
+  readonly source: ModeMessageValueSource;
+  /** Counter, ramp or element index for the sources that need one; -1 else. */
+  readonly index: number;
+  /**
+   * The figure itself, for the one source that is CONFIGURATION rather than
+   * state: `elementScore`. Nothing in the decoded corpus writes an element's
+   * +$1E..$23, and the port already carries it as `ModeElement.score`, so the
+   * exporter reads the six BCD bytes and the panel prints them. Zero on every
+   * other source, whose figure is read live off the tick report.
+   */
+  readonly value: number;
+  readonly x: number;
+  readonly row: number;
+  readonly font: number;
+  readonly align: number;
+}
+
 export interface ModeMessage {
   readonly index: number;
   /** The record's TEXT operands in program order, first appearance winning. */
   readonly lines: readonly string[];
   /** Index-parallel with `lines`: where each one goes. */
   readonly layout: readonly ModeMessageLine[];
+  /** The record's live-value opcodes, in program order. See `ModeMessageValue`. */
+  readonly values: readonly ModeMessageValue[];
   /**
    * How long the machine leaves this record's text on the strip, in ticks.
    *
@@ -517,12 +606,37 @@ export interface ModeMessage {
    * hold while an animation runs (0x664E) — which is exactly the rule the panel
    * layer reproduces by holding the text back until its own queue drains.
    *
-   * Zero is real and means what it says: 35 of the 174 text-bearing records
-   * print and END on the same frame. They are the live-value status screens the
-   * machine re-posts every frame, and what re-posts them is not decoded, so
-   * this port shows them for no time at all rather than inventing one.
+   * Zero is real, and `latched` says what it means: every one of the 30
+   * text-bearing records with a hold of zero carries the latch bit, and none
+   * without it does.
    */
   readonly holdTicks: number;
+  /**
+   * THE LATCH — the record's `+$00` bit 0, and the answer to "what re-posts a
+   * record whose hold is zero".
+   *
+   *     006C2C  move.w (a0),d0 / andi.w #$1,d0 / beq 0x6C4C   ; not a message
+   *     006C34  ... move.l (a7)+,$23D0(a5) / clr.l $23D4(a5)  ; THE LATCH
+   *
+   * and the interpreter, on the frame the RING DRAINS (0x667A beq 0x66E8):
+   *
+   *     0066F0  tst.l  $23C8(a5) / bne 0x674A   ; unless art owns the strip
+   *     0066F8  move.l $23D0(a5),d0 / beq 0x6730
+   *     006700  ... one instruction ...
+   *     006728  bra 0x6700                      ; ALL OF THEM, THIS FRAME
+   *     00672A  clr.w $4(a0) / rts              ; END -> PC BACK TO ZERO
+   *
+   * A latched record is not a message: it is the running mode's STATUS SCREEN.
+   * It runs its whole program to END every frame the ring is empty, is redrawn
+   * from the top the next frame, and holds the strip until a ring record covers
+   * it or one of the four `clr.l $23D0` sites takes it away — new game (0x404C),
+   * ball start (0x41DE) and the two mission teardowns (0x584C, 0x5DB6).
+   *
+   * MEASURED over the corpus: of the 160 records carrying words, the 30 with a
+   * hold of zero are the 30 with this bit, with no disagreement either way
+   * (`research/display-text/probe-latched.mjs`).
+   */
+  readonly latched: boolean;
   /**
    * The record's `+$02` and `+$03`, which are the display poster's whole
    * arbitration (0x6C4E-0x6C6A): a record whose primary is BELOW what is on
@@ -822,11 +936,40 @@ export function parseTableModesDocument(doc: TableModesDocument): TableModes {
         align: requireWholeNumber(geometry["align"], `${where} align`, 0, 8),
       });
     });
+    // The live-value opcodes. Optional so a document written before the number
+    // opcodes were decoded still loads with no figures rather than throwing.
+    const values = requireArray(item["values"] ?? [], `${label} message ${at} values`).map(
+      (entry2, slot) => {
+        const value = entry2 as Record<string, unknown>;
+        const where = `${label} message ${at} value ${slot}`;
+        const source = value["source"];
+        if (
+          typeof source !== "string" ||
+          !MODE_MESSAGE_VALUE_SOURCES.includes(source as ModeMessageValueSource)
+        ) {
+          throw new Error(`${where} names source ${JSON.stringify(source)}, which is not decoded`);
+        }
+        return Object.freeze({
+          source: source as ModeMessageValueSource,
+          index: requireWholeNumber(value["index"], `${where} index`, -1, 255),
+          // Only `elementScore` carries one: the element's +$1E..$23 is
+          // configuration, so the exporter resolves it and the runtime does not
+          // have to hold an element list to draw it.
+          value: requireWholeNumber(value["value"] ?? 0, `${where} value`, 0, 999_999_999_999),
+          x: requireWholeNumber(value["x"], `${where} x`, 0, 400),
+          row: requireWholeNumber(value["row"], `${where} row`, 0, 200),
+          font: requireWholeNumber(value["font"], `${where} font`, 0, 32),
+          align: requireWholeNumber(value["align"], `${where} align`, 0, 8),
+        });
+      },
+    );
     messages.push(
       Object.freeze({
         index: at,
         lines: Object.freeze(lines as string[]),
         layout: Object.freeze(layout),
+        values: Object.freeze(values),
+        latched: item["latched"] === true,
         holdTicks: requireWholeNumber(item["holdTicks"], `${label} message ${at} holdTicks`, 0, 60_000),
         priority: requireWholeNumber(item["priority"], `${label} message ${at} priority`, 0, 255),
         priority2: requireWholeNumber(item["priority2"], `${label} message ${at} priority2`, 0, 255),

@@ -329,10 +329,11 @@ const EFFECT_ADVANCE_LADDER = 21;
  * The missions that want the value put back say so with opcode 15, and the ones
  * that want it stopped say so with opcode 16. Same argument `payStep` records.
  *
- * The handler's other half — the value copied into the ramp's +$22..$29 — is
- * NOT modelled: no relocated pointer in any of the three packages lands there
- * and 0x6334, the ramp list's only reader in main hunk 0, never sources it, so
- * the copy has no decoded consumer. research/effects-tail/EFFECTS_TAIL.md §9.1.
+ * The handler's other half — the value copied into the ramp's +$22..$29 — IS
+ * modelled since the live-value round, as `ModeState.rampPaid`. It has a decoded
+ * consumer after all: the display, whose number printer reads backwards from a
+ * pointer to +$2A rather than forwards from +$22, which is why the search for a
+ * pointer at +$22 found nothing. See `ModeState.rampPaid`.
  *
  * `counter` is -1 on every effect-19 element for the same reason it is on every
  * effect-17 one: a ramp record is not on the descriptor's counter list. The
@@ -600,6 +601,29 @@ export interface ModeState {
    */
   readonly rampValues: Float64Array;
   readonly rampRunning: Uint8Array;
+  /**
+   * PER RAMP RECORD, the copy award effect 19 leaves in the record's own tail.
+   *
+   *     0061F6  movea.l $34(a2),a0     ; the ramp
+   *     0061FA  lea     $2(a0),a3      ; its eight-byte value slot
+   *     0061FE  move.l  (a3)+,$22(a0)  ; +$02..$05 -> +$22..$25
+   *     006202  move.l  (a3)+,$26(a0)  ; +$06..$09 -> +$26..$29
+   *     006206  jsr     $6BCC          ; and pay the same six bytes to the score
+   *
+   * `EFFECTS_TAIL.md` §9 listed this copy under "what is NOT established" and was
+   * right on both halves: no relocated pointer in any package lands on +$22, and
+   * it left open whether something read it anyway — "e.g. to print LAST JACKPOT
+   * on the panel". THE READER IS THE PANEL, exactly where it said to look. It was
+   * invisible to that search because the display's number printer reads BACKWARDS
+   * from its pointer, so the pointer is +$2A — the end of the slot, one past the
+   * 42-byte record — and there are seventeen of them across the three tables. It
+   * is the figure the award captions carry: "2ND GEAR" and the rest print what
+   * the jackpot just paid, not what the ramp has climbed to since.
+   *
+   * Written only by effect 19, and left alone by both reset walks exactly as
+   * `rampValues` is, because 0x61F6 is the only site that touches these bytes.
+   */
+  readonly rampPaid: Float64Array;
 
   /**
    * PER LAMP-GROUP LAMP (flattened over `TableModes.lampGroups` in group then
@@ -777,6 +801,7 @@ export function createModeState(modes: TableModes): ModeState {
     // The ramps ship stopped with a zero value and no walk resets them.
     rampValues: new Float64Array(modes.ramps.length),
     rampRunning: Uint8Array.from(modes.ramps, (ramp) => (ramp.running ? 1 : 0)),
+    rampPaid: new Float64Array(modes.ramps.length),
     groupLampLit: new Uint8Array(lampCount),
     groupLampAlways: new Uint8Array(lampCount),
     groupFired: new Uint8Array(modes.lampGroups.length),
@@ -2010,7 +2035,14 @@ function applyAwardEffect(
   // started it, which is what the machine's own uninitialised +$04..$09 gives.
   // See `EFFECT_PAY_RAMP`.
   if (element.effect === EFFECT_PAY_RAMP) {
-    if (element.rampCollect >= 0) out.comboPaid += state.rampValues[element.rampCollect] ?? 0;
+    if (element.rampCollect >= 0) {
+      const paid = state.rampValues[element.rampCollect] ?? 0;
+      // 0x61FE/0x006202, BEFORE the pay: the two longs of the value slot are
+      // copied into the record's tail, which is the figure the award caption
+      // then prints. See `ModeState.rampPaid`.
+      state.rampPaid[element.rampCollect] = paid;
+      out.comboPaid += paid;
+    }
     return;
   }
   // The counting and accumulator effects, all on the record the element's
