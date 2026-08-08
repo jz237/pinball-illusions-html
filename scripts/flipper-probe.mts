@@ -283,7 +283,14 @@ function trial(
   // called that a defect; the ball has to be on the line the bat collides on.
   place(game, start.x, start.y, start.vx, start.vy, config.level);
 
-  let alongAtPress = 0;
+  // NaN, not 0. This was `let alongAtPress = 0`, and `0` is a perfectly good
+  // `along`: a trial that drained before tick `settle` never reached the
+  // `if (tick === settle)` write, kept the initialiser, and then satisfied
+  // `onBladeAtPress = alongAtPress <= 43` — "the ball was on the blade when the
+  // button went down" for a trial in which the button never went down at all.
+  // NaN fails every comparison, so an unrecorded press cannot be mistaken for a
+  // recorded one.
+  let alongAtPress = Number.NaN;
   let launchSpeed = 0;
   let minPerp = Number.POSITIVE_INFINITY;
   let touched = false;
@@ -336,6 +343,10 @@ function trial(
   // was. The old research harness scored the same band separately — "ballistic
   // falls past the raised tip (44..52 px)" — and calling it a pass-under would
   // convict the engine of a defect the geometry cannot commit.
+  //
+  // NaN when the press never happened — the ball was gone before tick `settle` —
+  // and `NaN <= 43` is false, so such a trial cannot be scored PASSED_UNDER on a
+  // press it never saw. It falls through to DRAINED, which is what it was.
   const onBladeAtPress = alongAtPress <= 43;
   if (passedUnder && onBladeAtPress) outcome = "PASSED_UNDER";
   else if (launchSpeed >= 2048) outcome = "STRUCK";
@@ -344,7 +355,7 @@ function trial(
   else outcome = "CARRIED";
   return {
     outcome,
-    alongAtPress,
+    alongAtPress: Number.isFinite(alongAtPress) ? alongAtPress : -1,
     launchSpeed,
     minPerp: Number.isFinite(minPerp) ? minPerp : 0,
     underStroke,
@@ -368,10 +379,36 @@ export interface BatReport {
   /** Cradle: `along` after 600 held ticks from each seat, and whether it left. */
   readonly holdEnd: readonly (readonly [number, number, number])[];
   readonly holdLost: number;
-  /** Gap drops: how many ended under a raised bat. */
-  readonly gapUnder: number;
-  readonly gapDrained: number;
-  readonly gapStruck: number;
+}
+
+/**
+ * The GAP scenario's own report, which is per TABLE and per bats-up/bats-down
+ * and not per bat — which is why it never fitted in `BatReport`.
+ *
+ * IT USED TO BE THREE FIELDS ON `BatReport` HARD-CODED TO ZERO. `gapUnder` was
+ * documented as "Gap drops: how many ended under a raised bat" and the literal
+ * that reached the `--json` dump was `gapUnder: 0`, on every bat of every table,
+ * for ever: `probeGap`'s result was `console.log`ged and then discarded. So the
+ * ONE scenario written for the operator's original complaint — "the ball goes
+ * through the flippers when flipping" — was the one scenario that could not be
+ * diffed before and after a change, which is the only reason the dump exists.
+ *
+ * `under`, `struck` and `drained` DO NOT PARTITION `trials` between them: a ball
+ * that is struck and then drains later in the same 120 ticks counts as `struck`
+ * only, and a ball still on the table when the window closes is none of the
+ * three. `settled` is that remainder, so the four DO partition and the printed
+ * line cannot be read as a breakdown that fails to add up.
+ */
+export interface GapReport {
+  readonly table: TableId;
+  readonly raised: boolean;
+  readonly trials: number;
+  /** Trials that ended UNDER a raised blade, having been over it first. */
+  readonly under: number;
+  readonly struck: number;
+  readonly drained: number;
+  /** Neither under, struck nor drained: still in play when the window closed. */
+  readonly settled: number;
 }
 
 const ROLL_SETTLES = [
@@ -487,9 +524,6 @@ export function probeBat(tableId: TableId, config: FlipperConfig): BatReport {
     rollLaunchMedian: median(rollLaunch),
     holdEnd,
     holdLost,
-    gapUnder: 0,
-    gapDrained: 0,
-    gapStruck: 0,
   };
 }
 
@@ -502,12 +536,11 @@ export function probeBat(tableId: TableId, config: FlipperConfig): BatReport {
  * the operator's first report ("goes through the flippers when flipping") in
  * its purest form.
  */
-function probeGap(tableId: TableId, configs: readonly FlipperConfig[], raised: boolean): {
-  under: number;
-  drained: number;
-  struck: number;
-  trials: number;
-} {
+function probeGap(
+  tableId: TableId,
+  configs: readonly FlipperConfig[],
+  raised: boolean,
+): GapReport {
   const lower = configs.filter((one) => one.id !== "upper");
   const left = lower[0]!;
   const right = lower[1]!;
@@ -560,7 +593,17 @@ function probeGap(tableId: TableId, configs: readonly FlipperConfig[], raised: b
       else if (gone) drained += 1;
     }
   }
-  return { under, drained, struck, trials };
+  // The three are ordered tests, not a partition — see `GapReport`. `settled` is
+  // what is left over, and it is printed so the line adds up.
+  return {
+    table: tableId,
+    raised,
+    under,
+    drained,
+    struck,
+    trials,
+    settled: trials - under - drained - struck,
+  };
 }
 
 /**
@@ -618,6 +661,7 @@ function main(argv: readonly string[]): number {
   const tables = wanted.length > 0 ? (wanted as TableId[]) : [...TABLE_IDS];
   const jsonArg = argv.find((arg) => arg.startsWith("--json="));
   const reports: BatReport[] = [];
+  const gaps: GapReport[] = [];
   for (const tableId of tables) {
     const configs = flipperConfigsFor(tableId);
     for (const config of configs) {
@@ -637,14 +681,20 @@ function main(argv: readonly string[]): number {
     }
     for (const raised of [true, false]) {
       const gap = probeGap(tableId, configs, raised);
+      gaps.push(gap);
       console.log(
         `${tableId.padStart(15)} GAP bats ${raised ? "UP  " : "DOWN"}  trials ${gap.trials}  ` +
-          `UNDER ${gap.under}  struck ${gap.struck}  drained ${gap.drained}`,
+          `UNDER ${gap.under}  struck ${gap.struck}  drained ${gap.drained}  ` +
+          `settled ${gap.settled}`,
       );
     }
   }
   if (jsonArg !== undefined) {
-    writeFileSync(jsonArg.slice(7), JSON.stringify(reports), "utf8");
+    // `{ bats, gap }`, not the bare array it used to be. `probe-tally.mjs` reads
+    // either shape, so old dumps still tally; what changes is that the GAP
+    // scenario now reaches the file at all instead of being printed and thrown
+    // away with three zeroes left behind in its place.
+    writeFileSync(jsonArg.slice(7), JSON.stringify({ bats: reports, gap: gaps }), "utf8");
   }
   return 0;
 }

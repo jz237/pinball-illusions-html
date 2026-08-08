@@ -178,6 +178,19 @@ export interface TableModesDocument {
   readonly messages: readonly Readonly<Record<string, unknown>>[];
   readonly scripts: readonly Readonly<Record<string, unknown>>[];
   readonly missions: readonly Readonly<Record<string, unknown>>[];
+  /**
+   * The decoded award-effect-6 count ladders — the X2..X10 and combo ladders.
+   *
+   * Declared here because it is both SHIPPED and READ and was simply missing:
+   * `export-table-modes.mjs` writes it, `parseTableModesDocument` reads
+   * `raw["ladders"]` (`table-modes.ts:987`), and all three documents on disk
+   * carry it. A reader that indexed `doc.ladders` was told the field did not
+   * exist — which is exactly what `research/multiball-reach/reach.mts` was told,
+   * twice, the moment a typecheck was pointed at `research/`.
+   */
+  readonly ladders?: readonly Readonly<Record<string, unknown>>[];
+  /** The ramp records. Shipped by the exporter and read at `table-modes.ts:1034`. */
+  readonly ramps?: readonly Readonly<Record<string, unknown>>[];
   /** The progress-counter records off the descriptor's own list at +$40. */
   readonly counters?: readonly Readonly<Record<string, unknown>>[];
   /** Index into `counters` of the one the end-of-ball bonus pays combos for, or -1. */

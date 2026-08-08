@@ -96,6 +96,16 @@
 //     exports together element by element). +$3C is a second award-path sound
 //     slot a few records carry (BabeWatch's jackpot fanfare r96A4 hangs there);
 //     it is used only when +$10 is empty.
+//
+//     "A FEW" IS NOW A MEASUREMENT, and it is a small one. Of the 141 +$3C
+//     longwords this walk follows across the three tables, **2** are sound
+//     records — both BabeWatch's — and 139 are not: 59 of 59 on Law 'n Justice
+//     and 44 of 44 on Extreme Sports point at something else entirely, mostly
+//     runs of 8-byte `04 00 00 0N 00 II 00 01` rows with the mode exporter's own
+//     $FFFE selector terminator a few rows on, and one of them sits 10 bytes
+//     from the end of its hunk. So the +$3C read is a GUESS that CHECK 2 filters,
+//     and CHECK 8 counts every rejection out loud so that the guess can never
+//     quietly become a wrong sample or a silently missing one.
 //   * display records — element +$14 (START path), +$18 (AWARD path), and the
 //     message records MESSAGE shows — are programs for the display VM whose
 //     opcode table is at main.seg00 $6748, and its op 0x10 ($6940) plays the
@@ -146,6 +156,11 @@
 //    because N is the same N the mode VM reports, and this is what pins it.
 // 7. EVERY OP-0x10 SITE LIES INSIDE A KNOWN DISPLAY RECORD — between a display
 //    or message start and the next known record, never past ATTRIBUTION_SPAN.
+// 8. EVERY BINDING THAT DOES NOT REACH THE DOCUMENT IS COUNTED AND PRINTED, and
+//    one on a DIRECT slot is fatal unless it is hard-listed in
+//    ALLOWED_NON_SOUND_SLOTS with the address it points at. A dropped binding is
+//    a permanently silent game event and the browser cannot tell it from one
+//    that never existed; 140 were being dropped in silence before this check.
 //
 // Usage:
 //   node scripts/export-table-audio.mjs <segment-dir> [out-dir] [--check]
@@ -186,6 +201,33 @@ const ELEMENT_SOUND_AWARD = 0x10;
 const ELEMENT_SOUND_AWARD_ALT = 0x3c;
 const ELEMENT_DISPLAY_START = 0x14;
 const ELEMENT_DISPLAY_AWARD = 0x18;
+
+/** The labels a binding carries so CHECK 8 can say which pointer it was reading. */
+const ELEMENT_SOUND_START_LABEL = "+$0C";
+const ELEMENT_SOUND_AWARD_LABEL = "+$10";
+const ELEMENT_SOUND_AWARD_ALT_LABEL = "+$3C";
+
+/**
+ * SLOTS THAT ARE KNOWN NOT TO HOLD A SOUND RECORD, with the address each one
+ * points at instead. CHECK 8 requires every entry to fire and refuses any drop
+ * on a direct slot that is not listed here.
+ *
+ * ONE ENTRY, and it was found by counting the drops rather than by reading the
+ * code. BabeWatch element 67's START pointer (`+$0C`) is a live relocation that
+ * lands on 4:39262, which is not a sound record and does not look remotely like
+ * one: it is the middle of a run of 8-byte rows — `04 00 00 02 00 12 00 01`,
+ * `04 00 00 02 00 13 00 01`, ... — of exactly the shape the mode exporter's
+ * selector walk reads, `$FFFE`-terminated a few rows further on. Whatever the
+ * `+$0C` longword means on that element, it is not the address of a sound.
+ *
+ * It is hard-listed rather than "fixed" because the fix is a decode question
+ * this round did not settle: either the element's START slot is overloaded on
+ * some records, or element 67's record is not the shape the walk assumes. A
+ * documented unknown beats an invented sound.
+ */
+const ALLOWED_NON_SOUND_SLOTS = new Map([
+  [`Table002:mode-start-67${ELEMENT_SOUND_START_LABEL}`, "4:39262"],
+]);
 
 /** The display VM's play-record opcode; operand is a relocated longword. */
 const OP_PLAY_RECORD = 0x0010;
@@ -391,6 +433,33 @@ function readSoundRecord(pkg, at) {
   if (!PROTRACKER_PERIODS.has(period)) return null;
   const volume = readU16(pkg, at, SOUND_VOLUME);
   if (volume > 64) return null;
+  return readSoundRecordUnchecked(pkg, at);
+}
+
+/**
+ * WHY an address is not a sound record, for a refusal that can be acted on.
+ *
+ * `readSoundRecord` answering null is the whole of CHECK 2, and a caller that
+ * has to stop because of it should be able to say which of the three tests
+ * failed and on what byte — the difference between "this pointer is not a sound
+ * slot at all" and "this record is a sound record the reader is too strict
+ * about" is the difference between a decode question and a bug.
+ */
+function soundRecordRejection(pkg, at) {
+  if (!inBounds(pkg, at, 26)) return "out of bounds";
+  const kind = readU8(pkg, at, SOUND_KIND);
+  if (kind !== KIND_SAMPLE && kind !== KIND_INSTRUMENT) return `kind ${kind}`;
+  const period = readU16(pkg, at, SOUND_PERIOD);
+  if (!PROTRACKER_PERIODS.has(period)) return `period ${period}`;
+  const volume = readU16(pkg, at, SOUND_VOLUME);
+  if (volume > 64) return `volume ${volume}`;
+  return "none";
+}
+
+function readSoundRecordUnchecked(pkg, at) {
+  const kind = readU8(pkg, at, SOUND_KIND);
+  const volume = readU16(pkg, at, SOUND_VOLUME);
+  const period = readU16(pkg, at, SOUND_PERIOD);
 
   return {
     at,
@@ -613,11 +682,24 @@ function modeBindings(pkg, modesDoc) {
 
   const found = [];
   // The direct element sounds first, so they win the id over a display sting.
+  //
+  // `slot` rides along so a refusal can say WHICH of the three pointers it was
+  // reading — see CHECK 8. The three are different claims about the record
+  // layout and they fail for different reasons.
   for (const [index, at] of elements.entries()) {
-    const award = follow(pkg, at, ELEMENT_SOUND_AWARD) ?? follow(pkg, at, ELEMENT_SOUND_AWARD_ALT);
-    if (award !== null) found.push({ id: `mode-element-${index}`, sound: award });
+    const direct = follow(pkg, at, ELEMENT_SOUND_AWARD);
+    const award = direct ?? follow(pkg, at, ELEMENT_SOUND_AWARD_ALT);
+    if (award !== null) {
+      found.push({
+        id: `mode-element-${index}`,
+        sound: award,
+        slot: direct === null ? ELEMENT_SOUND_AWARD_ALT_LABEL : ELEMENT_SOUND_AWARD_LABEL,
+      });
+    }
     const start = follow(pkg, at, ELEMENT_SOUND_START);
-    if (start !== null) found.push({ id: `mode-start-${index}`, sound: start });
+    if (start !== null) {
+      found.push({ id: `mode-start-${index}`, sound: start, slot: ELEMENT_SOUND_START_LABEL });
+    }
   }
 
   // Then the display stings, first site per container.
@@ -646,7 +728,20 @@ function modeBindings(pkg, modesDoc) {
     found.push({ id: holder.id, sound: site.target });
   }
 
-  return { found, stats: { elements: elements.length, messages: messages.length, sites: sites.length, layered } };
+  return {
+    found,
+    stats: {
+      elements: elements.length,
+      messages: messages.length,
+      sites: sites.length,
+      layered,
+      // How many award bindings came off the SPECULATIVE `+$3C` slot rather than
+      // the direct `+$10`. CHECK 8 prints this beside the count of them that
+      // turned out not to be sound records, so the header's "a few records carry
+      // it" is a measured ratio on screen and not a recollection.
+      altSlot: found.filter((one) => one.slot === ELEMENT_SOUND_AWARD_ALT_LABEL).length,
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -701,15 +796,79 @@ function decode(pkg, table, modesDoc) {
   const triggerById = new Map();
   const modes = modeBindings(pkg, modesDoc);
 
+  /**
+   * CHECK 8 — EVERY DROPPED TRIGGER IS COUNTED, NAMED AND PRINTED, AND THE ONES
+   * THAT WOULD BE DATA LOSS ARE FATAL.
+   *
+   * Two of the four `continue`s in this loop delete a whole `{ id, sample }`
+   * trigger, and until this round they did it with no count, no log and no
+   * refusal. The browser looks a sound up BY TRIGGER ID, so a dropped binding is
+   * a permanently silent game event with no diagnostic anywhere — the exact
+   * shape of the loss that cost this project 228 of 229 display pointers, and
+   * the only silent unbounded drop in the twenty-one exporters.
+   *
+   * MEASURED THE MOMENT A COUNTER WENT IN: **140 triggers were being dropped** —
+   * Law 'n Justice 59, BabeWatch 37, Extreme Sports 44 — all of them at the
+   * `readSoundRecord` test and none at `pcmFor`. So the honest answer is neither
+   * "throw on everything" nor "it was fine": the drops split cleanly in two, and
+   * only one half is a claim about the layout at all.
+   *
+   * 139 OF THE 140 ARE THE `+$3C` FALLBACK, WHICH IS SPECULATIVE BY CONSTRUCTION.
+   * `modeBindings` reads the award sound as `+$10 ?? +$3C`, and `+$3C` is only
+   * consulted when the element carries no `+$10` at all. The header calls `+$3C`
+   * "a second award-path sound slot A FEW records carry", and the measurement is
+   * now on the record: of every `+$3C` longword this walk follows, only a
+   * handful are sound records. What the rest point at was read off the disk for
+   * this round — 8-byte-stride tables of `04 00 00 0N 00 II 00 01` rows, several
+   * terminated by the `$FFFE` sentinel the mode exporter's selector walk knows
+   * (`export-table-modes.mjs`, `entry.terminator === 0xfffe`), and one of them,
+   * Law 'n Justice element 125's, is 10 bytes from the end of its hunk so a
+   * 26-byte record cannot even fit there. They are not sounds. `readSoundRecord`
+   * rejecting them is the test doing exactly its job, and it is the ONLY thing
+   * standing between the `+$3C` guess and 139 wrong samples in the manifest.
+   * Those are therefore COUNTED AND PRINTED, per table, every run — never silent
+   * again — and not fatal.
+   *
+   * 1 OF THE 140 IS A DIRECT SLOT: BabeWatch element 67's `+$0C`, the START
+   * sound, which points at 4:39262 — another of those stride-8 tables. That one
+   * is hard-listed below WITH ITS ADDRESS, so it is expected rather than
+   * tolerated, and any drift in it fails the export.
+   *
+   * EVERYTHING ELSE IS FATAL: any `+$10` or `+$0C` rejection that is not the
+   * hard-listed one, any rejection on the device / zone / bumper / slingshot
+   * chains (which are single-purpose pointers and drop zero today), and any
+   * `pcmFor` failure (zero today). That is the `throw` density the other
+   * nineteen exporters have, applied where a drop would really be a lost sound.
+   *
+   * The third `continue` at `triggerById.has` is DELIBERATE and documented (the
+   * first binding of an id wins); it is counted separately as `layeredIds` so
+   * the deliberate one can never be mistaken for one of these.
+   */
+  const dropped = { speculative: [], direct: [], allowed: [], noPcm: [], layeredIds: 0 };
+
   for (const binding of [...bindings(pkg), ...modes.found]) {
     const record = readSoundRecord(pkg, binding.sound);
-    if (record === null) continue;
-    if (triggerById.has(binding.id)) continue;
+    if (record === null) {
+      const where = `${binding.id}${binding.slot ?? ""}@${key(binding.sound)}`;
+      const note = `${where}(${soundRecordRejection(pkg, binding.sound)})`;
+      const allowed = ALLOWED_NON_SOUND_SLOTS.get(`${pkg.stem}:${binding.id}${binding.slot ?? ""}`);
+      if (allowed === key(binding.sound)) dropped.allowed.push(note);
+      else if (binding.slot === ELEMENT_SOUND_AWARD_ALT_LABEL) dropped.speculative.push(note);
+      else dropped.direct.push(note);
+      continue;
+    }
+    if (triggerById.has(binding.id)) {
+      dropped.layeredIds += 1;
+      continue;
+    }
     const recordKey = key(binding.sound);
     let index = byRecord.get(recordKey);
     if (index === undefined) {
       const pcm = pcmFor(pkg, record, audio);
-      if (pcm === null || pcm.length === 0) continue;
+      if (pcm === null || pcm.length === 0) {
+        dropped.noPcm.push(`${binding.id}@${key(binding.sound)}`);
+        continue;
+      }
       index = samples.length;
       byRecord.set(recordKey, index);
       const rate = Math.round(PAL_CLOCK / record.period);
@@ -737,10 +896,45 @@ function decode(pkg, table, modesDoc) {
     triggerById.set(binding.id, index);
   }
 
+  // CHECK 8, the refusal. A binding on a DIRECT slot that names a sound and does
+  // not reach the document is a game event that will be silent for ever in the
+  // browser, and the only honest thing to do with one is stop, because there is
+  // no way to tell from the shipped JSON that it was ever there. A drop that is
+  // genuinely expected belongs in `ALLOWED_NON_SOUND_SLOTS` with its address
+  // beside it — the way `export-table-devices.mjs` hard-lists
+  // `UNREACHABLE_DEVICE_SLOTS` — and not in a bare `continue`.
+  const lost = [...dropped.direct, ...dropped.noPcm];
+  if (lost.length > 0) {
+    throw new Error(
+      `${pkg.stem}: ${lost.length} sound trigger(s) would be dropped with no sample — ` +
+        `${dropped.direct.length} on a DIRECT slot whose pointer is not a sound record ` +
+        `[${dropped.direct.join(" ")}], ${dropped.noPcm.length} whose record has no PCM ` +
+        `[${dropped.noPcm.join(" ")}]. Each one is a permanently silent game event; explain ` +
+        `it in ALLOWED_NON_SOUND_SLOTS rather than letting the export lose it.`,
+    );
+  }
+
+  // And the hard list must be EXACTLY used: an exception that has stopped firing
+  // is an exception that is describing a tree this is no longer looking at.
+  const expected = [...ALLOWED_NON_SOUND_SLOTS.keys()].filter((k) => k.startsWith(`${pkg.stem}:`));
+  if (dropped.allowed.length !== expected.length) {
+    throw new Error(
+      `${pkg.stem}: ALLOWED_NON_SOUND_SLOTS lists ${expected.length} expected non-sound slot(s) ` +
+        `[${expected.join(" ")}] and ${dropped.allowed.length} fired [${dropped.allowed.join(" ")}]; ` +
+        `an exception that no longer applies must be removed, not left standing.`,
+    );
+  }
+
   const triggers = [...triggerById.entries()]
     .map(([id, sample]) => ({ id, sample }))
     .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-  return { samples, triggers, banks: [...audio.values()], modeStats: modes.stats };
+  return {
+    samples,
+    triggers,
+    banks: [...audio.values()],
+    modeStats: modes.stats,
+    dropped,
+  };
 }
 
 function buildDocument(table, decoded) {
@@ -798,6 +992,19 @@ function main(argv) {
       failures += 1;
       continue;
     }
+
+    // CHECK 8's census, printed in BOTH modes including `--check`, so the
+    // numbers are on screen every single time this file runs rather than only on
+    // a write. An uncounted drop is what this exporter used to do, and a counter
+    // nobody ever sees is the same defect wearing a number.
+    const drops = decoded.dropped;
+    console.log(
+      `  ${table.tableId.padStart(15)}: CHECK 8 — ${drops.speculative.length} of ` +
+        `${decoded.modeStats.altSlot} +$3C award guesses are not sound records and are dropped; ` +
+        `${drops.allowed.length} hard-listed non-sound slot(s); ` +
+        `${drops.direct.length} direct-slot drop(s); ${drops.noPcm.length} with no PCM ` +
+        `(${drops.layeredIds} deliberate second binding(s) of an id already taken)`,
+    );
 
     const json = JSON.stringify(buildDocument(table, decoded));
     const out = join(outDir, `${table.tableId}.audio.json`);

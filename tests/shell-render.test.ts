@@ -694,17 +694,35 @@ describe.skipIf(!exported)("legibility, screen by screen", () => {
    * fail here too. Under the wrongly-read palette the backdrop carried six
    * entries of $fff, i.e. a ratio of 1.00, and this fails on the first page.
    */
-  it("keeps the ink at least 3:1 against the backdrop on every page of the cycle", async () => {
+  it("keeps the ink at least 3:1 against the backdrop on all eight held pages", async () => {
     const art = await shippedArt();
     const skin = await shippedSkin();
     let worst = Infinity;
+    // The WHOLE loop, derived. This was the literal 6147 — the pre-251 figure,
+    // 24 frames short of the real 6171 — so the search was bounded inside the
+    // thing it was searching.
+    const loop = CYCLE_FRAMES * SHELL_BACKDROP_PAGES.length;
+    let measured = 0;
     for (let tint = 0; tint < SHELL_PALETTE_LIVE; tint += 1) {
+      // TINT 8 IS `SHELL_BLACK_PALETTE`, THE CROSSFADE OUT, AND IT IS NEVER HELD.
+      // Its segment carries `hold = 0`, so `within - start` never reaches `fade`
+      // and `settled` is false for every frame of it. The search below therefore
+      // ran to its bound on this tint and measured contrast at an arbitrary
+      // frame under some OTHER tint, silently, while the case claimed to cover
+      // "every page of the cycle". There are eight held pages; this is all eight
+      // of them, and the black transient is excluded on purpose rather than by
+      // falling off the end of a loop.
+      if (tint === SHELL_PALETTE_LIVE - 1) continue;
       let tick = 0;
-      while (tick < 6147) {
+      while (tick < loop) {
         const frame = shellBackdropFrame(art, tick);
         if (frame.settled && frame.tint === tint) break;
         tick += 1;
       }
+      // AND THE SEARCH IS ASSERTED. It never was: a tint that could not be found
+      // fell through with `tick === loop` and the case went on measuring.
+      expect(tick, `tint ${tint} never settles anywhere in one whole loop`).toBeLessThan(loop);
+      measured += 1;
       const state = createShell(store);
       state.ticks = tick;
       state.attractPage = 1;
@@ -728,6 +746,8 @@ describe.skipIf(!exported)("legibility, screen by screen", () => {
         }
       }
     }
+    // Eight pages really were measured, at a real settled frame each.
+    expect(measured).toBe(SHELL_PALETTE_LIVE - 1);
     // The gold page's own tint, $980, is the tightest the original ever gets.
     expect(worst).toBeGreaterThan(3.5);
     expect(worst).toBeLessThan(3.7);

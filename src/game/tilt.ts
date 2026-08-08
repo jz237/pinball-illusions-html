@@ -75,7 +75,13 @@
  * no-ball paths at +0x00A750 and +0x00A770. Four passes to a 50 Hz frame, so the
  * counter loses 200 a second.
  *
- * WHAT THE SHIPPED MACHINE THEREFORE DOES, with sensitivity 100 against 200:
+ * WHAT THAT DECODE PREDICTS, with sensitivity 100 against 200 — AND IT IS NOT
+ * WHAT THIS FILE SHIPS. Read the note under `MEASURED_TILT_THRESHOLD` before
+ * believing a number in this paragraph: the 200/4 pair is REFUTED BY THE RUNNING
+ * MACHINE on filmed, millisecond-logged key scripts, and `nudgeConfigFor` ships
+ * the calibrated 400/2. The prediction is kept because it is a correct reading
+ * of thirteen instructions and the gap between it and the film is an open
+ * disassembly question — but it is a description of the decode, not of the port.
  *
  *     one nudge   -> 100, drained to nothing in 25 frames, half a second
  *     two nudges  -> CANNOT tilt. 100 + (100 - 4) is 196 at the very best.
@@ -84,10 +90,11 @@
  *     sensitivity 200 -> the first nudge tilts
  *
  * It is not "the second nudge", which is what a threshold of exactly twice the
- * default looks like on paper before the decay is counted. It is the third
- * inside half a second, and it is the same on all three tables — record 3 is
- * byte-identical across `table001.opt`, `table002.opt` and `table003.opt`, so
- * the per-table difference this file used to advertise does not exist.
+ * default looks like on paper before the decay is counted. On the decoded pair
+ * it is the third inside half a second; on the film, and therefore in this port,
+ * it is the fifth press. Either way it is the same on all three tables — record
+ * 3 is byte-identical across `table001.opt`, `table002.opt` and `table003.opt`,
+ * so the per-table difference this file used to advertise does not exist.
  */
 
 import type { TableId } from "./contracts.js";
@@ -158,9 +165,26 @@ export const MEASURED_TILT_DECAY_PER_TICK = 2;
 export interface NudgeConfig {
   /** Option record 3: counts added to the warning per shove. MEASURED. */
   readonly sensitivity: number;
-  /** The warning value that tilts the table. MEASURED: 200. */
+  /**
+   * The warning value that tilts the table. MEASURED OFF FILM: 400, not the
+   * disassembly's 200 — see `MEASURED_TILT_THRESHOLD`, which is the only value
+   * `nudgeConfigFor` ever puts here.
+   *
+   * These two docs used to read "MEASURED: 200" and "MEASURED: four, one per
+   * pass", which are the `ORIGINAL_TILT_THRESHOLD` and `TILT_DECAY_PER_TICK`
+   * sitting fifty lines above — decode-only records that this file's own text
+   * calls REFUTED BY THE RUNNING MACHINE and that no `src/` file reads. An
+   * author tuning tilt would have found the documented values right there and
+   * "corrected" the producer, halving the threshold and doubling the decay: the
+   * table would tilt on the third nudge instead of the fifth and players would
+   * lose about twice as many balls to it.
+   */
   readonly threshold: number;
-  /** Counts the warning loses each tick. MEASURED: four, one per pass. */
+  /**
+   * Counts the warning loses each tick. MEASURED OFF FILM: 2. The decode says
+   * four, one per collision pass, and no fit survives it — see
+   * `MEASURED_TILT_DECAY_PER_TICK`.
+   */
   readonly decayPerTick: number;
   /** Ticks a nudge is locked out for while the cabinet recentres. */
   readonly cooldownTicks: number;

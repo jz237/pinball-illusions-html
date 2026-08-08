@@ -830,7 +830,27 @@ export interface Game {
   bonus: BonusPhase | null;
   /** The mission machine's state, or null when the table has no mission layer. */
   modeState: ModeState | null;
-  /** The lines the running mission last put on the display, newest first. */
+  /**
+   * The lines the running mission last put on the display, IN PROGRAM ORDER —
+   * the order the record's own TEXT operands appear, first appearance winning.
+   *
+   * NOT "newest first", which is what this said and what nothing on the path
+   * does. `mode-vm.ts` builds it with a plain `push` over `record.lines`
+   * (`:1636`), `table-modes.ts:593` states the ordering rule at the source, and
+   * `game-loop.ts` copies the array wholesale. There is no `unshift` and no
+   * `reverse` anywhere between the two.
+   *
+   * The distinction matters because a record's `lines` are the two halves of one
+   * sentence — "SHOOT ALL" then "TERRORISTS" — and the sole consumer,
+   * `missionLine`, joins them with a space. An author who believed the old
+   * comment and reversed the array to "print it chronologically", or took
+   * `modeMessages[0]` as "the latest line", would render the banner backwards or
+   * truncated to the wrong half on every table with two-line mission text.
+   *
+   * `lockEjectStack` forty lines above really IS newest first — `unshift` in,
+   * `shift` out — so the idiom is used precisely elsewhere in this file, which
+   * is exactly why a reader was entitled to believe it here.
+   */
   modeMessages: readonly string[];
   /** The ball sitting on the plunger rod, or null once it has been launched. */
   laneBallId: number | null;

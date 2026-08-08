@@ -1,0 +1,53 @@
+// TYPECHECK THE RESEARCH PROBES.
+//
+// `tsconfig.json` covers `src`, `tests`, `scripts` and nothing else, so the
+// forty-odd `.mts` harnesses under `../research/` — every one of which imports
+// signatures straight out of `game/src` — were checked by nothing at all. A
+// rename in `src` broke them silently and the breakage only surfaced the next
+// time somebody happened to run that probe, in a project whose entire evidence
+// base IS those probes.
+//
+// Extends the shipped config so the probes are held to exactly the same rules
+// the game is: `strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`,
+// `verbatimModuleSyntax`. Two are relaxed, and only two:
+//
+//   noUnusedLocals / noUnusedParameters — a probe legitimately decodes more
+//   than it prints on any given run, and an unused intermediate is how a
+//   measurement gets parked while the next one is written. Refusing those would
+//   make the check a nuisance rather than a rail, and neither can mask a drift
+//   in a signature, which is what this config exists to catch.
+//
+// `../research` is NOT in this git repository (it is the operator's local
+// working tree), so this config is deliberately NOT part of `npm run build`:
+// a clean checkout has nothing to point it at. `npm run typecheck:research`
+// runs it and says out loud when the tree is absent — see
+// `scripts/typecheck-research.mjs`.
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noUnusedLocals": false,
+    "noUnusedParameters": false
+  },
+  "include": ["../research/**/*.mts"],
+  // TWO ARCHIVED DIRECTORIES, AND THE EXCLUSION IS BY DIRECTORY SO THAT A NEW
+  // PROBE ANYWHERE ELSE UNDER research/ IS PICKED UP WITHOUT ANYONE DECIDING TO.
+  //
+  // Both hold drivers that were WRITTEN IN AND RUN FROM `game/scripts/` and
+  // moved here afterwards, which their own headers say:
+  // `view/fixround/INDEX.txt` — "the drivers in drivers\ ran from game\scripts\
+  // via npx vite-node scripts/_verify-fidelity.mts ... (moved here afterwards to
+  // leave the repo tree as the fix round left it)"; and
+  // `view/fixround/drivers/_verify-tables.mts` — "Temporary; deleted after the
+  // round." Their `../src/...` and `../tests/...` specifiers therefore resolve
+  // from `game/scripts/` and from nowhere else, and `./_verify5.mts` is a
+  // sibling import that only a bundler run accepts.
+  //
+  // MEASURED, so the exclusion is a number and not a hand-wave: including them
+  // contributes 102 of the 127 errors the very first run found — 67 TS2307
+  // "cannot find module ../src/...", 12 TS5097 ".mts extension" and 23 TS7006
+  // implicit-any parameters that only exist because the modules those callbacks
+  // come from could not be resolved. Every one is a statement about where the
+  // file is sitting, not about the code. They are artefacts of finished rounds;
+  // nothing runs them again. The remaining 25 are real drift in 10 live probes.
+  "exclude": ["../research/view/round5/verify/harness", "../research/view/fixround/drivers"]
+}

@@ -144,6 +144,7 @@ import type {
   TableAccelDocument,
   TableDevicesDocument,
   TableId,
+  TableMap,
   TableMapDocument,
   TableModesDocument,
 } from "../src/game/contracts.js";
@@ -746,45 +747,76 @@ interface TrapCensus {
 /** Ticks a released ball is given to find the drain. 900 = eighteen seconds. */
 const TRAP_TICKS = 900;
 
-function trapCensus(tableId: TableId, level: 0 | 1, step: number): TrapCensus {
-  const map = mapFor(tableId);
+/**
+ * THE MACHINE A RELEASED BALL IS STEPPED ON. Built once, here, and used by BOTH
+ * the trap census and `--drop`, which is the only way the `--drop` header's
+ * claim to be "the same machine the trap census runs" can be true rather than
+ * maintained by hand. It was not true: `--drop` built the first two options and
+ * not the second two, so the tool used to walk a census site back to the tick
+ * that made it ran the ball THROUGH the bat the census says is holding it.
+ *
+ * THE DRIVE AND THE SURFACE IDS ARE NOT OPTIONAL. `mapFor` registers both, and
+ * `stepBalls` defaults them to null: a census run without the drive would make
+ * every shallow ramp a trap by construction and every figure it printed would be
+ * about a machine this project does not ship. `game-loop.ts` spreads exactly
+ * these two in for the same reason.
+ *
+ * THE BATS ARE NOT OPTIONAL EITHER, and leaving them out is why this census
+ * could not see the round that put them into the frame. `stepBalls` defaults
+ * `bats` to null, so every release here used to run past nine bats that were not
+ * there — and the two pockets this census exists to name both sit against Law 'n
+ * Justice's resting upper bat. Measured: identical figures before and after the
+ * bats joined the collision passes, on 121,639 releases, which is a statement
+ * about the instrument and not about the tree.
+ *
+ * AND THE EJECTOR'S OWN VIEW OF THOSE BATS, which is not optional either and for
+ * a sharper version of the same reason: the two Law 'n Justice pockets this
+ * census exists to name are pockets the machine's ejector walks a ball out of,
+ * and it can only do that because it counts its ring over `map OR bat`
+ * (`+0x0039FA`). A run with `batUnion` null measures a port that is not the one
+ * the game loop ships. See `BatUnionMask` in `ball-physics.ts`.
+ *
+ * Nobody is pressing anything, so the bank is at rest and the sweeps are
+ * constant for the whole run: a bat standing still is exactly the furniture a
+ * stranded ball leans on. The clamp is the map's own, as the game loop's is.
+ *
+ * `batPass()` hands out a FRESH resolver per ball, because the approach-side
+ * memory inside it is per (ball, bat) state that outlives a tick. The sweeps and
+ * the clamp never change, so everything else is shared.
+ *
+ * The same four are built for the test suite by `restingMachineFor` in
+ * `tests/table-fixtures.ts`; the two constructions are deliberately separate
+ * because this file registers a different set of table documents than the test
+ * fixture does, and they must not drift into each other's registry.
+ */
+function releaseMachine(tableId: TableId, map: TableMap) {
   const materials = materialTableFor(tableId);
-  const view =
-    level === 0 ? playfieldViewFor(map, VIRTUAL_TOP_WALL_ROWS[tableId]) : upperLevelViewFor(map);
-  const forces = { gravityY: SIMULATION_GRAVITY, tiltX: 0, nudgeX: 0, nudgeY: 0 };
-  // THE DRIVE AND THE SURFACE IDS ARE NOT OPTIONAL. `mapFor` registers both,
-  // and `stepBalls` defaults them to null: a census run without the drive would
-  // make every shallow ramp a trap by construction and every figure it printed
-  // would be about a machine this project does not ship. `game-loop.ts` spreads
-  // exactly these two in for the same reason.
   const options = { rampDrive: tableAccelerationFor(tableId), surfaces: tableDevicesFor(tableId) };
-  // THE BATS ARE NOT OPTIONAL EITHER, and leaving them out is why this census
-  // could not see the round that put them into the frame. `stepBalls` defaults
-  // `bats` to null, so every release here used to run past nine bats that were
-  // not there — and the two pockets this census exists to name both sit against
-  // Law 'n Justice's resting upper bat. Measured: identical figures before and
-  // after the bats joined the collision passes, on 121,639 releases, which is a
-  // statement about the instrument and not about the tree.
-  //
-  // Nobody is pressing anything, so the bank is at rest and the sweeps are
-  // constant for the whole census: a bat standing still is exactly the
-  // furniture a stranded ball leans on. The clamp is the map's own, as the game
-  // loop's is.
   const batSweeps = tickFlipperBank(
     createFlipperBank(tableId),
     flipperInputFrom(false, false, UPPER_FLIPPER_RECORDS[tableId].role),
   ).sweeps;
   const clamp = pushClampForMap(map, materials, options);
-  // AND THE EJECTOR'S OWN VIEW OF THOSE BATS, which is not optional either and
-  // for a sharper version of the same reason: the two Law 'n Justice pockets
-  // this census exists to name are pockets the machine's ejector walks a ball
-  // out of, and it can only do that because it counts its ring over `map OR
-  // bat` (`+0x0039FA`). A census run with `batUnion` null measures a port that
-  // is not the one the game loop ships. See `BatUnionMask` in `ball-physics.ts`.
   const batUnion = batUnionMaskFor(
     batSweeps,
     createBatUnionMasks(flipperConfigsFor(tableId), levelSolidForMap(map, materials, options)),
   );
+  return {
+    materials,
+    options,
+    batUnion,
+    batPass: () =>
+      createFlipperPass(batSweeps, undefined, clamp, undefined, createFlipperApproachSides())
+        .resolve,
+  };
+}
+
+function trapCensus(tableId: TableId, level: 0 | 1, step: number): TrapCensus {
+  const map = mapFor(tableId);
+  const view =
+    level === 0 ? playfieldViewFor(map, VIRTUAL_TOP_WALL_ROWS[tableId]) : upperLevelViewFor(map);
+  const forces = { gravityY: SIMULATION_GRAVITY, tiltX: 0, nudgeX: 0, nudgeY: 0 };
+  const { materials, options, batUnion, batPass } = releaseMachine(tableId, map);
   const sites = new Map<string, number>();
   let starts = 0;
   let drained = 0;
@@ -803,12 +835,12 @@ function trapCensus(tableId: TableId, level: 0 | 1, step: number): TrapCensus {
       const ball = spawnBall(set, pixelsToQ10(x), pixelsToQ10(y), 0, 0, level);
       // One approach-side memory per release, because it is per (ball, bat)
       // state that outlives a tick. One resolver too: the sweeps never change.
-      const bats = createFlipperPass(batSweeps, undefined, clamp, undefined, createFlipperApproachSides());
+      const bats = batPass();
       let gone = false;
       for (let tick = 0; tick < TRAP_TICKS; tick += 1) {
         const result = stepBalls(set, map, materials, forces, {
           ...options,
-          bats: bats.resolve,
+          bats,
           batUnion,
         });
         if (result.drained.length > 0) {
@@ -853,17 +885,24 @@ function trapCensus(tableId: TableId, level: 0 | 1, step: number): TrapCensus {
 /**
  * Releases ONE ball from rest at one place and prints where it goes.
  *
- * `--drop=<table>,<level>,<x>,<y>[,<ticks>]` — the same machine the trap
- * census runs, so a site the census names is walkable back to the tick that
- * made it. Gravity and the table's own drive, nothing else.
+ * `--drop=<table>,<level>,<x>,<y>[,<ticks>]` — the same machine the trap census
+ * runs, so a site the census names is walkable back to the tick that made it.
+ * Gravity, the table's own drive, its surface ids, its bats at rest and the
+ * ejector's view of those bats, and nothing else.
+ *
+ * "THE SAME MACHINE" IS NOW STRUCTURAL AND NOT A CLAIM: both callers take their
+ * four options from `releaseMachine` and there is nowhere left to build half of
+ * them. This used to pass `rampDrive` and `surfaces` only, so the tracer for a
+ * census site ran the ball through the resting bat the census had it leaning on,
+ * and the two tools could disagree about the same coordinate for ever.
  */
 function dropOne(spec: string): void {
   const [table, level, x, y, ticks] = spec.split(",");
   const tableId = table as TableId;
   const map = mapFor(tableId);
-  const materials = materialTableFor(tableId);
   const forces = { gravityY: SIMULATION_GRAVITY, tiltX: 0, nudgeX: 0, nudgeY: 0 };
-  const options = { rampDrive: tableAccelerationFor(tableId), surfaces: tableDevicesFor(tableId) };
+  const { materials, options, batUnion, batPass } = releaseMachine(tableId, map);
+  const bats = batPass();
   const set = createBallSet();
   const ball = spawnBall(
     set,
@@ -879,7 +918,7 @@ function dropOne(spec: string): void {
   let lastX = ball.x;
   let lastY = ball.y;
   for (let tick = 0; tick < budget; tick += 1) {
-    const result = stepBalls(set, map, materials, forces, options);
+    const result = stepBalls(set, map, materials, forces, { ...options, bats, batUnion });
     const moved = Math.abs(ball.x - lastX) + Math.abs(ball.y - lastY);
     if (tick < 40 || tick % 25 === 0 || moved === 0) {
       console.log(

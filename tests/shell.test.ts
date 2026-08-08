@@ -951,4 +951,71 @@ describe("the multi-player high-score walk", () => {
     press(state, store, SELECT);
     expect(state.phase).toBe("ladder");
   });
+
+  it("leaves the attract ladder showing the LAST player's score, not the last qualifier's", () => {
+    // THE HOT-SEAT BUG, in the exact shape that produced it. `finalScore` is
+    // what `drawGameOver` and `drawLadder` print, and the walk used to
+    // overwrite it once per qualifying player and never put it back. So a game
+    // whose EARLIER player qualified and whose LAST player did not ended with
+    // the attract ladder captioned "GAME OVER / <player 1's score>" over player
+    // 2's finished game, and it stayed there until the next game started.
+    //
+    // Two players, and only the first can qualify: player 2's 1,000 beats
+    // nothing any ladder this table can hold.
+    const { state, store } = intoPlay("law-n-justice");
+    const top = state.ladder[0]?.score ?? 0;
+    const winner = top + 2_000_000;
+    shellGameEnded(state, [winner, 1_000]);
+
+    // The GAME OVER card was always right, and still is.
+    expect(state.finalScore).toBe(1_000);
+
+    press(state, store, SELECT); // cut the card
+    expect(state.phase).toBe("fanfare");
+    expect(state.scoringPlayer).toBe(1);
+    press(state, store, SELECT); // cut the fanfare
+    expect(state.phase).toBe("initials");
+    // The walk is placing player 1, so THAT is the score it carries...
+    expect(state.entryScore).toBe(winner);
+    // ...and the game's own figure is untouched while it does.
+    expect(state.finalScore).toBe(1_000);
+
+    type(state, store, "ABC");
+    // Player 2 does not qualify, so the walk falls out to the attract ladder.
+    expect(state.phase).toBe("ladder");
+    // The ladder took player 1's score, under player 1's initials.
+    expect(state.ladder.find((entry) => entry.initials === "ABC")?.score).toBe(winner);
+    // And the caption over it is the game's last player, which is the whole
+    // point: this printed player 1's millions over player 2's game before.
+    expect(state.finalScore).toBe(1_000);
+  });
+
+  it("carries the right score into the ladder for EVERY qualifier of a three-player walk", () => {
+    // The other half of the same split: `entryScore` has to STEP, or the second
+    // qualifier's initials would be written against the first one's score.
+    const { state, store } = intoPlay("babewatch");
+    const top = state.ladder[0]?.score ?? 0;
+    const first = top + 4_000_000;
+    const third = top + 2_000_000;
+    shellGameEnded(state, [first, 1_000, third]);
+    expect(state.finalScore).toBe(third);
+
+    press(state, store, SELECT);
+    press(state, store, SELECT);
+    expect(state.entryScore).toBe(first);
+    type(state, store, "ONE");
+
+    // Player 2's 1,000 is skipped; the walk steps to player 3 and its score.
+    expect(state.scoringPlayer).toBe(3);
+    expect(state.entryScore).toBe(third);
+    press(state, store, SELECT);
+    type(state, store, "TRE");
+
+    expect(state.phase).toBe("ladder");
+    expect(state.ladder.find((entry) => entry.initials === "ONE")?.score).toBe(first);
+    expect(state.ladder.find((entry) => entry.initials === "TRE")?.score).toBe(third);
+    // Here the last player IS a qualifier, so the old code happened to agree —
+    // which is exactly why the bug survived: it is invisible in this shape.
+    expect(state.finalScore).toBe(third);
+  });
 });

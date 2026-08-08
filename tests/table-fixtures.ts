@@ -22,10 +22,32 @@
 
 import { readFileSync } from "node:fs";
 import { parseTableMapDocument } from "../src/game/table-map.js";
-import { parseTableAccelDocument, registerTableAcceleration } from "../src/game/table-accel.js";
+import {
+  parseTableAccelDocument,
+  registerTableAcceleration,
+  tableAccelerationFor,
+} from "../src/game/table-accel.js";
 import type { TableAcceleration } from "../src/game/table-accel.js";
-import { parseTableDevicesDocument, registerTableDevices } from "../src/game/table-devices.js";
+import {
+  parseTableDevicesDocument,
+  registerTableDevices,
+  tableDevicesFor,
+} from "../src/game/table-devices.js";
 import type { TableDevices } from "../src/game/table-devices.js";
+import { levelSolidForMap, pushClampForMap } from "../src/game/ball-physics.js";
+import type { BatPassResolver, BatUnionMask } from "../src/game/ball-physics.js";
+import {
+  UPPER_FLIPPER_RECORDS,
+  batUnionMaskFor,
+  createBatUnionMasks,
+  createFlipperApproachSides,
+  createFlipperBank,
+  createFlipperPass,
+  flipperConfigsFor,
+  flipperInputFrom,
+  tickFlipperBank,
+} from "../src/game/flippers.js";
+import { materialTableFor } from "../src/game/materials.js";
 import { parseTableModesDocument, registerTableModes } from "../src/game/table-modes.js";
 import type { TableModes } from "../src/game/table-modes.js";
 import { parseTableLampsDocument, registerTableLamps } from "../src/game/table-lamps.js";
@@ -124,4 +146,69 @@ export function mapFor(tableId: TableId): TableMap {
   flipperBatsFixture();
   const doc = JSON.parse(readFileSync(documentUrl(tableId, "map"), "utf8")) as TableMapDocument;
   return parseTableMapDocument(doc);
+}
+
+/**
+ * THE MACHINE A HAND-PLACED BALL SHOULD BE STEPPED ON, with nobody pressing
+ * anything: the ramp drive, the surface-id map, the bank of bats at rest, and
+ * the ejector's own view of those bats.
+ *
+ * `stepBalls` defaults ALL FOUR of these to null (`DEFAULT_SIMULATION_OPTIONS`),
+ * and a four-argument call is therefore a call against a machine this project
+ * does not ship — which is exactly the mistake `pathology-sweep.mts`'s trap
+ * census was fixed for, in capitals, at `:761-786`:
+ *
+ *   "THE DRIVE AND THE SURFACE IDS ARE NOT OPTIONAL ... a census run without the
+ *    drive would make every shallow ramp a trap by construction"
+ *   "THE BATS ARE NOT OPTIONAL EITHER, and leaving them out is why this census
+ *    could not see the round that put them into the frame."
+ *   "AND THE EJECTOR'S OWN VIEW OF THOSE BATS ... A census run with `batUnion`
+ *    null measures a port that is not the one the game loop ships."
+ *
+ * The census was brought onto the shipped machine and the regression tests for
+ * the three traps it found were not, so those tests were pinning physics that
+ * no longer exists. This is that construction, once, so a test cannot half-arm
+ * anything here either. `game-loop.ts` spreads the same four at `:1755-1770`.
+ *
+ * Nobody is pressing anything, so the bank is at rest and the sweeps are
+ * constant for the whole run: a bat standing still is exactly the furniture a
+ * stranded ball leans on.
+ */
+export interface RestingMachine {
+  readonly rampDrive: TableAcceleration;
+  readonly surfaces: TableDevices;
+  readonly batUnion: BatUnionMask;
+  /**
+   * A FRESH bat resolver. One per ball, never shared: the approach-side memory
+   * inside it is per (ball, bat) state that outlives a tick, which is what the
+   * pass-under fix turned from a stale position into a sign.
+   */
+  batPass(): BatPassResolver;
+}
+
+export function restingMachineFor(tableId: TableId, map: TableMap): RestingMachine {
+  const materials = materialTableFor(tableId);
+  const rampDrive = tableAccelerationFor(map.tableId);
+  const surfaces = tableDevicesFor(map.tableId);
+  if (surfaces === null) {
+    throw new Error(`${tableId}: no scoring layer registered; call mapFor() first`);
+  }
+  const options = { rampDrive, surfaces };
+  const batSweeps = tickFlipperBank(
+    createFlipperBank(tableId),
+    flipperInputFrom(false, false, UPPER_FLIPPER_RECORDS[tableId].role),
+  ).sweeps;
+  const clamp = pushClampForMap(map, materials, options);
+  const batUnion = batUnionMaskFor(
+    batSweeps,
+    createBatUnionMasks(flipperConfigsFor(tableId), levelSolidForMap(map, materials, options)),
+  );
+  return {
+    rampDrive,
+    surfaces,
+    batUnion,
+    batPass: () =>
+      createFlipperPass(batSweeps, undefined, clamp, undefined, createFlipperApproachSides())
+        .resolve,
+  };
 }

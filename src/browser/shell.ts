@@ -318,8 +318,30 @@ export interface ShellState {
    * into every replay. Recorded as a divergence, not an oversight.)
    */
   players: number;
-  /** The score the finished game ended on — the LAST player's, as the machine's game-over screen shows. */
+  /**
+   * The score the finished game ended on — the LAST player's, as the machine's
+   * game-over screen shows, and it stays the last player's for the whole of the
+   * high-score walk.
+   *
+   * IT USED NOT TO. `advanceScoreEntry` wrote the cursor's score here once per
+   * qualifying player and never put it back, so in a two-player game where
+   * player 1 qualified and player 2 did not, the attract ladder the walk falls
+   * out to (`drawLadder`, "GAME OVER" over `formatScore(finalScore)`) captioned
+   * player 2's finished game with player 1's score and left it there until the
+   * next game. The walk's own cursor score now lives in `entryScore`.
+   */
   finalScore: number;
+  /**
+   * The score the high-score walk is currently placing, or 0 outside a walk.
+   *
+   * `advanceScoreEntry` sets it as it steps onto each qualifying player and
+   * `commitInitials` is the only reader: it is the score written into the ladder
+   * beside the typed initials. Split out of `finalScore` because the two are
+   * different questions — "what did this game end on", which is about the game
+   * and is what the cards print, against "whose score am I entering", which is
+   * about the walk and outlives no part of it.
+   */
+  entryScore: number;
   /**
    * Every player's final score in player order, from the game that just
    * ended. The high-score check walks these exactly as the original's state-2
@@ -396,6 +418,7 @@ export function createShell(store: ScoreStore): ShellState {
     ladder: store.load(first.id),
     players: 1,
     finalScore: 0,
+    entryScore: 0,
     finalScores: [],
     scoreCursor: 0,
     scoringPlayer: 1,
@@ -683,6 +706,7 @@ function leaveTable(state: ShellState, store: ScoreStore): ShellEffect[] {
   state.attractTicks = 0;
   state.tableId = null;
   state.finalScore = 0;
+  state.entryScore = 0;
   state.finalScores = [];
   state.scoreCursor = 0;
   state.scoringPlayer = 1;
@@ -970,6 +994,7 @@ export function shellGameEnded(state: ShellState, score: number | readonly numbe
   state.phase = "game-over";
   state.finalScores = scores;
   state.finalScore = scores.length === 0 ? 0 : (scores[scores.length - 1] ?? 0);
+  state.entryScore = 0;
   state.scoreCursor = 0;
   state.scoringPlayer = 1;
   state.holdTicks = GAME_OVER_TICKS;
@@ -1002,7 +1027,10 @@ function advanceScoreEntry(state: ShellState): ShellEffect[] {
     if (place < 0) continue;
     state.place = place;
     state.scoringPlayer = player + 1;
-    state.finalScore = score;
+    // The WALK's score, not the GAME's: `finalScore` is what the game ended on
+    // and what the cards and the attract ladder print, and it must survive a
+    // walk that stops on somebody who is not the last player.
+    state.entryScore = score;
     // "PLAYER n GOT A / HIGHSCORE" for three seconds, then the name box.
     state.phase = "fanfare";
     state.holdTicks = HIGHSCORE_FANFARE_TICKS;
@@ -1029,7 +1057,7 @@ function finishGameOver(state: ShellState, store: ScoreStore): ShellEffect[] {
 function commitInitials(state: ShellState, store: ScoreStore): ShellEffect[] {
   const tableId = state.tableId;
   const initials = state.initials.trim().length === 0 ? "AAA" : state.initials;
-  state.ladder = insertScore(state.ladder, initials, state.finalScore).slice(0, HIGH_SCORE_SLOTS);
+  state.ladder = insertScore(state.ladder, initials, state.entryScore).slice(0, HIGH_SCORE_SLOTS);
   if (tableId !== null) {
     // The original stores the ladder back through nonvolatile.library at 0x3438
     // when the table is torn down. Saving at the moment the name is accepted is

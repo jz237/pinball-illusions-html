@@ -20,9 +20,13 @@
  * free-running service over them (`main.bin` h0+0x10AA, called once per PAL
  * field from the shell's main loop at h0+0x1060, in EVERY shell state):
  *
- *     fade to palette 0, hold 250 frames, fade to palette 1, hold 250 ...
- *     fade to palette 7, hold 250, fade to palette 8 — which is black — and at
+ *     fade to palette 0, hold 251 frames, fade to palette 1, hold 251 ...
+ *     fade to palette 7, hold 251, fade to palette 8 — which is black — and at
  *     black swap to the next backdrop strip and restart at palette 0.
+ *
+ * 251, not the 250 this line and three others used to say: see
+ * `SHELL_TINT_HOLD_FRAMES`, which is where the hold was measured and where the
+ * one-frame residual against the film is stated.
  *
  * The fade itself is h0+0x0A44: colours 1..15 only, each R/G/B nibble moved ONE
  * step per frame toward the target, so a fade lasts as many frames as the
@@ -30,8 +34,14 @@
  * $0000 once at init and stays there — which is why the object field is black on
  * every page of the original.
  *
- * One backdrop is 2049 frames (40.98 s at 50 Hz) and the whole three-strip loop
- * 6147 (122.9 s). Because the service runs in every state, WHICH STRIP IS ON
+ * One backdrop is 2057 frames (41.14 s at 50 Hz) and the whole three-strip loop
+ * 6171 (123.4 s) — eight holds of `SHELL_TINT_HOLD_FRAMES` plus this
+ * reconstruction's 49 frames of fade, the black palette taking no hold. This
+ * said 2049/6147, which is 8 x 250 + 49: the pre-251 figures, left behind when
+ * the hold was re-measured. `shellBackdropCycle` is the arithmetic and
+ * `tests/shell-render.test.ts` builds the same product from the constant rather
+ * than from a literal, so the two cannot part company again.
+ * Because the service runs in every state, WHICH STRIP IS ON
  * SCREEN IS NOT DECIDED BY WHICH SCREEN YOU ARE ON: the film caught the same
  * credits page on the cube strip once and the torus twice across three cold
  * boots, and caught the main menu on the cube. `shellBackdropFrame` is that
@@ -122,7 +132,7 @@ export interface ShellBackdropFrame {
   readonly from: number;
   /** Fade steps applied so far; equal to the fade's length once settled. */
   readonly step: number;
-  /** True once the registers have reached `tint` and the 250-frame hold runs. */
+  /** True once the registers have reached `tint` and the 251-frame hold runs. */
   readonly settled: boolean;
   /** The sixteen colours currently in the registers, 48 bytes r,g,b. */
   readonly palette: Uint8Array;
@@ -179,7 +189,7 @@ interface CycleSegment {
   readonly to: number;
   readonly fade: number;
   readonly hold: number;
-  /** First frame of this segment within one backdrop's 2049. */
+  /** First frame of this segment within one backdrop's 2057. */
   readonly start: number;
 }
 
@@ -276,7 +286,7 @@ export interface ShellSkin {
   readonly sourceScale: number;
   /**
    * One strip painted through `palette` (48 bytes, as `ShellBackdropFrame`
-   * carries it). Repainted only when the palette actually changed, so the 250
+   * carries it). Repainted only when the palette actually changed, so the 251
    * frames a page is held cost nothing.
    */
   backdrop(role: ShellBackdropRole, palette: Uint8Array): CanvasImageSource;

@@ -21,9 +21,10 @@ import {
 import type { Game, InputSource } from "../src/browser/game-loop.js";
 import { CONTROLS, IDLE_SNAPSHOT } from "../src/browser/input.js";
 import type { Control, ControlEdges, ControlSnapshot } from "../src/browser/input.js";
-import { mapFor } from "./table-fixtures.js";
+import { mapFor, restingMachineFor } from "./table-fixtures.js";
+import type { RestingMachine } from "./table-fixtures.js";
 import { pixelsToQ10, q10ToPixel } from "../src/core/fixed-point.js";
-import type { TableId } from "../src/game/contracts.js";
+import type { TableId, TableMap } from "../src/game/contracts.js";
 import { TABLE_IDS } from "../src/game/contracts.js";
 import { materialTableFor } from "../src/game/materials.js";
 import { createBallSet, spawnBall, stepBalls } from "../src/game/ball-physics.js";
@@ -31,6 +32,7 @@ import { ballIsOnTheRod } from "../src/game/plunger.js";
 import { SIMULATION_GRAVITY } from "../src/game/timebase.js";
 import { freeCentre, levelViewsOf } from "../src/game/level-scan.js";
 import { flipperConfigsFor } from "../src/game/flippers.js";
+import { BALL_RADIUS_PIXELS } from "../src/game/collision-probe.js";
 import type { LevelViews } from "../src/game/level-scan.js";
 
 function realMap() {
@@ -951,8 +953,43 @@ const HISTORIC_STRAND_SITES: Readonly<Record<TableId, readonly (readonly [number
     ],
   });
 
+/**
+ * The map and the resting machine for one table, built once.
+ *
+ * The bat union masks are per (table, bat, pose) and cost real time to build, so
+ * they are cached exactly as the game loop caches its own (`batUnionsFor`). The
+ * ONLY per-ball thing in there is the approach-side memory, and
+ * `RestingMachine.batPass()` hands out a fresh one of those on every call.
+ */
+const MACHINES = new Map<TableId, { map: TableMap; machine: RestingMachine }>();
+function machineFor(tableId: TableId): { map: TableMap; machine: RestingMachine } {
+  const cached = MACHINES.get(tableId);
+  if (cached !== undefined) return cached;
+  const map = mapFor(tableId);
+  const fresh = { map, machine: restingMachineFor(tableId, map) };
+  MACHINES.set(tableId, fresh);
+  return fresh;
+}
+
 describe("the deterministic ball traps", () => {
-  /** Steps one hand-placed ball on the real geometry, with nothing else in play. */
+  /**
+   * Steps one hand-placed ball on the real geometry, with nobody playing.
+   *
+   * "NOTHING ELSE IN PLAY" USED TO MEAN "NO DRIVE, NO SURFACES, NO BATS", which
+   * is not a quieter machine, it is a DIFFERENT one. This called `stepBalls`
+   * with four arguments, so `resolveOptions` filled `rampDrive`, `surfaces`,
+   * `bats` and `batUnion` from `DEFAULT_SIMULATION_OPTIONS` — all four null —
+   * and the three named trap sites below were being regression-tested against
+   * physics the game does not run. `pathology-sweep.mts`'s trap census, which is
+   * what FOUND these three sites, was corrected for exactly this and these tests
+   * were never brought along; the census's own note records that the two Law 'n
+   * Justice pockets "both sit against Law 'n Justice's resting upper bat", which
+   * is furniture this helper could not see at all.
+   *
+   * All three traps still reproduce on the shipped machine — measured, not
+   * assumed: with the four options restored the assertions below pass unchanged
+   * and no expectation was touched to make that so.
+   */
   function settle(
     tableId: TableId,
     x: number,
@@ -960,14 +997,28 @@ describe("the deterministic ball traps", () => {
     level: 0 | 1,
     ticks: number,
   ): { readonly x: number; readonly y: number; readonly level: number; readonly moved: number } {
-    const map = mapFor(tableId);
+    const { map, machine } = machineFor(tableId);
     const materials = materialTableFor(tableId);
     const set = createBallSet();
     const ball = spawnBall(set, pixelsToQ10(x), pixelsToQ10(y), 0, 0, level);
     const startX = ball.x;
     const startY = ball.y;
+    // One resolver for this ball, for the whole run: the approach-side memory
+    // is per (ball, bat) and must not be shared with the next release.
+    const bats = machine.batPass();
     for (let tick = 0; tick < ticks; tick += 1) {
-      stepBalls(set, map, materials, { gravityY: SIMULATION_GRAVITY, nudgeX: 0, nudgeY: 0 });
+      stepBalls(
+        set,
+        map,
+        materials,
+        { gravityY: SIMULATION_GRAVITY, nudgeX: 0, nudgeY: 0 },
+        {
+          rampDrive: machine.rampDrive,
+          surfaces: machine.surfaces,
+          bats,
+          batUnion: machine.batUnion,
+        },
+      );
     }
     return {
       x: ball.x / 1024,
@@ -976,6 +1027,79 @@ describe("the deterministic ball traps", () => {
       moved: Math.max(Math.abs(ball.x - startX), Math.abs(ball.y - startY)) / 1024,
     };
   }
+
+  /** The same release with `stepBalls` given none of the four options. */
+  function settleBare(
+    tableId: TableId,
+    x: number,
+    y: number,
+    level: 0 | 1,
+    ticks: number,
+  ): { readonly x: number; readonly y: number; readonly level: number } {
+    const { map } = machineFor(tableId);
+    const materials = materialTableFor(tableId);
+    const set = createBallSet();
+    const ball = spawnBall(set, pixelsToQ10(x), pixelsToQ10(y), 0, 0, level);
+    for (let tick = 0; tick < ticks; tick += 1) {
+      stepBalls(set, map, materials, { gravityY: SIMULATION_GRAVITY, nudgeX: 0, nudgeY: 0 });
+    }
+    return { x: ball.x / 1024, y: ball.y / 1024, level: ball.level };
+  }
+
+  it("settles on the SHIPPED machine, and that is not the same machine as the bare one", () => {
+    // THE RAIL UNDER THE OTHER THREE CASES IN THIS BLOCK.
+    //
+    // `settle` used to call `stepBalls` with four arguments, so `resolveOptions`
+    // filled `rampDrive`, `surfaces`, `bats` and `batUnion` from
+    // `DEFAULT_SIMULATION_OPTIONS` — all four null — and the three named trap
+    // sites were regression-tested against physics the game does not run. All
+    // three still reproduce with the options restored, which is the good news
+    // and also the reason this case has to exist: their assertions come out the
+    // same either way, so nothing else in the file would notice if the options
+    // were dropped again.
+    //
+    // MEASURED over a sample of the releases the three cases below make: on Law
+    // 'n Justice's orbit 6 of 8 end more than a pixel from where the bare
+    // machine leaves them, worst 28.2 px and a level change; on Extreme Sports'
+    // crown mouth every one of a 9-column sample does, worst 223.3 px; on
+    // BabeWatch's roulette lane 14 of 15 do, worst 7.6 px — the smallest of the
+    // three, because that lane is walls rather than drive. So the claim is per
+    // table and deliberately loose: MOST of the releases move, and at least one
+    // moves by half a ball. Anything tighter would be a fit to today's numbers.
+    const sites: Readonly<Record<TableId, readonly (readonly [number, number, 0 | 1, number])[]>> = {
+      "law-n-justice": [[214, 21, 1, BALL_SEARCH_TICKS], [216, 21, 1, BALL_SEARCH_TICKS],
+        [218, 22, 1, BALL_SEARCH_TICKS], [222, 23, 1, BALL_SEARCH_TICKS],
+        [226, 24, 1, BALL_SEARCH_TICKS], [230, 25, 1, BALL_SEARCH_TICKS],
+        [240, 28, 1, BALL_SEARCH_TICKS], [250, 31, 1, BALL_SEARCH_TICKS]],
+      "extreme-sports": [[262, 130, 0, 900], [267, 130, 0, 900], [272, 130, 0, 900],
+        [277, 130, 0, 900], [282, 130, 0, 900], [287, 130, 0, 900], [292, 130, 0, 900],
+        [297, 130, 0, 900], [302, 130, 0, 900]],
+      babewatch: [[85, 138, 0, BALL_SEARCH_TICKS], [86, 138, 0, BALL_SEARCH_TICKS],
+        [87, 138, 0, BALL_SEARCH_TICKS], [88, 143, 0, BALL_SEARCH_TICKS],
+        [89, 148, 0, BALL_SEARCH_TICKS], [90, 152, 0, BALL_SEARCH_TICKS]],
+    };
+    for (const tableId of TABLE_IDS) {
+      let differ = 0;
+      let worst = 0;
+      const list = sites[tableId];
+      for (const [x, y, level, ticks] of list) {
+        const armed = settle(tableId, x, y, level, ticks);
+        const bare = settleBare(tableId, x, y, level, ticks);
+        const apart = Math.max(Math.abs(armed.x - bare.x), Math.abs(armed.y - bare.y));
+        if (apart > 1 || armed.level !== bare.level) differ += 1;
+        worst = Math.max(worst, apart);
+      }
+      expect(
+        differ,
+        `${tableId}: only ${differ} of ${list.length} releases noticed the drive, the surface ` +
+          `ids and the bats; worst separation ${worst.toFixed(2)}px`,
+      ).toBeGreaterThan(list.length / 2);
+      expect(
+        worst,
+        `${tableId}: the shipped machine moved no release by even half a ball`,
+      ).toBeGreaterThan(BALL_RADIUS_PIXELS / 2);
+    }
+  });
 
   it("law-n-justice: a ball that runs out of speed on the top orbit rolls back down it", () => {
     // TRAP ONE. A ball coasting up the right leg of the top arch on the upper
@@ -1179,16 +1303,27 @@ describe("all three tables", () => {
       // a fraction of a pixel and passes. That is strictly more searching than
       // the equality test it replaces: it would have caught a crawl that happened
       // to pass through exactly (0,0) on tick 500, and this cannot.
-      const map = mapFor(tableId);
+      //
+      // AND IT RUNS THE SHIPPED MACHINE, which it did not: this called
+      // `stepBalls` with four arguments too, so the drive, the surface ids, the
+      // bats and the ejector's bat union were all null. See `settle` above.
+      const { map, machine } = machineFor(tableId);
       const materials = materialTableFor(tableId);
       const forces = { gravityY: SIMULATION_GRAVITY, nudgeX: 0, nudgeY: 0 };
       for (const [x, y] of HISTORIC_STRAND_SITES[tableId]) {
         const set = createBallSet();
         const ball = spawnBall(set, pixelsToQ10(x), pixelsToQ10(y));
+        const bats = machine.batPass();
+        const options = {
+          rampDrive: machine.rampDrive,
+          surfaces: machine.surfaces,
+          bats,
+          batUnion: machine.batUnion,
+        };
         let startX = ball.x;
         let startY = ball.y;
         for (let tick = 0; tick < BALL_SEARCH_TICKS && ball.active; tick += 1) {
-          stepBalls(set, map, materials, forces);
+          stepBalls(set, map, materials, forces, options);
           // The search anchors after the ball has settled onto the geometry, so
           // measure from the same place it would.
           if (tick === 0) {
@@ -1203,7 +1338,7 @@ describe("all three tables", () => {
         const parkedY = ball.y;
         let excursion = 0;
         for (let tick = 0; tick < BALL_SEARCH_TICKS && ball.active; tick += 1) {
-          stepBalls(set, map, materials, forces);
+          stepBalls(set, map, materials, forces, options);
           excursion = Math.max(
             excursion,
             Math.abs(ball.x - parkedX) / 1024,
@@ -1220,20 +1355,54 @@ describe("all three tables", () => {
       }
     });
 
-    it(`${tableId} never writes a ball off into a sealed pocket`, () => {
+    it(`${tableId} ends every ball somewhere the drain is reachable from`, () => {
       // The ball search is allowed to give up on a ball a cup is holding — a
       // real machine does exactly that, and this reconstruction has no coils to
       // empty one with. What it must NEVER do is give up on a ball in a place
       // the geometry has no way out of, because that means the ball was put
       // somewhere it could not have got to.
+      //
+      // ------------------------------------------------------------------------
+      // THIS TEST USED TO EXECUTE ITS LOOP BODY ZERO TIMES, ON ALL THREE TABLES
+      // ------------------------------------------------------------------------
+      // It read `if (end.drained) continue;` over `runFor(tableId).ends` — and
+      // the sibling test below asserts, over THE SAME CACHED RUN, that every one
+      // of those ends is drained. So `continue` fired on every element, no
+      // assertion ran at all, and the case reported green. `drainConnected`
+      // returning an empty set, or `nearestFreeCentreKey` returning null
+      // unconditionally, both passed it. That is worse than having no test,
+      // because it reads as coverage.
+      //
+      // The premise is now stated rather than assumed, and the check is made of
+      // EVERY end rather than of the empty subset:
+      //
+      //  - there ARE ends, and the run is the scripted one, so the count is a
+      //    property of the machine and not of the loop;
+      //  - NONE of them is a write-off today. That is the stronger fact and it
+      //    is asserted HERE, in the test whose corpus it empties, rather than
+      //    only two cases away where a reader of this one would never see it;
+      //  - and every end, however it ended, sits at a free ball centre from
+      //    which a flood-fill up from the bottom rows can reach the drain. For a
+      //    drained ball that is close to given — it is at the drain — but it is
+      //    the assertion that keeps the geometry helpers honest, and the write-off
+      //    clause is live for the day a write-off appears rather than waiting to
+      //    be re-enabled by somebody who notices.
       const reach = drainConnected(tableId);
-      for (const end of runFor(tableId).ends) {
-        if (end.drained) continue;
+      expect(reach.size, `${tableId}: nothing at all reaches the drain`).toBeGreaterThan(1000);
+      const ends = runFor(tableId).ends;
+      expect(ends.length, `${tableId} produced no ball ends`).toBeGreaterThanOrEqual(3);
+      const writtenOff = ends.filter((end) => !end.drained);
+      expect(
+        writtenOff.map((end) => `(${end.x},${end.y})`),
+        `${tableId}: the scripted game wrote a ball off`,
+      ).toEqual([]);
+      for (const end of ends) {
+        const where = `${end.drained ? "drained" : "written off"} at (${end.x},${end.y})`;
         const key = nearestFreeCentreKey(tableId, end.x, end.y);
-        expect(key, `written off at (${end.x},${end.y}) with no free centre near it`).not.toBeNull();
+        expect(key, `${tableId}: ${where}, with no free centre near it`).not.toBeNull();
         expect(
           key === null ? false : reach.has(key),
-          `written off at (${end.x},${end.y}), which no path reaches the drain from`,
+          `${tableId}: ${where}, which no path reaches the drain from`,
         ).toBe(true);
       }
     });
