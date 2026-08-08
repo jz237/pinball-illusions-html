@@ -194,6 +194,139 @@ function batFrame(
   };
 }
 
+/**
+ * WHERE THE BALL IS RELATIVE TO ONE BLADE, in the three terms the crossing rule
+ * needs. ONE definition — `trial` and `probeGap` used to compute their own and
+ * they had drifted apart in the band they scored on.
+ *
+ * `onBlade` is only "inside the blade's span", and that is a STRIP ACROSS THE
+ * WHOLE PLAYFIELD, not a neighbourhood of the bat: `along` and `perp` are a
+ * rotation of the table's own axes about the pivot, so a ball 200 px down the
+ * table can sit inside `along in [2,43]` while being nowhere near the bat. That
+ * is precisely the mistake `911bed7` left behind — see `CrossingWatch`.
+ *
+ * `touching` is the blade's own reach: half-thickness at that `along` plus 9, a
+ * ball centre inside it is in contact. `near` adds one whole ball diameter of
+ * clearance on top, so a ball outside it is separated from the blade by a gap a
+ * ball would fit through and cannot be in the act of passing through it.
+ */
+interface BladeGeometry {
+  readonly along: number;
+  readonly perp: number;
+  readonly reach: number;
+  readonly onBlade: boolean;
+  readonly touching: boolean;
+  readonly near: boolean;
+}
+
+/**
+ * Slack beyond the blade's own reach that still counts as NEAR it.
+ *
+ * Eight px — one ball diameter. The blade's half-thickness runs 8.0 px at the
+ * boss to 4.1 at the tip on every bat of all three tables, so `reach` is 17.0
+ * down to 13.1 and the near band is 42 to 50 px wide. THE BALL CANNOT JUMP IT:
+ * the velocity clamp is 16 px a tick per axis, i.e. 22.6 px of diagonal travel
+ * in one tick, so a ball crossing the axis gets at least one sample inside the
+ * band however fast it is going. `worstStep` re-measures that bound on every run
+ * rather than trusting this paragraph.
+ */
+const NEAR_BLADE_SLACK = 8;
+
+function bladeGeometry(
+  config: FlipperConfig,
+  stroke: number,
+  ballX: number,
+  ballY: number,
+): BladeGeometry {
+  const { along, perp } = batFrame(config, stroke, ballX, ballY);
+  const reach = batRadiusAt(config, pixelsToQ10(Math.max(0, along))) / Q10_ONE + 9;
+  // ON THE BLADE means between the boss and the tip. Past the tip is not the
+  // blade, and a ball that falls past a raised tip has MISSED, not passed
+  // under — the old research harness scored those separately for the same
+  // reason. 43 px of the 44 px blade, one pixel clear of the tip cap.
+  const onBlade = along >= 2 && along <= 43;
+  return {
+    along,
+    perp,
+    reach,
+    onBlade,
+    touching: onBlade && Math.abs(perp) <= reach + 2,
+    near: onBlade && Math.abs(perp) <= reach + NEAR_BLADE_SLACK,
+  };
+}
+
+/**
+ * Ticks the ball may spend away from the blade and still be counted as having
+ * gone THROUGH it.
+ *
+ * Two, i.e. 45 px of travel at the clamp — several times the 8 px the blade is
+ * thick, so no honest passage needs more. It exists at all because a ball
+ * arriving at 22 px a tick can be above the blade at one sample and below it at
+ * the next with nothing in between; without it the rule would refuse the fastest
+ * pass-unders, which are the ones that matter.
+ */
+const CROSSING_GRACE_TICKS = 2;
+
+/**
+ * THE CROSSING RULE, and this is the thing this round changed.
+ *
+ * `911bed7` connected the upper bats' button for the first time and eleven
+ * crossings appeared that were called PASSED_UNDER. All eleven — and BOTH of the
+ * two lower-bat crossings that had been carried as known residue since the probe
+ * was written — turned out to be the same artifact, and the traces are in
+ * `research/flipper-power/UPPER_BAT.md` §6:
+ *
+ *   the bat STRUCK the ball, the ball flew off the table's far side, and 60 to
+ *   90 ticks later it fell back into the `along` strip from OUTSIDE — past the
+ *   tip, or behind the boss — already below the blade's plane. On Extreme
+ *   Sports' upper bat it was 192 to 239 px below the axis, i.e. most of the way
+ *   down a 600 px table, with the bat parked at rest.
+ *
+ * The old rule could not tell that from a pass-under because its "was above"
+ * latch was set once, anywhere in the strip, and never cleared. So a ball that
+ * was above the blade at the START of the trial satisfied it for ever.
+ *
+ * THE RULE NOW: the latch is armed only while the ball is NEAR the blade and
+ * above it, and it is cleared when the ball has been away from the blade for
+ * more than `CROSSING_GRACE_TICKS`. A crossing is the ball appearing below the
+ * blade's plane, inside the blade's span, without having left its neighbourhood
+ * since it was last above it. That is "through the blade" and nothing else.
+ *
+ * `plane` keeps the OLD number alongside it — the ball ended below the blade's
+ * infinite plane inside the strip — so this tightening stays auditable for ever
+ * instead of being a count that silently got smaller. It is NOT a defect and it
+ * is not what any outcome is scored on.
+ */
+class CrossingWatch {
+  /** Near the blade AND above it, within the grace window. THE LATCH. */
+  private armed = false;
+  /** Ticks since the ball was last near this blade. */
+  private awayTicks = CROSSING_GRACE_TICKS + 1;
+  /** The OLD latch: above it ANYWHERE in the strip, ever. Diagnostic only. */
+  private everAbove = false;
+
+  /**
+   * One tick. `scoring` is false before the button goes down, so a crossing
+   * cannot be attributed to a press that has not happened.
+   */
+  observe(
+    geometry: BladeGeometry,
+    scoring: boolean,
+  ): { readonly under: boolean; readonly plane: boolean; readonly armed: boolean } {
+    if (geometry.near) {
+      this.awayTicks = 0;
+      if (geometry.perp > BALL_RADIUS_PIXELS) this.armed = true;
+    } else {
+      this.awayTicks += 1;
+      if (this.awayTicks > CROSSING_GRACE_TICKS) this.armed = false;
+    }
+    if (geometry.onBlade && geometry.perp > BALL_RADIUS_PIXELS) this.everAbove = true;
+    // Clearly below, not grazing: a perp of -1 is the ball riding the edge.
+    const below = geometry.onBlade && geometry.perp < -(BALL_RADIUS_PIXELS + 2) && scoring;
+    return { under: below && this.armed, plane: below && this.everAbove, armed: this.armed };
+  }
+}
+
 /** A resting place on the bat's top face: `along` px out, just clear of it. */
 function seatOn(
   config: FlipperConfig,
@@ -274,19 +407,60 @@ function controlFor(tableId: TableId, config: FlipperConfig): Control {
  * silently fails to break anything reports a healthy machine and is worse than
  * no self-test at all.
  */
+/**
+ * THE SECOND MUTATION: `FLIPPER_PROBE_SELFTEST=through` MAKES THE BAT MISS.
+ *
+ * A crossing rule that has been TIGHTENED has to prove it still catches the
+ * thing it is for, and "the count went down" is not that proof. This sets the
+ * bank's collision LEVEL to a value no ball ever rides, and
+ * `resolveFlipperContacts` skips a bat whose level differs from the ball's
+ * (`sweep.config.level !== ball.level`, flippers.ts). The blade still animates —
+ * the animation is driven by the button, not by contacts — so every bat sweeps
+ * its full 54 degrees straight THROUGH the ball, which is the operator's own
+ * report ("the ball goes through the flippers when flipping") in its purest and
+ * most extreme form. A rule that cannot see the blade pass through the ball
+ * cannot see a blade that half-passes through it either.
+ *
+ * It is the BANK's config, not `FLIPPER_RECORDS`, and not the `config` the
+ * scenarios measure geometry in: the trial places its ball on `config.level`
+ * from the decode, and `batFrame` reads the decode's pivot and poses, so the
+ * frame the crossing is scored in is untouched and only the contact is gone.
+ */
 const SELFTEST = process.env["FLIPPER_PROBE_SELFTEST"] ?? "";
 const SELFTEST_COIL = 2;
+const SELFTEST_LEVEL = 7;
 
 function applySelfTest(game: Game): void {
-  if (SELFTEST !== "stall") return;
-  for (const config of game.flippers.configs) {
-    (config as { upAcceleration: number }).upAcceleration = SELFTEST_COIL;
-    if (config.upAcceleration !== SELFTEST_COIL) {
-      throw new Error(
-        `FLIPPER_PROBE_SELFTEST=stall could not weaken ${config.id}: the config is frozen, ` +
-          `so this run would have reported the SHIPPED coil as if it were the broken one`,
-      );
+  if (SELFTEST === "stall") {
+    for (const config of game.flippers.configs) {
+      (config as { upAcceleration: number }).upAcceleration = SELFTEST_COIL;
+      if (config.upAcceleration !== SELFTEST_COIL) {
+        throw new Error(
+          `FLIPPER_PROBE_SELFTEST=stall could not weaken ${config.id}: the config is frozen, ` +
+            `so this run would have reported the SHIPPED coil as if it were the broken one`,
+        );
+      }
     }
+    return;
+  }
+  if (SELFTEST === "through") {
+    for (const config of game.flippers.configs) {
+      (config as { level: number }).level = SELFTEST_LEVEL;
+      if ((config as { level: number }).level !== SELFTEST_LEVEL) {
+        throw new Error(
+          `FLIPPER_PROBE_SELFTEST=through could not lift ${config.id} off the ball's ` +
+            `collision line: the config is frozen, so this run would have reported the ` +
+            `SHIPPED geometry as if the bat had been made to miss`,
+        );
+      }
+    }
+    return;
+  }
+  if (SELFTEST !== "") {
+    throw new Error(
+      `FLIPPER_PROBE_SELFTEST=${SELFTEST} is not a mutation this probe knows; ` +
+        `a typo here silently runs the SHIPPED machine and reports it as a self-test`,
+    );
   }
 }
 
@@ -371,6 +545,20 @@ const OUTCOME_LETTER: Readonly<Record<Outcome, string>> = {
  */
 const STALL_TICKS = 3;
 
+/**
+ * Largest single-tick ball displacement STARTING FROM INSIDE a blade's near
+ * band, px. The bound `CROSSING_GRACE_TICKS` rests on, re-measured every run.
+ *
+ * The band is 42 px wide at its narrowest and the velocity clamp is 16 px a
+ * tick per axis, so the arithmetic says a moving ball cannot jump it. That is
+ * not the whole story and this number is why it is measured rather than
+ * asserted: a device eject TELEPORTS the ball, and the unrestricted maximum
+ * over a whole run is 52.93 px — a scoop firing, not a ball flying. What the
+ * rule needs to survive is a jump that starts next to the blade, which is what
+ * this measures, and the grace window covers two ticks of it.
+ */
+let worstNearStep = 0;
+
 interface Trial {
   readonly outcome: Outcome;
   /** `along` when the button went down, px from the pivot. */
@@ -390,6 +578,14 @@ interface Trial {
    */
   readonly underStroke: number;
   readonly underTicksAfterPress: number;
+  /**
+   * The OLD rule fired and the new one did not: the ball ended below the
+   * blade's infinite plane inside the `along` strip, having come back into it
+   * from outside rather than through the blade. NOT A DEFECT — carried so the
+   * tightening in `CrossingWatch` stays auditable and cannot quietly become a
+   * rule that misses real crossings too.
+   */
+  readonly underPlaneOnly: boolean;
   /**
    * Longest run of held ticks over which the BAT's stroke did not move while
    * the ball was on it and the bat was short of its far stop.
@@ -414,6 +610,39 @@ interface Trial {
 }
 
 /**
+ * One tick of a trial, in the classifier's own terms.
+ *
+ * THE TRACE IS THE TRIAL. `traceTrial` used to re-implement the placement, the
+ * press and the loop, which made it a second experiment that could drift from
+ * the one whose number it was explaining — and the eleven upper-bat crossings
+ * this round had to triage are exactly the case where a trace that is only
+ * nearly the trial is worse than none. `trial` now emits its own state and the
+ * trace prints it, so a traced tick and a counted tick cannot disagree.
+ */
+interface TickObservation {
+  readonly tick: number;
+  /** Ticks since the button went down; negative before the press. */
+  readonly sincePress: number;
+  readonly held: boolean;
+  readonly stroke: number;
+  readonly along: number;
+  readonly perp: number;
+  readonly ballX: number;
+  readonly ballY: number;
+  readonly velocityX: number;
+  readonly velocityY: number;
+  /** `along` inside the blade's span: the band the crossing is scored in. */
+  readonly onBlade: boolean;
+  /** Inside the band AND close enough to the blade to be touching it. */
+  readonly nearBlade: boolean;
+  /** The above-latch AFTER this tick's update. */
+  readonly wasAbove: boolean;
+  /** This tick scored the crossing. */
+  readonly crossed: boolean;
+  readonly drained: boolean;
+}
+
+/**
  * Runs one trial: place the ball, wait `settle` ticks, press the bat's button
  * for `hold`, and watch for `window` ticks.
  */
@@ -424,6 +653,7 @@ function trial(
   settle: number,
   hold: number,
   windowTicks: number,
+  observe?: (observation: TickObservation) => void,
 ): Trial {
   const game = servedGame(tableId);
   const control = controlFor(tableId, config);
@@ -448,11 +678,15 @@ function trial(
   let launchSpeed = 0;
   let minPerp = Number.POSITIVE_INFINITY;
   let touched = false;
-  let wasAbove = false;
+  const crossing = new CrossingWatch();
   let passedUnder = false;
+  let planeOnly = false;
   let drained = false;
   let underStroke = -1;
   let underTick = -1;
+  let previousX = start.x;
+  let previousY = start.y;
+  let previousNear = false;
   // NaN for the same reason `alongAtPress` is: the first held tick has no
   // previous stroke to be equal to, and `0 === 0` would score it as one.
   let previousStroke = Number.NaN;
@@ -466,34 +700,66 @@ function trial(
     const report = step(game, input, 1)[0];
     if ((report?.drained.length ?? 0) > 0) {
       drained = true;
+      observe?.({
+        tick,
+        sincePress: tick - settle,
+        held: tick >= settle && tick < settle + hold,
+        stroke: -1,
+        along: Number.NaN,
+        perp: Number.NaN,
+        ballX: Number.NaN,
+        ballY: Number.NaN,
+        velocityX: 0,
+        velocityY: 0,
+        onBlade: false,
+        nearBlade: false,
+        wasAbove: false,
+        crossed: false,
+        drained: true,
+      });
       break;
     }
     const state = debugSnapshot(game);
     const ball = state.balls.find((one) => one.active);
     if (ball === undefined) break;
     const stroke = state.flippers.find((one) => one.id === config.id)?.stroke ?? 0;
-    const frame = batFrame(config, stroke, ball.x, ball.y);
-    if (tick === settle) alongAtPress = frame.along;
-    const reach = batRadiusAt(config, pixelsToQ10(Math.max(0, frame.along))) / Q10_ONE + 9;
-    // ON THE BLADE means between the boss and the tip. Past the tip is not the
-    // blade, and a ball that falls past a raised tip has MISSED, not passed
-    // under — the old research harness scored those separately for the same
-    // reason. 43 px of the 44 px blade, one pixel clear of the tip cap.
-    const onBlade = frame.along >= 2 && frame.along <= 43;
-    if (onBlade && Math.abs(frame.perp) <= reach + 2) touched = true;
-    if (onBlade) {
-      // Clearly above, then clearly below, with the blade in between: a
-      // grazing perp of -1 is the ball riding the edge, not passing through.
-      if (frame.perp > BALL_RADIUS_PIXELS) wasAbove = true;
-      if (frame.perp < -(BALL_RADIUS_PIXELS + 2) && wasAbove && tick >= settle) {
-        if (!passedUnder) {
-          underStroke = stroke;
-          underTick = tick - settle;
-        }
-        passedUnder = true;
-      }
-      if (tick >= settle) minPerp = Math.min(minPerp, frame.perp);
+    const geometry = bladeGeometry(config, stroke, ball.x, ball.y);
+    if (tick === settle) alongAtPress = geometry.along;
+    // THE BOUND THE CROSSING RULE RESTS ON, re-measured rather than asserted:
+    // how far one tick can take a ball that STARTED beside the blade.
+    const stepPx = Math.hypot(ball.x - previousX, ball.y - previousY) / Q10_ONE;
+    if (previousNear && stepPx > worstNearStep) worstNearStep = stepPx;
+    previousNear = geometry.near;
+    previousX = ball.x;
+    previousY = ball.y;
+    if (geometry.touching) touched = true;
+    const scored = crossing.observe(geometry, tick >= settle);
+    let crossedNow = false;
+    if (scored.under && !passedUnder) {
+      crossedNow = true;
+      underStroke = stroke;
+      underTick = tick - settle;
     }
+    if (scored.under) passedUnder = true;
+    if (scored.plane) planeOnly = true;
+    if (geometry.onBlade && tick >= settle) minPerp = Math.min(minPerp, geometry.perp);
+    observe?.({
+      tick,
+      sincePress: tick - settle,
+      held: tick >= settle && tick < settle + hold,
+      stroke,
+      along: geometry.along,
+      perp: geometry.perp,
+      ballX: ball.x / Q10_ONE,
+      ballY: ball.y / Q10_ONE,
+      velocityX: ball.velocityX,
+      velocityY: ball.velocityY,
+      onBlade: geometry.onBlade,
+      nearBlade: geometry.near,
+      wasAbove: scored.armed,
+      crossed: crossedNow,
+      drained: false,
+    });
     if (ball.velocityY < 0) launchSpeed = Math.max(launchSpeed, -ball.velocityY);
 
     // ---- THE BAT, not the ball ------------------------------------------
@@ -503,8 +769,7 @@ function trial(
     // scores a healthy cradle as the defect.
     const heldNow = tick >= settle && tick < settle + hold;
     if (heldNow && stroke > strokeReached) strokeReached = stroke;
-    const touchingNow = onBlade && Math.abs(frame.perp) <= reach + 2;
-    if (heldNow && touchingNow && stroke < config.sweep && stroke === previousStroke) {
+    if (heldNow && geometry.touching && stroke < config.sweep && stroke === previousStroke) {
       stallRun += 1;
       if (stallRun > stalledTicks) {
         stalledTicks = stallRun;
@@ -551,6 +816,7 @@ function trial(
     minPerp: Number.isFinite(minPerp) ? minPerp : 0,
     underStroke,
     underTicksAfterPress: underTick,
+    underPlaneOnly: planeOnly && !passedUnder && onBladeAtPress,
     stalledTicks,
     stallStroke,
     stallTicksAfterPress: stallTick,
@@ -594,6 +860,14 @@ export interface BatReport {
    * shipped 20 while the bank ran 2 is a summary that hides its own break.
    */
   readonly seatCoil: number;
+  /**
+   * ROLL + DROP trials the OLD crossing rule would have called PASSED_UNDER and
+   * the tightened one does not: the ball came back into the `along` strip from
+   * outside it, already below the blade's plane. NOT A DEFECT. Printed so the
+   * change of rule is a visible number for ever rather than a count that got
+   * quietly smaller.
+   */
+  readonly underPlaneOnly: number;
 }
 
 /**
@@ -620,6 +894,12 @@ export interface GapReport {
   readonly trials: number;
   /** Trials that ended UNDER a raised blade, having been over it first. */
   readonly under: number;
+  /**
+   * Trials the OLD sticky-latch rule counted as `under` and the tightened one
+   * does not. Same meaning as `BatReport.underPlaneOnly` and printed for the
+   * same reason: so the change of rule is a number and not an absence.
+   */
+  readonly underPlaneOnly: number;
   readonly struck: number;
   readonly drained: number;
   /** Neither under, struck nor drained: still in play when the window closed. */
@@ -663,20 +943,23 @@ export function probeBat(tableId: TableId, config: FlipperConfig): BatReport {
   const roll: Outcome[] = [];
   const rollOuter: Outcome[] = [];
   const rollLaunch: number[] = [];
+  let underPlaneOnly = 0;
   for (const seat of ROLL_SEATS) {
-    const at = seatOn(config, 0, seat);
     for (const settle of ROLL_SETTLES) {
-      const result = trial(tableId, config, { ...at, vx: 0, vy: 0 }, settle, 25, 90);
-      // Every pass-under names itself, because a residual count is only useful
-      // if the next round can reproduce the residue: `--trace=<table>,<bat>,
-      // <seat>,<settle>` replays exactly this trial.
+      const plan = rollTrialSpec(config, seat, settle);
+      const result = trial(tableId, config, plan.start, plan.settle, TRACE_HOLD, TRACE_WINDOW);
+      // Every pass-under names itself, and names the command that replays it,
+      // because a residual count is only useful if the next round can reproduce
+      // the residue without transcribing four numbers into a different shape.
       if (result.outcome === "PASSED_UNDER") {
         console.log(
           `    UNDER ${tableId} ${config.id} seat ${seat} settle ${settle} ` +
             `along ${result.alongAtPress.toFixed(2)} minPerp ${result.minPerp.toFixed(2)} ` +
-            `at stroke ${result.underStroke}, ${result.underTicksAfterPress} ticks after the press`,
+            `at stroke ${result.underStroke}, ${result.underTicksAfterPress} ticks after the press` +
+            ` [--trace=${tableId},${config.id},roll,${seat},${settle}]`,
         );
       }
+      if (result.underPlaneOnly) underPlaneOnly += 1;
       roll.push(result.outcome);
       if (result.alongAtPress >= 22) rollOuter.push(result.outcome);
       if (result.outcome === "STRUCK") rollLaunch.push(result.launchSpeed);
@@ -686,23 +969,20 @@ export function probeBat(tableId: TableId, config: FlipperConfig): BatReport {
   // ---- DROP: falling onto the blade, flipped on arrival ------------------
   const drop: Outcome[] = [];
   for (const along of DROP_ALONGS) {
-    const at = seatOn(config, 0, along);
     for (const speed of DROP_SPEEDS) {
-      // Start a whole fall above the seat so the ball arrives AT the seat with
-      // roughly `speed`, and press on the tick it gets there.
-      const ticks = 6;
-      const rise = (speed * ticks) / Q10_ONE;
-      const from = { x: at.x, y: (at.y - pixelsToQ10(Math.round(rise))) | 0, vx: 0, vy: speed };
-      const result = trial(tableId, config, from, ticks, 25, 90);
+      const plan = dropTrialSpec(config, along, speed);
+      const result = trial(tableId, config, plan.start, plan.settle, TRACE_HOLD, TRACE_WINDOW);
       // Named for the same reason the ROLL loop names its own: a residual count
       // is only useful if the next round can reproduce the residue.
       if (result.outcome === "PASSED_UNDER") {
         console.log(
           `    UNDER ${tableId} ${config.id} DROP along ${along} speed ${speed} ` +
             `alongAtPress ${result.alongAtPress.toFixed(2)} minPerp ${result.minPerp.toFixed(2)} ` +
-            `at stroke ${result.underStroke}, ${result.underTicksAfterPress} ticks after the press`,
+            `at stroke ${result.underStroke}, ${result.underTicksAfterPress} ticks after the press` +
+            ` [--trace=${tableId},${config.id},drop,${along},${speed}]`,
         );
       }
+      if (result.underPlaneOnly) underPlaneOnly += 1;
       drop.push(result.outcome);
     }
   }
@@ -782,6 +1062,7 @@ export function probeBat(tableId: TableId, config: FlipperConfig): BatReport {
     seatStalled,
     stallFrom,
     seatCoil,
+    underPlaneOnly,
   };
 }
 
@@ -794,61 +1075,100 @@ export function probeBat(tableId: TableId, config: FlipperConfig): BatReport {
  * the operator's first report ("goes through the flippers when flipping") in
  * its purest form.
  */
-function probeGap(
-  tableId: TableId,
-  configs: readonly FlipperConfig[],
-  raised: boolean,
-): GapReport {
+function gapPlan(configs: readonly FlipperConfig[]): {
+  readonly lower: readonly FlipperConfig[];
+  readonly xs: readonly number[];
+  readonly dropY: number;
+} {
   const lower = configs.filter((one) => one.id !== "upper");
   const left = lower[0]!;
   const right = lower[1]!;
   const minX = Math.min(left.pivotX, right.pivotX) / Q10_ONE - 10;
   const maxX = Math.max(left.pivotX, right.pivotX) / Q10_ONE + 10;
   const pivotY = Math.max(left.pivotY, right.pivotY) / Q10_ONE;
+  const xs: number[] = [];
+  for (let x = Math.round(minX); x <= Math.round(maxX); x += 2) xs.push(x);
+  return { lower, xs, dropY: pivotY - 40 };
+}
+
+const GAP_SPEEDS = [4096, 10240, 16384];
+
+/**
+ * ONE gap drop. Extracted for the same reason `rollTrialSpec` was: so
+ * `--tracegap` replays exactly the trial the count came from and not a second
+ * experiment shaped like it.
+ */
+function gapTrial(
+  tableId: TableId,
+  lower: readonly FlipperConfig[],
+  dropY: number,
+  raised: boolean,
+  x: number,
+  speed: number,
+  observe?: (tick: number, id: string, geometry: BladeGeometry, armed: boolean, under: boolean, drained: boolean) => void,
+): { under: boolean; plane: boolean; struck: boolean; gone: boolean } {
+  const game = servedGame(tableId);
+  const input = new ScriptedInput(() => (raised ? ["leftFlipper", "rightFlipper"] : []));
+  if (raised) step(game, input, 8);
+  place(game, pixelsToQ10(x), pixelsToQ10(dropY), 0, speed, 0);
+  let wentUnder = false;
+  let wentUnderPlane = false;
+  let gone = false;
+  let up = false;
+  // THE SAME `CrossingWatch` THE TRIALS USE, one per bat. It used to be a
+  // `Set` of "was above this bat at some point", which is the sticky latch
+  // the trials were carrying too and it convicts a ball that came back into
+  // the strip from outside it — see `CrossingWatch`. Two crossing rules in
+  // one file is how one of them rots, so there is now one.
+  const watches = new Map(lower.map((config) => [config.id, new CrossingWatch()]));
+  for (let tick = 0; tick < 120; tick += 1) {
+    const report = step(game, input, 1)[0];
+    if ((report?.drained.length ?? 0) > 0) {
+      gone = true;
+      observe?.(tick, "", { along: 0, perp: 0, reach: 0, onBlade: false, touching: false, near: false }, false, false, true);
+      break;
+    }
+    const state = debugSnapshot(game);
+    const ball = state.balls.find((one) => one.active);
+    if (ball === undefined) break;
+    if (ball.velocityY < -2048) up = true;
+    for (const config of lower) {
+      const stroke = state.flippers.find((one) => one.id === config.id)?.stroke ?? 0;
+      const geometry = bladeGeometry(config, stroke, ball.x, ball.y);
+      const scored = watches.get(config.id)!.observe(geometry, true);
+      observe?.(tick, config.id, geometry, scored.armed, scored.under, false);
+      if (scored.under) wentUnder = true;
+      if (scored.plane) wentUnderPlane = true;
+    }
+  }
+  return { under: wentUnder, plane: wentUnderPlane, struck: !wentUnder && up, gone };
+}
+
+function probeGap(
+  tableId: TableId,
+  configs: readonly FlipperConfig[],
+  raised: boolean,
+): GapReport {
+  const { lower, xs, dropY } = gapPlan(configs);
   let under = 0;
+  let underPlaneOnly = 0;
   let drained = 0;
   let struck = 0;
   let trials = 0;
-  for (let x = Math.round(minX); x <= Math.round(maxX); x += 2) {
-    for (const speed of [4096, 10240, 16384]) {
+  for (const x of xs) {
+    for (const speed of GAP_SPEEDS) {
       trials += 1;
-      const game = servedGame(tableId);
-      const input = new ScriptedInput(() => (raised ? ["leftFlipper", "rightFlipper"] : []));
-      if (raised) step(game, input, 8);
-      place(game, pixelsToQ10(x), pixelsToQ10(pivotY - 40), 0, speed, 0);
-      let wentUnder = false;
-      let gone = false;
-      let up = false;
-      // A ball is only UNDER a bat if it was OVER it first. Without that the
-      // test convicts every honest miss: a ball falling down the gap outside
-      // the blade is below the axis from the moment it passes the pivot line,
-      // and the drain is where it is supposed to go.
-      const wasAbove = new Set<string>();
-      for (let tick = 0; tick < 120; tick += 1) {
-        const report = step(game, input, 1)[0];
-        if ((report?.drained.length ?? 0) > 0) {
-          gone = true;
-          break;
-        }
-        const state = debugSnapshot(game);
-        const ball = state.balls.find((one) => one.active);
-        if (ball === undefined) break;
-        if (ball.velocityY < -2048) up = true;
-        for (const config of lower) {
-          const stroke = state.flippers.find((one) => one.id === config.id)?.stroke ?? 0;
-          const frame = batFrame(config, stroke, ball.x, ball.y);
-          if (frame.along <= 4 || frame.along >= 44) continue;
-          if (frame.perp > BALL_RADIUS_PIXELS) wasAbove.add(config.id);
-          // Under the BLADE, not merely below the pivot: between the boss and
-          // the tip, on the wrong side, and deeper than the bat is thick.
-          if (frame.perp < -(BALL_RADIUS_PIXELS + 2) && wasAbove.has(config.id)) {
-            wentUnder = true;
-          }
-        }
+      const result = gapTrial(tableId, lower, dropY, raised, x, speed);
+      if (result.under) under += 1;
+      else if (result.struck) struck += 1;
+      else if (result.gone) drained += 1;
+      if (result.plane && !result.under) {
+        underPlaneOnly += 1;
+        console.log(
+          `    PLANE ${tableId} GAP bats ${raised ? "UP" : "DOWN"} x ${x} speed ${speed}` +
+            ` [--tracegap=${tableId},${x},${speed},${raised ? "up" : "down"}]`,
+        );
       }
-      if (wentUnder) under += 1;
-      else if (up) struck += 1;
-      else if (gone) drained += 1;
     }
   }
   // The three are ordered tests, not a partition — see `GapReport`. `settled` is
@@ -857,6 +1177,7 @@ function probeGap(
     table: tableId,
     raised,
     under,
+    underPlaneOnly,
     drained,
     struck,
     trials,
@@ -865,54 +1186,159 @@ function probeGap(
 }
 
 /**
- * One trial, printed tick by tick in the bat's own frame.
+ * Sets up one ROLL or one DROP trial exactly as `probeBat` does.
  *
- * `--trace=<table>,<bat>,<seat>,<settle>[,<window>]` — the four numbers a summary
- * line reports, so every count above is walkable back to the geometry that made
- * it. `window` defaults to 60; ROLL and DROP both use 90, so a trial whose
- * outcome is decided by a ball that flew up and came back has to be given it or
- * the trace stops before the thing being explained.
+ * ONE definition, used by the scenario loops AND by the trace, so the tick a
+ * trace prints is the tick the summary counted. It used to be two: `traceTrial`
+ * re-derived the seat, the press tick and the window, and could have been
+ * explaining a trial next door to the one whose residue it was called on.
+ */
+function rollTrialSpec(
+  config: FlipperConfig,
+  seat: number,
+  settle: number,
+): { start: { x: number; y: number; vx: number; vy: number }; settle: number } {
+  const at = seatOn(config, 0, seat);
+  return { start: { ...at, vx: 0, vy: 0 }, settle };
+}
+
+function dropTrialSpec(
+  config: FlipperConfig,
+  along: number,
+  speed: number,
+): { start: { x: number; y: number; vx: number; vy: number }; settle: number } {
+  const at = seatOn(config, 0, along);
+  // Start a whole fall above the seat so the ball arrives AT the seat with
+  // roughly `speed`, and press on the tick it gets there.
+  const ticks = 6;
+  const rise = (speed * ticks) / Q10_ONE;
+  return {
+    start: { x: at.x, y: (at.y - pixelsToQ10(Math.round(rise))) | 0, vx: 0, vy: speed },
+    settle: ticks,
+  };
+}
+
+const TRACE_HOLD = 25;
+const TRACE_WINDOW = 90;
+
+/**
+ * One trial, printed tick by tick in the bat's own frame AND in the
+ * classifier's own terms.
+ *
+ * `--trace=<table>,<bat>,roll,<seat>,<settle>` and
+ * `--trace=<table>,<bat>,drop,<along>,<speed>` — the exact strings every `UNDER`
+ * line now prints for itself, so a residual count is walkable back to the
+ * geometry that made it without a transcription step in between.
+ *
+ * The `band` column is what the crossing rule sees: `-` off the blade entirely,
+ * `.` in the `along` band but out of reach of the face, `o` in contact, `^`
+ * above-latched. `<<< UNDER` marks the tick the crossing scores.
  */
 function traceTrial(spec: string): void {
-  const [table, bat, seat, settle, window] = spec.split(",");
+  const parts = spec.split(",");
+  const [table, bat, scenario, first, second] = parts;
   const tableId = table as TableId;
   const config = flipperConfigsFor(tableId).find((one) => one.id === bat);
   if (config === undefined) throw new Error(`no bat "${bat}" on ${tableId}`);
-  const at = seatOn(config, 0, Number(seat ?? 16));
-  const pressAt = Number(settle ?? 30);
-  const windowTicks = window === undefined ? 60 : Number(window);
-  const game = servedGame(tableId);
-  const control = controlFor(tableId, config);
-  const input = new ScriptedInput((tick) =>
-    tick >= pressAt && tick < pressAt + 25 ? [control] : [],
-  );
-  place(game, at.x, at.y, 0, 0, config.level);
-  console.log(`trace ${tableId} ${config.id} seat ${seat} press at tick ${pressAt}`);
-  for (let tick = 0; tick < pressAt + windowTicks; tick += 1) {
-    const report = step(game, input, 1)[0];
-    const state = debugSnapshot(game);
-    const ball = state.balls.find((one) => one.active);
-    if (ball === undefined) {
-      console.log(`t${tick} no ball`);
-      break;
-    }
-    const stroke = state.flippers.find((one) => one.id === config.id)?.stroke ?? 0;
-    const frame = batFrame(config, stroke, ball.x, ball.y);
-    console.log(
-      `t${String(tick).padStart(4)} stroke ${String(stroke).padStart(5)} ` +
-        `along ${frame.along.toFixed(2).padStart(7)} perp ${frame.perp.toFixed(2).padStart(7)} ` +
-        `xy (${(ball.x / 1024).toFixed(2)},${(ball.y / 1024).toFixed(2)}) ` +
-        `v (${ball.velocityX},${ball.velocityY})` +
-        `${(report?.drained.length ?? 0) > 0 ? " DRAIN" : ""}`,
+  if (scenario !== "roll" && scenario !== "drop") {
+    throw new Error(
+      `--trace needs <table>,<bat>,roll,<seat>,<settle> or <table>,<bat>,drop,<along>,<speed>`,
     );
-    if ((report?.drained.length ?? 0) > 0) break;
   }
+  const plan =
+    scenario === "roll"
+      ? rollTrialSpec(config, Number(first), Number(second))
+      : dropTrialSpec(config, Number(first), Number(second));
+  console.log(
+    `trace ${tableId} ${config.id} ${scenario} ${first} ${second} ` +
+      `press at tick ${plan.settle}, held ${TRACE_HOLD}, window ${TRACE_WINDOW}`,
+  );
+  const result = trial(
+    tableId,
+    config,
+    plan.start,
+    plan.settle,
+    TRACE_HOLD,
+    TRACE_WINDOW,
+    (o) => {
+      if (o.drained) {
+        console.log(`t${String(o.tick).padStart(4)} DRAIN`);
+        return;
+      }
+      const band = !o.onBlade ? "-" : o.nearBlade ? (o.wasAbove ? "^" : "o") : o.wasAbove ? "^" : ".";
+      console.log(
+        `t${String(o.tick).padStart(4)} p${String(o.sincePress).padStart(4)} ` +
+          `${o.held ? "HELD" : "    "} stroke ${String(o.stroke).padStart(5)} ` +
+          `along ${o.along.toFixed(2).padStart(8)} perp ${o.perp.toFixed(2).padStart(9)} ` +
+          `${band}${o.onBlade ? "B" : " "}${o.nearBlade ? "N" : " "}${o.wasAbove ? "A" : " "} ` +
+          `xy (${o.ballX.toFixed(2)},${o.ballY.toFixed(2)}) ` +
+          `v (${o.velocityX},${o.velocityY})` +
+          `${o.crossed ? "  <<< UNDER" : ""}`,
+      );
+    },
+  );
+  console.log(
+    `RESULT ${result.outcome} alongAtPress ${result.alongAtPress.toFixed(2)} ` +
+      `minPerp ${result.minPerp.toFixed(2)} underStroke ${result.underStroke} ` +
+      `underTicksAfterPress ${result.underTicksAfterPress} launch ${result.launchSpeed} ` +
+      `planeOnly ${result.underPlaneOnly}`,
+  );
+}
+
+/**
+ * One GAP drop, printed tick by tick against BOTH lower bats.
+ *
+ * `--tracegap=<table>,<x>,<speed>,up|down` — the string every `PLANE` line
+ * prints for itself. The GAP scenario is the one written for the operator's
+ * original complaint and it was the one scenario with no way to look at a
+ * single trial; a rule change that moved its count could not be checked.
+ */
+function traceGap(spec: string): void {
+  const [table, x, speed, raised] = spec.split(",");
+  const tableId = table as TableId;
+  const configs = flipperConfigsFor(tableId);
+  const { lower, dropY } = gapPlan(configs);
+  const up = raised !== "down";
+  console.log(
+    `tracegap ${tableId} x ${x} speed ${speed} bats ${up ? "UP" : "DOWN"} ` +
+      `dropped from y ${dropY}`,
+  );
+  const result = gapTrial(
+    tableId,
+    lower,
+    dropY,
+    up,
+    Number(x),
+    Number(speed),
+    (tick, id, geometry, armed, under, drained) => {
+      if (drained) {
+        console.log(`t${String(tick).padStart(4)} DRAIN`);
+        return;
+      }
+      const band = !geometry.onBlade ? "-" : geometry.near ? "o" : ".";
+      console.log(
+        `t${String(tick).padStart(4)} ${id.padEnd(12)} ` +
+          `along ${geometry.along.toFixed(2).padStart(8)} perp ${geometry.perp.toFixed(2).padStart(9)} ` +
+          `${band}${geometry.onBlade ? "B" : " "}${geometry.near ? "N" : " "}${armed ? "A" : " "}` +
+          `${under ? "  <<< UNDER" : ""}`,
+      );
+    },
+  );
+  console.log(
+    `RESULT under ${result.under} plane ${result.plane} struck ${result.struck} ` +
+      `drained ${result.gone}`,
+  );
 }
 
 function main(argv: readonly string[]): number {
   const traceArg = argv.find((arg) => arg.startsWith("--trace="));
   if (traceArg !== undefined) {
     traceTrial(traceArg.slice(8));
+    return 0;
+  }
+  const gapArg = argv.find((arg) => arg.startsWith("--tracegap="));
+  if (gapArg !== undefined) {
+    traceGap(gapArg.slice(11));
     return 0;
   }
   const wanted = argv.filter((arg) => !arg.startsWith("-"));
@@ -943,7 +1369,8 @@ function main(argv: readonly string[]): number {
           `${show("seat", report.seat)} | STALLED ${report.seatStalled}/${SEAT_ALONGS.length}` +
           `${report.stallFrom < 0 ? "" : ` from ${report.stallFrom} px`} | ` +
           `coil ${report.seatCoil} | stroke of ${config.sweep} ` +
-          `[${report.seatStroke.map(([along, stroke]) => `${along}->${stroke}`).join(" ")}]`,
+          `[${report.seatStroke.map(([along, stroke]) => `${along}->${stroke}`).join(" ")}]` +
+          ` | plane-only ${report.underPlaneOnly}`,
       );
     }
     for (const raised of [true, false]) {
@@ -952,10 +1379,18 @@ function main(argv: readonly string[]): number {
       console.log(
         `${tableId.padStart(15)} GAP bats ${raised ? "UP  " : "DOWN"}  trials ${gap.trials}  ` +
           `UNDER ${gap.under}  struck ${gap.struck}  drained ${gap.drained}  ` +
-          `settled ${gap.settled}`,
+          `settled ${gap.settled}  plane-only ${gap.underPlaneOnly}`,
       );
     }
   }
+  // THE BOUND THE CROSSING RULE RESTS ON, measured by the run that used it: how
+  // far one tick can carry a ball that started beside a blade. The near band is
+  // 42 px wide at its narrowest and the grace window is two ticks of it.
+  console.log(
+    `  worst single-tick step from inside the near band ${worstNearStep.toFixed(2)} px ` +
+      `over every ROLL/DROP/SEAT trial ` +
+      `(band >= ${2 * (4 + 9 + NEAR_BLADE_SLACK)} px wide, grace ${CROSSING_GRACE_TICKS} ticks)`,
+  );
   if (jsonArg !== undefined) {
     // `{ bats, gap }`, not the bare array it used to be. `probe-tally.mjs` reads
     // either shape, so old dumps still tally; what changes is that the GAP
