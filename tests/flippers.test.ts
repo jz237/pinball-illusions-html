@@ -1476,11 +1476,18 @@ describe("flipping", () => {
    * that can have switched the along-face term off is the comparand.
    *
    * MEASURED, and the constant is the instruction's: fitted free against five
-   * rival comparands on 366 single passes out of the machine's own RAM, the
-   * decoded quantity agrees on 89.3 % where "the impulse alone" manages 74.3 %
-   * and "always add it" 55.5 %, and the machine applies the tangent on 100 % of
-   * the passes under 3,750 and 0 % of those over 5,250. See
-   * `research/flipper-power/BW_RIGHT_BAT.md` §9.1.
+   * rival comparands on 342 single passes out of the machine's own RAM — 181
+   * with the machine's own tangent applied and 161 without — the decoded
+   * quantity agrees on 88.60 % where "the impulse alone" manages 73.98 % and
+   * "always add it" 52.92 %, and the machine applies the tangent on 93..100 %
+   * of every band below 4,000 and on none of the band above 5,250.
+   *
+   * THOSE ARE THE RE-RUN'S FIGURES. The first round's (366 passes, 89.3 %,
+   * 55.5 %) came from a probe that filtered its corpus on the port's own gated
+   * tangent, so once this rule shipped it deleted its own negative class; see
+   * BUG_HUNT §A#1 and `research/flipper-power/BW_RIGHT_BAT.md` §9.6. The rule
+   * survives the correction — the decode still beats the null model by 122
+   * passes of 342 — which is why this test still asserts what it asserts.
    */
   it("drops the along-face term when the kick and the approach are 4000 apart", () => {
     // A bat already at rate, so the impulse is the same size on every row, and a
@@ -1545,6 +1552,95 @@ describe("flipping", () => {
     expect(flipperImpulseMagnitude(8, 16) * (LEFT.upMaxRate - flipperRateTaken(8, 16)))
       .toBe(1938);
     expect(ORIGINAL_TANGENT_GATE).toBe(4000);
+  });
+
+  /**
+   * THE CITATION ITSELF, PINNED — and this test exists because the thing it
+   * guards has already gone wrong once.
+   *
+   * From `a9943e1` to the commit this test lands in, `flippers.ts` carried a
+   * paragraph of measured percentages that quoted a corpus of 354 where the
+   * document said 366 and the file both of them named said 195, and quoted
+   * "always add it 56.5 %" for a file whose own number by then read 94.36 %.
+   * Nothing could fail: a doc-comment is not executed,
+   * the probe that produced the figures lives outside this repository, and its
+   * output is not a build input. So the numbers rotted in place while the rule
+   * they justify carried on shipping.
+   *
+   * The guard is arithmetic rather than string equality, because that is what
+   * distinguishes a re-measurement from a slip. Every "A of B, P %" the comment
+   * quotes is parsed out of the source and checked three ways:
+   *
+   *   1. every B is the SAME corpus size — a paragraph that cites two different
+   *      totals is citing two different measurements and calling them one;
+   *   2. P really is 100*A/B to the digits printed — a percentage that does not
+   *      follow from its own numerator cannot have been read off a run;
+   *   3. the whole parsed table equals the pinned one, so re-running the probe
+   *      and pasting new figures is a deliberate two-place edit and not a drift.
+   *
+   * The pinned values ARE `research/flipper-power/out/gate-threshold.txt` of
+   * 2026-08-08, reproduced by `research/flipper-power/run.cmd gate-threshold.mts`.
+   * That probe now refuses to report a fit whose smaller class is under twenty,
+   * and `GATE_PROBE_SELFTEST=contaminate` reinstates the old corpus filter so
+   * the refusal can be watched to fire (171 passes, 164 against 7, exit 1).
+   */
+  it("cites the tangent gate's corpus for figures that corpus actually contains", () => {
+    const source = readFileSync(
+      fileURLToPath(new URL("../src/game/flippers.ts", import.meta.url)),
+      "utf8",
+    );
+    const start = source.indexOf("MEASURED — and re-measured on");
+    const end = source.indexOf("`research/flipper-power/BW_RIGHT_BAT.md` §9.6", start);
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    const block = source.slice(start, end);
+
+    // The corpus size, stated once in words at the top of the paragraph.
+    const corpus = Number(/(\d+) single passes/.exec(block)?.[1]);
+    // The class balance, which is the whole point: a one-sided corpus cannot
+    // fit a threshold, and the first round's had eleven negatives in 195.
+    const applied = Number(/APPLIED on (\d+) of them/.exec(block)?.[1]);
+    const absent = Number(/ABSENT on (\d+)/.exec(block)?.[1]);
+    expect({ corpus, applied, absent }).toEqual({ corpus: 342, applied: 181, absent: 161 });
+    expect(applied + absent).toBe(corpus);
+    // Neither class may be one that `fit()` would degenerate on.
+    expect(Math.min(applied, absent)).toBeGreaterThanOrEqual(20);
+
+    const rows = [...block.matchAll(/(\d+) of (\d+)\s+\(?([\d.]+) %/g)].map((m) => ({
+      agrees: Number(m[1]),
+      of: Number(m[2]),
+      percent: m[3] as string,
+    }));
+    // Six rivals plus the instruction's own constant scored beside them.
+    expect(rows).toEqual([
+      { agrees: 303, of: 342, percent: "88.60" }, // |$1c - d0|, the decode
+      { agrees: 253, of: 342, percent: "73.98" }, // |$1c|, the impulse alone
+      { agrees: 240, of: 342, percent: "70.18" }, // |d0|, the approach alone
+      { agrees: 181, of: 342, percent: "52.92" }, // |$1c + d0|, their sum
+      { agrees: 257, of: 342, percent: "75.15" }, // the contact radius
+      { agrees: 181, of: 342, percent: "52.92" }, // ALWAYS add the tangent
+      { agrees: 288, of: 342, percent: "84.21" }, // the instruction's #$fa0
+    ]);
+    for (const row of rows) {
+      expect(row.of).toBe(corpus);
+      expect(((100 * row.agrees) / row.of).toFixed(2)).toBe(row.percent);
+    }
+
+    // AND THE MARGINS THE PARAGRAPH CLAIMS ARE ITS OWN TABLE'S SUBTRACTION.
+    // "beats the null model by 122 and its nearest rival by 46" is the sentence
+    // a reader takes the verdict from, so it is derived here rather than
+    // trusted: the null model is the sixth row and the nearest rival is the
+    // best of the four that are neither the decode nor the null.
+    const decode = rows[0]?.agrees ?? 0;
+    const nullModel = rows[5]?.agrees ?? 0;
+    const nearestRival = Math.max(...rows.slice(1, 5).map((r) => r.agrees));
+    const claimed = [...block.matchAll(/by (\d+) passes|nearest rival by (\d+)/g)]
+      .map((m) => Number(m[1] ?? m[2]));
+    expect(claimed).toEqual([decode - nullModel, decode - nearestRival]);
+    expect(claimed).toEqual([122, 46]);
+    // The null model IS "always add the tangent", i.e. the count of applied
+    // passes, so a decode that beat it would be beating an arithmetic identity.
+    expect(nullModel).toBe(applied);
   });
 
   it("hits harder than a bat that is standing still", () => {

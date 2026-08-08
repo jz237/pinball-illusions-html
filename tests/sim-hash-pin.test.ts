@@ -776,12 +776,23 @@ const TICKS = 4000;
  *   THE TANGENT GATE, `cmpi.w #$fa0,d1 / bhi` at +0x00B534. The along-face term
  *   `$1a(a4)` is added to the contact only when the pending kick and the ball's
  *   own normal velocity are within 4000 doubled units of each other; this port
- *   added it on every kick. Scored on 366 single passes taken 30 us apart out of
- *   the machine's own RAM, with the threshold FITTED rather than assumed and
- *   against five rival comparands, the decoded quantity agrees on 89.3 % where
- *   "the impulse alone" manages 74.3 %, a radius gate 73.2 % and "always add it"
- *   55.5 %. The machine applies the tangent on 100 % of the passes under 3,750
- *   and 0 % of those over 5,250.
+ *   added it on every kick. Scored on 342 single passes taken 30 us apart out of
+ *   the machine's own RAM — 181 with the machine's own tangent applied and 161
+ *   without — with the threshold FITTED rather than assumed and against five
+ *   rival comparands, the decoded quantity agrees on 88.60 % where "the impulse
+ *   alone" manages 73.98 %, a radius gate 75.15 % and "always add it" 52.92 %.
+ *   The machine applies the tangent on 93..100 % of every band below 4,000 and
+ *   on none of the band above 5,250.
+ *
+ *   THOSE FIGURES WERE RE-MEASURED, and this note used to carry the others.
+ *   366 passes / 89.3 % / 55.5 % came from a probe that selected its corpus
+ *   with `Math.abs(pT) > 1` — the PORT's own gated tangent — so once this very
+ *   rule shipped, the probe deleted every pass the rule rejects and its
+ *   negative class fell to eleven of 195. The corpus is now partitioned on the
+ *   MACHINE's along-face delta-v and on nothing the gate touches. THE RULE
+ *   SURVIVED THE CORRECTION and these three digests are unmoved by it, which is
+ *   the only reason this entry did not need re-pinning: see BUG_HUNT §A#1 and
+ *   `research/flipper-power/BW_RIGHT_BAT.md` §9.6.
  *
  *   THE MID-PASS RATE WRITE-BACK, +0x00AED2. The reduced bat rate is stored to
  *   `$10(a0)` INSIDE the collision pass and the animation step that follows

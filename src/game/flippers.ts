@@ -2475,20 +2475,45 @@ function resolveAtPass(
     // of each other, and a hard kick meeting a fast approach gets the normal
     // and nothing else.
     //
-    // MEASURED, on 354 single passes taken out of the machine's own RAM 30 us
-    // apart, with the threshold FITTED rather than assumed and scored against
-    // five rival comparands: the decoded quantity agrees with the machine on
-    // 89.3 % where "the impulse alone" manages 74.9 %, "the approach alone"
-    // 69.5 %, a radius gate 73.7 % and "always add it" 56.5 %. Across the
-    // threshold the machine applies the tangent on 100 % of the passes under
-    // 3,750 and 0 % of those over 5,250. The free fit lands at 4,529 and the
-    // instruction's own 4,000 scores 84.5 %; the gap is the size and sign the
-    // one reconstructed term predicts (`d0` is projected on the PORT's normal
-    // from a sample up to 30 us early), and on the sub-corpus where `|d0|` is
-    // under 400 — where the quantity is exact — the fit is 4,233. The constant
-    // shipped is the instruction's, because the instruction is the measurement
-    // and the fit is what fails to contradict it. See
-    // `research/flipper-power/BW_RIGHT_BAT.md` §4 and `out/gate-threshold.txt`.
+    // MEASURED — and re-measured on 2026-08-08 after the probe that produced
+    // the first figures was found to be selecting its corpus with the output of
+    // this very rule (BUG_HUNT §A#1). The numbers below are the RE-RUN's, on a
+    // corpus partitioned by the MACHINE's along-face delta-v out of RAM and by
+    // nothing this port computes; the superseded ones are recorded in
+    // BW_RIGHT_BAT §9.6 rather than deleted.
+    //
+    // 342 single passes out of the machine's own RAM 30 us apart, the machine's
+    // tangent APPLIED on 181 of them and ABSENT on 161 — both classes populated,
+    // which is the property the first round lost. The threshold is FITTED rather
+    // than assumed and scored against five rival comparands:
+    //
+    //   |$1c - d0|  the decode        fit 4529   303 of 342   88.60 %
+    //   |$1c|       impulse alone     fit 4048   253 of 342   73.98 %
+    //   |d0|        approach alone    fit 2540   240 of 342   70.18 %
+    //   |$1c + d0|  their sum         fit 13980  181 of 342   52.92 %
+    //   contact radius in px          fit 23.5   257 of 342   75.15 %
+    //   ALWAYS add the tangent        --         181 of 342   52.92 %
+    //
+    // The decode beats the null model by 122 passes and its nearest rival by 46,
+    // and it does so at every label cut from 0.30 to 0.70 (decode 86.84..88.60 %,
+    // null 50.88..55.26 %), so the answer is not a property of where the line was
+    // drawn. The transition is a transition: 93..100 % of every band below 4,000,
+    // 47.6 % at 4,500..4,750, 0 % at 5,250..5,500.
+    //
+    // WHAT IS SETTLED IS THE QUANTITY, NOT THE LAST 500 OF THE CONSTANT. The
+    // instruction's own `#$fa0` = 4000 scores 288 of 342 (84.21 %) against the
+    // free fit's 303 at 4,529. The previous round explained that gap as the one
+    // reconstructed term (`d0`, projected on the PORT's normal from a sample up
+    // to 30 us early) and cited a `|d0| < 400` sub-corpus fitting at 4,233 —
+    // BOTH ARE WITHDRAWN. That sub-corpus has seven negative examples in it and
+    // the re-run refuses to fit it; and stratifying by the ball's SPEED, which
+    // is what actually carries that error, does not move the fit toward 4,000
+    // (4,529 slow, 4,290 fast). Why the fit sits 529 high is an open question
+    // and is §9.7. The constant shipped is still the instruction's, because
+    // `cmpi.w #$fa0,d1` is a direct reading of the machine's own code and the
+    // fit is what fails to contradict it at the resolution this corpus has —
+    // not because the gap has been explained. See
+    // `research/flipper-power/BW_RIGHT_BAT.md` §9.6 and `out/gate-threshold.txt`.
     //
     // WHAT IT DOES TO THE GAME: it makes shots STRAIGHTER, not stronger. On
     // BabeWatch's lower-right boss this port used to push the ball 2.6 to 3.3
