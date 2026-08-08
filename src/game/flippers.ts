@@ -758,8 +758,16 @@ export const FLIPPER_PLACEMENT_NOTE =
  *   +6  rest pose      +8  flipped pose, on the 120-pose/3-degree flipdat scale
  *   +A  KEY BINDING    1 = LEFT button, 0 = RIGHT button
  *   +C  spring accel   +E  spring cap, signed
+ *   +14 stroke LIMIT, signed: `sweepPoses * 64`, and `$1A = angle >> 6`
  *   +16 coil accel     +18 coil cap, signed
- *   +1C longword, relocated into the table's hunk 2: the pose/mask bank
+ *   +1A CURRENT POSE, signed, written by the animation at +0xBE44
+ *   +1C longword, relocated into the table's hunk 2: THE COLLISION PLANE
+ *   +30 longword, AllocMem'd at load: the per-pose MASK BLOCK   +34 its size
+ *   +B8 word[32] each pose's byte offset into that block (a LEFT bat's run
+ *       DOWN from +$F8, which is the same storage read the other way)
+ *   +F8 word: the per-pose BOX's x1, which is one field for every pose
+ *   +FA word[4][32] each pose's BOX, x0,y0,x1,y1, in the ball's own top-left
+ *       corner coordinates (a left bat's run down from +$1FA)
  *
  * THE KEY BINDING IS MEASURED, at +0xBD6C: `cmpi.w #0,$A(a0) / beq` takes the
  * RIGHT path at +0xBE04, which tests `$23F4(a5)` (built at +0xBD5A from key
@@ -767,16 +775,31 @@ export const FLIPPER_PLACEMENT_NOTE =
  * at +0xBD76 testing `$23F3(a5)`. THERE IS NO THIRD BUTTON. An upper bat fires
  * on the same shift key as the lower bat on its side.
  *
- * THE LEVEL IS A READING AND NOT A MEASUREMENT, and is labelled so wherever it
- * is used. The +0x1C bank pointer is hunk2+0 for every main-level bat and
- * hunk2+0x65B8 for the BabeWatch and Extreme Sports upper bats. 0x65B8 = 26040 =
- * 42 bytes a row x 620 rows, exactly one more 336-px-wide one-bit-per-pixel
- * plane, and hunk 2's body of 0x19050 = 42 x 2440 rows decomposes as
- * 620+620+600+600 on all three tables. The arithmetic is exact; that the two
- * banks ARE the two collision levels' bat masks was not confirmed from code, and
- * the hunk-2 consumers were not traced. What supports it independently is the
- * geometry: BabeWatch's (205,115) has upper-level walls around it and nothing at
- * all on the main level there.
+ * THE LEVEL IS NOW MEASURED, and this note used to say the opposite. The +0x1C
+ * longword is hunk2+0 for every main-level bat and hunk2+0x65B8 for the
+ * BabeWatch and Extreme Sports upper bats; 0x65B8 = 26040 = 42 bytes a row x 620
+ * rows is exactly one more 336-px-wide one-bit-per-pixel plane, and hunk 2's
+ * body of 0x19050 = 42 x 2440 rows decomposes as 620+620+600+600 on all three
+ * tables. That arithmetic was all this file had, and it explicitly declined to
+ * call the two banks the two collision planes because the consumers had not been
+ * traced. THEY HAVE BEEN, three ways, and all three agree:
+ *
+ *   * `+0x00B2B0`'s `cmp.l $1c(a0),d2` compares it against the BALL's `$54(a4)`
+ *     and steps to the next record when they differ, and `+0x00B43A`'s
+ *     `movea.l $54(a4),a1` blits the ball's probe ring against `$54` directly.
+ *     So `$54` is the base address of a collision plane and `$1C` is one too.
+ *   * `+0x00390E`'s per-pose mask builder ORs `$1c(a4)` into every pose's mask
+ *     at table load (`+0x0039FA`, `BLTCON0 = $0DFC`, D = A OR B) at the MAP's
+ *     own 42-byte row stride. See `createBatUnionMasks` below.
+ *   * A ball's level is SEVEN fields set together, at `+0x0053C6` (main) and
+ *     `+0x0053F4` (raised) and nowhere else: `$50` the surface-id map, `$54` the
+ *     collision plane, `$58`/`$5C`/`$60`/`$64`, and the `$08` level BYTE last.
+ *
+ * And it is read back rather than inferred: `research/flipper-power/tools/
+ * dump-bats.py` reads each record's `+$1C` out of a running machine, and on all
+ * three tables it equals `$230A(a5)` on the raised bat and `$22F2(a5)` on the
+ * main ones -- the very longs `+0x0053F4` and `+0x0053C6` write into `$54`.
+ * `FlipperConfig.level` is that pointer's identity and nothing weaker.
  *
  * THE SUB-HANDLER FAMILIES (+1) are eight 0x3C-byte handlers at +0xB036 whose
  * CODE is byte-identical; only a trailing 8-byte octant mask differs, and
@@ -785,6 +808,14 @@ export const FLIPPER_PLACEMENT_NOTE =
  * original's way of saying "only the face the bat sweeps through". This port
  * gates analytically on the approach side in `touchAt`, which subsumes it, so
  * the family byte is recorded and not used.
+ *
+ * BabeWatch's upper bat is the only FAMILY 5 in the twelve records, and that was
+ * carried for a round as the leading suspect for a per-record body difference.
+ * It is not one, for a reason that is in the instruction order: the octant mask
+ * is tested INSIDE the handler (`tst.b $b06a(pc,d3.w)` at +0xB03A), and
+ * +0x00AEE0 has already written the reduced rate back before the handler is
+ * called at all. A masked-out contact still slows the blade. The family byte
+ * cannot make a bat weaker; it can only withhold the kick.
  */
 export interface FlipperRecord {
   /** Matches `FlipperConfig.id` and the drawn record's id in the pose bank. */
