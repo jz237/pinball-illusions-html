@@ -63,7 +63,11 @@ function minimalDocument(): TableModesDocument {
         counter: -1,
       },
     ],
-    messages: [{ index: 0, lines: ["HELLO"] }],
+    messages: [
+      // The geometry the machine's own `$73D0` reads out of the print record:
+      // x, the panel scanline, the font and the alignment word.
+      { index: 0, lines: ["HELLO"], layout: [{ x: 160, row: 2, font: 1, align: 2 }], holdTicks: 100, priority: 64, priority2: 0 },
+    ],
     scripts: [
       {
         index: 0,

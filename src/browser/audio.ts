@@ -258,6 +258,14 @@ function playEngineTrigger(bank: AudioBank, id: string): void {
  * original queues those display programs on its ring and the sting plays when
  * the display does; this port plays it on the tick the record is queued, which
  * is at most a few frames early.
+ *
+ * `mode-start-N` NO LONGER BINDS ON ANY SHIPPED TABLE, and the line is kept
+ * rather than deleted. The audio exporter emits that id only for an element
+ * display record the message pool does not already hold, and `modePools` now
+ * seeds the pool from every element's own `+$14`, so every START-path sting is
+ * a `mode-message-N` and reaches the same sample by the line below. Keeping the
+ * lookup costs one miss a tick and means a document that ever does carry the id
+ * still sounds; deleting it would make that failure silent.
  */
 export function playTick(bank: AudioBank, report: GameTickReport): void {
   if (bank.muted) return;

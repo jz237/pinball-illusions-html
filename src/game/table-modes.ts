@@ -109,6 +109,19 @@ export const ELEMENT_FLAG_DONE_SURVIVES_BALL = 0x20;
 export const COUNTER_FLAG_REBUILD_ACCUMULATOR = 0x01;
 
 /**
+ * One entry of award effect 26's cumulative-probability table.
+ *
+ * `threshold` is the machine's own running total out of 256, so this entry's
+ * odds are its gap from the entry before it; `script` is queued when the roll
+ * lands in that gap. See `ModeElement.prizeTable`.
+ */
+export interface ModePrize {
+  readonly flags: number;
+  readonly threshold: number;
+  readonly script: number;
+}
+
+/**
  * One playfield element: a shot a mission can arm, award and wait on.
  *
  * `score` and `bonus` are the packed-BCD fields at +$1E and +$26 read as decimal
@@ -191,6 +204,25 @@ export interface ModeElement {
    * static audit could find no referrer for.
    */
   readonly chainScript: number;
+  /**
+   * Award effect 26's PRIZE TABLE: the FIFTH reading of +$34, empty otherwise.
+   *
+   * The handler at main.seg00 +0x006102 masks the VBlank counter `$C8AC` to a
+   * byte and walks 8-byte entries until one whose `threshold` is ABOVE the
+   * roll, then queues that entry's script through the same `$6C10` effect 17
+   * uses. The thresholds are cumulative and the last is 256, so a roll in
+   * 0..255 always lands and each entry's odds are its gap over 256.
+   *
+   * `flags` bit 0 is the machine's award-ONCE bit (`btst.b #$0,(a0)`), and bit
+   * 1 is the claim it sets on first award; a repeat roll onto a claimed
+   * once-only prize adds 93 to the roll and walks again. EVERY entry on the one
+   * shipped table has flags 0, so that path is dead on this corpus and the
+   * runtime refuses a non-zero flag rather than guessing at it.
+   *
+   * One element carries it — BabeWatch 66, the casino wheel — and it is that
+   * table's only route to a 100,000,000 award and to HOLD BONUS.
+   */
+  readonly prizeTable: readonly ModePrize[];
   /**
    * Award effects 15 and 25: the element's OWN six packed-BCD bytes at
    * +$3A..$3F, which +0x0060DC adds into and +0x0060B2 subtracts from the
@@ -448,9 +480,59 @@ export interface ModeMultiplierRestore {
   readonly group: number;
 }
 
+/**
+ * One line of a display record, with the geometry the machine's own printer
+ * reads out of it.
+ *
+ * `$73D0` — the ASCIIZ printer every TEXT instruction reaches — takes all four
+ * from the print record itself: `movem.w (a0),d3-d5` is `{x, row, font}` and
+ * `move.w $6(a0),d0` is the alignment, with the string at +$8. `row` is a
+ * DIRECT PANEL SCANLINE, not an index: `mulu.w #$28,d4` multiplies it by the
+ * 40-byte stride of the one-plane 320 x 16 strip at $6000A00.
+ *
+ * `align` is the raw word because the machine's test is raw: 0 leaves the pen
+ * at `x` (LEFT), 1 subtracts the whole string width (RIGHT), and anything else
+ * subtracts half of it (CENTRE).
+ */
+export interface ModeMessageLine {
+  readonly x: number;
+  readonly row: number;
+  readonly font: number;
+  readonly align: number;
+}
+
 export interface ModeMessage {
   readonly index: number;
+  /** The record's TEXT operands in program order, first appearance winning. */
   readonly lines: readonly string[];
+  /** Index-parallel with `lines`: where each one goes. */
+  readonly layout: readonly ModeMessageLine[];
+  /**
+   * How long the machine leaves this record's text on the strip, in ticks.
+   *
+   * Summed off the record's own program: the waits between its first TEXT and
+   * its END, with `WAIT_FRAMES` (0x6822) counted raw and `WAIT_SECONDS`
+   * (0x696A) multiplied by VBlankFrequency, and SET_LOOP/LOOP unrolled. An
+   * ANIM_BLOCK contributes nothing, because the interpreter refuses to age the
+   * hold while an animation runs (0x664E) — which is exactly the rule the panel
+   * layer reproduces by holding the text back until its own queue drains.
+   *
+   * Zero is real and means what it says: 35 of the 174 text-bearing records
+   * print and END on the same frame. They are the live-value status screens the
+   * machine re-posts every frame, and what re-posts them is not decoded, so
+   * this port shows them for no time at all rather than inventing one.
+   */
+  readonly holdTicks: number;
+  /**
+   * The record's `+$02` and `+$03`, which are the display poster's whole
+   * arbitration (0x6C4E-0x6C6A): a record whose primary is BELOW what is on
+   * screen is dropped and never shown, one above it flushes the ring and takes
+   * over, and on a tie the secondary decides between appending and taking over.
+   * A primary with bit 7 set always takes over. Both are cleared to zero when
+   * the ring drains (0x66E8), so an idle display accepts anything.
+   */
+  readonly priority: number;
+  readonly priority2: number;
 }
 
 export interface ModeMission {
@@ -629,6 +711,36 @@ function requireArray(value: unknown, label: string): readonly unknown[] {
   return value;
 }
 
+/**
+ * Award effect 26's prize table, with the two invariants its walk depends on.
+ * Empty for every element that is not effect 26, which is all but one.
+ */
+function parsePrizeTable(value: unknown, label: string, scriptCount: number): readonly ModePrize[] {
+  const raw = requireArray(value ?? [], label);
+  const prizes: ModePrize[] = [];
+  for (const [at, entry] of raw.entries()) {
+    const one = entry as Record<string, unknown>;
+    const where = `${label} ${at}`;
+    const threshold = requireWholeNumber(one["threshold"], `${where} threshold`, 1, 256);
+    const previous = prizes[at - 1];
+    if (previous !== undefined && threshold <= previous.threshold) {
+      throw new Error(`${where} threshold ${threshold} does not exceed the one before it`);
+    }
+    prizes.push(
+      Object.freeze({
+        flags: requireWholeNumber(one["flags"] ?? 0, `${where} flags`, 0, 255),
+        threshold,
+        script: requireWholeNumber(one["script"], `${where} script`, 0, scriptCount - 1),
+      }),
+    );
+  }
+  const last = prizes[prizes.length - 1];
+  if (last !== undefined && last.threshold !== 256) {
+    throw new Error(`${label} ends at ${last.threshold}, not 256; a roll above it would walk off the table`);
+  }
+  return Object.freeze(prizes);
+}
+
 const OPERAND_KINDS: readonly string[] = ["e", "s", "m", "o", "n", "w", "c", "i"];
 
 /** The two opcodes that bracket a mission's use of an arm element. */
@@ -691,7 +803,35 @@ export function parseTableModesDocument(doc: TableModesDocument): TableModes {
     if (lines.some((line) => typeof line !== "string")) {
       throw new Error(`${label} message ${at} has a non-string line`);
     }
-    messages.push(Object.freeze({ index: at, lines: Object.freeze(lines as string[]) }));
+    // The geometry is index-parallel with the text, because both come off the
+    // same TEXT instruction; a document where they are not is a document whose
+    // lines would be drawn in the wrong places.
+    const rawLayout = requireArray(item["layout"], `${label} message ${at} layout`);
+    if (rawLayout.length !== lines.length) {
+      throw new Error(
+        `${label} message ${at} has ${lines.length} line(s) but ${rawLayout.length} layout entr(ies)`,
+      );
+    }
+    const layout = rawLayout.map((entry2, line) => {
+      const geometry = entry2 as Record<string, unknown>;
+      const where = `${label} message ${at} line ${line}`;
+      return Object.freeze({
+        x: requireWholeNumber(geometry["x"], `${where} x`, 0, 400),
+        row: requireWholeNumber(geometry["row"], `${where} row`, 0, 200),
+        font: requireWholeNumber(geometry["font"], `${where} font`, 0, 32),
+        align: requireWholeNumber(geometry["align"], `${where} align`, 0, 8),
+      });
+    });
+    messages.push(
+      Object.freeze({
+        index: at,
+        lines: Object.freeze(lines as string[]),
+        layout: Object.freeze(layout),
+        holdTicks: requireWholeNumber(item["holdTicks"], `${label} message ${at} holdTicks`, 0, 60_000),
+        priority: requireWholeNumber(item["priority"], `${label} message ${at} priority`, 0, 255),
+        priority2: requireWholeNumber(item["priority2"], `${label} message ${at} priority2`, 0, 255),
+      }),
+    );
   }
 
   // The script pool's size is needed before the scripts themselves are walked:
@@ -792,6 +932,12 @@ export function parseTableModesDocument(doc: TableModesDocument): TableModes {
         // Award effect 17's follow-on record. Bounded by `scriptCount` rather
         // than by a parsed pool: the scripts are parsed below this loop.
         chainScript: requireWholeNumber(item["chainScript"] ?? -1, `${where} chainScript`, -1, scriptCount - 1),
+        // Award effect 26's prize table, checked the way the machine's own walk
+        // needs it: the thresholds must ascend and the last must reach 256,
+        // because +0x006110 steps 8 bytes at a time until one compares ABOVE
+        // the roll and has no bound of its own. A table that never does would
+        // walk off the end of the record.
+        prizeTable: parsePrizeTable(item["prizeTable"], `${where} prizeTable`, scriptCount),
         stepAddend: requireWholeNumber(
           item["stepAddend"] ?? 0,
           `${where} stepAddend`,

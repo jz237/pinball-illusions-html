@@ -460,6 +460,8 @@ const EFFECT_LAUNCH_AT_COUNT = 22;
 const EFFECT_COUNT_DOWN = 24;
 const EFFECT_HOLD_MULTIPLIER = 8;
 const EFFECT_ADD_TIME = 23;
+/** Award effect 26, the casino wheel. See `spinPrizeWheel`. */
+const EFFECT_RANDOM_AWARD = 26;
 
 /**
  * MEASURED: the element flag bits that relight a lamp the moment it is awarded.
@@ -719,6 +721,20 @@ export interface ModeState {
    */
   abortWait: boolean;
 
+  /**
+   * `$C8AC`: the VBlank frame counter, counted here as calls to `tickModes`.
+   *
+   * The machine's is a free-running word at a fixed address that the video
+   * interrupt bumps once a frame; this port runs the mission machine once per
+   * 50 Hz tick and nowhere else, so counting the ticks counts the same frames.
+   * TWO decoded sites read it and both want a cheap deterministic clock rather
+   * than entropy: award effect 26's prize roll (+0x006102) and the display
+   * VM's own TEXT_IF (+0x006832). It is monotonic across balls and across
+   * players, exactly like the machine's, and it survives `resetModesForNewBall`
+   * because the machine's counter does not restart either.
+   */
+  frames: number;
+
   /** RECONSTRUCTION. Which selector entry the next arm shot will start. */
   selectorCursor: number;
   /** RECONSTRUCTION. One byte per mission: 1 once it has been played this game. */
@@ -783,6 +799,7 @@ export function createModeState(modes: TableModes): ModeState {
     resumePc: -1,
     waitIndefinite: false,
     abortWait: false,
+    frames: 0,
     selectorCursor: 0,
     played: new Uint8Array(modes.missions.length),
   };
@@ -2092,7 +2109,67 @@ function applyAwardEffect(
     state.waitTicks += TICKS_PER_SECOND;
     return;
   }
+  if (element.effect === EFFECT_RANDOM_AWARD) {
+    spinPrizeWheel(state, out, element);
+    return;
+  }
   void index;
+}
+
+/**
+ * AWARD EFFECT 26 — THE MYSTERY WHEEL, and the last unimplemented award effect
+ * on any of the three tables.
+ *
+ * The handler is the whole of main.seg00 +0x006102:
+ *
+ *     006102  move.w  $C8AC.l,d0     ; the VBlank frame counter
+ *     006108  movea.l $34(a2),a0     ; the element's prize table
+ *     00610C  andi.w  #$FF,d0        ; a roll in 0..255
+ *     006110  cmp.w   $2(a0),d0
+ *     006114  bcs.b   $611C          ; roll BELOW this threshold -> it wins
+ *     006116  adda.w  #$8,a0
+ *     00611A  bra.b   $6110
+ *     00611C  btst.b  #$0,(a0)       ; the award-ONCE bit
+ *     006120  beq.b   $612E
+ *     006122  bset.b  #$1,(a0)
+ *     006126  beq.b   $612E
+ *     006128  addi.w  #$5D,d0        ; a claimed once-only prize: re-roll +93
+ *     00612C  bra.b   $6108
+ *     00612E  movea.l $4(a0),a0
+ *     006132  jsr     $6C10          ; queued exactly as effect 17 queues
+ *
+ * THE ROLL IS NOT RANDOM AND MUST NOT BE. `$C8AC` is the machine's free-running
+ * VBlank counter — a deterministic clock, not an entropy source — so this port
+ * rolls `ModeState.frames`, its own count of `tickModes` calls, which is one
+ * per VBlank for exactly the same reason. `Math.random()` would put a number in
+ * the hashed snapshot that neither the census nor the sim-hash pin could
+ * reproduce; a frame counter reproduces both, and it is also what the machine
+ * does. What a player gets is decided by WHEN script 154's eight-second timer
+ * expires, which is what decides it on the original too.
+ *
+ * The `once` path is refused rather than reconstructed: every entry of the one
+ * shipped table has `flags = 0`, so there is no second example to check a
+ * reconstruction against.
+ */
+function spinPrizeWheel(state: ModeState, out: Accumulator, element: ModeElement): void {
+  if (element.prizeTable.length === 0) {
+    out.unimplemented += 1;
+    return;
+  }
+  const roll = state.frames & 0xff;
+  for (const prize of element.prizeTable) {
+    if (roll >= prize.threshold) continue;
+    if (prize.flags !== 0) {
+      out.unimplemented += 1;
+      return;
+    }
+    queueScript(state, prize.script);
+    return;
+  }
+  // Unreachable on a document the parser accepted — it refuses a table whose
+  // last threshold is not 256 — but the machine's own walk has no terminator,
+  // so saying so out loud beats running off the end of the array.
+  out.unimplemented += 1;
 }
 
 /**
@@ -2603,6 +2680,11 @@ export function tickModes(modes: TableModes, state: ModeState): ModeTickReport {
     ballSaveTicks: -1,
     unimplemented: 0,
   };
+
+  // `$C8AC`, bumped once per frame before anything reads it — the video
+  // interrupt's own increment happens before the frame chain runs. See
+  // `ModeState.frames`; the roll starts at 1 on the first tick, not 0.
+  state.frames += 1;
 
   for (let index = 0; index < state.timers.length; index += 1) {
     const left = state.timers[index] ?? 0;

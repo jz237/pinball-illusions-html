@@ -833,11 +833,56 @@ const TICKS = 4000;
  *   5,437,500 / 3,775,000 against 5,977,500 / 5,995,000 / 1,490,000, and
  *   ball-1 medians 375,000 / 777,500 / 485,000. Three write-offs of 313 on Law
  *   'n Justice and none on the other two.
+ *
+ * ---------------------------------------------------------------------------
+ * THE DISPLAY-TEXT ROUND: ONE TABLE MOVES, AND IT MOVES BY ONE FIELD
+ * ---------------------------------------------------------------------------
+ * The exporter's display pool used to be MESSAGE-opcode operands only, and each
+ * element's own `+$14` / `+$18` was then resolved through it — so 228 of 229
+ * element display pointers shipped as -1 and the machine's own caption for a
+ * shot the player takes was not in the file at all. `modePools` now seeds the
+ * pool from those pointers, `pushMessage` therefore fires on element starts and
+ * awards that used to push nothing, and `modeMessages` is in this snapshot.
+ *
+ * LAW 'N JUSTICE AND BABEWATCH DO NOT MOVE. Byte-identical over all 4,000
+ * ticks, and that is a measurement, not an assumption: the scripted input above
+ * reaches no element with a newly-resolved display record on either table
+ * inside 4,000 ticks. It also means the CASINO WHEEL — award effect 26, wired
+ * this round — does not move BabeWatch's digest either, because this script
+ * never puts a ball in the lower lock, let alone the upper one eight seconds
+ * later. `research/effects-tail/EFFECTS_TAIL.md` section 8 predicted no
+ * movement for the wrong reason (it thought the element unreachable) and
+ * `PARITY_LEDGER.md` section 5 predicted movement for the right one; on THIS
+ * script both are moot, and `casino-wheel.test.ts` drives the wheel directly
+ * rather than hoping this one stumbles into it.
+ *
+ * EXTREME SPORTS MOVES, at t2513, and the diff is one field:
+ *
+ *     modeMessages  []  ->  ["MODES ENABLED"]
+ *
+ * ES element 83 is the award-effect-22 arm element, and its `displayStart` is
+ * the record whose program is `SET_LOOP 2 / SOUND / TEXT "MODES ENABLED" /
+ * WAIT 10 / CLEAR_1 / WAIT 10 / LOOP / SOUND / TEXT / WAIT_SECONDS 1`. The
+ * player was already taking that shot on tick 2513 of this very script and the
+ * machine's caption for it was not in the document. Nothing else on the tick
+ * differs — not a ball, not a velocity, not the score — and the two trees agree
+ * byte for byte on all 2,512 ticks before it.
+ *
+ *   old: ed9a8d8d... / c66fd394... / 5a93dd87...
+ *   new: ed9a8d8d... / c66fd394... / e37851e4...
+ *
+ * THE GATES ON THIS ROUND. Physics gate unmoved, exit 0 at
+ * 576/218/470/558/282/487 — this is rules and presentation work and it touches
+ * no physics. Flipper probe unmoved: 0 of 648 roll-and-flip and 0 of 210
+ * drop-and-flip pass-unders, 0 of 36 cradles lost, and the same two
+ * bat-stroke-zero late drains HEAD reports. Census 90 x 3 x 40,000: 90/90 on
+ * all three, with the figures recorded in
+ * research/parity-ledger/DISPLAY_TEXT.md.
  */
 const PINNED: Record<TableId, string> = {
   "law-n-justice": "ed9a8d8da0b6cca1768ded7b835f4b22db9eaf29cb89421bf01b271dea7ae8d3",
   "babewatch": "c66fd3945f17edd996e1b86c1406b64c7067d89f8f469f8a23e7ec2174b660f6",
-  "extreme-sports": "5a93dd8751d36331a52472b11af8bc4332bb86746160d93adf665746a7035776",
+  "extreme-sports": "e37851e442f80f6f4a4c85705ff1df81f91ea708cfed74f29a9ebb6f6c3922e4",
 };
 
 /** Same shape as the determinism harness's input: behaviour = f(tick index). */

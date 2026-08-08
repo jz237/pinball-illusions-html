@@ -443,6 +443,81 @@ const BONUS_MULTIPLIER_LEFT_X = 40;
 const BONUS_MULTIPLIER_RIGHT_X = 280;
 
 /**
+ * THE MACHINE'S OWN CAPTIONS — one display record's text, ready to place.
+ *
+ * ---------------------------------------------------------------------------
+ * WHERE EVERY NUMBER IN HERE COMES FROM
+ * ---------------------------------------------------------------------------
+ * A display record is a PROGRAM for the interpreter at main.seg00 +0x006642,
+ * and its TEXT instruction (opcode 3, handler 0x694C) hands a print record to
+ * `$73D0`, which reads the geometry out of the record itself:
+ *
+ *     0073DA  movem.w (a0),d3-d5   ; +$0 X, +$2 ROW, +$4 FONT
+ *     0073DE  mulu.w  #$28,d4      ; ROW x 40 bytes = ROW x one 320-px scanline
+ *     007404  move.w  $6(a0),d0    ; +$6 ALIGN
+ *     00740A  cmpi.b  #$0,d0       ; 0 -> pen at X          (LEFT)
+ *     007410  cmpi.b  #$1,d0       ; 1 -> pen at X - width  (RIGHT)
+ *     007416  ...lsr.w #1...       ; else X - width/2       (CENTRE)
+ *
+ * so `x` and `align` here are the machine's and are used exactly. `row` is the
+ * machine's too and is NOT used exactly, for the one reason `bonusPenY` above
+ * already documents: the machine's panel font is five rows and this port's is
+ * eight, so a caption at row 2 and a second line at row 9 would overlap and the
+ * second would run two rows off a sixteen-row strip. `messagePenY` maps the
+ * machine's row onto the same two halves the bonus and the card use, which
+ * reproduces its PITCH and its line ORDER and nothing else about its height.
+ * Every row in the shipped corpus is 0, 2, 4, 5, 6 or 9, so the split at eight
+ * is a split between the machine's top line and its bottom one and never falls
+ * inside one.
+ *
+ * `font` is carried and deliberately not used. The machine has six panel fonts
+ * — the table at h0+0x7136, each `{bitmap in main h5, metrics in h0}`, with
+ * 0/1 sharing metrics at 0xCD54, 2/3 at 0xCDE6 and 4/5 at 0xCE72 — and this
+ * port ships one. Which shipped font corresponds to which is not decoded, so
+ * the field travels, is ignored, and says so rather than being guessed at.
+ */
+export interface PanelMessageLine {
+  readonly x: number;
+  readonly row: number;
+  readonly font: number;
+  readonly align: number;
+  readonly text: string;
+}
+
+export interface PanelMessageView {
+  readonly lines: readonly PanelMessageLine[];
+}
+
+/**
+ * The pen row for a machine scanline, on this port's taller font.
+ *
+ * The same two halves `bonusPenY` picks and for the same measured reason; see
+ * `PanelMessageView`. Eight is the machine's own line pitch — its caption sits
+ * on row 2 and its figure on row 10 — so "below eight" is "the top line".
+ */
+function messagePenY(font: ShellFont, row: number): number {
+  return bonusPenY(font, row < Math.floor(PANEL_HEIGHT / 2) ? 0 : 1);
+}
+
+/**
+ * The machine's three alignments, as `alignShellText` names them. `$73D0`
+ * tests `0`, then `1`, then falls through, so anything else centres.
+ */
+function messageAlign(align: number): "left" | "right" | "center" {
+  if (align === 0) return "left";
+  if (align === 1) return "right";
+  return "center";
+}
+
+function drawMessage(target: PixelTarget, font: ShellFont, message: PanelMessageView): void {
+  for (const line of message.lines) {
+    if (line.text.length === 0) continue;
+    const penX = alignShellText(font, line.text, line.x, messageAlign(line.align));
+    drawText(target, font, line.text, penX, messagePenY(font, line.row), PANEL_AMBER, PANEL_WHITE);
+  }
+}
+
+/**
  * The PLAYER/BALL card — the serve announcement (state 5) and the
  * multi-player end-of-ball "PL n" card. Structurally `game-loop.ts`'s
  * `PanelCard`, declared here the way `PanelBonusView` twins `BonusView`, so
@@ -528,6 +603,7 @@ export function renderPanelInto(
   target: PixelTarget,
   bonus?: PanelBonusView | null,
   card?: PanelCardView | null,
+  message?: PanelMessageView | null,
 ): PixelTarget {
   if (target.width !== PANEL_WIDTH || target.height !== PANEL_HEIGHT) {
     throw new RangeError(
@@ -553,6 +629,22 @@ export function renderPanelInto(
   const frame = currentPanelFrame(state);
   if (frame !== null) {
     drawFrame(target, frame);
+    return target;
+  }
+  // A DISPLAY RECORD'S TEXT OUTRANKS THE SCORE AND WAITS BEHIND AN ANIMATION,
+  // both because the machine does. The record owns the strip while it runs —
+  // it clears it (`CLEAR_1` at 0x681A, `CLEAR_2`, `CLEAR_ALL`), prints, and
+  // 0x66E0 clears it again on END, so the score cannot show through. And the
+  // interpreter refuses to age the hold at all while an animation is up:
+  //
+  //     00664E  tst.l   $23C8(a5)     ; an ANIM_BLOCK is running
+  //     006652  bne.b   $665E         ; -> do nothing this frame
+  //
+  // so within one record the animation plays first and the caption follows,
+  // which is exactly this order with the port's own queue standing in for
+  // `$23C8`. See `PanelDisplay` for the hold and the priority gate.
+  if (message !== undefined && message !== null && message.lines.length > 0) {
+    drawMessage(target, font, message);
     return target;
   }
 

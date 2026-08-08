@@ -398,13 +398,32 @@ describe("the tick report reaches the engine sounds", () => {
   });
 
   it("mode starts and shown messages fire the sting layer", () => {
-    // BabeWatch binds mode-message-0 and mode-start-7; see the exporter's log.
+    // BabeWatch binds mode-message-6 and mode-element-8; see the exporter's log.
+    //
+    // THE `mode-start-*` FAMILY IS GONE, and that is the point of this round
+    // rather than a regression. A display record used to be bound as
+    // `mode-start-N` / `mode-element-N` only because the message pool could not
+    // hold it: the pool was MESSAGE operands alone, so an element's own +$14 /
+    // +$18 record had no message index to be named by. Now `modePools` seeds the
+    // pool from those pointers too, the exporter's own rule — "the message pool
+    // claims an address first, because the mode VM pushes an element's display
+    // onto `messagesShown` whenever that display is in the pool" — takes over,
+    // and BabeWatch's e7 START sting moves from `mode-start-7` to
+    // `mode-message-6`, e7's `displayStart` being message 6. SAME RECORD, SAME
+    // SAMPLE, SAME MOMENT: `startElement` pushes the message on the tick it
+    // reports the start. The binding COUNT does not move on any table (50/38/17).
     const { bank, host } = stubbedBank("babewatch");
-    expect(bank.audio.sampleForAward("mode-message-0")).not.toBeNull();
-    expect(bank.audio.sampleForAward("mode-start-7")).not.toBeNull();
-    playTick(bank, reportWith({ messagesShown: [0] }));
+    expect(bank.audio.sampleForAward("mode-message-6")).not.toBeNull();
+    expect(bank.audio.sampleForAward("mode-element-8")).not.toBeNull();
+    expect(bank.audio.sampleForAward("mode-start-7")).toBeNull();
+    playTick(bank, reportWith({ messagesShown: [6] }));
     host.currentTime += 10;
-    playTick(bank, reportWith({ elementStarts: [7] }));
+    playTick(
+      bank,
+      reportWith({
+        awards: [{ source: "mode", id: "mode-element-8", score: 0, bonus: 0, repeat: false }],
+      }),
+    );
     expect(host.started.length).toBe(2);
   });
 

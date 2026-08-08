@@ -48,7 +48,13 @@ import {
   renderPanelInto,
   stepPanel,
 } from "./panel-renderer.js";
-import type { PanelAnimation, PanelBonusView, PanelCardView, PanelState } from "./panel-renderer.js";
+import type {
+  PanelAnimation,
+  PanelBonusView,
+  PanelCardView,
+  PanelMessageView,
+  PanelState,
+} from "./panel-renderer.js";
 import { createPixelTarget } from "./playfield-renderer.js";
 import type { PixelTarget } from "./playfield-renderer.js";
 import { dmdBandOffset, dmdGeometryFor, renderDmdInto } from "./panel-dmd.js";
@@ -57,6 +63,7 @@ import { PANEL_UNLIT } from "./palette.js";
 import { decodePanelObjectFrames, panelFramePixels } from "../game/table-panel.js";
 import type { TablePanel } from "../game/table-panel.js";
 import type { ShellFont } from "../game/shell-art.js";
+import type { ModeMessage } from "../game/table-modes.js";
 
 /** A canvas the blit path can draw to; injectable so nothing here assumes DOM. */
 export type PanelSurfaceFactory = (
@@ -86,6 +93,21 @@ export class PanelDisplay implements PanelPresenter {
    * heard of the bonus gets it anyway.
    */
   #bonus: PanelBonusView | null = null;
+  /**
+   * THE MACHINE'S CAPTION CHANNEL: the display record whose text is up, the
+   * hold it has left, and the priority it took the strip at.
+   *
+   * Held here for the same reason `#bonus` is — the panel stays a function of
+   * the tick stream and nothing else — and the fields are the machine's own:
+   * `$23A6` is the record on screen, `$23B6` its countdown and `$23B2`/`$23B3`
+   * the priority it holds the strip at. See `observe`.
+   */
+  #message: PanelMessageView | null = null;
+  #messageTicks = 0;
+  #messagePriority = 0;
+  #messagePriority2 = 0;
+  /** The display records: their text, geometry, hold and priority. */
+  readonly #messages: readonly ModeMessage[];
 
   // The blit path, all lazy: nothing canvas-shaped exists until `draw` runs.
   readonly #createSurface: PanelSurfaceFactory;
@@ -114,13 +136,21 @@ export class PanelDisplay implements PanelPresenter {
   #dmdCell = 0;
   #dmdBand = 0;
 
+  /**
+   * `messages` is the mode document's display-record pool. It is optional so
+   * that a caller with only the panel document still gets the animations — the
+   * behaviour this class had before it could draw captions — and an empty pool
+   * simply means no text, never a throw.
+   */
   constructor(
     panel: TablePanel,
     font: () => ShellFont | null,
     createSurface?: PanelSurfaceFactory,
+    messages: readonly ModeMessage[] = [],
   ) {
     this.#panel = panel;
     this.#font = font;
+    this.#messages = messages;
     this.#createSurface =
       createSurface ??
       ((width, height) => {
@@ -157,6 +187,7 @@ export class PanelDisplay implements PanelPresenter {
   observe(report: GameTickReport): void {
     this.#bonus = report.bonus;
     this.#state = stepPanel(this.#state, 1);
+    this.#ageMessage();
     for (const element of report.elementStarts) {
       this.#enqueue(this.#startsByElement.get(element));
     }
@@ -165,7 +196,74 @@ export class PanelDisplay implements PanelPresenter {
     }
     for (const message of report.messagesShown) {
       this.#enqueue(this.#objectsByMessage.get(message));
+      this.#offerMessage(message);
     }
+  }
+
+  /**
+   * One frame of the machine's hold, `$23B6`.
+   *
+   *     006642  tst.w  $23B8(a5)        ; a raw frame wait outranks everything
+   *     006648  tst.b  $23B4(a5)        ; is a hold running at all?
+   *     00664E  tst.l  $23C8(a5)        ; an ANIM_BLOCK: DO NOT AGE THE HOLD
+   *     006654  tst.w  $23B6(a5)
+   *     00665A  subq.w #$1,$23B6(a5)
+   *
+   * The `$23C8` refusal is the load-bearing line and it is why this asks the
+   * animation queue first: within one record the machine plays the animation,
+   * and only when it is done does the caption's clock start. This port's queue
+   * stands in for `$23C8` — the panel document's `references.messages` is where
+   * that record's animations went — so a caption queued behind art waits for
+   * the art exactly as it does on the machine. When the hold runs out, 0x66E0
+   * clears the strip and the score comes back, which is what dropping the
+   * record here does.
+   */
+  #ageMessage(): void {
+    if (this.#message === null) return;
+    if (!panelIsIdle(this.#state)) return;
+    if (this.#messageTicks > 0) {
+      this.#messageTicks -= 1;
+      return;
+    }
+    this.#message = null;
+    // 0x66E8: the ring drained, so both priority bytes go back to zero and the
+    // next record — whatever its priority — is accepted.
+    this.#messagePriority = 0;
+    this.#messagePriority2 = 0;
+  }
+
+  /**
+   * The display poster's arbitration, 0x6C4E-0x6C6A, on the caption channel.
+   *
+   * A record whose primary priority is BELOW what is on screen is dropped and
+   * never shown; one above it takes the strip; a primary with bit 7 set always
+   * takes it; on a tie the secondary decides, and equal-on-both takes it too
+   * (the machine falls through into its own flush). What this does NOT do is
+   * flush the ANIMATION queue the way 0x6C6C does: that queue is filmed and
+   * ordered and this round has no measurement of what a flush would do to it,
+   * so the caption channel arbitrates and the animation channel keeps the
+   * ordering it shipped with. That divergence is stated rather than hidden.
+   *
+   * A record with no text does not take the strip at all — 114 of the 288
+   * carry none, and they are the pure animation and live-value programs — and
+   * neither does one whose own decoded hold is zero, which is the machine
+   * saying it prints and ends on the same frame.
+   */
+  #offerMessage(index: number): void {
+    const record = this.#messages[index];
+    if (record === undefined || record.lines.length === 0 || record.holdTicks === 0) return;
+    if (this.#message !== null) {
+      if (record.priority < this.#messagePriority) return;
+      if (record.priority === this.#messagePriority && record.priority2 < this.#messagePriority2) {
+        return;
+      }
+    }
+    this.#message = {
+      lines: record.lines.map((text, line) => ({ ...record.layout[line]!, text })),
+    };
+    this.#messageTicks = record.holdTicks;
+    this.#messagePriority = record.priority;
+    this.#messagePriority2 = record.priority2;
   }
 
   /**
@@ -176,6 +274,10 @@ export class PanelDisplay implements PanelPresenter {
   reset(): void {
     this.#state = createPanelState();
     this.#bonus = null;
+    this.#message = null;
+    this.#messageTicks = 0;
+    this.#messagePriority = 0;
+    this.#messagePriority2 = 0;
   }
 
   #enqueue(objects: readonly number[] | undefined): void {
@@ -225,7 +327,7 @@ export class PanelDisplay implements PanelPresenter {
     font: ShellFont,
     card?: PanelCardView | null,
   ): PixelTarget {
-    return renderPanelInto(this.#state, score, font, target, this.#bonus, card);
+    return renderPanelInto(this.#state, score, font, target, this.#bonus, card, this.#message);
   }
 
   /**
@@ -249,7 +351,7 @@ export class PanelDisplay implements PanelPresenter {
     const font = this.#font();
     if (font === null) return false;
 
-    renderPanelInto(this.#state, score, font, this.#target, this.#bonus, card);
+    renderPanelInto(this.#state, score, font, this.#target, this.#bonus, card, this.#message);
 
     const geometry = dmdGeometryFor(scale);
     if (geometry !== null) return this.#drawDotMatrix(context, geometry, viewWidth);

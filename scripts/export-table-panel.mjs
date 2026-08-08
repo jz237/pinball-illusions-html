@@ -56,17 +56,23 @@
 //
 // THE REFERENCE MAP. Display records are what the mode VM queues, and they are
 // reached from: an element's +$14 (on START) and +$18 (on AWARD), the MESSAGE
-// opcode's operand pool (the modes document's `messages`, same indices), and
-// the descriptor's +$84 attract/score-trailer record. Type-1 devices carry an
+// opcode's operand pool, and the descriptor's +$84 attract/score-trailer
+// record. The first two are now ONE pool — `modePools` in
+// export-table-modes.mjs, the modes document's `messages`, same indices —
+// because the START, START_TIMED and AWARD handlers make the identical
+// `jsr $6C2C` call the MESSAGE opcode's handler does. Type-1 devices carry an
 // animation record at +$06 — walked here both on the device record and on its
 // mode record, and EMPTY on all three shipped tables (the longword is zero).
-// The display VM behind $6C2C is not decoded, so which objects belong to a
-// record is a RECONSTRUCTION with the same shape as the modes exporter's
-// `messageText`: the record is scanned from its base to the next known record
-// base (capped at $60 bytes) for directive-word-preceded relocations into slot
-// 5. The offsets and objects are exact; the record membership is the
-// reconstructed claim. Directive sites no known record claims — the credits
-// records — are exported factually under `other` with their h4 offsets.
+// The display VM behind $6C2C IS now decoded (its dispatch table is 0x6748 and
+// its 26 opcodes are transcribed in export-table-modes.mjs), but this file's
+// object membership is still the RECONSTRUCTION it always was: the record is
+// scanned from its base to the next known record base (capped at $60 bytes) for
+// directive-word-preceded relocations into slot 5. Reading the ANIM_BLOCK and
+// ANIM_BG operands out of the decoded program instead would be strictly better
+// and is not done here — this round changed the pool, not the walk. The offsets
+// and objects are exact; the record membership is the reconstructed claim.
+// Directive sites no known record claims — the credits records — are exported
+// factually under `other` with their h4 offsets.
 //
 // ---------------------------------------------------------------------------
 // THE CHECKS, ALL FATAL
@@ -91,7 +97,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import {
   loadPackage,
-  findScripts,
+  modePools,
   follow,
   key,
   readU16,
@@ -345,29 +351,12 @@ function discoverObjects(pkg, stem, targets, blobs) {
 // Reference discovery
 // ---------------------------------------------------------------------------
 
-/** The element pool, exactly as export-table-modes.mjs derives it. */
-function elementPool(pkg) {
-  const scripts = findScripts(pkg);
-  const elementKeys = new Set();
-  const messageKeys = new Set();
-  for (const script of scripts.values()) {
-    for (const op of script.ops) {
-      for (const arg of op.args) {
-        if (arg.target === null || arg.target === undefined) continue;
-        if (arg.kind === "e") elementKeys.add(key(arg.target));
-        if (arg.kind === "m") messageKeys.add(key(arg.target));
-      }
-    }
-  }
-  const byKey = (set) =>
-    [...set]
-      .map((k) => {
-        const [hunk, offset] = k.split(":").map(Number);
-        return { hunk, offset };
-      })
-      .sort((a, b) => a.hunk - b.hunk || a.offset - b.offset);
-  return { elements: byKey(elementKeys), messages: byKey(messageKeys) };
-}
+// The element and display-record pools are `modePools` in export-table-modes.mjs
+// and are imported rather than rebuilt: this file used to carry its own copy of
+// the rule, and a copy that drifts is a panel whose `mode-message-N` means a
+// different record from the one the mode document numbered. CHECK 1 below still
+// compares the imported pool against the shipped modes.json, so the two
+// documents cannot ship out of step even if the rule changes again.
 
 /** Every h4 longword the relocation table sends into the panel heap. */
 function panelReferences(pkg) {
@@ -485,7 +474,7 @@ function decode(pkg, table, modesDoc) {
   const { heap, objects, byOffset } = discoverObjects(pkg, table.stem, targets, table.blobs);
 
   // CHECK 4 — pool agreement with the shipped modes document.
-  const pools = elementPool(pkg);
+  const pools = modePools(pkg);
   if (!Array.isArray(modesDoc.elements) || modesDoc.elements.length !== pools.elements.length) {
     throw new Error(
       `${table.stem}: element pool has ${pools.elements.length} entries but the shipped ` +
@@ -509,12 +498,17 @@ function decode(pkg, table, modesDoc) {
     ]) {
       const display = follow(pkg, at, delta);
       const shipped = modesDoc.elements[index][path === "start" ? "displayStart" : "displayAward"];
-      // The modes document files an element display under `messages` only when
-      // a MESSAGE opcode also names it; presence beyond that cannot be
-      // cross-checked there, so only the positive direction is held.
-      if (shipped >= 0 && display === null) {
+      // BOTH DIRECTIONS, now that the pool holds the element display records
+      // too. It used to be one-way — the modes document filed an element's
+      // display under `messages` only when a MESSAGE opcode also named it, so
+      // 228 of 229 pointers shipped as -1 and their absence proved nothing.
+      // With `modePools` seeding the pool from the same `+$14` / `+$18` this
+      // loop reads, a pointer that exists and did not ship is now a defect this
+      // check catches.
+      if ((display === null) !== (shipped < 0)) {
         throw new Error(
-          `${table.stem}: element ${index} ${path} display disagrees with the shipped modes.json`,
+          `${table.stem}: element ${index} ${path} display disagrees with the shipped modes.json ` +
+            `(package says ${display === null ? "none" : key(display)}, document says ${shipped})`,
         );
       }
       if (display !== null) {

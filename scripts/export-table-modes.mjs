@@ -283,8 +283,13 @@ const HEADER_BONUS_ROUTINE = 0x80;
  * (25/35/45/6/35/40/45/25) sum to exactly 256. Script 159 is prize #0. The
  * "CASINO" name came from adjacency — "THE CASINO IS CLOSED\0" ends at
  * h4+0x605C, two bytes before the table. See research/effects-tail/EFFECTS_TAIL.md
- * §4. This export still leaves the prize table unbound: element 66's only
- * awarder is unreachable, so nothing in play can spin the wheel.
+ * §4. `elementPrizeTable` now exports it and `mode-vm.ts` walks it, and the
+ * note this comment used to carry — "element 66's only awarder is unreachable,
+ * so nothing in play can spin the wheel" — was WRONG, from a census that did
+ * not read `chainScript`: BabeWatch e65 is award effect 17 with
+ * `chainScript = 153`, so the lower lock arms the casino, the upper lock
+ * awards it, s154 waits eight seconds and AWARDs e66, and e66 is lit at game
+ * start. See research/parity-ledger/PARITY_LEDGER.md §5.
  */
 const HEADER_LAMP_GROUPS = 0x38;
 /** Group record fields. Cited on `HEADER_LAMP_GROUPS`. */
@@ -349,6 +354,16 @@ const EFFECT_SET_MULTIPLIER = 5;
  * elements carry it (Law 'n Justice 5, BabeWatch 17, Extreme Sports 12).
  */
 const EFFECT_QUEUE_SCRIPT = 17;
+/** THE FIFTH READING OF +$34 — award effect 26's prize table. See `elementPrizeTable`. */
+const EFFECT_RANDOM_AWARD = 26;
+const PRIZE_ENTRY_BYTES = 0x08;
+const PRIZE_FLAGS = 0x00;
+const PRIZE_THRESHOLD = 0x02;
+const PRIZE_SCRIPT = 0x04;
+/** `andi.w #$FF,d0` at 0x610C: the roll is a byte, so the last threshold is 256. */
+const PRIZE_ROLL_RANGE = 0x100;
+/** Guard on the walk; the one shipped table has eight entries. */
+const PRIZE_TABLE_MAX_ENTRIES = 64;
 /**
  * Award effect 20's WINDOW SECONDS, the element's +$38 read as a WORD:
  * `move.w $38(a2),d0 / mulu.w $50(a5),d0 / move.w d0,$26(a0)` at +0x006212
@@ -535,8 +550,76 @@ const DEVICE_MODE_POINTER = 0x22;
 const ZONE_TRIGGER_EVENT = 0x06;
 const ZONE_LOCK_EVENT = 0x14;
 
-/** Bytes scanned inside a display record for print records. See `messageText`. */
-const MESSAGE_SPAN = 0x40;
+/**
+ * THE DISPLAY RECORD IS A PROGRAM, AND THIS IS ITS DISPATCH TABLE.
+ *
+ * `$6C2C` is the display poster, and FOUR sites hand it the same kind of
+ * pointer in A0: the MESSAGE opcode's handler (0x5BC0, `movea.l $2(a1),a0 /
+ * jsr $6C2C`), the element START handler's `+$14` (0x5A7A), START_TIMED's
+ * (0x5AF6) and the AWARD handler's `+$18` (0x5CD6). An element's own display
+ * record and a MESSAGE operand are therefore the same record kind, which is
+ * what lets one pool hold both.
+ *
+ * The interpreter is at 0x6642 and runs ONE instruction per VBlank call:
+ *
+ *     0066AC  move.w  $4(a0),d0             ; the record's own PC
+ *     0066B0  lea     $6(a0,d0.w),a1        ; the instruction
+ *     0066B4  move.w  (a1),d0               ; opcode; 0 ends the record
+ *     0066B8  movem.w (0x8C,PC,d0.w*4),d0-d1  ; table 0x6748 {off.w, len.w}
+ *     0066C0  add.w   d1,$4(a0)             ; advance PC by the length
+ *     0066C4  jsr     (0x86,PC,d0.w)        ; handler = 0x674C + off
+ *
+ * (both extension words are full-format with a word base displacement: 0x0520
+ * at 0x66BC, scale 4, PC 0x66BC; 0x0120 at 0x66C6, scale 1, PC 0x66C6. The
+ * same encoding as the mode VM's own dispatch at 0x58FC, whose base this file
+ * already quotes as 0x5912.) The table runs 0x6748..0x67B3 and 0x67B4 is the
+ * first handler, so there are exactly 27 slots and opcode 0 is handled inline.
+ *
+ * RECORD:
+ *     +$00 u16  flags; bit 0 sends it to $23D0 instead of the ring (0x6C34)
+ *     +$02 u8   primary priority      +$03 u8  secondary priority
+ *     +$04 u16  PC, runtime, cleared on dequeue at 0x6692
+ *     +$06 ...  the program
+ *
+ * `args` names the operand words after the opcode: "p" a relocated pointer
+ * (two words), "w" a plain word. Every one of the 288 display pointers on the
+ * three tables walks to a clean END under this table, which is the check that
+ * makes it a decode instead of a guess.
+ */
+const DISPLAY_OPS = {
+  1: { name: "ANIM_BLOCK", len: 16, args: "pwwwww" },
+  2: { name: "CLEAR_ALL", len: 2, args: "" },
+  3: { name: "TEXT", len: 6, args: "p" },
+  4: { name: "NOP_PTR", len: 6, args: "p" },
+  5: { name: "NUM_WORD", len: 14, args: "pwwww" },
+  6: { name: "NUM", len: 14, args: "pwwww" },
+  7: { name: "WAIT_SECONDS", len: 4, args: "w" },
+  8: { name: "NUM_SCORE", len: 10, args: "wwww" },
+  9: { name: "NUM_WORD_IDX", len: 14, args: "pwwww" },
+  10: { name: "WAIT_FRAMES", len: 4, args: "w" },
+  11: { name: "NATIVE", len: 6, args: "p" },
+  12: { name: "ANIM_BG", len: 16, args: "pwwwww" },
+  13: { name: "CLEAR_1", len: 2, args: "" },
+  14: { name: "NUM_SCRATCH", len: 10, args: "wwww" },
+  15: { name: "CLEAR_2", len: 2, args: "" },
+  16: { name: "SOUND", len: 6, args: "p" },
+  17: { name: "NOP", len: 2, args: "" },
+  18: { name: "NUM_PLAYER_C", len: 10, args: "wwww" },
+  19: { name: "SET_LOOP", len: 4, args: "w" },
+  20: { name: "LOOP", len: 4, args: "w" },
+  21: { name: "NOP_PTR21", len: 6, args: "p" },
+  22: { name: "NOP_PTR22", len: 6, args: "p" },
+  23: { name: "NOP_PTR23", len: 6, args: "p" },
+  24: { name: "BLIT", len: 2, args: "" },
+  25: { name: "COMMIT", len: 2, args: "" },
+  26: { name: "TEXT_IF", len: 8, args: "pw" },
+};
+/** The program starts here; +$04 is the PC the interpreter advances. */
+const DISPLAY_PROGRAM = 0x06;
+/** Guard on a runaway walk; the longest shipped program is 27 instructions. */
+const DISPLAY_MAX_STEPS = 256;
+/** `mulu.w $50(a5),d0` at 0x696E — VBlankFrequency, 50 on PAL. See timebase.ts. */
+const DISPLAY_TICKS_PER_SECOND = 50;
 
 /**
  * The 31 opcodes, by index: name, instruction length in bytes, and the operand
@@ -697,6 +780,19 @@ function bodyOf(pkg, hunk) {
 }
 
 export const key = (at) => `${at.hunk}:${at.offset}`;
+
+/**
+ * A key set back as addresses, in package order. Every pool in this file is
+ * built this way so an index is a function of the addresses alone and never of
+ * the order they were discovered in.
+ */
+export const byKeyOf = (set) =>
+  [...set]
+    .map((k) => {
+      const [hunk, offset] = k.split(":").map(Number);
+      return { hunk, offset };
+    })
+    .sort((a, b) => a.hunk - b.hunk || a.offset - b.offset);
 
 export function inBounds(pkg, at, span) {
   const body = pkg.bodies[at.hunk];
@@ -1437,14 +1533,28 @@ export function findScripts(pkg) {
 // ---------------------------------------------------------------------------
 
 /**
- * One print record: `{u16 x, u16 row, u16 font, u16 align, ASCIIZ}`.
+ * One print record, read exactly as `$73D0` reads it:
  *
- * The bounds on the four header words are what stops a random longword being
- * read as text: a display line is somewhere on a 336-pixel screen in one of a
- * handful of fonts, and the string that follows is printable ASCII.
+ *     0073DA  movem.w (a0),d3-d5     ; +$0 X, +$2 ROW, +$4 FONT
+ *     0073DE  mulu.w  #$28,d4        ; ROW x 40 bytes: ROW IS A PANEL SCANLINE
+ *     0073E2  adda.l  d4,a3          ;   on the one-plane 320 x 16 strip at
+ *                                    ;   $6000A00 (0x6B68 clears exactly 640 B)
+ *     007404  move.w  $6(a0),d0      ; +$6 ALIGN
+ *     007408  addq.w  #$8,a0         ; +$8 the ASCIIZ
+ *     00740A  cmpi.b  #$0,d0 / beq   ; align 0: pen = X, so LEFT
+ *     007410  cmpi.b  #$1,d0 / beq   ; align 1: pen = X - width, so RIGHT
+ *     007416  ... lsr.w #1 ...       ; anything else: X - width/2, CENTRE
+ *
+ * `align` is exported raw rather than as a name because the machine's own test
+ * is `0`, `1`, else — every shipped record uses 0, 1 or 2 and the runtime
+ * reproduces the same three-way test.
+ *
+ * The four bounds are what stops a stray longword being read as text; they are
+ * unchanged from the round that guessed this shape, and the disassembly now
+ * says the shape was right.
  */
 function printRecord(pkg, at) {
-  if (!inBounds(pkg, at, 10)) return null;
+  if (at === null || !inBounds(pkg, at, 9)) return null;
   const x = readU16(pkg, at, 0);
   const row = readU16(pkg, at, 2);
   const font = readU16(pkg, at, 4);
@@ -1455,37 +1565,140 @@ function printRecord(pkg, at) {
   let text = "";
   for (let i = at.offset + 8; i < body.length && text.length < 64; i += 1) {
     const byte = body.readUInt8(i);
-    if (byte === 0) break;
+    // An empty line is real — a record can print nothing at a column — so the
+    // terminator returns the record rather than rejecting it.
+    if (byte === 0) return { x, row, font, align, text };
     if (byte < 32 || byte > 126) return null;
     text += String.fromCharCode(byte);
   }
-  return text.length >= 2 ? text : null;
+  return null;
 }
 
 /**
- * RECONSTRUCTION — the lines a display record shows, in record order.
+ * THE RECORD'S OWN PROGRAM, walked the way 0x6642 walks it.
  *
- * The display VM behind `$6C2C` is not decoded, so this does not run it: it
- * walks the longwords of the record over a fixed span and keeps the ones that
- * point at a well-formed print record. The OFFSETS are exact and the strings are
- * verbatim; what is reconstructed is the claim that these lines belong to this
- * record and appear in this order. The step is two bytes rather than four
- * because the records are not longword aligned — Law 'n Justice's mission titles
- * live at +$1E and +$24 of a record whose own address is 2 mod 4, and a
- * four-byte walk finds the second line and misses the first.
+ * Returns null when the record is not a display program — an opcode outside
+ * the 26-entry table, an operand block that does not fill the table's own
+ * length, a TEXT whose pointer is not a print record, or a walk that leaves
+ * the hunk. That refusal is the check: all 288 display pointers on the three
+ * tables decode, so nothing here is being read as something it is not.
  */
-function messageText(pkg, at) {
-  const lines = [];
-  const seen = new Set();
-  for (let delta = 0; delta < MESSAGE_SPAN; delta += 2) {
-    const target = follow(pkg, at, delta);
-    if (target === null) continue;
-    const text = printRecord(pkg, target);
-    if (text === null || seen.has(text)) continue;
-    seen.add(text);
-    lines.push(text);
+function displayProgram(pkg, at) {
+  if (!inBounds(pkg, at, 8)) return null;
+  const ops = [];
+  let pc = 0;
+  for (let steps = 0; steps < DISPLAY_MAX_STEPS; steps += 1) {
+    const ip = { hunk: at.hunk, offset: at.offset + DISPLAY_PROGRAM + pc };
+    if (!inBounds(pkg, ip, 2)) return null;
+    const opcode = readU16(pkg, ip, 0);
+    if (opcode === 0) {
+      return { priority: readU8(pkg, at, 2), priority2: readU8(pkg, at, 3), ops };
+    }
+    const spec = DISPLAY_OPS[opcode];
+    if (spec === undefined || !inBounds(pkg, ip, spec.len)) return null;
+    const op = { name: spec.name, pc, len: spec.len, words: [] };
+    let delta = 2;
+    for (const kind of spec.args) {
+      if (kind === "p") {
+        op.pointer = follow(pkg, ip, delta);
+        delta += 4;
+      } else {
+        op.words.push(readU16(pkg, ip, delta));
+        delta += 2;
+      }
+    }
+    if (delta !== spec.len) return null;
+    if (spec.name === "TEXT" || spec.name === "TEXT_IF") {
+      op.print = printRecord(pkg, op.pointer);
+      if (op.print === null) return null;
+    }
+    ops.push(op);
+    pc += spec.len;
   }
-  return lines;
+  return null;
+}
+
+/**
+ * What one display record puts on the strip, and for how long.
+ *
+ * `lines` and `layout` are the record's TEXT operands in program order, first
+ * appearance wins — a record that flashes prints the same line twice and the
+ * player sees one caption. `holdTicks` is the machine's own duration: the
+ * waits from the first TEXT to the record's END, `WAIT_FRAMES` counted raw and
+ * `WAIT_SECONDS` multiplied by VBlankFrequency exactly as 0x696E does, with
+ * SET_LOOP/LOOP unrolled the way 0x6938/0x6906 unroll them.
+ *
+ * ANIM_BLOCK contributes NO ticks on purpose: the tick at 0x664E refuses to
+ * age `$23B6` while `$23C8` holds an animation, so an animation's own length
+ * is what delays the program and the panel layer already owns that queue.
+ */
+function messageDisplay(pkg, at) {
+  const program = displayProgram(pkg, at);
+  if (program === null) {
+    throw new Error(
+      `${pkg.stem}: ${key(at)} is used as a display record but does not decode as a display ` +
+        "program; see DISPLAY_OPS and the interpreter at main.seg00 +0x006642",
+    );
+  }
+  const lines = [];
+  const layout = [];
+  const seen = new Set();
+  const byPc = new Map(program.ops.map((op) => [op.pc, op]));
+  let pc = 0;
+  let loop = 0;
+  let ticks = 0;
+  let firstText = null;
+  for (let steps = 0; steps < DISPLAY_MAX_STEPS * 4; steps += 1) {
+    const op = byPc.get(pc);
+    if (op === undefined) break;
+    if (op.name === "SET_LOOP") {
+      loop = op.words[0];
+    } else if (op.name === "LOOP") {
+      loop -= 1;
+      if (loop !== 0) {
+        pc = op.words[0];
+        continue;
+      }
+    } else if (op.name === "WAIT_FRAMES") {
+      ticks += op.words[0];
+    } else if (op.name === "WAIT_SECONDS") {
+      ticks += op.words[0] * DISPLAY_TICKS_PER_SECOND;
+    } else if (op.name === "TEXT" || op.name === "TEXT_IF") {
+      if (firstText === null) firstText = ticks;
+      const { x, row, font, align, text } = op.print;
+      if (text.length >= 2 && !seen.has(text)) {
+        seen.add(text);
+        lines.push(text);
+        layout.push({ x, row, font, align });
+      }
+    }
+    pc += op.len;
+  }
+  return {
+    lines,
+    layout,
+    holdTicks: firstText === null ? 0 : ticks - firstText,
+    // THE RECORD'S OWN TWO PRIORITY BYTES, which are the whole of the display
+    // poster's arbitration at 0x6C4C:
+    //
+    //     006C4E  move.b  $3(a0),d1
+    //     006C52  move.b  $2(a0),d0
+    //     006C56  bmi.b   $6C6C          ; bit 7 set: always take over
+    //     006C58  cmp.b   $23B2(a5),d0   ; against what is on screen
+    //     006C5C  bcs.w   $6CCC          ; LOWER: dropped outright
+    //     006C60  bhi.b   $6C6C          ; HIGHER: flush the ring, take over
+    //     006C62  cmp.b   $23B3(a5),d1
+    //     006C66  bcs.w   $6CCC          ; LOWER secondary: dropped
+    //     006C6A  bhi.b   $6CAA          ; HIGHER: appended, no flush
+    //                                    ; EQUAL both: falls into the flush
+    //
+    // and 0x66E8 clears both back to zero when the ring drains, so an idle
+    // display accepts anything. This is the machine's answer to "what happens
+    // when two messages arrive together": the higher one wins and the lower one
+    // is never shown at all.
+    priority: program.priority,
+    priority2: program.priority2,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1646,22 +1859,56 @@ function scanSelectorTables(pkg) {
 // Assembling one table
 // ---------------------------------------------------------------------------
 
-function decode(pkg, table) {
-  const residue = new Set(RESIDUE_DEVICE_SLOTS[table.tableId] ?? []);
-  const scripts = findScripts(pkg);
-
-  // Pools. Elements and display records are whatever the opcodes point at, and
-  // an address may not be two different things — check 4 is what proves the
-  // opcode table's operand kinds are right.
+/**
+ * THE ELEMENT AND DISPLAY-RECORD POOLS, in one place.
+ *
+ * Exported because `export-table-panel.mjs` and `export-table-audio.mjs` both
+ * key their own documents by these indices and each used to rebuild them by
+ * hand: three copies of one rule, which is three chances for the panel's
+ * `mode-message-N` and this document's message index to mean different things.
+ * The panel exporter already refuses to run when the pools disagree, and that
+ * check now compares against this function instead of a duplicate of it.
+ *
+ * Elements are whatever the opcodes point at with operand kind "e". Display
+ * records are the "m" operands PLUS EVERY ELEMENT'S OWN `+$14` / `+$18`:
+ *
+ *     005A7A  move.l  $14(a2),d0   ; START
+ *     005A82  jsr     $6C2C
+ *     005AF6  move.l  $14(a2),d0   ; START_TIMED
+ *     005CD6  move.l  $18(a2),d0   ; AWARD
+ *     005CDE  jsr     $6C2C
+ *     005BC0  movea.l $2(a1),a0    ; the MESSAGE opcode's handler
+ *     005BC4  jsr     $6C2C        ; ...the identical call
+ *
+ * so an element display pointer and a MESSAGE operand are the same record kind
+ * and belong in the same pool. Until this function existed the pool held only
+ * the opcode operands and `displayStart` / `displayAward` were looked up in it
+ * anyway: of 229 element display pointers across the three tables exactly ONE
+ * resolved, and that one only because Law 'n Justice's script 168 happens to
+ * MESSAGE the same address. The other 228 shipped as -1 and the machine's own
+ * caption for a shot the player takes was simply not in the file.
+ *
+ * An address may not be two different things — check 4 is what proves the
+ * opcode table's operand kinds are right — and the check now covers the
+ * element display pointers too.
+ */
+export function modePools(pkg, scripts = findScripts(pkg)) {
   const elementKeys = new Set();
   const messageKeys = new Set();
   for (const script of scripts.values()) {
     for (const op of script.ops) {
       for (const arg of op.args) {
-        if (arg.target === null) continue;
+        if (arg.target === null || arg.target === undefined) continue;
         if (arg.kind === "e") elementKeys.add(key(arg.target));
         if (arg.kind === "m") messageKeys.add(key(arg.target));
       }
+    }
+  }
+  const elements = byKeyOf(elementKeys);
+  for (const at of elements) {
+    for (const delta of [ELEMENT_DISPLAY_START, ELEMENT_DISPLAY_AWARD]) {
+      const target = follow(pkg, at, delta);
+      if (target !== null) messageKeys.add(key(target));
     }
   }
   for (const k of elementKeys) {
@@ -1675,17 +1922,16 @@ function decode(pkg, table) {
       throw new Error(`${pkg.stem}: ${k} is used both as an element and as an event record`);
     }
   }
+  return { elements, messages: byKeyOf(messageKeys) };
+}
 
-  const byKey = (set) =>
-    [...set]
-      .map((k) => {
-        const [hunk, offset] = k.split(":").map(Number);
-        return { hunk, offset };
-      })
-      .sort((a, b) => a.hunk - b.hunk || a.offset - b.offset);
+function decode(pkg, table) {
+  const residue = new Set(RESIDUE_DEVICE_SLOTS[table.tableId] ?? []);
+  const scripts = findScripts(pkg);
 
-  const elementList = byKey(elementKeys);
-  const messageList = byKey(messageKeys);
+  const pools = modePools(pkg, scripts);
+  const elementList = pools.elements;
+  const messageList = pools.messages;
   const scriptList = [...scripts.values()].sort(
     (a, b) => a.at.hunk - b.at.hunk || a.at.offset - b.at.offset,
   );
@@ -1757,6 +2003,73 @@ function decode(pkg, table) {
   });
   const elementCounter = elementList.map((at) => counterIndexOf(follow(pkg, at, ELEMENT_COUNTER)));
   const comboCounter = comboCounterOf(pkg, counterIndexOf);
+
+  // AWARD EFFECT 26's PRIZE TABLE — the FIFTH reading of +$34, and the last
+  // award effect in the corpus with no handler.
+  //
+  // The whole of it, main.seg00 +0x006102, read out of the package:
+  //
+  //     006102  move.w  $C8AC.l,d0     ; THE VBLANK FRAME COUNTER
+  //     006108  movea.l $34(a2),a0     ; the element's prize table
+  //     00610C  andi.w  #$FF,d0        ; its low byte, so a roll in 0..255
+  //     006110  cmp.w   $2(a0),d0      ; against this entry's threshold
+  //     006114  bcs.b   $611C          ; roll < threshold -> THIS ENTRY WINS
+  //     006116  adda.w  #$8,a0         ; else the next 8-byte entry
+  //     00611A  bra.b   $6110
+  //     00611C  btst.b  #$0,(a0)       ; entry flag bit 0 = award ONCE
+  //     006120  beq.b   $612E          ; not once-only -> take it
+  //     006122  bset.b  #$1,(a0)       ; else claim it; Z is the OLD bit
+  //     006126  beq.b   $612E          ; was clear -> first time -> take it
+  //     006128  addi.w  #$5D,d0        ; ALREADY TAKEN: nudge the roll by 93
+  //     00612C  bra.b   $6108          ;   and re-walk (the andi re-masks it)
+  //     00612E  movea.l $4(a0),a0      ; the winning entry's script
+  //     006132  jsr     $6C10          ; queued, same poster as effect 17
+  //
+  // ENTRY: `{u8 flags, u8 spare, u16 cumulative threshold, u32 script}`.
+  // The thresholds ascend and the last is 256, so the walk always terminates
+  // and the gaps are the odds out of 256.
+  //
+  // ONE element on the three tables carries it — BabeWatch e66, whose table is
+  // `h4+0x605E` with gaps 25/35/45/6/35/40/45/25 — and EVERY entry's flags
+  // byte is zero, so the once-only retry at 0x6128 is dead on this corpus.
+  // `flags` is exported anyway and the runtime refuses a non-zero one rather
+  // than quietly ignoring it: a documented unknown beats a plausible
+  // invention, and nothing here has a second table to check the rule against.
+  const elementPrizeTable = elementList.map((at) => {
+    if (readU16(pkg, at, ELEMENT_EFFECT) !== EFFECT_RANDOM_AWARD) return [];
+    const base = follow(pkg, at, ELEMENT_COUNTER);
+    if (base === null) {
+      throw new Error(`${pkg.stem}: effect-26 element at ${key(at)} has no +$34 prize table`);
+    }
+    const entries = [];
+    for (let index = 0; index < PRIZE_TABLE_MAX_ENTRIES; index += 1) {
+      const entry = { hunk: base.hunk, offset: base.offset + PRIZE_ENTRY_BYTES * index };
+      if (!inBounds(pkg, entry, PRIZE_ENTRY_BYTES)) {
+        throw new Error(`${pkg.stem}: effect-26 prize table at ${key(base)} runs off its hunk`);
+      }
+      const threshold = readU16(pkg, entry, PRIZE_THRESHOLD);
+      const target = follow(pkg, entry, PRIZE_SCRIPT);
+      const script = target === null ? undefined : scriptIndex.get(key(target));
+      if (script === undefined) {
+        throw new Error(
+          `${pkg.stem}: effect-26 prize ${index} at ${key(entry)} points its +$04 at ` +
+            `${target === null ? "nothing" : key(target)}, which is not a script record; ` +
+            "the handler queues that pointer through $6C10",
+        );
+      }
+      if (entries.length > 0 && threshold <= entries[entries.length - 1].threshold) {
+        throw new Error(
+          `${pkg.stem}: effect-26 prize thresholds at ${key(base)} do not ascend ` +
+            `(${entries[entries.length - 1].threshold} then ${threshold}); the walk would not terminate`,
+        );
+      }
+      entries.push({ flags: readU8(pkg, entry, PRIZE_FLAGS), threshold, script });
+      if (threshold >= PRIZE_ROLL_RANGE) return entries;
+    }
+    throw new Error(
+      `${pkg.stem}: effect-26 prize table at ${key(base)} has no entry reaching ${PRIZE_ROLL_RANGE}`,
+    );
+  });
 
   // AWARD EFFECT 17's CHAIN SCRIPT — the third reading of +$34, resolved through
   // the script index this pass already owns. See `EFFECT_QUEUE_SCRIPT`.
@@ -1858,6 +2171,8 @@ function decode(pkg, table) {
     ladder: elementLadder[index],
     // Award effect 17's follow-on record: the SAME +$34, as a script.
     chainScript: elementChainScript[index],
+    // Award effect 26's: the SAME +$34, as a cumulative-probability table.
+    prizeTable: elementPrizeTable[index],
     // THE RUNNING-STEP MACHINE. `stepAddend` is what effects 15 and 25 add to
     // and subtract from the counter's running step; `stepRamp` is the ramp
     // effect 27 harvests instead; `payCount` is effect 10's ask.
@@ -1869,7 +2184,7 @@ function decode(pkg, table) {
     payCount: elementPayCount(pkg, at),
   }));
 
-  const messages = messageList.map((at, index) => ({ index, lines: messageText(pkg, at) }));
+  const messages = messageList.map((at, index) => ({ index, ...messageDisplay(pkg, at) }));
 
   let dangled = 0;
   const scriptDocs = scriptList.map((script, index) => {

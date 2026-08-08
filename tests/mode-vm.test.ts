@@ -451,7 +451,9 @@ describe("the display-queue feed", () => {
     // record on START and the message record's own list — so the report has to
     // carry the INDEX, not just the arming and the flattened text.
     const raw = fixtureDocument() as unknown as Record<string, unknown>;
-    raw["messages"] = [{ lines: ["READY"] }];
+    raw["messages"] = [
+      { lines: ["READY"], layout: [{ x: 160, row: 2, font: 1, align: 2 }], holdTicks: 100, priority: 64, priority2: 0 },
+    ];
     (raw["elements"] as { displayStart: number }[])[2]!.displayStart = 0;
     const modes = parseTableModesDocument(raw as unknown as TableModesDocument);
     const state = createModeState(modes);

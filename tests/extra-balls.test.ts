@@ -89,19 +89,40 @@ const EXTRA_BALL_ELEMENTS: Record<string, number[]> = {
 // ---------------------------------------------------------------------------
 
 describe("award effect 1, in the shipped documents", () => {
-  it("is eight elements, all of them feedback-less", () => {
+  it("is eight elements with no lamp and no sound, and the machine's own card", () => {
     let total = 0;
     for (const tableId of TABLE_IDS) {
       const modes = modesFor(tableId);
       const carriers = modes.elements.filter((one) => one.effect === 1);
       expect(carriers.map((one) => one.index)).toEqual(EXTRA_BALL_ELEMENTS[tableId]);
       total += carriers.length;
-      // 8 OF 8, NO EXCEPTIONS, and no other effect on any table is that uniform:
-      // the handler lights the engine's own SHOOT AGAIN lamp, so the elements
-      // need no lamp, no sound and no display card of their own.
+      // 8 OF 8, NO EXCEPTIONS on the lamp and the sound: the handler lights the
+      // engine's own SHOOT AGAIN lamp, so the elements need neither.
+      //
+      // THE DISPLAY IS THE CORRECTION THIS ROUND MAKES. This test used to
+      // assert `displayAward === -1` and call the effect "feedback-less", and
+      // that was an artefact: the exporter's display pool held only MESSAGE
+      // operands, so 228 of 229 element display pointers shipped as -1 and
+      // EVERY element looked feedback-less. Read out of the package, all eight
+      // carry BOTH records — a START card that says "EXTRA BALL IS LIT" and an
+      // AWARD record that is a sting and an animation with no text at all
+      // (Law 'n Justice e21's is h4+0x3718: `SOUND / ANIM_BLOCK / WAIT 2 s`).
+      // So the effect is silent in words on the award and loud on the arm,
+      // which is what a SHOOT AGAIN lamp wants either side of it.
       for (const one of carriers) {
-        expect([one.lampAward, one.soundAward, one.displayAward]).toEqual([false, false, -1]);
+        expect([one.lampAward, one.soundAward]).toEqual([false, false]);
+        expect(one.displayAward).toBeGreaterThanOrEqual(0);
+        expect(modes.messages[one.displayAward]!.lines).toEqual([]);
       }
+      // The START card, on every one of them that anything arms. Law 'n
+      // Justice's e47 is the exception and is not a decode gap: nothing in the
+      // decoded corpus arms it (its only arming scripts s104/s105/s106 have no
+      // referrer), and its `+$14` really is null in the package.
+      const lit = carriers.filter((one) => one.displayStart >= 0);
+      for (const one of lit) {
+        expect(modes.messages[one.displayStart]!.lines).toEqual(["EXTRA BALL IS LIT"]);
+      }
+      expect(lit.length).toBe(tableId === "law-n-justice" ? 2 : carriers.length);
       // AND THE +$34 IS NOT READ. The handler names no element field at all, so
       // every one of these must arrive with the polymorphic pointer unresolved
       // in all four of its readings — that is what "dispatch by effect alone"

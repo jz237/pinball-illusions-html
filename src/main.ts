@@ -71,7 +71,7 @@ import {
 } from "./game/table-art-hd.js";
 import { loadTableAcceleration } from "./game/table-accel.js";
 import { loadTableDevices } from "./game/table-devices.js";
-import { loadTableModes } from "./game/table-modes.js";
+import { loadTableModes, tableModesFor } from "./game/table-modes.js";
 import { loadTableLamps } from "./game/table-lamps.js";
 import { loadTableBall } from "./game/table-ball.js";
 import { loadFlipperBats } from "./game/flipper-bats.js";
@@ -813,7 +813,16 @@ async function boot(): Promise<void> {
     }
     const game = createGame(map);
     const heap = tablePanelFor(tableId);
-    const panel = heap === null ? null : new PanelDisplay(heap, () => panelFont);
+    // The mode document's display-record pool goes to the panel as well as to
+    // the rules: those records carry the machine's own captions, the geometry
+    // `$73D0` reads out of them and the hold its interpreter counts down, and
+    // until this round nothing drew a single one of them. A table whose modes
+    // document is missing gets animations only, which is the panel's
+    // pre-caption behaviour and not an error.
+    const panel =
+      heap === null
+        ? null
+        : new PanelDisplay(heap, () => panelFont, undefined, tableModesFor(tableId)?.messages ?? []);
     // The loop's animation frames are never used: the single driver below calls
     // `frame()` by hand. What the loop is here for is its SCHEDULER — the fixed
     // step and the catch-up clamp — and keeping one per table means a table

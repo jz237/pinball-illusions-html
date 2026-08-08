@@ -153,7 +153,7 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { createHash } from "node:crypto";
-import { findScripts } from "./export-table-modes.mjs";
+import { findScripts, modePools } from "./export-table-modes.mjs";
 
 const PREAMBLE = 4;
 const DEVICE_SLOTS = 160;
@@ -539,28 +539,18 @@ function bindings(pkg) {
 function modeBindings(pkg, modesDoc) {
   const scripts = findScripts(pkg);
 
-  // The pools, exactly as the modes exporter derives them: every element and
-  // message operand of every surviving script, sorted by address.
-  const elementKeys = new Set();
-  const messageKeys = new Set();
-  for (const script of scripts.values()) {
-    for (const op of script.ops) {
-      for (const arg of op.args) {
-        if (arg.target === null || arg.target === undefined) continue;
-        if (arg.kind === "e") elementKeys.add(key(arg.target));
-        if (arg.kind === "m") messageKeys.add(key(arg.target));
-      }
-    }
-  }
-  const byKey = (set) =>
-    [...set]
-      .map((k) => {
-        const [hunk, offset] = k.split(":").map(Number);
-        return { hunk, offset };
-      })
-      .sort((a, b) => a.hunk - b.hunk || a.offset - b.offset);
-  const elements = byKey(elementKeys);
-  const messages = byKey(messageKeys);
+  // The pools, IMPORTED from the modes exporter rather than rebuilt: this file
+  // used to carry its own copy of the rule and so did the panel exporter, and a
+  // copy that drifts is a `mode-message-N` naming a different record from the
+  // one the mode document numbered. `modePools` now seeds the display pool from
+  // every element's own +$14 / +$18 as well as from the MESSAGE operands, which
+  // is why the message pool below is far larger than it was and why nearly
+  // every `mode-element-N` / `mode-start-N` binding has become a
+  // `mode-message-N`. Same record, same moment, same sample: `startElement` and
+  // `awardElement` push the display onto `messagesShown` at exactly the point
+  // they used to report only the element, which is what the note under
+  // "Containers" below has always said would happen.
+  const { elements, messages } = modePools(pkg, scripts);
   const messageIndex = new Map(messages.map((at, index) => [key(at), index]));
 
   // CHECK 6 — this pool must be the modes document's pool, element for element.
