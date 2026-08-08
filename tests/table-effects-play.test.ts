@@ -343,7 +343,15 @@ const ENGINE_EVENTS: readonly { readonly id: string; readonly premise: string }[
 describe.skipIf(!exported)("a played game sounds the table's own records", () => {
   for (const tableId of TABLE_IDS) {
     it(`${tableId}: every trigger class a player touches is audible`, async () => {
-      const heard = await listen(tableId, { runs: 6, ticks: 9000 });
+      // EIGHTEEN GAMES, and it was six. The bat's mid-tick write-back moved the
+      // bot's trajectories, and on BabeWatch two lane zones ended up firing only
+      // on ticks a louder record had already taken — which is the channel doing
+      // its job (its own case below asserts that displacement happens at all),
+      // not a silent binding, but at six games it left the claim untested on
+      // those two. The answer to a thin sample is a bigger one, not a smaller
+      // claim: every id that fires still has to reach the destination, and the
+      // bar has not moved.
+      const heard = await listen(tableId, { runs: 18, ticks: 9000 });
 
       for (const group of PLAY_CLASSES) {
         const ids = boundIds(tableId)
@@ -520,7 +528,10 @@ describe.skipIf(!exported)("the sounds that are silent, and why", () => {
 
 describe.skipIf(!exported)("the one effect channel under a real tick's load", () => {
   it("babewatch: the busiest tick asks for four sounds and exactly one is heard", async () => {
-    const heard = await listen("babewatch", { runs: 6, ticks: 9000 });
+    // TEN GAMES, and it was six, for the reason above: the four-request tick is
+    // a rare coincidence of a played game and the bat change moved where the bot
+    // goes. The bar itself is unmoved at four.
+    const heard = await listen("babewatch", { runs: 10, ticks: 9000 });
     // THE PREMISE: the channel has to have been asked for more than one sound
     // on some tick, or "one at a time" is a statement about nothing. Four is
     // what the multiball round measured and it is what a driven game makes.

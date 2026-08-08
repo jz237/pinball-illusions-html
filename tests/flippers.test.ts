@@ -31,7 +31,13 @@ import {
 } from "../src/game/collision-probe.js";
 import { Q10_ONE, pixelsToQ10, q10Multiply, q10ToPixel } from "../src/core/fixed-point.js";
 import type { Q10 } from "../src/core/fixed-point.js";
-import type { FlipperConfig, FlipperState, FlipperSweep } from "../src/game/flippers.js";
+import type {
+  FlipperBank,
+  FlipperConfig,
+  FlipperContact,
+  FlipperState,
+  FlipperSweep,
+} from "../src/game/flippers.js";
 
 /**
  * A bat parked at a stroke with no angular velocity.
@@ -97,6 +103,7 @@ import {
   flipperImpulseRadius,
   flipperRateTaken,
   ORIGINAL_IMPULSE_FLOOR,
+  ORIGINAL_TANGENT_GATE,
   ORIGINAL_IMPULSE_TABLE_SIDE,
   tangentialSpeed,
   tickFlipper,
@@ -351,11 +358,9 @@ function runTicks(
   const each = Math.trunc(gravity / ORIGINAL_SUBSTEPS_PER_FRAME);
   const last = gravity - each * (ORIGINAL_SUBSTEPS_PER_FRAME - 1);
   for (let tick = 0; tick < ticks; tick += 1) {
-    const sweeps: FlipperSweep[] = configs.map((config, index) => {
-      const sweep = tickFlipper(config, states[index] as FlipperState, held[index] === true);
-      states[index] = sweep.to;
-      return sweep;
-    });
+    const sweeps: FlipperSweep[] = configs.map((config, index) =>
+      tickFlipper(config, states[index] as FlipperState, held[index] === true),
+    );
     const bats = createFlipperPass(sweeps, BALL_RADIUS, null, undefined, sides);
     for (const ball of balls) {
       if (!ball.active) continue;
@@ -366,6 +371,14 @@ function runTicks(
         ball.velocityY += substep === ORIGINAL_SUBSTEPS_PER_FRAME - 1 ? last : each;
       }
     }
+    // THE BAT'S TICK ENDS AFTER THE PASSES and this line used to sit before
+    // them, which threw every write-back away: `sweep.to` read at the top of a
+    // tick is where an UNLOADED blade would have finished. The sweep now
+    // refuses a deduction once its end has been read, so this cannot be got
+    // wrong quietly a second time.
+    sweeps.forEach((sweep, index) => {
+      states[index] = sweep.to;
+    });
     contacts += bats.contacts.length;
   }
   return { states, contacts };
@@ -847,30 +860,71 @@ describe("the impulse table", () => {
     expect(flipperImpulseMagnitude(0, 0)).toBeGreaterThan(0);
   });
 
-  it("takes momentum out of the bat, so the second ball of a multiball gets less", () => {
+  /**
+   * THE BITE IS SPENT INSIDE THE TICK — `research/flipper-power/BW_RIGHT_BAT.md`
+   * §5, and the whole of what this round changed about the bat.
+   *
+   * `+0x00AED2` writes the reduced rate to `$10(a0)` in the collision pass, and
+   * the animation step at `+0x00BD86` that runs next moves the bat by it. This
+   * port used to report `rateTaken` on the contact and spend it in the BANK
+   * after the whole tick, which left the blade where an unloaded one would have
+   * finished and merely noted that it was turning more slowly — measured at
+   * +5.78 to +12.00 bat units of over-travel per loaded tick on all six lower
+   * bats of all three tables, and worth a whole missed contact on `bw-ramp`
+   * frame 4969 (the machine lands three impulses there, the precomputed ladder
+   * two).
+   */
+  it("spends the ball's bite INSIDE the tick, so the blade does not over-travel", () => {
     const bank = createFlipperBank("law-n-justice");
     const config = bank.configs[0] as FlipperConfig;
+    const spinning: FlipperState = { stroke: 0, rate: config.upMaxRate };
+    const clean = tickFlipper(config, spinning, true);
+    const loaded = tickFlipper(config, spinning, true);
+
+    // Pass 0 reads the rate the tick started with — the machine's `$10(a0)` as
+    // the previous frame's last animation step left it.
+    expect(loaded.stateAt(0).rate).toBe(config.upMaxRate);
+    loaded.takeRate(0, 16);
+    // A SECOND ball at the same pass reads what the first one left: the machine
+    // keeps one rate word per bat, not one per ball.
+    expect(loaded.stateAt(0).rate).toBe(config.upMaxRate - 16);
+
+    // THE ANIMATION MOVES BY THE REDUCED RATE. The blade is 16 units short of
+    // an unloaded one at the very next pass and stays exactly 16 short for the
+    // rest of the tick, because the coil's acceleration is the same on both.
+    expect(clean.stateAt(1).stroke - loaded.stateAt(1).stroke).toBe(16);
+    expect(clean.stateAt(2).stroke - loaded.stateAt(2).stroke).toBe(16);
+    expect(clean.stateAt(3).stroke - loaded.stateAt(3).stroke).toBe(16);
+    expect(clean.to.stroke - loaded.to.stroke).toBe(16);
+    expect(loaded.taken).toBe(16);
+
+    // The STROKE is what the deduction lands on, over the tick; the RATE is back
+    // at the cap by the end of it, which is why a bat that has been loaded still
+    // reaches the top, just later.
+    expect(loaded.to.rate).toBe(config.upMaxRate);
+    expect(clean.to.rate).toBe(config.upMaxRate);
+  });
+
+  it("hands the settled bat back through the bank, and allocates nothing when nothing moved", () => {
+    const bank = createFlipperBank("law-n-justice");
+    const config = bank.configs[1] as FlipperConfig;
     const spinning: FlipperState = { stroke: config.sweep >> 1, rate: config.upMaxRate };
-    const loaded = applyFlipperReactions(
-      { configs: bank.configs, states: new Map([[config.id, spinning]]) },
-      [
-        {
-          ballId: 0,
-          flipperId: config.id,
-          normalX: 0,
-          normalY: -Q10_ONE,
-          along: 0,
-          batSpeed: 0,
-          approachSpeed: 0,
-          struck: true,
-          rateTaken: 16,
-        },
-      ],
-    );
-    const after = loaded.states.get(config.id) as FlipperState;
-    expect(after.rate).toBe(config.upMaxRate - 16);
-    // The stroke is untouched: the bat still gets to the top, just later.
-    expect(after.stroke).toBe(spinning.stroke);
+    const start: FlipperBank = {
+      configs: bank.configs,
+      states: new Map([[config.id, spinning]]),
+    };
+    const sweeps = [tickFlipper(config, spinning, true)];
+    sweeps[0]?.takeRate(1, 16);
+    const after = applyFlipperReactions(start, sweeps).states.get(config.id) as FlipperState;
+    expect(after).toEqual(sweeps[0]?.to);
+    // 16 units of the four steps' travel, taken out between the second and the
+    // third of them, and not a rate the bank subtracts afterwards.
+    expect(after.stroke).toBe(tickFlipper(config, spinning, true).to.stroke - 16);
+
+    // A bank whose bats did not move at all is returned by identity.
+    const still = createFlipperBank("law-n-justice");
+    const idle = tickFlipperBank(still, flipperInputFrom(false, false));
+    expect(applyFlipperReactions(still, idle.sweeps)).toBe(still);
   });
 });
 
@@ -1130,9 +1184,12 @@ describe("the bat is resolved at the frame's own collision passes", () => {
     // the shipped one and the horizontal axis makes the seat trivial to state.
     const flat: FlipperConfig = validateFlipperConfig({ ...LEFT, restAngle: 0, restPose: 0 });
     const sweep = tickFlipper(flat, FLIPPER_AT_REST, true);
-    // The tick's own four animation steps do accelerate from a standstill...
+    // The tick's own four animation steps do accelerate from a standstill —
+    // read off a sweep NOTHING touches, because a blade with a ball on it is
+    // slowed between its own steps and this is the free ladder.
     expect(sweep.from.rate).toBe(0);
-    expect(sweep.steps.map((one) => one.rate)).toEqual([20, 40, 60, 80]);
+    expect(tickFlipper(flat, FLIPPER_AT_REST, true).steps.map((one) => one.rate))
+      .toEqual([20, 40, 60, 80]);
 
     const start = ballRestingOn(flat, FLIPPER_AT_REST, 20);
     const ball = createBall(0, start.x, start.y, 0, 200);
@@ -1144,12 +1201,27 @@ describe("the bat is resolved at the frame's own collision passes", () => {
     expect(contacts[0]?.batSpeed).toBe(0);
     expect(contacts[0]?.struck).toBe(false);
     expect(contacts[0]?.rateTaken).toBe(0);
-    // The other three carry 20, 40 and 60 — `sweep.steps[0..2]` — so their bat
-    // speeds rise, and none of them is the 80 the tick ends on.
+    // The other three carry a rate that rises, and none of them is the 80 the
+    // free ladder ends on.
     const speeds = contacts.slice(1).map((one) => Math.abs(one.batSpeed));
     expect(speeds[0]).toBeGreaterThan(0);
     expect(speeds[1]).toBeGreaterThan(speeds[0] ?? 0);
     expect(speeds[2]).toBeGreaterThan(speeds[1] ?? 0);
+
+    // AND THE LADDER IS NOT THE FREE ONE ANY MORE, which is the whole of
+    // BW_RIGHT_BAT §5. This ball charges the blade 8 units at each of passes 1,
+    // 2 and 3 — pass 0 meets a bat that is not turning and charges nothing — and
+    // each charge is spent by the animation step that FOLLOWS it, so the blade
+    // ends the tick 48 units behind an untouched one: 3 steps of the first
+    // charge, 2 of the second, 1 of the third.
+    expect(contacts.map((one) => one.rateTaken)).toEqual([0, 8, 8, 8]);
+    expect(sweep.taken).toBe(24);
+    const free = tickFlipper(flat, FLIPPER_AT_REST, true);
+    expect(free.to.stroke - sweep.to.stroke).toBe(48);
+    // The rates each pass READ are still the four the machine reads, and they
+    // still rise — the coil out-accelerates this ball's bite, which is what a
+    // 20-unit lower coil does and a 10-unit upper one need not.
+    expect(contacts.map((one) => Math.abs(one.batSpeed))).toEqual([0, 1152, 2063, 2847]);
   });
 
   /**
@@ -1205,13 +1277,17 @@ describe("the bat is resolved at the frame's own collision passes", () => {
         ball.velocityX = 0;
         ball.velocityY = 0;
         const sweep = tickFlipper(config, state, true);
-        state = sweep.to;
         const bats = createFlipperPass([sweep], BALL_RADIUS, null, undefined, sides);
         for (let substep = 0; substep < ORIGINAL_SUBSTEPS_PER_FRAME; substep += 1) {
           if (substep % 2 === 0) bats.resolve(ball, substep / 2);
           ball.x = (ball.x + (ball.velocityX >> 3)) | 0;
           ball.y = (ball.y + (ball.velocityY >> 3)) | 0;
         }
+        // AFTER the passes: this ball is on the blade for the whole stroke and
+        // takes rate out of it at every one of them, so where the bat finishes
+        // is not known until they have run. Read before them, this seated the
+        // next tick from an unloaded blade.
+        state = sweep.to;
         // The striking face at the pose this tick ended on: every normal has to
         // have a positive component along it, whatever the ring read.
         const angle = flipperAngle(config, state);
@@ -1303,21 +1379,32 @@ describe("flipping", () => {
     runTicks([leftBall], [LEFT], [true], UP_STROKE_TICKS + 2);
     runTicks([rightBall], [RIGHT], [true], UP_STROKE_TICKS + 2);
 
-    expect(rightBall.velocityY).toBe(leftBall.velocityY);
     expect(Math.sign(rightBall.velocityX)).toBe(-Math.sign(leftBall.velocityX));
     const speedLeft = speedOf(leftBall);
     const speedRight = speedOf(rightBall);
-    expect(Math.abs(speedRight - speedLeft) / speedLeft).toBeLessThan(0.001);
-    expect({ left: leftBall.velocityX, right: rightBall.velocityX })
-      .toEqual({ left: 2310, right: -2227 });
+    expect({
+      left: [leftBall.velocityX, leftBall.velocityY],
+      right: [rightBall.velocityX, rightBall.velocityY],
+      speedGapPercent: Math.round(
+        (10000 * Math.abs(speedRight - speedLeft)) / speedLeft,
+      ) / 100,
+    }).toEqual({ left: [1420, -15040], right: [-1718, -15836], speedGapPercent: 5.44 });
     // The placement mirrors to a pixel, and the outgoing position with it.
     expect(
       Math.abs(q10ToPixel(right.x) - q10ToPixel(RIGHT.pivotX) +
         (q10ToPixel(left.x) - q10ToPixel(LEFT.pivotX))),
     ).toBeLessThanOrEqual(1);
-    expect(Math.abs(rightBall.x - RIGHT.pivotX + (leftBall.x - LEFT.pivotX)))
-      .toBeLessThan(2 * Q10_ONE);
-    expect(Math.abs(rightBall.y - leftBall.y)).toBeLessThan(2 * Q10_ONE);
+    // AND THE OUTGOING POSITIONS ARE PINNED TOO, for the same reason the
+    // velocities above are: once the write-back is spent inside the tick, a
+    // raster pair that differs by one pixel of RADIUS differs by one unit of
+    // deduction, and a unit of deduction is a unit of STROKE rather than a unit
+    // of rate that the tick was about to throw away. The two bats are still
+    // mirrors to within a couple of pixels after six ticks; they are no longer
+    // mirrors to within one, and a bound would only hide which.
+    expect({
+      x: Math.abs(rightBall.x - RIGHT.pivotX + (leftBall.x - LEFT.pivotX)),
+      y: Math.abs(rightBall.y - leftBall.y),
+    }).toEqual({ x: 2088, y: 3708 });
   });
 
   it("measures how far the shipped raster is from being its own mirror", () => {
@@ -1367,6 +1454,99 @@ describe("flipping", () => {
       .toEqual({ pairs: 62, total: 7600, worstPose: 23, worstDiffering: 204 });
   });
 
+  /**
+   * THE TANGENT GATE AT +0x00B534, asserted where it actually decides.
+   *
+   *   00B528  move.w  $1c(a4), d1     ; the pending NORMAL impulse
+   *   00B52E  sub.w   d0, d1          ; minus the ball's own normal velocity
+   *   00B530  bpl.b   $B534 / neg.w d1
+   *   00B534  cmpi.w  #$fa0, d1       ; 4000
+   *   00B538  bhi.b   $B544           ; TOO FAR APART -> the normal ONLY
+   *   00B53A  add.w   $1a(a4), d2     ; ... otherwise the tangent as well
+   *
+   * The two operands are in the DOUBLED frame the rotation at +0x00B4FE
+   * produces, so `$1c` is `-magnitude(r) * 2 * rate` and `d0` is twice the
+   * ball's velocity into the surface. Both grow with the approach, so a ball
+   * arriving fast at a bat swinging fast gets the outward kick and no
+   * along-face term at all.
+   *
+   * This drives the threshold from the ONE side that can be swept cleanly: the
+   * ball's approach speed, with the geometry and the stroke held. Everything
+   * else about the contact is identical between the two rows, so the only thing
+   * that can have switched the along-face term off is the comparand.
+   *
+   * MEASURED, and the constant is the instruction's: fitted free against five
+   * rival comparands on 366 single passes out of the machine's own RAM, the
+   * decoded quantity agrees on 89.3 % where "the impulse alone" manages 74.3 %
+   * and "always add it" 55.5 %, and the machine applies the tangent on 100 % of
+   * the passes under 3,750 and 0 % of those over 5,250. See
+   * `research/flipper-power/BW_RIGHT_BAT.md` §9.1.
+   */
+  it("drops the along-face term when the kick and the approach are 4000 apart", () => {
+    // A bat already at rate, so the impulse is the same size on every row, and a
+    // seat NEAR THE BOSS on its striking face: the gate quantity is
+    // `2 * (magnitude(r) * rate + approach)` and out at the tip the kick alone
+    // is over 4000 at every approach, so a sweep out there has nothing to cross.
+    const spinning: FlipperState = { stroke: LEFT.sweep >> 1, rate: LEFT.upMaxRate };
+    const seat = ballRestingOn(LEFT, spinning, 8);
+
+    /** The along-face share of what one pass did to a ball closing at `into`. */
+    const alongFaceAt = (into: number): number => {
+      const sweep = tickFlipper(LEFT, spinning, true);
+      const ball = createBall(0, seat.x, seat.y, 0, into);
+      const beforeX = ball.velocityX;
+      const beforeY = ball.velocityY;
+      const bats = createFlipperPass([sweep], BALL_RADIUS, null, undefined, null);
+      bats.resolve(ball, 0);
+      const contact = bats.contacts[0] as FlipperContact;
+      // The port's own along-face axis, `(normalY, -normalX)`.
+      return (
+        q10Multiply(ball.velocityX - beforeX, -contact.normalY) +
+        q10Multiply(ball.velocityY - beforeY, contact.normalX)
+      );
+    };
+
+    // A ball barely moving: the kick alone is inside the threshold, and the
+    // tangent is there, pointing along the face toward the pivot.
+    expect(Math.abs(alongFaceAt(0))).toBeGreaterThan(500);
+    // The same contact with the ball arriving hard: the gate closes and all that
+    // is left along the face is the RESPONDER's own slip — the row's `$3A` rule,
+    // 17 Q10 against the impulse's 3,600 — which is a different term and is
+    // untouched by this rule.
+    expect(alongFaceAt(8000)).toBe(-17);
+
+    // AND IT SWITCHES ONCE, at a closing speed the constant fixes. Walked a
+    // Q10 unit at a time, the along-face term is present on every row up to the
+    // crossing and absent on every row after it — one edge, not a scatter —
+    // and the crossing itself is pinned, so moving `ORIGINAL_TANGENT_GATE` by
+    // one threshold-width fails here rather than only in a hashed digest.
+    let crossing = -1;
+    let edges = 0;
+    const impulseIsThere = (into: number): boolean => Math.abs(alongFaceAt(into)) > 500;
+    let previous = impulseIsThere(0);
+    for (let into = 1; into <= 8000; into += 1) {
+      const open = impulseIsThere(into);
+      if (open !== previous) {
+        edges += 1;
+        if (crossing < 0) crossing = into;
+        previous = open;
+      }
+    }
+    //
+    // AND THE CROSSING IS THE CONSTANT'S OWN ARITHMETIC, not a fitted number.
+    // The seat is 18 px from the pivot, so `magnitude` is 17 and the ball takes
+    // 6 of the bat's 120, leaving `17 * 114 = 1,938` of kick. The gate opens
+    // while `kick + approach <= 2,000` — half of 4,000, because both terms are
+    // doubled by the rotation at +0x00B4FE — so it must shut when the approach
+    // passes 62 of the original's velocity units, which is 248 Q10. It shuts at
+    // 253, the first Q10 unit whose projection onto the contact normal clears
+    // 62. A gate at 8,000 would not shut anywhere in this sweep at all.
+    expect({ edges, crossing }).toEqual({ edges: 1, crossing: 253 });
+    expect(flipperImpulseMagnitude(8, 16) * (LEFT.upMaxRate - flipperRateTaken(8, 16)))
+      .toBe(1938);
+    expect(ORIGINAL_TANGENT_GATE).toBe(4000);
+  });
+
   it("hits harder than a bat that is standing still", () => {
     const start = ballRestingOn(LEFT, FLIPPER_AT_REST, 25);
 
@@ -1403,12 +1583,20 @@ describe("flipping", () => {
       runTicks([ball], [LEFT], [true], ticks);
       return speedOf(ball);
     };
-    let previousSpeed = 0;
+    //
+    // AND THE TANGENT GATE MOVED THE SPEEDS WITHOUT MOVING THE MECHANISM.
+    // `+0x00B534` drops the along-face term when the kick and the approach are
+    // more than 4000 doubled units apart, and the kick is `magnitude * rate` —
+    // so the gate closes at the OUTER end of the blade and stays open at the
+    // boss. Removing a term that points along the face toward the pivot takes
+    // speed off the outer contacts, and the ladder is no longer monotone in
+    // SPEED even though the magnitude the claim is about still is. The speeds
+    // are therefore pinned exactly, and the monotonicity is asserted where the
+    // sentence above actually makes it: on the magnitude.
+    const speeds: number[] = [];
     let previousMagnitude = 0;
     for (const alongPixels of [6, 12, 20, 28, 36, 40]) {
-      const speed = speedAfter(alongPixels, 2);
-      expect({ alongPixels, rising: speed > previousSpeed }).toEqual({ alongPixels, rising: true });
-      previousSpeed = speed;
+      speeds.push(Math.round(speedAfter(alongPixels, 2)));
 
       const at = ballRestingOn(LEFT, FLIPPER_AT_REST, alongPixels);
       const magnitude = flipperImpulseMagnitude(
@@ -1419,20 +1607,16 @@ describe("flipping", () => {
         .toEqual({ alongPixels, rising: true });
       previousMagnitude = magnitude;
     }
-    // AND THE TIP BEATS THE BOSS BY HALF AGAIN, at the tick the impulse lands:
-    // 11,582 against 7,478 Q10.
-    //
-    // This line used to compare the two over the WHOLE up-stroke, and that
-    // comparison stopped meaning anything when the body became the drawn bat.
-    // A ball on the tip is thrown CLEAR by the first strike — 46 px of blade
-    // sweeping under a 16 px ball leaves it behind — so its shot is finished
-    // while the boss ball is still being carried, and after five ticks the boss
-    // ball has had four more impulses and reads faster (15,517 against 11,392).
-    // That is not the tip hitting softer, it is the tip having let go, and the
-    // measurement below says so directly at the moment both are still in
-    // contact. The retired capsule hid it because its own tip cap reached 48 px
-    // — 2 px past anything the original draws — and kept the ball a tick longer.
-    expect(speedAfter(40, 2)).toBeGreaterThan(1.5 * speedAfter(6, 2));
+    expect(speeds).toEqual([14456, 6052, 5949, 15323, 15555, 14223]);
+    // THE TWO LOW ONES ARE BALLS STILL BEING CARRIED, not balls hit softly, and
+    // they are the mid-tick write-back doing exactly what it was shipped to do:
+    // a blade that has been charged turns more slowly, so at along 12 and 20 the
+    // ball is still ON it at tick 2 rather than already away. Two ticks later
+    // every seat is launched and every one of the six is over 4 px a tick.
+    for (const alongPixels of [6, 12, 20, 28, 36, 40]) {
+      expect({ alongPixels, launched: speedAfter(alongPixels, 4) > 4096 })
+        .toEqual({ alongPixels, launched: true });
+    }
   });
 
   it("does not fire a ball that the bat is moving away from", () => {
@@ -2168,7 +2352,10 @@ describe("a table's bank of flippers", () => {
     expect([...bank.states.values()].every((s) => s.stroke === 0)).toBe(true);
 
     for (let tick = 0; tick < UP_STROKE_TICKS; tick += 1) {
-      bank = tickFlipperBank(bank, flipperInputFrom(true, false)).bank;
+      // A bat's tick is not over until its four passes have run, so the bank is
+      // settled by `applyFlipperReactions` and not by `tickFlipperBank`. Nothing
+      // touches these bats, so nothing is taken and the stroke is the pure one.
+      bank = applyFlipperReactions(bank, tickFlipperBank(bank, flipperInputFrom(true, false)).sweeps);
     }
     expect(bank.states.get("lower-left")?.stroke).toBe(FLIPPER_SWEEP_UNITS);
     expect(bank.states.get("lower-right")?.stroke).toBe(0);
@@ -2263,10 +2450,13 @@ describe("a table's bank of flippers", () => {
       for (let tick = 0; tick < 400; tick += 1) {
         const held = flip && (balls.balls[0] as BallState).y >= trigger;
         const ticked = tickFlipperBank(bank, flipperInputFrom(held, false));
-        bank = ticked.bank;
         const result = stepBalls(balls, map, materials, forces);
         if (result.drained.length > 0 && drainTick < 0) drainTick = tick;
         resolveFlipperContacts(balls.balls, ticked.sweeps);
+        // AFTER the contacts, because a ball on the blade takes rate out of it
+        // between the tick's own animation steps and the bank has to be given
+        // the state that came out of THAT, not the unloaded one.
+        bank = applyFlipperReactions(bank, ticked.sweeps);
         const ball = balls.balls[0] as BallState;
         if (ball.active && ball.y < minY) minY = ball.y;
       }

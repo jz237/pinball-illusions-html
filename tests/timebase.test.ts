@@ -63,6 +63,7 @@ import {
   FLIPPER_AT_REST,
   FLIPPER_LENGTH_PIXELS,
   ORIGINAL_IMPULSE_TANGENT,
+  applyFlipperReactions,
   batRadiusAt,
   createFlipperBank,
   flipperAngle,
@@ -467,9 +468,12 @@ describe("how fast a flipper shot travels", () => {
       let launchedAt = -1;
       for (let tick = 0; tick < 400; tick += 1) {
         const ticked = tickFlipperBank(bank, flipperInputFrom(ball.y >= trigger, false));
-        bank = ticked.bank;
         stepBalls(balls, map, materials, forces);
         resolveFlipperContacts(balls.balls, ticked.sweeps);
+        // The bank is settled AFTER the passes: a ball on the blade takes rate
+        // out of the bat between the tick's own animation steps, so where the
+        // bat ends is not known until they have run.
+        bank = applyFlipperReactions(bank, ticked.sweeps);
         if (!ball.active) break;
         if (launchedAt < 0 && ball.velocityY < -2000) launchedAt = tick;
         if (launchedAt >= 0 && crossedAt < 0 && q10ToPixel(ball.y) < q10ToPixel(start.y) - 400) {

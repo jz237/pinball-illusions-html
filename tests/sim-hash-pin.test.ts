@@ -758,11 +758,86 @@ const TICKS = 4000;
  * Extreme Sports' element 83, and neither table's effect-17 elements are
  * awarded inside its window. A moved hash on either would have meant something
  * else changed with them.
+ *
+ * ---------------------------------------------------------------------------
+ * RE-PIN, THE TWO BAT RULES (this round). All three hashes moved.
+ * ---------------------------------------------------------------------------
+ *
+ * The digests this entry replaced, recorded so the move is auditable:
+ *   law-n-justice   9038d64e08bd11116334e6e4e3f77009cad5968b64e585e952dcf7029afac3b9
+ *   babewatch       16e02ba974870dd3c768e5e687d1ad879e3a5a67107f575710f7b5585a3fd325
+ *   extreme-sports  88834d88e7b19b6d443d558bd840df8110c97dbf00573155b14a77f57922bf78
+ *
+ * Same 4,000 ticks, same script, same strictness, same `hashedSnapshot`
+ * projection. Only the digests. Two rules landed, both decoded out of the
+ * collision responder and both measured against the machine's own RAM in
+ * `research/flipper-power/BW_RIGHT_BAT.md` and `out/gate-threshold.txt`:
+ *
+ *   THE TANGENT GATE, `cmpi.w #$fa0,d1 / bhi` at +0x00B534. The along-face term
+ *   `$1a(a4)` is added to the contact only when the pending kick and the ball's
+ *   own normal velocity are within 4000 doubled units of each other; this port
+ *   added it on every kick. Scored on 366 single passes taken 30 us apart out of
+ *   the machine's own RAM, with the threshold FITTED rather than assumed and
+ *   against five rival comparands, the decoded quantity agrees on 89.3 % where
+ *   "the impulse alone" manages 74.3 %, a radius gate 73.2 % and "always add it"
+ *   55.5 %. The machine applies the tangent on 100 % of the passes under 3,750
+ *   and 0 % of those over 5,250.
+ *
+ *   THE MID-PASS RATE WRITE-BACK, +0x00AED2. The reduced bat rate is stored to
+ *   `$10(a0)` INSIDE the collision pass and the animation step that follows
+ *   moves the bat by it, so a ball on the blade slows the blade DURING the tick
+ *   and the blade stays under it. This port precomputed all four steps and spent
+ *   the deduction in the bank afterwards. Driven from the machine's own ball on
+ *   300 loaded ticks over six bats, the blade's advance error goes from +8.19
+ *   bat units — one-signed, over-travelling on every bat of every table — to
+ *   -0.59, and the machine's own step ladder on `bw-ramp` frame 4969 (80, 93,
+ *   105, 111 against the precomputed 80, 100, 120, 120) is now reproduced
+ *   exactly.
+ *
+ * THE FIRST DIVERGENT TICK, per table, and it is the write-back on all three:
+ * every earlier tick is byte-identical and at the tick named the bat's own
+ * STROKE is short by the deduction the tick has now already spent.
+ *
+ *   law-n-justice  t1025. The lower-left bat ends the tick at stroke 68 where
+ *                  HEAD ends it at 120 — 52 bat units, the ball on the blade
+ *                  charging three of the tick's four passes. The ball goes
+ *                  (135.653,568.593) v=(8889,-4725) -> (135.185,569.013)
+ *                  v=(6973,-3007).
+ *   babewatch      t827. Lower-right, stroke 505 against HEAD's 540. The ball's
+ *                  vertical word is the clamp on both trees (-16348) and the
+ *                  HORIZONTAL one moves, -14459 -> -16380: that is the tangent
+ *                  gate as well, dropping an along-face term the machine does
+ *                  not apply at that kick.
+ *   extreme-sports t565. The upper bat, stroke 364 against HEAD's 420, ball
+ *                  (152.091,185.179) v=(-4438,-10438) -> (152.153,185.601)
+ *                  v=(-4305,-9571).
+ *
+ * THE GATES.
+ *
+ *   THE FLIPPER PROBE. The six lower bats' cradles hold, 0 of 36 lost, unmoved.
+ *   Roll-and-flip and drop-and-flip each grow ONE pass-under of 648 and 210 —
+ *   and both are scored at bat stroke ZERO, 76 and 77 ticks after the press,
+ *   on trials whose ball was launched cleanly at 15.9 px/tick and came back a
+ *   second and a half later to drain past a bat parked on its rest stop. The
+ *   probe now reports the stroke and the tick offset of every crossing it
+ *   scores, so the operator's own defect — a ball going under a bat that is
+ *   rising or raised — is separable from a late drain: at 0 of 648 and 0 of 210
+ *   it is unmoved.
+ *
+ *   THE PHYSICS GATE, unmoved and exit 0 at 576/218/470/558/282/487, as it must
+ *   be: its corpus excludes every frame the machine's own ball spent in bat
+ *   contact.
+ *
+ *   THE CENSUS, 90 games x 3 tables x 40,000 ticks: 90/90 completed on all
+ *   three. Ends per game 3.48 (LnJ), 3.10 (BW), 3.83 (ES); medians 3,197,500 /
+ *   5,437,500 / 3,775,000 against 5,977,500 / 5,995,000 / 1,490,000, and
+ *   ball-1 medians 375,000 / 777,500 / 485,000. Three write-offs of 313 on Law
+ *   'n Justice and none on the other two.
  */
 const PINNED: Record<TableId, string> = {
-  "law-n-justice": "9038d64e08bd11116334e6e4e3f77009cad5968b64e585e952dcf7029afac3b9",
-  "babewatch": "16e02ba974870dd3c768e5e687d1ad879e3a5a67107f575710f7b5585a3fd325",
-  "extreme-sports": "88834d88e7b19b6d443d558bd840df8110c97dbf00573155b14a77f57922bf78",
+  "law-n-justice": "ed9a8d8da0b6cca1768ded7b835f4b22db9eaf29cb89421bf01b271dea7ae8d3",
+  "babewatch": "c66fd3945f17edd996e1b86c1406b64c7067d89f8f469f8a23e7ec2174b660f6",
+  "extreme-sports": "5a93dd8751d36331a52472b11af8bc4332bb86746160d93adf665746a7035776",
 };
 
 /** Same shape as the determinism harness's input: behaviour = f(tick index). */

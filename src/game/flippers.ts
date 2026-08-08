@@ -519,6 +519,18 @@ export const ORIGINAL_IMPULSE_FLOOR = 46;
 export const ORIGINAL_IMPULSE_TANGENT = 8;
 
 /**
+ * How far apart the pending kick and the ball's own approach may be before the
+ * along-face term is dropped: `cmpi.w #$fa0,d1` at +0x00B534, i.e. 4000.
+ *
+ * MEASURED, in the original's own DOUBLED contact frame — `$1c` is
+ * `-magnitude * 2 * rate` and `d0` is the ball's normal velocity after the
+ * rotation at +0x00B4FE, which doubles it. `resolveAtPass` has the instruction
+ * sequence, what the rule does to a shot, and the 354-pass fit that confirms the
+ * quantity and brackets the constant at 4,000..4,500.
+ */
+export const ORIGINAL_TANGENT_GATE = 4000;
+
+/**
  * The original's raw table entry for a ball `dx`,`dy` pixels from the pivot.
  *
  * Whole pixels in, whole units out, integers throughout. Both offsets are taken
@@ -1211,29 +1223,107 @@ export function batAngleToBearing(units: number): number {
 }
 
 /**
- * One tick of one flipper: where the bat started, where it ended, and which bat
- * it was. Returned as a unit so a caller cannot advance the state and then
- * resolve contacts against a stale or mismatched starting pose.
+ * One tick of one flipper: where the bat started, what each of the frame's four
+ * collision passes reads, and where it ended.
+ *
+ * ---------------------------------------------------------------------------
+ * IT IS NOT A PRECOMPUTED LADDER ANY MORE, AND THAT COST A CONTACT
+ * ---------------------------------------------------------------------------
+ * MEASURED. `+0x00AED2` writes the REDUCED bat rate back to `$10(a0)` INSIDE
+ * the collision pass, and the animation step at `+0x00BD86` that runs
+ * immediately afterwards moves the bat by that reduced rate. So on the machine
+ * a ball lying on the blade slows the blade DURING the tick and the blade stays
+ * under it.
+ *
+ * This type used to hand out all four steps computed before the first pass ran,
+ * and `applyFlipperReactions` spent the deduction in the bank AFTER the tick.
+ * The blade therefore finished a loaded tick further round than the machine's
+ * did — `research/flipper-power/BW_RIGHT_BAT.md` §5, +9.03 bat units of 441.54
+ * over 37 loaded ticks on BabeWatch's lower-right, 46 % of them over-travelled,
+ * and the SAME SIGN on every bat of every table:
+ *
+ *   law-n-justice slot 2 +9.51 (106)   slot 3 +6.64 (75)
+ *   babewatch     slot 2 +12.00 (5)    slot 3 +9.03 (37)
+ *   extreme-sports slot 2 +5.78 (41)   slot 3 +8.89 (36)
+ *
+ * It costs a real contact rather than a decimal place. On `bw-ramp` frame 4969
+ * the machine's own angle steps through the tick are 80, 93, 105, 111 — the
+ * coil ramping and being deducted from three times — and the sample stream
+ * shows THREE impulses; the precomputed ladder's steps are 80, 100, 120, 120
+ * and it resolves TWO. The blade has swept past the ball by the pass the third
+ * would have happened on.
+ *
+ * So the four steps are REPLAYED from `from` and the deductions recorded so
+ * far, every time one is asked for. `takeRate` records; `stateAt`, `steps` and
+ * `to` replay. That keeps the sweep a pure function of (start, button,
+ * deductions) rather than a cursor, which matters because `stepBalls`
+ * integrates one ball all the way through its four passes before it starts the
+ * next one, where the machine runs every ball at a pass and THEN animates.
+ *
+ * WHAT THAT ORDER MEANS FOR MULTIBALL, stated rather than hidden: two balls on
+ * the same blade at the same pass both charge that pass, and the second one
+ * reads the rate the first left (`stateAt` folds in every deduction recorded at
+ * that pass). But the first ball's LATER passes were already resolved against a
+ * ladder the second ball then changed, and they are not re-run. Every capture
+ * this rule was measured on is a single ball; the ordering residue is named in
+ * `FLIPPER_POWER.md` §7 and is not measured.
  */
 export interface FlipperSweep {
   readonly config: FlipperConfig;
   readonly from: FlipperState;
-  readonly to: FlipperState;
   /**
-   * The bat's state after each of the four steps of this tick, oldest first.
+   * The (pose, rate) collision pass `pass` reads — one animation step EARLIER
+   * than the state that pass's `$bc24` is about to write, and with every
+   * write-back already recorded AT that pass folded in.
+   *
+   * A tick of a fresh stroke reads 0, 20, 40 and 60 bat units, not 20/40/60/80:
+   * each pass runs before its own animation step. `resolveAtPass`'s header has
+   * the unrolled frame this is read off.
+   */
+  stateAt(pass: number): FlipperState;
+  /**
+   * Records that the ball met at `pass` took `units` out of the bat's rate.
+   *
+   * `+0x00AED0`'s `lsr.w #1,d3` sizes it and `+0x00AED2` stores it; the point of
+   * putting it here rather than in the bank is that the animation step BETWEEN
+   * this pass and the next one then moves by the reduced rate, which is what
+   * keeps the blade under the ball.
+   */
+  takeRate(pass: number, units: number): void;
+  /** Total bat units taken out of the rate this tick, over all four passes. */
+  readonly taken: number;
+  /**
+   * The bat's state after each of the four animation steps, oldest first.
    *
    * Real state rather than a debugging convenience: the original resolves a
    * collision pass BETWEEN every pair of steps, so the rate a ball meets is the
    * rate the bat carries at that step and not the one it ends the tick with. A
-   * tick of a fresh stroke runs at 20, 40, 60 and 80 bat units, a factor of four
-   * across a single frame, and collapsing that to one number is exactly what
-   * removed the flipper's timing gradient.
+   * tick of a fresh unloaded stroke runs at 20, 40, 60 and 80 bat units, a
+   * factor of four across a single frame, and collapsing that to one number is
+   * exactly what removed the flipper's timing gradient.
+   *
+   * LIVE: a deduction recorded by `takeRate` shows up here, because it really
+   * does change where the blade is by the end of the tick.
    */
   readonly steps: readonly FlipperState[];
+  /** Where the bat ends the tick. `from` by identity when it did not move. */
+  readonly to: FlipperState;
 }
 
 /**
- * Advances one flipper by a tick: FOUR steps of the measured stroke.
+ * The rate a ball has taken its share out of: toward zero by `units` and no
+ * further. `+0x00AED2..+0x00AEE0` is a signed subtract with a `bpl`/`bmi` pair
+ * that clamps at zero rather than reversing the bat.
+ */
+function rateAfterTaking(rate: number, units: number): number {
+  if (units <= 0 || rate === 0) return rate;
+  const magnitude = Math.max(0, Math.abs(rate) - units);
+  return rate < 0 ? -magnitude : magnitude;
+}
+
+/**
+ * Advances one flipper by a tick: FOUR steps of the measured stroke, with a
+ * collision pass ahead of each of them.
  *
  * `held` is the state of the button at the end of the tick. A press and release
  * inside the same tick is not special-cased: unlike the plunger, whose whole
@@ -1249,53 +1339,111 @@ export interface FlipperSweep {
  *
  * Hitting either end clamps the angle and kills the rate, exactly as +0x00BD90
  * and +0x00BD9C do. There is no bounce off the stops.
+ *
+ * NOTHING IS COMPUTED HERE. The returned sweep replays the ladder on demand, so
+ * that a write-back recorded at pass `n` is spent by animation step `n+1` and
+ * not by the bank after the tick. See `FlipperSweep`.
  */
 export function tickFlipper(
   config: FlipperConfig,
   state: FlipperState,
   held: boolean,
 ): FlipperSweep {
-  let stroke = state.stroke;
-  let rate = state.rate;
-  const steps: FlipperState[] = [];
-  for (let step = 0; step < FLIPPER_STEPS_PER_TICK; step += 1) {
-    stroke += rate;
-    // The far stop is INCLUSIVE going up and EXCLUSIVE coming back, which reads
-    // like a typo and is not: the original's up path continues only while
-    // `angle > limit` (+0x00BD98 `cmp.w d2,d1 / bgt`) and its down path while
-    // `angle >= limit` (+0x00BDDA `cmp.w d4,d3 / bge`). That one bit of
-    // asymmetry is what lets a bat sitting on the stop start back down at all —
-    // reaching a stop also SKIPS the acceleration (`clr.w $10(a0)` then a branch
-    // past it), so a symmetric test would weld the bat to the top of its stroke.
-    const stopped = held ? stroke >= config.sweep : stroke > config.sweep;
-    if (stopped) {
-      stroke = config.sweep;
-      rate = 0;
-      steps.push({ stroke, rate });
-      continue;
+  const deductions = new Array<number>(FLIPPER_STEPS_PER_TICK).fill(0);
+  let atPass: FlipperState[] | null = null;
+  let afterStep: FlipperState[] | null = null;
+  // HAS ANYONE TAKEN THE END OF THE TICK AWAY YET? A caller that reads `to`
+  // (or `steps`, which ends on it) before the four passes have run gets the
+  // UNLOADED answer and then silently throws every write-back away — which is
+  // exactly the shape of the defect this whole change removes, one level up.
+  // It is not hypothetical: `tests/flippers.test.ts`'s own `runTicks` did it,
+  // and under a live getter alone it would have kept doing it and passed.
+  let settled = false;
+
+  function replay(): void {
+    if (atPass !== null && afterStep !== null) return;
+    const reads: FlipperState[] = [];
+    const ends: FlipperState[] = [];
+    let stroke = state.stroke;
+    let rate = state.rate;
+    for (let step = 0; step < FLIPPER_STEPS_PER_TICK; step += 1) {
+      // THE WRITE-BACK, +0x00AED2, and it happens BEFORE this step's animation
+      // because the pass that produced it ran before this step. This is the
+      // whole of the rule; everything below it is the animation unchanged.
+      rate = rateAfterTaking(rate, deductions[step] ?? 0);
+      reads.push({ stroke, rate });
+      stroke += rate;
+      // The far stop is INCLUSIVE going up and EXCLUSIVE coming back, which
+      // reads like a typo and is not: the original's up path continues only
+      // while `angle > limit` (+0x00BD98 `cmp.w d2,d1 / bgt`) and its down path
+      // while `angle >= limit` (+0x00BDDA `cmp.w d4,d3 / bge`). That one bit of
+      // asymmetry is what lets a bat sitting on the stop start back down at all
+      // — reaching a stop also SKIPS the acceleration (`clr.w $10(a0)` then a
+      // branch past it), so a symmetric test would weld the bat to the top.
+      const stopped = held ? stroke >= config.sweep : stroke > config.sweep;
+      if (stopped) {
+        stroke = config.sweep;
+        rate = 0;
+      } else if (stroke <= 0 && !held) {
+        // The near stop, and `<= 0` rather than `< 0` because of what the
+        // per-step rates made visible: a bat parked at rest with the button up
+        // used to be given -30 on every first step and clamped back on the
+        // second, so it reported a live rate while standing still. It never
+        // moved and the end of the tick was identical, but the rate is real
+        // state that a contact reads, and a bat leaning on its own stop must
+        // not impart anything.
+        stroke = 0;
+        rate = 0;
+      } else {
+        rate = held
+          ? Math.min(config.upMaxRate, rate + config.upAcceleration)
+          : Math.max(-config.downMaxRate, rate - config.downAcceleration);
+      }
+      ends.push({ stroke, rate });
     }
-    // The near stop, and `<= 0` rather than `< 0` because of what the per-step
-    // rates made visible: a bat parked at rest with the button up used to be
-    // given -30 on every first step and clamped back on the second, so it
-    // reported a live rate while standing still. It never moved and the end of
-    // the tick was identical, but the rate is now real state that a contact
-    // reads, and a bat leaning on its own stop must not impart anything.
-    if (stroke <= 0 && !held) {
-      stroke = 0;
-      rate = 0;
-      steps.push({ stroke, rate });
-      continue;
-    }
-    rate = held
-      ? Math.min(config.upMaxRate, rate + config.upAcceleration)
-      : Math.max(-config.downMaxRate, rate - config.downAcceleration);
-    steps.push({ stroke, rate });
+    atPass = reads;
+    afterStep = ends;
   }
+
   return {
     config,
     from: state,
-    to: stroke === state.stroke && rate === state.rate ? state : { stroke, rate },
-    steps,
+    stateAt(pass: number): FlipperState {
+      replay();
+      return (atPass as FlipperState[])[pass] ?? state;
+    },
+    takeRate(pass: number, units: number): void {
+      if (units <= 0) return;
+      if (pass < 0 || pass >= FLIPPER_STEPS_PER_TICK) {
+        throw new RangeError(`flipper pass ${pass} is not one of this frame's four`);
+      }
+      if (settled) {
+        throw new Error(
+          `flipper "${config.id}" was charged ${units} at pass ${pass} after its tick had ` +
+            `already been read off; the bank must be settled AFTER the collision passes, ` +
+            `not before them`,
+        );
+      }
+      deductions[pass] = (deductions[pass] ?? 0) + units;
+      atPass = null;
+      afterStep = null;
+    },
+    get taken(): number {
+      let total = 0;
+      for (const one of deductions) total += one;
+      return total;
+    },
+    get steps(): readonly FlipperState[] {
+      replay();
+      settled = true;
+      return afterStep as FlipperState[];
+    },
+    get to(): FlipperState {
+      replay();
+      settled = true;
+      const end = (afterStep as FlipperState[])[FLIPPER_STEPS_PER_TICK - 1] ?? state;
+      return end.stroke === state.stroke && end.rate === state.rate ? state : end;
+    },
   };
 }
 
@@ -2008,10 +2156,13 @@ export interface FlipperContact {
    * Bat angle units per step the ball took out of the bat, +0x00AED0's
    * `lsr.w #1,d3`. Zero when the bat imparted nothing.
    *
-   * Reported rather than applied here because a contact is resolved against a
-   * sweep, which is immutable; `applyFlipperReactions` is what puts it back into
-   * the bank. Without the write-back the second ball of a multiball gets the
-   * same stroke as the first, which the original does not give it.
+   * ALREADY SPENT by the time this is read: `resolveAtPass` hands it to
+   * `FlipperSweep.takeRate` inside the pass, which is where `+0x00AED2` puts
+   * it, so the animation step that follows this pass moves the bat by the
+   * reduced rate. This field is the RECEIPT — what the harnesses, the probes
+   * and the report read — and not the instruction. It used to be the
+   * instruction, carried out of the tick by `applyFlipperReactions`, and that
+   * is what let the blade over-travel; see `FlipperSweep`.
    */
   readonly rateTaken: number;
 }
@@ -2143,9 +2294,16 @@ export function createFlipperPass(
  * pass's `$bc24` is about to write. `resolveAtPass`'s header has the derivation;
  * this is it as a function so the union's pose lookup and the contact's cannot
  * come apart.
+ *
+ * IT USED TO INDEX A PRECOMPUTED LADDER (`pass === 0 ? from : steps[pass - 1]`)
+ * and now asks the sweep, because the ladder is no longer fixed when the tick
+ * starts: a write-back recorded at pass `n` is spent by animation step `n + 1`,
+ * so passes `n + 1`.. read a bat that is further back than an unloaded one
+ * would be. See `FlipperSweep`. On a tick that takes nothing the answer is
+ * identical, step for step.
  */
 function poseStateAt(sweep: FlipperSweep, pass: number): FlipperState {
-  return pass === 0 ? sweep.from : (sweep.steps[pass - 1] ?? sweep.from);
+  return sweep.stateAt(pass);
 }
 
 /**
@@ -2271,6 +2429,16 @@ function resolveAtPass(
     const dx = Math.trunc(Math.abs(ball.x - config.pivotX) / Q10_ONE);
     const dy = Math.trunc(Math.abs(ball.y - config.pivotY) / Q10_ONE);
     rateTaken = Math.min(Math.abs(state.rate), flipperRateTaken(dx, dy));
+    // THE WRITE-BACK, AND IT LANDS INSIDE THE TICK. `+0x00AED2` stores the
+    // reduced rate to `$10(a0)` here, in the pass, and the animation step at
+    // `+0x00BD86` that runs next moves the bat by it — so a ball on the blade
+    // slows the blade and the blade stays under it. This used to be reported on
+    // the contact and spent by `applyFlipperReactions` after the whole tick,
+    // which let the blade over-travel a loaded tick by 46 % of its own
+    // deduction and cost a third contact on `bw-ramp` frame 4969. See
+    // `FlipperSweep` for the measurement. It is still reported as well, because
+    // a contact that says what it charged is what the harnesses read.
+    sweep.takeRate(pass, rateTaken);
     // The rate AFTER the ball has taken its share, which is what the impulse
     // is computed from: +0x00AED2..+0x00AEE4 writes the reduced rate back
     // before +0x00AEF0 even looks at the magnitude. Signed the way the
@@ -2289,7 +2457,56 @@ function resolveAtPass(
     // the doubling puts every flipper shot at twice the machine's own
     // velocity clamp, where the whole bat saturates and nothing has range.
     const normal = originalVelocityToQ10(magnitude * Math.abs(driven));
-    const tangent = originalVelocityToQ10(ORIGINAL_IMPULSE_TANGENT * driven);
+    // THE TANGENT GATE at +0x00B534, and this port used to apply the along-face
+    // term unconditionally.
+    //
+    //   00B528  move.w  $1c(a4), d1     ; the pending NORMAL impulse
+    //   00B52C  beq.b   $B548
+    //   00B52E  sub.w   d0, d1          ; impulse minus the ball's own normal
+    //   00B530  bpl.b   $B534           ; velocity, both in the DOUBLED frame
+    //   00B532  neg.w   d1              ; |$1c - d0|
+    //   00B534  cmpi.w  #$fa0, d1       ; 4000
+    //   00B538  bhi.b   $B544           ; TOO FAR APART -> the normal ONLY
+    //   00B53A  add.w   $1a(a4), d2     ; ... otherwise the tangent as well
+    //
+    // `$1c` is `-magnitude * 2 * rate` and `d0` is the ball's velocity INTO the
+    // surface, doubled by the rotation at +0x00B4FE. So the along-face term is
+    // added only when the kick and the approach are within 4000 doubled units
+    // of each other, and a hard kick meeting a fast approach gets the normal
+    // and nothing else.
+    //
+    // MEASURED, on 354 single passes taken out of the machine's own RAM 30 us
+    // apart, with the threshold FITTED rather than assumed and scored against
+    // five rival comparands: the decoded quantity agrees with the machine on
+    // 89.3 % where "the impulse alone" manages 74.9 %, "the approach alone"
+    // 69.5 %, a radius gate 73.7 % and "always add it" 56.5 %. Across the
+    // threshold the machine applies the tangent on 100 % of the passes under
+    // 3,750 and 0 % of those over 5,250. The free fit lands at 4,529 and the
+    // instruction's own 4,000 scores 84.5 %; the gap is the size and sign the
+    // one reconstructed term predicts (`d0` is projected on the PORT's normal
+    // from a sample up to 30 us early), and on the sub-corpus where `|d0|` is
+    // under 400 — where the quantity is exact — the fit is 4,233. The constant
+    // shipped is the instruction's, because the instruction is the measurement
+    // and the fit is what fails to contradict it. See
+    // `research/flipper-power/BW_RIGHT_BAT.md` §4 and `out/gate-threshold.txt`.
+    //
+    // WHAT IT DOES TO THE GAME: it makes shots STRAIGHTER, not stronger. On
+    // BabeWatch's lower-right boss this port used to push the ball 2.6 to 3.3
+    // px/frame sideways toward the pivot on thirteen of twenty passes where the
+    // machine pushed it nowhere at all — about 21 degrees off a normal that
+    // points up the ramp.
+    const pendingNormal = originalVelocityToQ10(2 * magnitude * Math.abs(driven));
+    const pendingApproach =
+      -2 * (q10Multiply(ball.velocityX, touch.normalX) + q10Multiply(ball.velocityY, touch.normalY));
+    // `$1c` is negative and `d0` positive into the surface, so `$1c - d0` is
+    // `-(kick + approach)`; the machine takes its magnitude with the `neg.w`
+    // above. Everything here is Q10 OF the machine's own word, which is what
+    // `originalVelocityToQ10` puts both sides in, so the comparand is too.
+    const apart = Math.abs(-pendingNormal - pendingApproach);
+    const alongFaceGate = apart <= originalVelocityToQ10(ORIGINAL_TANGENT_GATE);
+    const tangent = alongFaceGate
+      ? originalVelocityToQ10(ORIGINAL_IMPULSE_TANGENT * driven)
+      : 0;
     // The normal is always outward — the sub-handlers negate `d2` on
     // whichever branch keeps `$1c` negative, and +0x00B550's `tst.w d0 /
     // ble` shows the frame's first axis points INTO the surface. The tangent
@@ -2445,66 +2662,76 @@ export function createFlipperBank(tableId: TableId): FlipperBank {
   return { configs, states };
 }
 
-/** What one tick did to a whole bank. */
+/**
+ * What one tick did to a whole bank.
+ *
+ * IT USED TO CARRY THE NEW BANK and it deliberately does not any more. The bat
+ * does not finish its tick until the four collision passes have run, because a
+ * ball on the blade slows the blade between them (`FlipperSweep`), so a caller
+ * that took the bank out of here and stored it before `stepBalls` would be
+ * storing the UNLOADED answer and throwing the write-back away. There is one
+ * way to settle a bank now — `applyFlipperReactions`, after the physics — and a
+ * caller that forgets it gets a type error rather than a quiet over-travel.
+ */
 export interface FlipperBankTick {
-  readonly bank: FlipperBank;
   readonly sweeps: readonly FlipperSweep[];
 }
 
 /**
- * Advances a whole bank. Iterates `configs`, never the map, so the order of the
- * sweeps depends on the table's declared flippers rather than on insertion order
- * — a Map's iteration order is stable but it is not the property this wants to
- * rest on.
+ * Starts a whole bank's tick. Iterates `configs`, never the map, so the order of
+ * the sweeps depends on the table's declared flippers rather than on insertion
+ * order — a Map's iteration order is stable but it is not the property this
+ * wants to rest on.
  */
 export function tickFlipperBank(bank: FlipperBank, input: FlipperInput): FlipperBankTick {
   const sweeps: FlipperSweep[] = [];
-  const states = new Map<string, FlipperState>();
   for (const config of bank.configs) {
     const state = bank.states.get(config.id) ?? FLIPPER_AT_REST;
-    const sweep = tickFlipper(config, state, input.get(config.id) === true);
-    sweeps.push(sweep);
-    states.set(config.id, sweep.to);
+    sweeps.push(tickFlipper(config, state, input.get(config.id) === true));
   }
-  return { bank: { configs: bank.configs, states }, sweeps };
+  return { sweeps };
 }
 
 /**
- * Puts the angular momentum the balls took back into the bank.
+ * Settles the bank at the end of a tick: every bat's own end state, with the
+ * angular momentum the balls took out of it already spent.
  *
  * MEASURED: +0x00AED2..+0x00AEE4 reduces the bat's rate toward zero by half the
  * raw impulse-table entry and writes it to $10(a0) DURING the collision pass, so
  * the rest of the stroke really is weaker for having hit something. The stroke
- * itself is untouched — only the rate — which is exactly what the original does
- * and is why a bat that has been loaded still reaches the top, just later.
+ * itself is untouched by the deduction — only the rate — which is why a bat that
+ * has been loaded still reaches the top, just later.
  *
- * Returns the bank unchanged, by identity, when nothing was taken: a tick that
- * hit nothing must not allocate.
+ * IT USED TO TAKE THE CONTACTS AND SPEND THEM HERE, on the rate the bat had
+ * already finished the tick with. That is a tick too late: the machine's four
+ * animation steps are interleaved with its four collision passes, so a
+ * deduction taken at pass 0 is spent by three of the tick's own steps and not by
+ * none of them. Measured over 300 loaded ticks on six bats, spending it here put
+ * the blade a mean 5.8 to 12.0 bat units further round than the machine's, ON
+ * EVERY BAT OF EVERY TABLE, and cost a whole contact where a ball rode the
+ * blade. `FlipperSweep` now spends it where the machine does and this function
+ * only reads the answer off.
+ *
+ * Returns the bank unchanged, by identity, when no bat moved: a tick that did
+ * nothing must not allocate.
  */
 export function applyFlipperReactions(
   bank: FlipperBank,
-  contacts: readonly FlipperContact[],
+  sweeps: readonly FlipperSweep[],
 ): FlipperBank {
-  let taken: Map<string, number> | null = null;
-  for (const contact of contacts) {
-    if (contact.rateTaken <= 0) continue;
-    taken ??= new Map<string, number>();
-    taken.set(contact.flipperId, (taken.get(contact.flipperId) ?? 0) + contact.rateTaken);
-  }
-  if (taken === null) return bank;
-
   const states = new Map<string, FlipperState>();
+  let moved = false;
   for (const config of bank.configs) {
-    const state = bank.states.get(config.id) ?? FLIPPER_AT_REST;
-    const loss = taken.get(config.id) ?? 0;
-    if (loss === 0 || state.rate === 0) {
-      states.set(config.id, state);
-      continue;
-    }
-    const magnitude = Math.max(0, Math.abs(state.rate) - loss);
-    states.set(config.id, { stroke: state.stroke, rate: state.rate < 0 ? -magnitude : magnitude });
+    const before = bank.states.get(config.id) ?? FLIPPER_AT_REST;
+    // A sweep per config is what `tickFlipperBank` builds, but this is also
+    // reached by harnesses that swing ONE bat over a bank of three, and a bat
+    // nobody ticked keeps the state it had.
+    const sweep = sweeps.find((one) => one.config.id === config.id);
+    const after = sweep === undefined ? before : sweep.to;
+    states.set(config.id, after);
+    if (after !== before) moved = true;
   }
-  return { configs: bank.configs, states };
+  return moved ? { configs: bank.configs, states } : bank;
 }
 
 /**

@@ -246,6 +246,17 @@ interface Trial {
   readonly launchSpeed: number;
   /** Lowest `perp` reached while the bat was raised: negative means underside. */
   readonly minPerp: number;
+  /**
+   * WHERE THE BAT WAS when the crossing was scored, and how long after the
+   * press — 0 stroke is a bat sitting on its rest stop.
+   *
+   * The operator's defect is a ball going under a bat that is RISING or RAISED;
+   * a ball that flew off, came back a second later and fell past a bat parked at
+   * rest is a drain. Both used to be counted as one number and the only way to
+   * tell them apart was to re-run the trial by hand. -1 when nothing crossed.
+   */
+  readonly underStroke: number;
+  readonly underTicksAfterPress: number;
 }
 
 /**
@@ -279,6 +290,8 @@ function trial(
   let wasAbove = false;
   let passedUnder = false;
   let drained = false;
+  let underStroke = -1;
+  let underTick = -1;
 
   for (let tick = 0; tick < settle + windowTicks; tick += 1) {
     const report = runTicks(game, input, 1)[0];
@@ -304,6 +317,10 @@ function trial(
       // grazing perp of -1 is the ball riding the edge, not passing through.
       if (frame.perp > BALL_RADIUS_PIXELS) wasAbove = true;
       if (frame.perp < -(BALL_RADIUS_PIXELS + 2) && wasAbove && tick >= settle) {
+        if (!passedUnder) {
+          underStroke = stroke;
+          underTick = tick - settle;
+        }
         passedUnder = true;
       }
       if (tick >= settle) minPerp = Math.min(minPerp, frame.perp);
@@ -330,6 +347,8 @@ function trial(
     alongAtPress,
     launchSpeed,
     minPerp: Number.isFinite(minPerp) ? minPerp : 0,
+    underStroke,
+    underTicksAfterPress: underTick,
   };
 }
 
@@ -392,7 +411,8 @@ export function probeBat(tableId: TableId, config: FlipperConfig): BatReport {
       if (result.outcome === "PASSED_UNDER") {
         console.log(
           `    UNDER ${tableId} ${config.id} seat ${seat} settle ${settle} ` +
-            `along ${result.alongAtPress.toFixed(2)} minPerp ${result.minPerp.toFixed(2)}`,
+            `along ${result.alongAtPress.toFixed(2)} minPerp ${result.minPerp.toFixed(2)} ` +
+            `at stroke ${result.underStroke}, ${result.underTicksAfterPress} ticks after the press`,
         );
       }
       roll.push(result.outcome);
@@ -411,7 +431,17 @@ export function probeBat(tableId: TableId, config: FlipperConfig): BatReport {
       const ticks = 6;
       const rise = (speed * ticks) / Q10_ONE;
       const from = { x: at.x, y: (at.y - pixelsToQ10(Math.round(rise))) | 0, vx: 0, vy: speed };
-      drop.push(trial(tableId, config, from, ticks, 25, 90).outcome);
+      const result = trial(tableId, config, from, ticks, 25, 90);
+      // Named for the same reason the ROLL loop names its own: a residual count
+      // is only useful if the next round can reproduce the residue.
+      if (result.outcome === "PASSED_UNDER") {
+        console.log(
+          `    UNDER ${tableId} ${config.id} DROP along ${along} speed ${speed} ` +
+            `alongAtPress ${result.alongAtPress.toFixed(2)} minPerp ${result.minPerp.toFixed(2)} ` +
+            `at stroke ${result.underStroke}, ${result.underTicksAfterPress} ticks after the press`,
+        );
+      }
+      drop.push(result.outcome);
     }
   }
 
@@ -536,16 +566,20 @@ function probeGap(tableId: TableId, configs: readonly FlipperConfig[], raised: b
 /**
  * One trial, printed tick by tick in the bat's own frame.
  *
- * `--trace=<table>,<bat>,<seat>,<settle>` — the four numbers a summary line
- * reports, so every count above is walkable back to the geometry that made it.
+ * `--trace=<table>,<bat>,<seat>,<settle>[,<window>]` — the four numbers a summary
+ * line reports, so every count above is walkable back to the geometry that made
+ * it. `window` defaults to 60; ROLL and DROP both use 90, so a trial whose
+ * outcome is decided by a ball that flew up and came back has to be given it or
+ * the trace stops before the thing being explained.
  */
 function traceTrial(spec: string): void {
-  const [table, bat, seat, settle] = spec.split(",");
+  const [table, bat, seat, settle, window] = spec.split(",");
   const tableId = table as TableId;
   const config = flipperConfigsFor(tableId).find((one) => one.id === bat);
   if (config === undefined) throw new Error(`no bat "${bat}" on ${tableId}`);
   const at = seatOn(config, 0, Number(seat ?? 16));
   const pressAt = Number(settle ?? 30);
+  const windowTicks = window === undefined ? 60 : Number(window);
   const game = servedGame(tableId);
   const control = BAT_CONTROL[config.id] ?? "leftFlipper";
   const input = new ScriptedInput((tick) =>
@@ -553,7 +587,7 @@ function traceTrial(spec: string): void {
   );
   place(game, at.x, at.y, 0, 0, config.level);
   console.log(`trace ${tableId} ${config.id} seat ${seat} press at tick ${pressAt}`);
-  for (let tick = 0; tick < pressAt + 60; tick += 1) {
+  for (let tick = 0; tick < pressAt + windowTicks; tick += 1) {
     const report = runTicks(game, input, 1)[0];
     const state = debugSnapshot(game);
     const ball = state.balls.find((one) => one.active);

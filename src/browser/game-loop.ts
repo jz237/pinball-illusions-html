@@ -1659,34 +1659,15 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     // The third bat rides its own side's button — there is no third button.
     UPPER_FLIPPER_RECORDS[game.map.tableId].role,
   );
+  // THE BANK IS NOT SETTLED HERE, and it used to be. A bat's tick is not over
+  // until the four collision passes have run, because a ball on the blade slows
+  // the blade BETWEEN them — `+0x00AED2` writes the reduced rate back inside the
+  // pass and the animation step that follows moves by it. Taking the new bank
+  // out of `tickFlipperBank` and storing it before `stepBalls` would store the
+  // unloaded answer and let the blade over-travel every loaded tick. The bank is
+  // settled by `applyFlipperReactions` after the step, and with it the stroke
+  // edges below, which are read off that same settled bank.
   const bankTick = tickFlipperBank(game.flippers, flipperInput);
-  game.flippers = bankTick.bank;
-  // Which bats the PLAYER is driving this tick: button down, or the stroke
-  // still somewhere other than rest (a raised hold, a rising flip, a spring
-  // return). The ball search reads this to tell a cradle from furniture — see
-  // the cradled set below for the two measured sites that forced the split.
-  const drivenBats = new Set<string>();
-  for (const sweep of bankTick.sweeps) {
-    if (
-      flipperInput.get(sweep.config.id) === true ||
-      sweep.from.stroke !== 0 ||
-      sweep.from.rate !== 0 ||
-      sweep.to.stroke !== 0 ||
-      sweep.to.rate !== 0
-    ) {
-      drivenBats.add(sweep.config.id);
-    }
-  }
-  // The stroke edges, for the report. OBSERVATION ONLY: nothing below reads
-  // these back, and the reactions applied after the physics change a bat's
-  // rate, never its stroke, so this is the whole tick's answer.
-  const raisedAfter = raisedSides(game.flippers);
-  const flipperRaised: FlipperSide[] = [];
-  const flipperRested: FlipperSide[] = [];
-  for (const side of ["left", "right"] as const) {
-    if (raisedAfter[side] && !raisedBefore[side]) flipperRaised.push(side);
-    if (!raisedAfter[side] && raisedBefore[side]) flipperRested.push(side);
-  }
 
   // ---- physics -----------------------------------------------------------
   const forces: SimulationForces = {
@@ -1756,9 +1737,38 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
   // on a rising blade reports one per pass, which is what the machine records:
   // +0x00AED2 writes the reduced bat rate back inside every pass.
   const flipperContacts = bats.contacts;
-  // The ball takes angular momentum out of the bat — measured, see
-  // `applyFlipperReactions` — so the bank has to be told what it just paid for.
-  game.flippers = applyFlipperReactions(game.flippers, flipperContacts);
+  // THE BAT'S TICK ENDS HERE. Each sweep has already spent every deduction at
+  // the pass that took it, so this reads the end state off rather than
+  // computing one — see `applyFlipperReactions`.
+  game.flippers = applyFlipperReactions(game.flippers, bankTick.sweeps);
+  // Which bats the PLAYER is driving this tick: button down, or the stroke
+  // still somewhere other than rest (a raised hold, a rising flip, a spring
+  // return). The ball search reads this to tell a cradle from furniture — see
+  // the cradled set below for the two measured sites that forced the split.
+  const drivenBats = new Set<string>();
+  for (const sweep of bankTick.sweeps) {
+    if (
+      flipperInput.get(sweep.config.id) === true ||
+      sweep.from.stroke !== 0 ||
+      sweep.from.rate !== 0 ||
+      sweep.to.stroke !== 0 ||
+      sweep.to.rate !== 0
+    ) {
+      drivenBats.add(sweep.config.id);
+    }
+  }
+  // The stroke edges, for the report. OBSERVATION ONLY: nothing below reads
+  // these back. They are taken from the SETTLED bank, because whether a bat
+  // reached its stop this tick is now a question the collision passes can
+  // answer differently: a loaded blade turns more slowly and can arrive a tick
+  // later than an unloaded one would have.
+  const raisedAfter = raisedSides(game.flippers);
+  const flipperRaised: FlipperSide[] = [];
+  const flipperRested: FlipperSide[] = [];
+  for (const side of ["left", "right"] as const) {
+    if (raisedAfter[side] && !raisedBefore[side]) flipperRaised.push(side);
+    if (!raisedAfter[side] && raisedBefore[side]) flipperRested.push(side);
+  }
 
   // A ball that comes back down the lane lands on the rod — the lane floor IS
   // the plunger rod, which is why the shipped collision layer has no floor
