@@ -177,14 +177,28 @@ export function ballSaveLampLit(ticks: number): boolean | null {
 
 /** Descriptor +$64 slot 1. See `TableLamps.engine`. */
 export const BALL_SAVE_ENGINE_SLOT = 1;
+/**
+ * Descriptor +$64 slot 0 — SHOOT AGAIN. See `TableLamps.engine`.
+ *
+ * Two instruction sites write it and they are the same sixteen bytes:
+ * award effect 1's handler at +0x00606C, and the BALL-START RELIGHT at
+ * +0x0050E0 whose guard two instructions earlier is `tst.b $10(a0)` on the
+ * player record — *if this player still has an extra ball banked, light SHOOT
+ * AGAIN*. Both do `st.b $5(a1)`, the whole byte rather than the player's bit,
+ * because the engine lamps are machine-global. So the lamp is a plain readout
+ * of the banked count, which is what this drives it from.
+ */
+export const SHOOT_AGAIN_ENGINE_SLOT = 0;
 
 export function lampModes(
   lamps: TableLamps,
   state: ModeState | null,
   ballSaveTicks = 0,
+  extraBalls = 0,
 ): Uint8Array {
   const modes = new Uint8Array(lamps.lamps.length);
   applyBallSaveLamp(lamps, modes, ballSaveTicks);
+  applyShootAgainLamp(lamps, modes, extraBalls);
   if (state === null) return modes;
   for (let lamp = 0; lamp < modes.length; lamp += 1) {
     let mode: LampMode = LAMP_OFF;
@@ -205,6 +219,7 @@ export function lampModes(
   // AFTER the mode walk as well as before it, because the engine writes the
   // lamp byte itself every frame and nothing in the mode layer can outvote it.
   applyBallSaveLamp(lamps, modes, ballSaveTicks);
+  applyShootAgainLamp(lamps, modes, extraBalls);
   return modes;
 }
 
@@ -215,6 +230,24 @@ function applyBallSaveLamp(lamps: TableLamps, modes: Uint8Array, ballSaveTicks: 
   const lit = ballSaveLampLit(ballSaveTicks);
   if (lit === null) return;
   modes[lamp] = lit ? LAMP_STEADY : LAMP_OFF;
+}
+
+/**
+ * Engine slot 0 — SHOOT AGAIN, steady while the player has an extra ball banked.
+ *
+ * STEADY and not blinking: both writers are `st.b $5(a1)` into the always-on
+ * byte, with no `ori #2` on the blink flag anywhere near either of them, which
+ * is the same distinction the START (blinking) and AWARD (steady) paths make.
+ * And unlike the ball saver's slot 1 this is applied on EVERY frame rather than
+ * only while something is armed — the machine's award lights it and only the
+ * per-game lamp clear puts it out, so `extraBalls === 0` is a real OFF and not
+ * "leave it to the mode layer". All three tables ship the lamp (Law 'n Justice
+ * 0, BabeWatch 41, Extreme Sports 0), so the `< 0` guard is defensive only.
+ */
+function applyShootAgainLamp(lamps: TableLamps, modes: Uint8Array, extraBalls: number): void {
+  const lamp = lamps.engine[SHOOT_AGAIN_ENGINE_SLOT] ?? -1;
+  if (lamp < 0 || lamp >= modes.length) return;
+  modes[lamp] = extraBalls > 0 ? LAMP_STEADY : LAMP_OFF;
 }
 
 /**

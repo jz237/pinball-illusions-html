@@ -304,6 +304,84 @@ const EFFECT_COUNT_AND_ADD = 18;
 const EFFECT_ARM_WINDOW = 20;
 const EFFECT_ADVANCE_LADDER = 21;
 /**
+ * Award effect 19, handler 0x61F6 — COLLECT THE GROWING JACKPOT.
+ *
+ * Twenty-two bytes, and the sibling of effect 27 above:
+ *
+ *     0061F6  206a 0034            movea.l $34(a2),a0   ; a RAMP RECORD, base
+ *     0061FA  47e8 0002            lea     $2(a0),a3    ; its 8-byte live value
+ *     0061FE  215b 0022            move.l  (a3)+,$22(a0)
+ *     006202  215b 0026            move.l  (a3)+,$26(a0)
+ *     006206  4eb9 0000 6bcc       jsr     $6BCC
+ *     00620C  4e75                 rts
+ *
+ * The two post-increments leave a3 at `ramp + $0A`, which is precisely what
+ * $6BCC wants: it predecrements six times, so it pays the ramp's +$04..$09 —
+ * the SAME six packed-BCD bytes the ramp service at 0x6334 accumulates into with
+ * its own `lea $A(a1),a2`, and the same six effect 27 harvests. The difference
+ * between the two is only where the value lands: 27 adds it to a counter's
+ * running step, 19 adds it to the SCORE. `out.comboPaid` is the score channel
+ * (game-loop.ts `addToBcdField(game.scoring.score, …)`), which is what $6BCC is.
+ *
+ * NOTHING ELSE. The handler does not stop the ramp, does not reset it and does
+ * not clear the value, so a jackpot collected twice inside one countdown pays
+ * twice — a little less the second time, because the ramp has gone on ticking.
+ * The missions that want the value put back say so with opcode 15, and the ones
+ * that want it stopped say so with opcode 16. Same argument `payStep` records.
+ *
+ * The handler's other half — the value copied into the ramp's +$22..$29 — is
+ * NOT modelled: no relocated pointer in any of the three packages lands there
+ * and 0x6334, the ramp list's only reader in main hunk 0, never sources it, so
+ * the copy has no decoded consumer. research/effects-tail/EFFECTS_TAIL.md §9.1.
+ *
+ * `counter` is -1 on every effect-19 element for the same reason it is on every
+ * effect-17 one: a ramp record is not on the descriptor's counter list. The
+ * exporter carries the target as `rampCollect`, and this runs OUTSIDE the
+ * `counter >= 0` block for exactly that reason.
+ */
+const EFFECT_PAY_RAMP = 19;
+/**
+ * Award effect 1, handler 0x606C — AWARD AN EXTRA BALL.
+ *
+ * Twenty-six bytes, and the port's first extra ball:
+ *
+ *     00606C  2035 0162 2352 0000  move.l  ([$2352,a5],$0),d0
+ *     006074  6706                 beq.s   $607C
+ *     006076  2240                 movea.l d0,a1
+ *     006078  50e9 0005            st.b    $5(a1)      ; SHOOT AGAIN, all players
+ *     00607C  206d 0dc2            movea.l $DC2(a5),a0 ; the current player record
+ *     006080  5228 0010            addq.b  #1,$10(a0)  ; ONE MORE EXTRA BALL
+ *     006084  4e75                 rts
+ *
+ * The first sixteen bytes are byte-identical to +0x0050E0, the BALL-START
+ * relight, whose guard two instructions earlier is `tst.b $10(a0)` on the same
+ * record: award-time and ball-start light the same lamp for the same byte.
+ * `$2352(a5)` is the descriptor's three-slot ENGINE LAMP list (+$64) whose slot
+ * 1 is BALL SAVE (see `table-lamps.ts`); this is slot 0, SHOOT AGAIN, and `st`
+ * rather than `or.b d7` because the engine lamps are machine-global.
+ *
+ * The byte it increments is the player record's +$10, and its consumer is the
+ * drain path at +0x00505A: `tst.b $10(a0) / beq $5070` — no bank, rotate the
+ * player — else `subq.b #1,$10(a0) / move.w #$7,$8E(a5) / bra $50B0`, which
+ * SKIPS the rotation at $5070 where `subq.w #1,$d82` (balls left) and
+ * `addq.w #1,$d84` (ball number) live. So an extra ball costs neither: it is a
+ * free re-serve to the same player, and it lands two instructions above the
+ * ball-start walks so it runs every one of them. `addq.b`, not `st`, so they
+ * stack; cleared only in the per-GAME walk at +0x004588, so a bank survives a
+ * drain.
+ *
+ * REPORTED, NOT APPLIED, exactly as effects 2, 5 and 8 are — +$10 is one byte of
+ * the same 22-byte player record `scoring.ts` owns, and the ball count belongs
+ * to the loop for the same reason `$d8a` does. See `ModeTickReport.extraBalls`.
+ *
+ * Eight elements carry it (Law 'n Justice 21/47/65, BabeWatch 7/67/122, Extreme
+ * Sports 58/96), all eight awarded at a saucer — LnJ lower lock 5, the jail; BW
+ * lower lock 16; ES upper lock 10 — and all eight shipping
+ * `lampAward=false soundAward=false displayAward=-1`, because the handler
+ * provides the feedback itself. research/effects-tail/EFFECTS_TAIL.md §2.
+ */
+const EFFECT_EXTRA_BALL = 1;
+/**
  * Award effect 17, handler 0x613A — QUEUE THE ELEMENT'S +$34 AS A SCRIPT.
  *
  * Twelve bytes, read out of the package rather than out of Capstone:
@@ -1401,10 +1479,23 @@ export interface ModeTickReport {
   /** An award effect 8 fired: this ball's multiplier survives into the next one. */
   readonly holdMultiplier: boolean;
   /**
-   * What award effects 16 and 7 paid of their counters' accumulators this
-   * tick, through $6BCC: SCORE only, no bonus half, on top of the element's
-   * own score and bonus riding in `awards`. Reported rather than applied for
-   * the same reason the multiplier is — the score is the scoring state's.
+   * EXTRA BALLS award effect 1 banked this tick — `addq.b #1,$10(a0)`, once per
+   * effect-1 award, 0 on almost every tick there has ever been.
+   *
+   * Reported rather than applied, and the reason is the same one the multiplier
+   * and the two holds give: +$10 is a byte of the 22-byte player record the
+   * scoring layer owns, and what it then does to the ball flow belongs to the
+   * loop, which is the only thing that knows what a serve is. See
+   * `EFFECT_EXTRA_BALL`, `ScoringState.extraBalls` and `endBallAfterBonus`.
+   */
+  readonly extraBalls: number;
+  /**
+   * What award effects 16, 7 and 19 paid this tick, through $6BCC: SCORE only,
+   * no bonus half, on top of the element's own score and bonus riding in
+   * `awards`. Effects 16 and 7 pay a counter record's accumulator; 19 pays a
+   * RAMP's live value, which is the growing jackpot's collect. Reported rather
+   * than applied for the same reason the multiplier is — the score is the
+   * scoring state's.
    */
   readonly comboPaid: number;
   /**
@@ -1446,6 +1537,7 @@ export const EMPTY_MODE_TICK: ModeTickReport = Object.freeze({
   bonusMultiplier: -1,
   holdBonus: false,
   holdMultiplier: false,
+  extraBalls: 0,
   comboPaid: 0,
   clearedFlagIds: Object.freeze([]),
   ballSaveTicks: -1,
@@ -1467,6 +1559,8 @@ interface Accumulator {
   bonusMultiplier: number;
   holdBonus: boolean;
   holdMultiplier: boolean;
+  /** Award effect 1's `addq.b #1,$10(a0)`, counted. See `EFFECT_EXTRA_BALL`. */
+  extraBalls: number;
   comboPaid: number;
   /**
    * Ticks mode-script opcode 11 wrote into `$D8A(a5)` this tick, or -1 for "it
@@ -1874,12 +1968,32 @@ function applyAwardEffect(
     out.holdMultiplier = true;
     return;
   }
+  // 0x606C's `addq.b #1,$10(a0)` — the fourth player-record effect, and the one
+  // that hands the ball back. A COUNT, not a flag: two extra balls awarded in
+  // one tick bank two. The engine lamp the handler's other half lights is
+  // driven off the banked count by `lamp-overlays.ts`, the same way the ball
+  // saver's slot 1 is. See `EFFECT_EXTRA_BALL`.
+  if (element.effect === EFFECT_EXTRA_BALL) {
+    out.extraBalls += 1;
+    return;
+  }
   // 0x613A: the element's +$34 read as a SCRIPT and posted to the background
   // queue. Outside the `counter >= 0` block on purpose — an effect-17 element's
   // +$34 is not on the descriptor's counter list, so its `counter` is always -1
   // and the chain would never be reached from in there.
   if (element.effect === EFFECT_QUEUE_SCRIPT) {
     if (element.chainScript >= 0) queueScript(state, element.chainScript);
+    return;
+  }
+  // 0x61F6: the element's +$34 read as a RAMP and its live value paid into the
+  // score. Outside the `counter >= 0` block for the same reason the chain above
+  // is — a ramp record is not on the descriptor's counter list, so an effect-19
+  // element's `counter` is always -1 and nothing in there would ever be reached.
+  // The value is whatever the ramp has reached, and zero before its mission ever
+  // started it, which is what the machine's own uninitialised +$04..$09 gives.
+  // See `EFFECT_PAY_RAMP`.
+  if (element.effect === EFFECT_PAY_RAMP) {
+    if (element.rampCollect >= 0) out.comboPaid += state.rampValues[element.rampCollect] ?? 0;
     return;
   }
   // The counting and accumulator effects, all on the record the element's
@@ -2483,6 +2597,7 @@ export function tickModes(modes: TableModes, state: ModeState): ModeTickReport {
     bonusMultiplier: -1,
     holdBonus: false,
     holdMultiplier: false,
+    extraBalls: 0,
     comboPaid: 0,
     clearedFlagIds: [],
     ballSaveTicks: -1,
@@ -2561,6 +2676,7 @@ export function tickModes(modes: TableModes, state: ModeState): ModeTickReport {
     out.bonusMultiplier < 0 &&
     !out.holdBonus &&
     !out.holdMultiplier &&
+    out.extraBalls === 0 &&
     out.comboPaid === 0 &&
     out.clearedFlagIds.length === 0 &&
     out.ballSaveTicks < 0 &&
@@ -2583,6 +2699,7 @@ export function tickModes(modes: TableModes, state: ModeState): ModeTickReport {
     bonusMultiplier: out.bonusMultiplier,
     holdBonus: out.holdBonus,
     holdMultiplier: out.holdMultiplier,
+    extraBalls: out.extraBalls,
     comboPaid: out.comboPaid,
     clearedFlagIds: out.clearedFlagIds,
     ballSaveTicks: out.ballSaveTicks,

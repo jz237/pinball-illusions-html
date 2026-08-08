@@ -417,3 +417,170 @@ describe("award effect 10", () => {
     expect(plenty.counterCounts[4]).toBe(30);
   });
 });
+
+/**
+ * AWARD EFFECT 19 - the COLLECT the twelve ramps were missing.
+ *
+ * The ramps have ticked in this port since the round above; nothing collected
+ * six of them. +0x0061F6 is the harvester, and it is effect 27's sibling with
+ * one field changed:
+ *
+ *     0061F6  206a 0034            movea.l $34(a2),a0   ; a RAMP RECORD, base
+ *     0061FA  47e8 0002            lea     $2(a0),a3
+ *     0061FE  215b 0022            move.l  (a3)+,$22(a0)
+ *     006202  215b 0026            move.l  (a3)+,$26(a0)
+ *     006206  4eb9 0000 6bcc       jsr     $6BCC
+ *     00620C  4e75                 rts
+ *
+ * The two post-increments leave a3 at `ramp + $0A`, and $6BCC predecrements six
+ * times from what it is handed, so the six bytes paid are the ramp's +$04..$09 -
+ * the same field the service at +0x006334 accumulates into and the same field
+ * effect 27 harvests. 27 adds it to a counter's running step; 19 adds it to the
+ * SCORE. research/effects-tail/EFFECTS_TAIL.md section 3.
+ */
+describe("award effect 19", () => {
+  it("is the missing harvester, and the two harvest families partition the twelve ramps", () => {
+    // THE DECISIVE MEASUREMENT, and the one that says the +$34 really is a ramp
+    // base rather than something ramp-shaped: across three tables the effect-19
+    // elements and the effect-27 elements between them name every one of the
+    // twelve shipped ramps, once. If this wiring were wrong the two sets would
+    // overlap or leave a gap.
+    const partition: Record<string, [number[], number[], number]> = {
+      "law-n-justice": [[0, 1], [], 2],
+      babewatch: [[0], [], 1],
+      "extreme-sports": [
+        [0, 4, 8],
+        [1, 2, 3, 5, 6, 7],
+        9,
+      ],
+    };
+    let total = 0;
+    for (const tableId of TABLE_IDS) {
+      const modes = modesFor(tableId);
+      const [collect, harvest, count] = partition[tableId]!;
+      expect(modes.ramps.length).toBe(count);
+      const byNineteen = modes.elements.filter((one) => one.effect === 19);
+      const bySeven = modes.elements.filter((one) => one.effect === 27);
+      total += byNineteen.length;
+      // Every effect-19 element resolves to a ramp - the exporter throws rather
+      // than dropping one, so a -1 here would mean the field is unread.
+      expect(byNineteen.every((one) => one.rampCollect >= 0)).toBe(true);
+      expect([...new Set(byNineteen.map((one) => one.rampCollect))].sort((a, b) => a - b)).toEqual(
+        collect,
+      );
+      expect([...new Set(bySeven.map((one) => one.stepRamp))].sort((a, b) => a - b)).toEqual(harvest);
+      expect(collect.filter((one) => harvest.includes(one))).toEqual([]);
+      expect([...collect, ...harvest].sort((a, b) => a - b)).toEqual(
+        modes.ramps.map((one) => one.index),
+      );
+      // And nothing else carries the field: it is read for effect 19 alone.
+      expect(modes.elements.filter((one) => one.effect !== 19 && one.rampCollect >= 0)).toEqual([]);
+    }
+    expect(total).toBe(18);
+  });
+
+  it("pays the ramp's LIVE value into the score, where the element's own score is zero", () => {
+    // Law 'n Justice's hostage mission: elements 113..117 on ramp 0, which runs
+    // 20,000,000 down to 5,000,000 at 12,340 a frame. All six of the table's
+    // effect-19 elements carry score 0 AND bonus 0, so before this round every
+    // one of these shots paid NOTHING AT ALL.
+    const modes = modesFor("law-n-justice");
+    const hostages = modes.elements.filter((one) => one.effect === 19);
+    expect(hostages.map((one) => one.index)).toEqual([100, 113, 114, 115, 116, 117]);
+    expect(hostages.every((one) => one.score === 0 && one.bonus === 0)).toBe(true);
+    const ramp = modes.ramps[0]!;
+    expect([ramp.up, ramp.start, ramp.limit, ramp.increment]).toEqual([
+      false, 20_000_000, 5_000_000, 12_340,
+    ]);
+
+    // A STOPPED ramp holds its value, so this measures the award and not the
+    // service: the payment is the value, exactly, on the awarding tick.
+    const state = createModeState(modes);
+    state.rampValues[0] = 20_000_000;
+    state.rampRunning[0] = 0;
+    expect(award(modes, state, 113)).toBe(20_000_000);
+    // NOTHING IS SPENT. The handler writes nothing back to +$04..$09, so a
+    // second collect inside one countdown pays again - what puts the value back
+    // is opcode 15, and what stops the clock is opcode 16.
+    expect(state.rampValues[0]).toBe(20_000_000);
+    expect(award(modes, state, 114)).toBe(20_000_000);
+
+    // Half way down the countdown it is worth half way down the countdown.
+    state.rampValues[0] = 11_357_000;
+    expect(award(modes, state, 115)).toBe(11_357_000);
+
+    // AND A RAMP NOBODY STARTED IS WORTH ZERO - the machine's own uninitialised
+    // +$04..$09, and the same answer effect 27 gives on an unstarted ramp.
+    const fresh = createModeState(modes);
+    expect(fresh.rampValues[0]).toBe(0);
+    expect(award(modes, fresh, 113)).toBe(0);
+  });
+
+  it("collects the hostage mission's own countdown, driven out of script 194", () => {
+    // THE SHIPPED MISSION, END TO END. Script 194 is "SHOOT ALL TERRORISTS TO
+    // FREE HOSTAGES", selector 0 entry 7 - a SELECTED mission, so it is a mode
+    // a player picks - and its shape is the growing jackpot's: `RESTORE_POS 0`
+    // (opcode 15, +0x005DDA: reload the start value and start the clock),
+    // `START 113`, `WAIT 113`, then the same four more times for 114..117.
+    // Each shot is collected at whatever the falling clock has reached.
+    const modes = modesFor("law-n-justice");
+    const mission = modes.scripts[194]!;
+    // FIVE restarts for five hostages (113..117) and two stops. The sixth
+    // `START 112` at pc184 is the mission's own finisher and gets no fresh
+    // countdown, which is why the restarts are five and not six.
+    expect(mission.ops.filter((op) => op.op === 15).map((op) => op.args[0])).toEqual([0, 0, 0, 0, 0]);
+    expect(mission.ops.filter((op) => op.op === 16).map((op) => op.args[0])).toEqual([0, 0]);
+
+    // Run the mission on the background ring, which executes one opcode a tick
+    // and does not honour its WAITs, so the ramp falls only for the handful of
+    // frames between the `RESTORE_POS` and the shot; a real mission gives it as
+    // long as the player takes. Either way the payment is the LIVE value on the
+    // awarding tick, which is what is under test.
+    const state = createModeState(modes);
+    state.armed[113] = 1;
+    queueScript(state, 194);
+    for (let i = 0; i < 40 && state.rampRunning[0] !== 1; i += 1) tickModes(modes, state);
+    expect(state.rampRunning[0]).toBe(1);
+    // Seeded at 20,000,000 and already one increment down: the ramp service is
+    // the tail of the same tick the opcode ran on, exactly as +0x006334's slot
+    // in the frame chain at +0x004B70 sits after the interpreters.
+    expect(state.rampValues[0]).toBe(20_000_000 - 12_340);
+
+    // Let the clock run a while, then take the shot through its own script.
+    for (let i = 0; i < 200; i += 1) tickModes(modes, state);
+    const live = state.rampValues[0]!;
+    expect(live).toBeLessThan(20_000_000);
+    expect(live).toBeGreaterThan(5_000_000);
+
+    const paid = award(modes, state, 113);
+    // The ramp is still falling while script 52 walks to its `AWARD 113`, so
+    // the payment is the value on the awarding tick - below where the clock was
+    // when the shot started and still above the floor. What matters is that it
+    // is MILLIONS: this shot paid 0 before.
+    expect(paid).toBeLessThanOrEqual(live);
+    expect(paid).toBeGreaterThan(5_000_000);
+    expect(paid).toBe(state.rampValues[0]);
+  });
+
+  it("pays Extreme Sports' rock climb and mission 166 too, where the port paid a token bonus", () => {
+    // ES elements 53..56 are "TIME TO SCALE THE ROCK" on ramp 0 (20,000,000 ->
+    // 5,000,000) and element 81 is mission 166's on ramp 8 (100,000,000 ->
+    // 10,000,000). They ship score 0 with a 100,000 / 250,000 BONUS, which is
+    // the consolation the port paid where the machine pays tens of millions.
+    const modes = modesFor("extreme-sports");
+    const climb = [53, 54, 55, 56].map((index) => modes.elements[index]!);
+    expect(climb.every((one) => one.effect === 19 && one.rampCollect === 0)).toBe(true);
+    expect(climb.every((one) => one.score === 0 && one.bonus === 100_000)).toBe(true);
+    const mission166 = modes.elements[81]!;
+    expect([mission166.effect, mission166.rampCollect, mission166.score, mission166.bonus]).toEqual([
+      19, 8, 0, 250_000,
+    ]);
+    expect(modes.ramps[8]!.start).toBe(100_000_000);
+
+    const state = createModeState(modes);
+    state.rampValues[0] = 20_000_000;
+    expect(award(modes, state, 53)).toBe(20_000_000);
+    state.rampValues[8] = 100_000_000;
+    expect(award(modes, state, 81)).toBe(100_000_000);
+  });
+});

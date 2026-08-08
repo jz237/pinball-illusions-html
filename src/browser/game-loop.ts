@@ -675,8 +675,16 @@ export interface Game {
    * Balls served so far this game — CHARGED serves, every player's together.
    * `ballsPerGame * playerCount` of them ends it; `ballNumber` derives the
    * machine's `$d84` from it, which works because charged serves are strictly
-   * round-robin (the port has no extra balls, the one thing that would decouple
-   * them).
+   * round-robin.
+   *
+   * AND THE PORT NOW HAS EXTRA BALLS, which is the one thing that looked like
+   * it would decouple the two and does not. An extra ball is served by state 7
+   * (`Game.extraBallServe`), whose entry at +0x00505A `bra`s clear over the
+   * rotation at $5070 — where `subq.w #1,$d82` and `addq.w #1,$d84` live — so
+   * it charges nothing and advances nothing. It inserts an UNCHARGED serve for
+   * the player already up and leaves the sequence of charged ones exactly the
+   * round-robin `ballNumber` and `ballsRemaining` read it as. Only this field's
+   * increment site may ever move it, and only state 5 reaches that.
    */
   ballsServed: number;
   /**
@@ -754,6 +762,32 @@ export interface Game {
    * tilt warning, and the tilt card is state 8's, at +0x004D98.
    */
   ballSaving: boolean;
+  /**
+   * THE ORIGINAL'S STATE 7 — SHOOT AGAIN: the ball-end chain spent an extra ball
+   * and the lane owes this player a FREE re-serve.
+   *
+   * `move.w #$7,$8e(a5)` occurs at exactly one address, +0x005068, inside the
+   * two instructions the drain path takes when the player record's +$10 is
+   * non-zero (`tst.b $10(a0) / beq $5070` — no bank, rotate the player — else
+   * `subq.b #1,$10(a0)`), and its `bra $50B0` jumps CLEAR OVER the rotation at
+   * $5070 where `subq.w #1,$d82` (balls left) and `addq.w #1,$d84` (ball number)
+   * both live. So the re-serve costs the player nothing: no rotation, no charge
+   * to `ballsServed`, and hence no move in `ballNumber` or `ballsRemaining`,
+   * which is exactly what those two derive.
+   *
+   * A BOOLEAN, where the record's +$10 is a count, because this is the debt of
+   * ONE serve: the count lives on `ScoringState.extraBalls` and is spent one at
+   * a time by the ball-end chain, which is the only thing that ever sets this.
+   *
+   * State 7 is a SERVE state, not a machine-owed one like state 6: `+0x004FC0`
+   * sets `$d7b` — the byte the tilt-meter reset at +0x0054B6 hangs off, and only
+   * states 5 and 7 set it — and `+0x004FC4` draws descriptor +$88's PLAYER/BALL
+   * card through the same `jsr $6868` state 5's own +0x0049BE does. What it does
+   * NOT do is write `$d8a`: an extra ball gets no ball saver, because the
+   * teardown at +0x0050FA has already zeroed the countdown and nothing in state
+   * 7 re-arms it. research/effects-tail/EFFECTS_TAIL.md §2.4.
+   */
+  extraBallServe: boolean;
   /**
    * Saucers whose script has run `PUSH` and which are counting down to spitting
    * their ball back onto the playfield, newest first.
@@ -1068,6 +1102,7 @@ export function createGame(map: TableMap, options?: Partial<GameOptions>): Game 
     multiball: false,
     ballSaveTicks: 0,
     ballSaving: false,
+    extraBallServe: false,
     lockEjectStack: [],
     lockEjecting: null,
     pushClamp: null,
@@ -1157,6 +1192,7 @@ export function startGame(game: Game, players: number = 1): void {
   game.laneBallId = null;
   game.ballSaveTicks = 0;
   game.ballSaving = false;
+  game.extraBallServe = false;
   game.serveCountdown = game.options.firstServeDelayTicks;
   game.stillTicks = 0;
   game.searchPulses = BALL_SEARCH_PULSES;
@@ -1465,6 +1501,27 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
           game.pendingServes -= 1;
           game.autoLaunchCountdown = AUTO_LAUNCH_DELAY_TICKS;
           if (game.pendingServes > 0) game.serveCountdown = game.options.serveDelayTicks;
+        } else if (game.extraBallServe) {
+          // THE ORIGINAL'S STATE 7. It is a serve state and not a machine-owed
+          // one, so it runs everything the charged serve at state 5 runs EXCEPT
+          // the charge and the saver: `+0x004FC0` sets `$d7b`, which is the byte
+          // the tilt-meter reset at +0x0054B6 hangs off and which only states 5
+          // and 7 ever set, and `+0x004FC4` draws descriptor +$88's PLAYER/BALL
+          // card through the same `jsr $6868` state 5 uses at +0x0049BE. It never
+          // writes `$d8a`, so there is NO BALL SAVER on an extra ball — the
+          // teardown at +0x0050FA zeroed the countdown and nothing here re-arms
+          // it. And it does not touch `ballsServed`, because $5070's two
+          // decrements were jumped clear over. See `Game.extraBallServe`.
+          game.extraBallServe = false;
+          game.tilt = resetTiltForNewBall();
+          game.ballsLocked = 0;
+          game.searchPulses = BALL_SEARCH_PULSES;
+          // `bra $50b0` lands two instructions above $3F10, so the ball-start
+          // soft reset runs for an extra ball exactly as it does for a fresh
+          // one and the group-backed first-hit awards come back. The comment on
+          // the charged serve below has the whole argument.
+          resetScoringForNewBall(game.scoring, groupBackedFlagIds(game.modes));
+          game.announcingServe = true;
         } else if (heldBallCount(game.locks) > 0) {
           // The table is empty only because a saucer is KEEPING the player's
           // ball. Replacing it costs the player nothing — the ball they were
@@ -2056,6 +2113,38 @@ function endBallAfterBonus(game: Game): boolean {
   // never needs to be per player.
   game.ballSaveTicks = 0;
   game.ballSaving = false;
+  // THE EXTRA-BALL ARM, +0x00505A, taken BEFORE the rotation and on either
+  // player count:
+  //
+  //     00505A  206d 0dc2      movea.l $dc2(a5),a0
+  //     00505E  4a28 0010      tst.b   $10(a0)        ; any banked?
+  //     005062  670c           beq.s   $5070          ;  no -> rotate the player
+  //     005064  5328 0010      subq.b  #1,$10(a0)     ; spend one
+  //     005068  3b7c 0007 008e move.w  #$7,$8e(a5)    ; state 7 = SHOOT AGAIN
+  //     00506E  6040           bra.s   $50b0          ; ...over $5070 entirely
+  //
+  // $5070 is where `subq.w #1,$d82` (balls left) and `addq.w #1,$d84` (ball
+  // number) live, so an extra ball costs neither. That is why NOTHING here
+  // touches `ballsServed`: `ballNumber` and `ballsRemaining` both derive from
+  // it, and both are right precisely because they derive from the CHARGED
+  // serves, which stay strictly round-robin — an extra ball inserts an
+  // uncharged serve for the same player and leaves that sequence alone.
+  //
+  // The tail is the one-player body below, line for line, because `bra $50b0`
+  // lands on exactly the block the rotation falls into: the ball-start walks
+  // (already run on this bank at the drain, since no rotation swapped it),
+  // $427C's hold settle, and hook 2. What it skips is the game-over test, and
+  // it must: a bank spent here is a ball the player has not been given yet.
+  if (game.scoring.extraBalls > 0) {
+    game.scoring.extraBalls -= 1;
+    game.extraBallServe = true;
+    game.serveCountdown = game.options.serveDelayTicks;
+    clearBonusForNewBall(game.scoring);
+    if (game.modes !== null && game.modeState !== null) {
+      restoreMultiplierLamps(game.modes, game.modeState, game.scoring.multiplier);
+    }
+    return false;
+  }
   if (game.playerCount <= 1) {
     clearBonusForNewBall(game.scoring);
     // Descriptor HOOK 2, `jsr ([$94,a5],$A4)` at +0x005116, runs on the
@@ -2304,6 +2393,13 @@ function runModes(game: Game, awards: readonly Award[]): ModeTickReport {
   if (report.bonusMultiplier >= 0) game.scoring.multiplier = report.bonusMultiplier;
   if (report.holdBonus) game.scoring.holdBonus = true;
   if (report.holdMultiplier) game.scoring.holdMultiplier = true;
+  // And the FOURTH of them: award effect 1's `addq.b #1,$10(a0)`, the extra
+  // ball. `+=` rather than `= true`, because the machine's is an ADD on a byte
+  // and banked extra balls stack. `game.scoring` is the ACTIVE player's bank,
+  // which is the record `$dc2(a5)` points at, so a shot in a four-player game
+  // banks the ball for whoever is shooting. What the loop then does with it is
+  // `endBallAfterBonus`; see `EFFECT_EXTRA_BALL` and `Game.extraBallServe`.
+  if (report.extraBalls > 0) game.scoring.extraBalls += report.extraBalls;
   // And the fourth: the force-off's `bclr` on an element's start lamp is a
   // `bclr` on a device's or a zone's first-hit flag byte, because on the
   // shipped data they are the same byte. The mission machine names the ids; the
@@ -3519,6 +3615,9 @@ export function renderGame(
       // out when the last ball goes — which is the whole of the time state 6's
       // card is up. See `ballSaveLampLit`.
       game.ballSaving ? 0 : game.ballSaveTicks,
+      // And SHOOT AGAIN is the engine's too, off the banked count on the player
+      // record whose ball is up. See `applyShootAgainLamp`.
+      game.scoring.extraBalls,
     );
   }
   // The bats and the balls, as decoded SPRITES on the playfield's own pixel

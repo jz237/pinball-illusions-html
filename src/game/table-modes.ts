@@ -213,6 +213,38 @@ export interface ModeElement {
    */
   readonly stepRamp: number;
   /**
+   * Award effect 19's RAMP TO COLLECT: an index into `TableModes.ramps`, or -1.
+   *
+   * The FOURTH reading of +$34, and the collect half of a growing jackpot.
+   * +0x0061F6 is twenty-two bytes — `movea.l $34(a2),a0 / lea $2(a0),a3 /
+   * move.l (a3)+,$22(a0) / move.l (a3)+,$26(a0) / jsr $6BCC` — and the two
+   * post-increments leave a3 at `ramp + $0A`, which is exactly the pointer
+   * `$6BCC` predecrements six times from: the ramp's own +$04..$09 live value,
+   * added straight into the CURRENT PLAYER'S SCORE.
+   *
+   * The sibling is `stepRamp`. Effect 27 harvests the same six bytes of a ramp
+   * into a counter's running STEP; effect 19 pays them to the SCORE. Across the
+   * three tables the two families partition the twelve shipped ramps exactly —
+   * 19 takes law-n-justice 0/1, babewatch 0, extreme-sports 0/4/8; 27 takes
+   * extreme-sports 1/2/3/5/6/7 — with no overlap and no gap, which is what says
+   * the two readings of two different fields are one mechanism seen twice.
+   *
+   * Eighteen elements carry it, and eleven of them are shots a player can reach
+   * today: Law 'n Justice's selected hostage mission (elements 113..117, ramp 0,
+   * counting 20,000,000 down to 5,000,000 over 24 seconds) and its jail lock's
+   * element 100 (ramp 1, 50,000,000 down to 10,000,000), and Extreme Sports'
+   * "TIME TO SCALE THE ROCK" (53..56, ramp 0) and mission s166's element 81
+   * (ramp 8, 100,000,000 down to 10,000,000). Before this field they paid their
+   * elements' own score, which is zero on Law 'n Justice's six and 100,000 to
+   * 250,000 on Extreme Sports'.
+   *
+   * The handler also copies the value into the ramp's otherwise-unused
+   * +$22..$29. NOT MODELLED and not exported: no relocated pointer in any
+   * package points there and the ramp list's one reader never sources it, so
+   * the copy has no decoded consumer. research/effects-tail/EFFECTS_TAIL.md §9.1.
+   */
+  readonly rampCollect: number;
+  /**
    * Award effect 10's PAY COUNT: the element's +$38 as a word, the number of
    * times +0x0061BA pays the counter's accumulator. Zero for every other
    * effect; Law 'n Justice's element 89 (25) is the corpus's one site.
@@ -767,6 +799,12 @@ export function parseTableModesDocument(doc: TableModesDocument): TableModes {
           Number.MAX_SAFE_INTEGER,
         ),
         stepRamp: requireWholeNumber(item["stepRamp"] ?? -1, `${where} stepRamp`, -1, ramps.length - 1),
+        rampCollect: requireWholeNumber(
+          item["rampCollect"] ?? -1,
+          `${where} rampCollect`,
+          -1,
+          ramps.length - 1,
+        ),
         payCount: requireWholeNumber(item["payCount"] ?? 0, `${where} payCount`, 0, 0xffff),
       }),
     );

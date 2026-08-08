@@ -270,10 +270,21 @@ const HEADER_BONUS_ROUTINE = 0x80;
  *   extreme-sports group 19  script 183  three lamps  = upper zones 7/8/9
  *                  (the upper-deck lanes; all three -> element 91 -> ladder 7)
  * BabeWatch's OTHER orphan, script 159, is not a lamp group: its one referrer
- * (h4+0x6062) is an entry of the {flag.w, time.w, script.l} timeline at
- * h4+0x605E — "THE CASINO IS OPEN / CLOSED", read through the descriptor's
- * +$68 clock-record list by the BCD clock service at main.seg00 +0x006334 —
- * a clock-scheduled award this export leaves unbound.
+ * (h4+0x6062) is an entry of the 8-byte-record table at h4+0x605E.
+ *
+ * THE RECORD SHAPE AND THE REFERRER ABOVE ARE RIGHT; THE CONSUMER NAMED IN AN
+ * EARLIER ROUND WAS NOT. That table is not a {flag.w, time.w, script.l} clock
+ * timeline on the descriptor's +$68, and +0x006334 does not read it: +$68 is
+ * the RAMP list (`HEADER_RAMPS`, and `rampList` fifty lines away builds it) and
+ * +0x006334 is the ramp service. The table is AWARD EFFECT 26's PRIZE TABLE,
+ * reached from BabeWatch element 66's own +$34 by the handler at main.seg00
+ * +0x006102, which rolls the VBlank counter `$C8AC & $FF` and walks eight
+ * {flags.b, spare.b, cumulative-threshold.w, script.l} entries whose gaps
+ * (25/35/45/6/35/40/45/25) sum to exactly 256. Script 159 is prize #0. The
+ * "CASINO" name came from adjacency — "THE CASINO IS CLOSED\0" ends at
+ * h4+0x605C, two bytes before the table. See research/effects-tail/EFFECTS_TAIL.md
+ * §4. This export still leaves the prize table unbound: element 66's only
+ * awarder is unreachable, so nothing in play can spin the wheel.
  */
 const HEADER_LAMP_GROUPS = 0x38;
 /** Group record fields. Cited on `HEADER_LAMP_GROUPS`. */
@@ -378,6 +389,37 @@ const EFFECT_STEP_SUBTRACT = 25;
  */
 const ELEMENT_STEP_RAMP = 0x38;
 const EFFECT_STEP_ADD_RAMP = 27;
+/**
+ * THE FOURTH READING OF +$34 — award effect 19's RAMP TO COLLECT.
+ *
+ * Effect 19's handler is the whole of main.seg00 +0x0061F6, twenty-two bytes:
+ *
+ *   0061F6  206a 0034        movea.l $34(a2),a0   ; a RAMP RECORD, base
+ *   0061FA  47e8 0002        lea     $2(a0),a3    ; its 8-byte LIVE VALUE
+ *   0061FE  215b 0022        move.l  (a3)+,$22(a0)
+ *   006202  215b 0026        move.l  (a3)+,$26(a0)
+ *   006206  4eb9 0000 6bcc   jsr     $6BCC        ; a3 = a0+$0A -> pay +$04..$09
+ *   00620C  4e75             rts
+ *
+ * `$6BCC` predecrements six times from the pointer it is handed and `abcd`s the
+ * six packed-BCD bytes into the CURRENT PLAYER'S SCORE, so effect 19 pays the
+ * ramp's +$04..$09 — the identical field the ramp service at +0x006334
+ * accumulates into with `lea $A(a1),a2`. It is the COLLECT of a growing jackpot,
+ * and effect 27 (which harvests the same six bytes into a counter's running step,
+ * naming them through the element's +$38 as `ramp + 2`) is its sibling.
+ *
+ * That the +$34 is a ramp BASE is measured, not assumed: all eighteen shipped
+ * effect-19 elements land on one, and the two harvest families partition the
+ * twelve shipped ramps exactly — effect 19 takes law-n-justice 0/1, babewatch 0
+ * and extreme-sports 0/4/8; effect 27 takes extreme-sports 1/2/3/5/6/7. No
+ * overlap and no gap, which is why this refuses rather than dropping.
+ *
+ * THE +$22..$29 COPY IS NOT EXPORTED. No relocated pointer in any of the three
+ * packages points at ramp+$22, and the only reader of the ramp list in main
+ * hunk 0 (+0x006334) never sources it, so the copy is a write with no decoded
+ * reader. research/effects-tail/EFFECTS_TAIL.md §3 and §9.1.
+ */
+const EFFECT_PAY_RAMP = 19;
 /**
  * Award effect 10 (+0x0061BA) reads the SAME +$38 word as effect 20 does, but as
  * a PAY COUNT: `move.w $38(a2),d0`, compared against the per-player count at
@@ -1771,6 +1813,27 @@ function decode(pkg, table) {
     return found;
   });
 
+  // AWARD EFFECT 19's RAMP — the fourth reading of +$34, resolved through the
+  // ramp pool by BASE (where effect 27's +$38 names the same record's live-value
+  // slot, base + 2). See `EFFECT_PAY_RAMP`.
+  //
+  // Refused rather than silently dropped, for the same reason `chainScript` and
+  // `stepRamp` refuse: an effect-19 element whose +$34 is not a ramp base would
+  // mean `jsr $6BCC` is paying six bytes of something else into the score.
+  const elementRampCollect = elementList.map((at) => {
+    if (readU16(pkg, at, ELEMENT_EFFECT) !== EFFECT_PAY_RAMP) return -1;
+    const target = follow(pkg, at, ELEMENT_COUNTER);
+    const found = target === null ? undefined : rampIndexByKey.get(key(target));
+    if (found === undefined) {
+      throw new Error(
+        `${pkg.stem}: effect-19 element at ${key(at)} points its +$34 at ` +
+          `${target === null ? "nothing" : key(target)}, which is not a ramp record base; ` +
+          "award effect 19 pays six packed-BCD bytes at that address + 4 into the score",
+      );
+    }
+    return found;
+  });
+
   // THE LAMP GROUPS off descriptor +$38, and the hook-2 multiplier restore
   // decoded from the descriptor's own tail. See `HEADER_LAMP_GROUPS`.
   const groups = lampGroups(pkg, scriptIndex, elementList, residue);
@@ -1800,6 +1863,9 @@ function decode(pkg, table) {
     // effect 27 harvests instead; `payCount` is effect 10's ask.
     stepAddend: elementStepAddend(pkg, at),
     stepRamp: elementStepRamp[index],
+    // Award effect 19's ramp, harvested to the SCORE where `stepRamp`'s goes to
+    // a counter's running step. The two sets partition the twelve ramps.
+    rampCollect: elementRampCollect[index],
     payCount: elementPayCount(pkg, at),
   }));
 

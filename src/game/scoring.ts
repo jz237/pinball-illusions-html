@@ -303,6 +303,25 @@ export interface ScoringState {
   holdBonus: boolean;
   /** `+$14`: this ball's multiplier survives into the next one. Award effect 8. */
   holdMultiplier: boolean;
+  /**
+   * `+$10`: EXTRA BALLS BANKED, the SHOOT AGAIN count. Award effect 1
+   * (+0x00606C `addq.b #1,$10(a0)`) adds one; the drain path at +0x00505A
+   * spends one and hands the ball back without rotating the player.
+   *
+   * PER PLAYER and PER GAME, and both halves are read off the instructions. Per
+   * player because it is a byte of this same 22-byte record — +$10, one below
+   * the hold bonus at +$11 and four below the hold multiplier at +$14 — reached
+   * through `$dc2(a5)` exactly as they are. Per game because the only clear in
+   * the segment is `move.b d1,$10(a0)` inside the per-GAME record walk at
+   * +0x004588, and `$427C` — the per-ball settle three fields away, which reads
+   * +$11 and +$14 — never touches it. So a bank survives a drain, which is what
+   * "SHOOT AGAIN" has to mean.
+   *
+   * A COUNT, not a flag: `addq.b #1` stacks and does not saturate. The machine's
+   * byte would wrap at 256 and no shipped table can plausibly get there.
+   * research/effects-tail/EFFECTS_TAIL.md §2.
+   */
+  extraBalls: number;
 }
 
 export function createScoringState(): ScoringState {
@@ -315,6 +334,7 @@ export function createScoringState(): ScoringState {
     multiplier: 0,
     holdBonus: false,
     holdMultiplier: false,
+    extraBalls: 0,
   };
 }
 

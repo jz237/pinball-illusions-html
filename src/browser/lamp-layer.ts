@@ -212,8 +212,9 @@ export function drawLampOverlays(
   tick: number,
   fullTable = false,
   ballSaveTicks = 0,
+  extraBalls = 0,
 ): void {
-  const modes = lampModes(lamps, modeState, ballSaveTicks);
+  const modes = lampModes(lamps, modeState, ballSaveTicks, extraBalls);
 
   const hd = hdLayerFor(map, lamps);
   if (hd !== null) {
