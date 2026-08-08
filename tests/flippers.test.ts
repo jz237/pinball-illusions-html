@@ -99,6 +99,7 @@ import {
   substepsPerStrokeStep,
   sweptAngle,
   applyFlipperReactions,
+  flipperContactArm,
   flipperImpulseMagnitude,
   flipperImpulseRadius,
   flipperRateTaken,
@@ -858,6 +859,63 @@ describe("the impulse table", () => {
     expect(flipperRateTaken(45, 0)).toBe(flipperImpulseRadius(45, 0) >> 1);
     expect(flipperRateTaken(0, 0)).toBe(0);
     expect(flipperImpulseMagnitude(0, 0)).toBeGreaterThan(0);
+  });
+
+  it("indexes at the BALL CENTRE where the machine indexes at the CONTACT POINT", () => {
+    // A KNOWN, MEASURED, DELIBERATELY UNCLOSED DIFFERENCE, and this case is what
+    // stops it becoming a forgotten one. `resolveAtPass` has the whole argument;
+    // the short version is that indexing here at `touch.armX/armY` makes the
+    // DEDUCTION exact on all 43 pinned seats (from 2, median +1 to 43, median 0)
+    // and takes the DEPARTURE from 0.9576 to 0.9173 on 139 machine-captured
+    // shots, and the machine spends one table entry on both.
+    //
+    // Both halves are asserted, because a note is not executed and BUG_HUNT §A#1
+    // is what happens when only one of them is:
+    //
+    //   1. `flipperContactArm` really is the machine's radius — the contact
+    //      point on the ball's circumference, hence STRICTLY NEARER the pivot
+    //      than the centre at every seat along the blade.
+    //   2. the SHIPPED resolver charges the CENTRE's deduction, not that one,
+    //      and the ladders differ by the pinned amounts below.
+    //
+    // Change the resolver and (2) fails with the new ladder in hand; change the
+    // geometry and (1) fails; and nothing can quietly agree with itself.
+    const machine: number[] = [];
+    const port: number[] = [];
+    for (let along = 12; along <= 44; along += 4) {
+      const at = ballRestingOn(LEFT, FLIPPER_AT_REST, along);
+      const arm = flipperContactArm(LEFT, FLIPPER_AT_REST, at.x, at.y);
+      expect(arm, `no contact at along ${along}`).not.toBeNull();
+      const centreDx = Math.trunc(Math.abs(at.x - LEFT.pivotX) / Q10_ONE);
+      const centreDy = Math.trunc(Math.abs(at.y - LEFT.pivotY) / Q10_ONE);
+      // (1) the contact point is a ball radius nearer the pivot, on every seat.
+      expect(
+        Math.hypot((arm as { dx: number }).dx, (arm as { dy: number }).dy),
+        `along ${along}`,
+      ).toBeLessThan(Math.hypot(centreDx, centreDy));
+      machine.push(flipperRateTaken((arm as { dx: number }).dx, (arm as { dy: number }).dy));
+      port.push(flipperRateTaken(centreDx, centreDy));
+    }
+    expect({ machine, port }).toEqual({
+      machine: [4, 6, 7, 9, 10, 12, 13, 14, 15],
+      port: [6, 7, 8, 9, 11, 12, 13, 15, 16],
+    });
+
+    // (2) and the shipped contact charges the PORT's ladder. Taken at a pass the
+    // coil has already got moving, so `min(|rate|, taken)` is not the rate.
+    const at = ballRestingOn(LEFT, FLIPPER_AT_REST, 28);
+    const ball = createBall(0, at.x, at.y);
+    const sweep = tickFlipper(LEFT, FLIPPER_AT_REST, true);
+    const contacts = resolveFlipperContacts([ball], [sweep], BALL_RADIUS);
+    const charged = contacts.filter((one) => one.rateTaken > 0);
+    expect(charged.length).toBeGreaterThan(0);
+    const centreDx = Math.trunc(Math.abs(at.x - LEFT.pivotX) / Q10_ONE);
+    const centreDy = Math.trunc(Math.abs(at.y - LEFT.pivotY) / Q10_ONE);
+    const arm = flipperContactArm(LEFT, FLIPPER_AT_REST, at.x, at.y);
+    expect(charged[0]?.rateTaken).toBe(flipperRateTaken(centreDx, centreDy));
+    expect(charged[0]?.rateTaken).not.toBe(
+      flipperRateTaken((arm as { dx: number }).dx, (arm as { dy: number }).dy),
+    );
   });
 
   /**

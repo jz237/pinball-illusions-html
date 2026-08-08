@@ -113,10 +113,18 @@
  * left is `elasticity` (400, against 612 for the measured rubber row), which is
  * what lets a ball be trapped on a raised flipper.
  *
- * The radius is the ball CENTRE's distance from the pivot, because that is what
- * +0x00AEB4 measures — `movem.w $2(a0),d3-d4` is the pivot and d0/d1 arrive as
- * the ball's whole-pixel position. It is not the lever arm to the touched point
- * on the surface.
+ * THE RADIUS THIS PORT USES IS THE BALL CENTRE'S, AND THE MACHINE'S IS THE
+ * CONTACT POINT'S. This file asserted for four rounds that the two were the same
+ * thing — "because that is what +0x00AEB4 measures" — and they are not.
+ * `+0x00AEB6`'s `sub.w d3,d0` measures from whatever d0/d1 hold, and what they
+ * hold is built seventy instructions earlier in a different routine, at
+ * `+0x00AD9E`: the ball's TOP-LEFT CORNER plus the ring offset for its contact
+ * bearing, stored to `$2a/$2c(a4)` and carried untouched through the region walk
+ * and the surface dispatch into the flipper handler. `flipperImpulseRadius` has
+ * the instructions and `resolveAtPass` has the measurement of what happens when
+ * this port indexes there instead — the deduction becomes exact on all 43 pinned
+ * seats and the departure gets worse on all 139 shots. The difference is
+ * therefore NAMED here and not closed, which is the state of it.
  *
  * ---------------------------------------------------------------------------
  * WHY THE TICK IS SUBDIVIDED
@@ -509,9 +517,15 @@ export const ORIGINAL_IMPULSE_SCALE_Q16 = 35810;
  * WHAT THE WIDER COLLISION BAT DID TO IT. The nearest a ball's CENTRE can come
  * to the pivot is the boss half-thickness plus the ball's radius, which the
  * silhouette re-measurement moved from 5 + 8 = 13 px to 8 + 8 = 16 px. So the
- * smallest table entry a flipper can now read is `isqrt(16*16*35810>>16)` = 11,
+ * smallest table entry a flipper can read is `isqrt(16*16*35810>>16)` = 11,
  * floored to 15, against 9 floored to 13 before. A boss shot leaves marginally
  * stronger, and no radius the bat can produce is outside the table.
+ *
+ * ON THE MACHINE THE FLOOR DOES MORE THAN THIS. It indexes at the CONTACT POINT
+ * (see `flipperImpulseRadius`), which sits a ball radius nearer the pivot, so
+ * its smallest reachable entry is `isqrt(8*8*35810>>16)` = 5, floored to 10 —
+ * a ball caught against the hub is handed a floor rather than a lever arm. This
+ * port does not reach that regime, and `resolveAtPass` says why.
  */
 export const ORIGINAL_IMPULSE_FLOOR = 46;
 
@@ -531,11 +545,38 @@ export const ORIGINAL_IMPULSE_TANGENT = 8;
 export const ORIGINAL_TANGENT_GATE = 4000;
 
 /**
- * The original's raw table entry for a ball `dx`,`dy` pixels from the pivot.
+ * The original's raw table entry for a CONTACT POINT `dx`,`dy` pixels from the
+ * pivot.
  *
  * Whole pixels in, whole units out, integers throughout. Both offsets are taken
  * as magnitudes (the `neg.w` pair at +0x00AEBC/+0x00AEC4) and clamped to the
  * table's 64 px side.
+ *
+ * WHICH POINT, in the machine's own bytes, because Capstone renders the two
+ * loads differently and only one of them is right — it drops the index SCALE
+ * bits, so `32 30 54 02` prints as `$2(a0,d5.w)` when the extension word `5402`
+ * has scale field 2, i.e. `*4`, exactly like the `5400` above it:
+ *
+ *     00ACFE  divu.w  d4, d5
+ *     00AD00  andi.w  #$7ff, d5        ; the ball's CONTACT BEARING, 2048/turn
+ *     00AD04  move.w  d5, $28(a4)
+ *     ...
+ *     00AD92  mulu.w  #$580, d5        ; bearing * 1408
+ *     00AD96  addi.l  #$8000, d5       ; + 1/2
+ *     00AD9C  swap    d5               ; >> 16  -> 0..44, the ring index
+ *     00AD9E  move.w  (a0, d5.w*4), d0 ; ring offset x   (4-byte entries)
+ *     00ADA2  move.w  $2(a0, d5.w*4), d1 ; ring offset y
+ *     00ADA6  add.w   $12(a4), d0      ; + the ball's TOP-LEFT x
+ *     00ADAA  add.w   $14(a4), d1      ; + its top-left y
+ *     00ADAE  move.w  d0, $2a(a4)      ; THE CONTACT POINT
+ *     00ADB2  move.w  d1, $2c(a4)
+ *
+ * d0/d1 are then carried untouched through the region walk at +0x00ADB6..
+ * +0x00AE08 and the surface dispatch at +0x00AE28 into the flipper handler, and
+ * `+0x00AEB6`'s `sub.w d3,d0` / `sub.w d4,d1` subtract the pivot FROM THEM. So
+ * the index is the touched point on the ball's circumference, not its centre.
+ * `tools/rig-upper.py` reads `$2a/$2c` out of RAM as the `ccx`/`ccy` columns and
+ * `research/flipper-power/UPPER_BAT.md` §4.2 is the measurement.
  */
 export function flipperImpulseRadius(dx: number, dy: number): number {
   const x = Math.min(ORIGINAL_IMPULSE_TABLE_SIDE - 1, Math.abs(Math.trunc(dx)));
@@ -2135,6 +2176,36 @@ function touchAt(
 }
 
 /**
+ * The whole-pixel `dx`,`dy` the MACHINE indexes its impulse table at for a ball
+ * at `ballX`,`ballY` against a bat in `state` — `|contact point - pivot|` per
+ * axis — or `null` if nothing touches.
+ *
+ * NOT what `resolveAtPass` indexes at. That is the whole point of it existing:
+ * the machine's rule and this port's rule are different, the difference is
+ * measured rather than assumed, and both instruments that measure it — the
+ * pinned-seat probe in `research/flipper-power` and the case in
+ * `tests/flippers.test.ts` — read the machine's radius from HERE instead of
+ * restating the arithmetic beside the resolver. §4.2's residual was measured for
+ * three rounds against a helper that recomputed `|ball - pivot|` on its own, and
+ * a probe that recomputes what it is scoring is a probe that goes on reporting
+ * the old answer after the subject changes.
+ */
+export function flipperContactArm(
+  config: FlipperConfig,
+  state: FlipperState,
+  ballX: Q10,
+  ballY: Q10,
+  ballRadius: Q10 = DEFAULT_PROBE_RADIUS,
+): { readonly dx: number; readonly dy: number } | null {
+  const touch = touchAt(config, state.stroke, flipperAngle(config, state), ballX, ballY, ballRadius);
+  if (touch === null) return null;
+  return {
+    dx: Math.trunc(Math.abs(touch.armX) / Q10_ONE),
+    dy: Math.trunc(Math.abs(touch.armY) / Q10_ONE),
+  };
+}
+
+/**
  * Poses that would have to be sampled inside ONE step of the stroke for a bat
  * not to be able to step its own tip over a ball: ONE, on every shipped bat.
  *
@@ -2457,6 +2528,43 @@ function resolveAtPass(
     q10Multiply(surfaceX, touch.normalX) + q10Multiply(surfaceY, touch.normalY);
   let rateTaken = 0;
   if (state.rate !== 0 && facing > 0) {
+    // THE BALL CENTRE — AND THE MACHINE USES THE CONTACT POINT. That is not a
+    // slip left lying about. It was decoded, implemented, measured on both
+    // instruments and WITHDRAWN on 2026-08-08, and the two numbers are why.
+    //
+    // `flipperImpulseRadius` carries the bytes. Swapping these two lines for
+    // `touch.armX/armY` — which IS `contact - pivot` and needs nothing else —
+    // makes the DEDUCTION exact: on the 43 pinned seats that load a blade
+    // without stopping it, `flipperRateTaken` goes from exact on 2, within one
+    // on 38, median +1, to exact on ALL 43, median 0. That is the residual
+    // `FLIPPER_POWER.md` §4 chased twice and mis-attributed once, and it closes
+    // completely.
+    //
+    // But the machine reads ONE table entry and spends it twice — `move.w d0,d3
+    // / lsr.w #1,d3` is the deduction and `add.w d5,d0` at +0x00AEF6 is the
+    // magnitude, both off the `d0` loaded at +0x00AEC6 — so the same swap moves
+    // the magnitude, and the magnitude is what the ball leaves at. On the 139
+    // machine-captured shots of §5 the departure ratio goes 0.9576 -> 0.9173 and
+    // the difference goes -0.612 +-0.494 -> -1.197 +-0.476 px/frame: from an
+    // interval that nearly contains zero to one that plainly does not. All three
+    // tables get worse — 0.9681 -> 0.9551, 0.9034 -> 0.8356, 0.9665 -> 0.8966.
+    //
+    // So the decode is right and this port's arithmetic does not reach it the
+    // same way: something in the magnitude path carries a compensating error of
+    // about a ball radius, and indexing at the centre has been hiding it.
+    // MEASURED, not inferred — charging the deduction at the contact point and
+    // leaving the magnitude here scores 0.9672 / -0.475 +-0.508, better than
+    // either whole answer. That is the shape of a cancellation, and it is
+    // exactly why it is not shipped: the machine has one radius, not two, and a
+    // port that used two because the pair scored well would be tuned rather than
+    // decoded.
+    //
+    // WHAT WOULD SETTLE IT is `$2a/$2c` captured on STRIKE frames. The pinned
+    // and grid captures carry those columns and say the port's contact point is
+    // the machine's there; none of the three strike captures the departure is
+    // measured on does, because they predate the columns. `flippers.test.ts`
+    // executes both halves of this note, so it cannot rot the way BUG_HUNT
+    // §A#1's citation did.
     const dx = Math.trunc(Math.abs(ball.x - config.pivotX) / Q10_ONE);
     const dy = Math.trunc(Math.abs(ball.y - config.pivotY) / Q10_ONE);
     rateTaken = Math.min(Math.abs(state.rate), flipperRateTaken(dx, dy));
