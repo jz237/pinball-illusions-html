@@ -981,12 +981,25 @@ describe("R5c: every table's third bat is wired, level-gated and throws upfield"
    * about 24 px along the blade, and that is exactly where the launches below
    * stop.
    *
-   * NOT MEASURED AGAINST THE MACHINE: no capture in `research/flipper-power` has
-   * a ball loading an upper bat, so this is the decoded rule extrapolated to a
-   * coil the RAM traces never exercise. It is asserted here as what the port
-   * DOES, with the mechanism named, rather than smoothed into a claim the
-   * evidence does not carry. The next round that captures a ball on BabeWatch's
-   * (205,115) settles it.
+   * MEASURED AGAINST THE MACHINE, 2026-08-08. This used to say "NOT MEASURED
+   * ... no capture in `research/flipper-power` has a ball loading an upper bat",
+   * and `research/flipper-power/tools/rig-upper.py` now puts one there by
+   * writing the machine's own ball record. On Extreme Sports' upper bat — the
+   * 15-unit coil — a ball pinned 45.6 px out holds the record's `+$12` angle on
+   * its rest stop for the whole 0.70 s hold while `+$10` cycles 15, 0, 15, 0:
+   * the coil putting its acceleration back at every animation step and the ball
+   * taking all of it at every collision pass. The control stroke immediately
+   * before it reached the full 1215. THE ORIGINAL STALLS.
+   *
+   * The deduction is measured too, on 29 loaded seats over three tables and
+   * four bats: the port's `flipperRateTaken` is within ONE unit of the
+   * machine's on 27 of them and within two on all 29, always on the high side.
+   * That one unit is why the port's stall threshold sits one deduction-unit
+   * inboard of the machine's, and it is named in `UPPER_BAT.md` §5 rather than
+   * tuned away. BabeWatch's own upper blade could not be loaded at all — the
+   * machine ran its FREE ladder at every one of 36 pinned seats where the other
+   * two tables' upper bats loaded — so the BabeWatch case below is still the
+   * arithmetic and not a reading. See `research/flipper-power/UPPER_BAT.md`.
    */
   it("launches a ball off every upper bat, from every point its own coil can lift", () => {
     // The drop matrix for the third bats: a ball laid on the striking face is

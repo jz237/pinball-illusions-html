@@ -6,7 +6,7 @@
 // goes under the flipper instead of shooting up". Neither is visible to a
 // census, to the per-frame RAM gate, or to the film gate. Both are visible here.
 //
-// Four scenarios, run against the REAL loop (`createGame` / `runTicks` /
+// FIVE scenarios, run against the REAL loop (`createGame` / `runTicks` /
 // `ScriptedInput`) with the ball placed by hand and nothing else touched, so
 // what is measured is the shipped machine and not a model of it:
 //
@@ -16,17 +16,52 @@
 //          "through the flippers while flipping" report.
 //   HOLD   ball placed on the RAISED bat and left there. Cradle, and the place
 //          the resting-ball position constraint would show if it were wrong.
+//   SEAT   ball laid on the RESTING bat at nine points along the blade and the
+//          coil held. THE STALL scenario — see below.
 //   GAP    ball dropped straight down the whole width of the bat pair, bats up
 //          and bats down. Nothing may end up under a raised bat.
 //
 // OUTCOMES are read from geometry alone — where the ball is relative to the
-// bat's own axis at that tick — so this needs no instrumentation hook and
-// survives any refactor of the responder:
+// bat's own axis at that tick, and where the bat's own stroke is — so this
+// needs no instrumentation hook and survives any refactor of the responder:
 //
 //   STRUCK        left the bat moving UP, which is what a flipper is for
 //   PASSED_UNDER  crossed from the top face to the underside: THE DEFECT
+//   STALLED       the BAT stopped moving under the ball: THE OTHER DEFECT
 //   CARRIED       still on the blade at the end of the window
 //   MISSED        never came within contact range of the bat at all
+//
+// ---------------------------------------------------------------------------
+// WHY STALLED EXISTS, AND WHY THIS PROBE HAD TO GROW IT
+// ---------------------------------------------------------------------------
+// `+0x00AED2` takes `entry(r) >> 1` out of the bat's rate INSIDE every
+// collision pass that finds the ball, and `+0x00BDA8` / `+0x00BE32` put the
+// record's own `+$16` acceleration back at every animation step. Where the
+// deduction is the larger of the two the coil never gets ahead of the ball and
+// the blade stands still — for as long as the button is held. BabeWatch's upper
+// bat is the one record on any table whose coil accelerates at TEN, so it is
+// pinned by a ball past 24 px out; Extreme Sports' upper accelerates at 15 and
+// is pinned past 39 px; a 20-unit bat would need 53 px, which is past the end
+// of a 44 px blade.
+//
+// `a9943e1` shipped the write-back, NAMED that consequence in its own report,
+// and shipped anyway — because this probe could not see it. All four of its
+// scenarios watched THE BALL, and a ball on a stalled bat sits still, which is
+// also what a ball on a healthy cradled bat does; the bat's own stroke was
+// never read. That is the eighteenth blind instrument this project has caught,
+// and the only reason this note is short is that it was caught before it cost
+// anything.
+//
+// THE RULE: three consecutive ticks with the button held, the ball touching the
+// blade, the bat short of its far stop, and the stroke not advancing by one
+// unit. Three ticks is 60 ms; a healthy bat advances 120 stroke units on the
+// first tick of a press and is at its stop on the fourth.
+//
+// PROVED RATHER THAN TRUSTED: `FLIPPER_PROBE_SELFTEST=stall` divides every
+// bat's coil acceleration down to 2, which pins all nine of them. The scenario
+// then reports STALLED on every bat of every table instead of on the two the
+// shipped records produce. A gate that would not have caught the bug it was
+// extended for is worth nothing.
 //
 // Usage:
 //   npx vite-node scripts/flipper-probe.mts -- [--json=PATH] [--quiet] [tableId ...]
@@ -42,7 +77,12 @@ import { parseTableAccelDocument, registerTableAcceleration } from "../src/game/
 import { parseTableDevicesDocument, registerTableDevices } from "../src/game/table-devices.js";
 import { parseTableModesDocument, registerTableModes } from "../src/game/table-modes.js";
 import { parseFlipperBatsDocument, registerFlipperBats } from "../src/game/flipper-bats.js";
-import { batRadiusAt, flipperAngle, flipperConfigsFor } from "../src/game/flippers.js";
+import {
+  UPPER_FLIPPER_RECORDS,
+  batRadiusAt,
+  flipperAngle,
+  flipperConfigsFor,
+} from "../src/game/flippers.js";
 import type { FlipperConfig } from "../src/game/flippers.js";
 import { BALL_RADIUS_PIXELS, cosineUnits, sineUnits } from "../src/game/collision-probe.js";
 import { Q10_ONE, pixelsToQ10, q10Multiply } from "../src/core/fixed-point.js";
@@ -169,11 +209,31 @@ function seatOn(
   };
 }
 
-const BAT_CONTROL: Readonly<Record<string, Control>> = {
-  "lower-left": "leftFlipper",
-  "lower-right": "rightFlipper",
-  upper: "upperFlipper",
-};
+/**
+ * The button that strokes a bat, and THE UPPER BAT HAS NO BUTTON OF ITS OWN.
+ *
+ * This was a table with `upper: "upperFlipper"` in it, and `upperFlipper` is a
+ * control the game loop does not read: `flipperInputFrom(left, right, role)`
+ * gives the third bat THE SAME BOOLEAN as the lower bat on its own side,
+ * because `cmpi.w #0,$A(a0)` at main.seg00 +0xBD6C routes each record to the
+ * right-button test or the left one and the machine has no third button.
+ *
+ * So every upper-bat trial this probe has ever run pressed a key nothing was
+ * listening to. That is why `a9943e1` found "all three upper-bat scenarios
+ * byte-identical" before and after a change to the bat's own rate rule — the
+ * bat never moved in any of them, before or after — and why all three upper
+ * cradles have always read `lost 6/6`. THE SCENARIOS WERE NOT INSENSITIVE. THE
+ * BUTTON WAS NOT CONNECTED.
+ *
+ * `UPPER_FLIPPER_RECORDS[table].role` is the same word the game loop routes on,
+ * read from the same place, so the two cannot drift: Law 'n Justice's upper bat
+ * is bound LEFT, BabeWatch's and Extreme Sports' RIGHT.
+ */
+function controlFor(tableId: TableId, config: FlipperConfig): Control {
+  if (config.id === "lower-left") return "leftFlipper";
+  if (config.id === "lower-right") return "rightFlipper";
+  return UPPER_FLIPPER_RECORDS[tableId].role === "right" ? "rightFlipper" : "leftFlipper";
+}
 
 /**
  * Runs the loop until the serve has actually put a ball on the table.
@@ -199,13 +259,60 @@ const BAT_CONTROL: Readonly<Record<string, Control>> = {
  * per tick. A ball still travelling is orders of magnitude above it, and every
  * scenario places its ball by hand afterwards anyway.
  */
+/**
+ * THE SELF-TEST, and it is a real mutation of the shipped physics.
+ *
+ * `FLIPPER_PROBE_SELFTEST=stall` drops every bat's coil acceleration to 2 in
+ * the bank the game actually runs. Two is under the deduction at EVERY point of
+ * every blade — the smallest a 16 px boss contact charges is 5 — so all nine
+ * bats are pinned at their rest stop, and a probe that cannot see that cannot
+ * see the thing it was extended for either.
+ *
+ * It is applied to the BANK rather than to `FLIPPER_RECORDS`, which is frozen
+ * and is the decode; nothing here can change what the port believes the machine
+ * ships. The mutation is asserted to have taken, because a self-test that
+ * silently fails to break anything reports a healthy machine and is worse than
+ * no self-test at all.
+ */
+const SELFTEST = process.env["FLIPPER_PROBE_SELFTEST"] ?? "";
+const SELFTEST_COIL = 2;
+
+function applySelfTest(game: Game): void {
+  if (SELFTEST !== "stall") return;
+  for (const config of game.flippers.configs) {
+    (config as { upAcceleration: number }).upAcceleration = SELFTEST_COIL;
+    if (config.upAcceleration !== SELFTEST_COIL) {
+      throw new Error(
+        `FLIPPER_PROBE_SELFTEST=stall could not weaken ${config.id}: the config is frozen, ` +
+          `so this run would have reported the SHIPPED coil as if it were the broken one`,
+      );
+    }
+  }
+}
+
+/**
+ * `runTicks` with the self-test re-applied FIRST, every tick.
+ *
+ * The bank is not a fixed object: `game.flippers = createFlipperBank(...)`
+ * (game-loop.ts:1265) replaces it wholesale every time a ball is served, so a
+ * mutation applied once is thrown away the moment a trial drains and re-serves.
+ * The first version of this self-test applied it before `startGame` and
+ * reported IDENTICAL against the unbroken probe — which reads as "the outcome
+ * is insensitive" and means "the break never happened". Re-applying it here
+ * costs nine field writes a tick and cannot be outlived by a re-serve.
+ */
+function step(game: Game, input: InputSource, ticks: number) {
+  applySelfTest(game);
+  return runTicks(game, input, ticks);
+}
+
 function servedGame(tableId: TableId): Game {
   const game = createGame(mapFor(tableId), { ballsPerGame: 3 });
   startGame(game);
   const idle = new ScriptedInput(() => []);
   const seated = 2 * SUBSTEP_GRAVITY;
   for (let tick = 0; tick < 400; tick += 1) {
-    runTicks(game, idle, 1);
+    step(game, idle, 1);
     const ball = game.balls.balls.find((one) => one.active);
     // Wait for it to be BOTH served and seated, so the starting velocity a
     // scenario asks for is the only velocity of any size it has.
@@ -236,7 +343,33 @@ function place(game: Game, x: number, y: number, vx: number, vy: number, level: 
   ball.level = level;
 }
 
-type Outcome = "STRUCK" | "PASSED_UNDER" | "CARRIED" | "MISSED" | "DRAINED";
+type Outcome = "STRUCK" | "PASSED_UNDER" | "STALLED" | "CARRIED" | "MISSED" | "DRAINED";
+
+/**
+ * The letter each outcome contributes to a summary line.
+ *
+ * EXPLICIT, because it used to be `key[0]` and STALLED collides with STRUCK on
+ * the first character. A tally that silently merges the defect it was added for
+ * with the thing that is not a defect is worse than no tally.
+ */
+const OUTCOME_LETTER: Readonly<Record<Outcome, string>> = {
+  STRUCK: "S",
+  PASSED_UNDER: "P",
+  STALLED: "X",
+  CARRIED: "C",
+  MISSED: "M",
+  DRAINED: "D",
+};
+
+/**
+ * Consecutive held ticks with the stroke standing still that count as a stall.
+ *
+ * Three, i.e. 60 ms. A healthy bat advances 120 stroke units on the FIRST tick
+ * of a press (its four passes read 0, 20, 40, 60) and is on its far stop by the
+ * fourth, so no honest stroke can hold one stroke value for three ticks
+ * anywhere short of that stop.
+ */
+const STALL_TICKS = 3;
 
 interface Trial {
   readonly outcome: Outcome;
@@ -257,6 +390,27 @@ interface Trial {
    */
   readonly underStroke: number;
   readonly underTicksAfterPress: number;
+  /**
+   * Longest run of held ticks over which the BAT's stroke did not move while
+   * the ball was on it and the bat was short of its far stop.
+   *
+   * The one number in this file that is about the bat rather than the ball. See
+   * the header for why it had to exist.
+   */
+  readonly stalledTicks: number;
+  /** The stroke the bat was pinned at, and how long after the press. -1 if not. */
+  readonly stallStroke: number;
+  readonly stallTicksAfterPress: number;
+  /** Furthest the bat's stroke got while the button was held. */
+  readonly strokeReached: number;
+  /**
+   * The coil acceleration the GAME's own bank ran, not the record's.
+   *
+   * They are the same object's field until `FLIPPER_PROBE_SELFTEST` weakens the
+   * bank, and a stall message that quotes the shipped 20 while the bank ran 2
+   * is a message that hides its own break.
+   */
+  readonly coil: number;
 }
 
 /**
@@ -272,7 +426,7 @@ function trial(
   windowTicks: number,
 ): Trial {
   const game = servedGame(tableId);
-  const control = BAT_CONTROL[config.id] ?? "leftFlipper";
+  const control = controlFor(tableId, config);
   const input = new ScriptedInput((tick) =>
     tick >= settle && tick < settle + hold ? [control] : [],
   );
@@ -299,9 +453,17 @@ function trial(
   let drained = false;
   let underStroke = -1;
   let underTick = -1;
+  // NaN for the same reason `alongAtPress` is: the first held tick has no
+  // previous stroke to be equal to, and `0 === 0` would score it as one.
+  let previousStroke = Number.NaN;
+  let stallRun = 0;
+  let stalledTicks = 0;
+  let stallStroke = -1;
+  let stallTick = -1;
+  let strokeReached = 0;
 
   for (let tick = 0; tick < settle + windowTicks; tick += 1) {
-    const report = runTicks(game, input, 1)[0];
+    const report = step(game, input, 1)[0];
     if ((report?.drained.length ?? 0) > 0) {
       drained = true;
       break;
@@ -333,6 +495,28 @@ function trial(
       if (tick >= settle) minPerp = Math.min(minPerp, frame.perp);
     }
     if (ball.velocityY < 0) launchSpeed = Math.max(launchSpeed, -ball.velocityY);
+
+    // ---- THE BAT, not the ball ------------------------------------------
+    // A stall needs all four: the button down, the ball actually on the blade,
+    // the bat short of its far stop (a bat resting on its stop is a cradle and
+    // is supposed to stand still), and the stroke not moving. Anything less
+    // scores a healthy cradle as the defect.
+    const heldNow = tick >= settle && tick < settle + hold;
+    if (heldNow && stroke > strokeReached) strokeReached = stroke;
+    const touchingNow = onBlade && Math.abs(frame.perp) <= reach + 2;
+    if (heldNow && touchingNow && stroke < config.sweep && stroke === previousStroke) {
+      stallRun += 1;
+      if (stallRun > stalledTicks) {
+        stalledTicks = stallRun;
+        if (stalledTicks >= STALL_TICKS && stallStroke < 0) {
+          stallStroke = stroke;
+          stallTick = tick - settle;
+        }
+      }
+    } else {
+      stallRun = 0;
+    }
+    previousStroke = heldNow ? stroke : Number.NaN;
   }
 
   let outcome: Outcome;
@@ -347,8 +531,15 @@ function trial(
   // NaN when the press never happened — the ball was gone before tick `settle` —
   // and `NaN <= 43` is false, so such a trial cannot be scored PASSED_UNDER on a
   // press it never saw. It falls through to DRAINED, which is what it was.
+  //
+  // STALLED OUTRANKS STRUCK, deliberately. A bat that stood still under the
+  // ball for three ticks and then freed itself when the ball slid inboard has
+  // stalled, and reporting it as a launch is exactly the averaging that let
+  // this class of defect ship once already. It ranks BELOW PASSED_UNDER, which
+  // is the operator's own report and stays the headline.
   const onBladeAtPress = alongAtPress <= 43;
   if (passedUnder && onBladeAtPress) outcome = "PASSED_UNDER";
+  else if (stalledTicks >= STALL_TICKS) outcome = "STALLED";
   else if (launchSpeed >= 2048) outcome = "STRUCK";
   else if (drained) outcome = "DRAINED";
   else if (!touched) outcome = "MISSED";
@@ -360,6 +551,13 @@ function trial(
     minPerp: Number.isFinite(minPerp) ? minPerp : 0,
     underStroke,
     underTicksAfterPress: underTick,
+    stalledTicks,
+    stallStroke,
+    stallTicksAfterPress: stallTick,
+    strokeReached,
+    coil:
+      game.flippers.configs.find((one) => one.id === config.id)?.upAcceleration ??
+      config.upAcceleration,
   };
 }
 
@@ -379,6 +577,23 @@ export interface BatReport {
   /** Cradle: `along` after 600 held ticks from each seat, and whether it left. */
   readonly holdEnd: readonly (readonly [number, number, number])[];
   readonly holdLost: number;
+  /**
+   * SEAT: the stall sweep. A ball laid on the RESTING blade at nine points and
+   * the coil held for fourteen ticks — four times what a free stroke needs.
+   */
+  readonly seat: Readonly<Record<string, number>>;
+  /** `[along, furthest stroke reached]` for each of the nine seats. */
+  readonly seatStroke: readonly (readonly [number, number])[];
+  /** Seats of the nine at which the bat stalled under the ball. */
+  readonly seatStalled: number;
+  /** The smallest `along` that stalls this bat, or -1 if none does. */
+  readonly stallFrom: number;
+  /**
+   * The coil acceleration the GAME's bank ran during the sweep — the record's,
+   * unless `FLIPPER_PROBE_SELFTEST` weakened it. A summary that quotes the
+   * shipped 20 while the bank ran 2 is a summary that hides its own break.
+   */
+  readonly seatCoil: number;
 }
 
 /**
@@ -420,6 +635,16 @@ const DROP_ALONGS = [10, 16, 22, 28, 34, 40, 44];
 const DROP_SPEEDS = [2048, 4096, 8192, 12288, 16384];
 const HOLD_SEATS = [10, 16, 22, 28, 34, 40];
 const HOLD_TICKS = 600;
+/**
+ * SEAT: nine points along the blade, and fourteen held ticks at each.
+ *
+ * The same sweep `research/flipper-power/tools/rig-upper.py` pins a ball at on
+ * the original, so the two sides answer the same question at the same places.
+ * Fourteen ticks is four times what a free stroke needs (3.5), so a bat that has
+ * not left its stop by then is not merely slow.
+ */
+const SEAT_ALONGS = [12, 16, 20, 24, 28, 32, 36, 40, 44];
+const SEAT_HOLD = 14;
 
 function tally(list: readonly Outcome[]): Record<string, number> {
   const out: Record<string, number> = {};
@@ -487,16 +712,16 @@ export function probeBat(tableId: TableId, config: FlipperConfig): BatReport {
   let holdLost = 0;
   for (const seat of HOLD_SEATS) {
     const game = servedGame(tableId);
-    const control = BAT_CONTROL[config.id] ?? "leftFlipper";
+    const control = controlFor(tableId, config);
     const input = new ScriptedInput(() => [control]);
     // Raise the bat first, THEN put the ball on the raised face: a ball placed
     // where a rising bat is about to be is a different experiment.
-    runTicks(game, input, 8);
+    step(game, input, 8);
     const at = seatOn(game.flippers.configs.find((one) => one.id === config.id) ?? config, 1152, seat);
     place(game, at.x, at.y, 0, 0, config.level);
     let lost = false;
     for (let tick = 0; tick < HOLD_TICKS; tick += 1) {
-      const report = runTicks(game, input, 1)[0];
+      const report = step(game, input, 1)[0];
       if ((report?.drained.length ?? 0) > 0) {
         lost = true;
         break;
@@ -515,6 +740,34 @@ export function probeBat(tableId: TableId, config: FlipperConfig): BatReport {
     }
   }
 
+  // ---- SEAT: the stall sweep --------------------------------------------
+  // The ball is laid on the RESTING blade and the coil is held from the first
+  // tick, which is the machine capture's own experiment
+  // (`tools/rig-upper.py`, `research/flipper-power/UPPER_BAT.md`). What is
+  // being asked is not what happens to the ball but whether the BAT moves.
+  const seat: Outcome[] = [];
+  const seatStroke: (readonly [number, number])[] = [];
+  let seatStalled = 0;
+  let stallFrom = -1;
+  let seatCoil = config.upAcceleration;
+  for (const along of SEAT_ALONGS) {
+    const at = seatOn(config, 0, along);
+    const result = trial(tableId, config, { ...at, vx: 0, vy: 0 }, 0, SEAT_HOLD, SEAT_HOLD + 6);
+    seat.push(result.outcome);
+    seatStroke.push([along, result.strokeReached]);
+    seatCoil = result.coil;
+    if (result.outcome === "STALLED") {
+      seatStalled += 1;
+      if (stallFrom < 0) stallFrom = along;
+      console.log(
+        `    STALL ${tableId} ${config.id} seat ${along} ` +
+          `bat pinned at stroke ${result.stallStroke} of ${config.sweep} for ` +
+          `${result.stalledTicks} ticks from ${result.stallTicksAfterPress} after the press ` +
+          `(coil ${result.coil})`,
+      );
+    }
+  }
+
   return {
     table: tableId,
     bat: config.id,
@@ -524,6 +777,11 @@ export function probeBat(tableId: TableId, config: FlipperConfig): BatReport {
     rollLaunchMedian: median(rollLaunch),
     holdEnd,
     holdLost,
+    seat: tally(seat),
+    seatStroke,
+    seatStalled,
+    stallFrom,
+    seatCoil,
   };
 }
 
@@ -556,7 +814,7 @@ function probeGap(
       trials += 1;
       const game = servedGame(tableId);
       const input = new ScriptedInput(() => (raised ? ["leftFlipper", "rightFlipper"] : []));
-      if (raised) runTicks(game, input, 8);
+      if (raised) step(game, input, 8);
       place(game, pixelsToQ10(x), pixelsToQ10(pivotY - 40), 0, speed, 0);
       let wentUnder = false;
       let gone = false;
@@ -567,7 +825,7 @@ function probeGap(
       // and the drain is where it is supposed to go.
       const wasAbove = new Set<string>();
       for (let tick = 0; tick < 120; tick += 1) {
-        const report = runTicks(game, input, 1)[0];
+        const report = step(game, input, 1)[0];
         if ((report?.drained.length ?? 0) > 0) {
           gone = true;
           break;
@@ -624,14 +882,14 @@ function traceTrial(spec: string): void {
   const pressAt = Number(settle ?? 30);
   const windowTicks = window === undefined ? 60 : Number(window);
   const game = servedGame(tableId);
-  const control = BAT_CONTROL[config.id] ?? "leftFlipper";
+  const control = controlFor(tableId, config);
   const input = new ScriptedInput((tick) =>
     tick >= pressAt && tick < pressAt + 25 ? [control] : [],
   );
   place(game, at.x, at.y, 0, 0, config.level);
   console.log(`trace ${tableId} ${config.id} seat ${seat} press at tick ${pressAt}`);
   for (let tick = 0; tick < pressAt + windowTicks; tick += 1) {
-    const report = runTicks(game, input, 1)[0];
+    const report = step(game, input, 1)[0];
     const state = debugSnapshot(game);
     const ball = state.balls.find((one) => one.active);
     if (ball === undefined) {
@@ -667,9 +925,11 @@ function main(argv: readonly string[]): number {
     for (const config of configs) {
       const report = probeBat(tableId, config);
       reports.push(report);
+      // `OUTCOME_LETTER`, not `key[0]`: STALLED and STRUCK both begin with S,
+      // and a tally that merged them would hide the outcome it was added for.
       const show = (label: string, counts: Record<string, number>): string =>
         `${label} ${Object.entries(counts)
-          .map(([key, value]) => `${key[0]}${value}`)
+          .map(([key, value]) => `${OUTCOME_LETTER[key as Outcome] ?? key[0]}${value}`)
           .join(" ")}`;
       console.log(
         `${tableId.padStart(15)} ${config.id.padEnd(12)} ` +
@@ -677,6 +937,13 @@ function main(argv: readonly string[]): number {
           `${show("drop", report.drop)} | launch ${report.rollLaunchMedian} | ` +
           `cradle lost ${report.holdLost}/${report.holdEnd.length} ` +
           `[${report.holdEnd.map(([seat, along]) => `${seat}->${along}`).join(" ")}]`,
+      );
+      console.log(
+        `${" ".repeat(15)} ${config.id.padEnd(12)} ` +
+          `${show("seat", report.seat)} | STALLED ${report.seatStalled}/${SEAT_ALONGS.length}` +
+          `${report.stallFrom < 0 ? "" : ` from ${report.stallFrom} px`} | ` +
+          `coil ${report.seatCoil} | stroke of ${config.sweep} ` +
+          `[${report.seatStroke.map(([along, stroke]) => `${along}->${stroke}`).join(" ")}]`,
       );
     }
     for (const raised of [true, false]) {
