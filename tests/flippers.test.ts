@@ -920,6 +920,51 @@ describe("the impulse table", () => {
     expect(charged[0]?.rateTaken).not.toBe(flipperRateTaken(centreDx, centreDy));
   });
 
+  it("truncates the centre BEFORE adding the ring, exactly as $12/$14 + (a0,d5.w*4) does", () => {
+    // The machine's `$2a/$2c` is `trunc(centre) + ring` — its ball record holds
+    // a TRUNCATED corner and the ring table is integers — and on a ball LEFT of
+    // the pivot with a fractional x the order of operations is worth a whole
+    // pixel of dx: trunc() moves the centre toward zero, which on that side is
+    // AWAY from the pivot, where truncating the Q10 arm afterwards moves the
+    // difference toward zero instead. Measured on the lnj-c/bw-c/es-c strike
+    // captures as a median -1 px against the machine's own words (UPPER_BAT.md
+    // §11.3), which is why `flipperContactArm` and the resolver both do the
+    // machine's order. WHERE the two orders can disagree is itself arithmetic:
+    // with the pivot and ring offsets whole, `trunc(centre) + ring - pivot` and
+    // `trunc(centre + ring - pivot)` are equal wherever the contact sits at
+    // positive offset from the pivot (floor(a) + n == floor(a + n)) and differ
+    // by one wherever it sits at NEGATIVE offset with a fraction
+    // (|floor(z)| == ceil(|z|) for z < 0). A seat on the LEFT bat's blade is
+    // right of its pivot on both axes, so the pinned-seat cases above can never
+    // see it; the RIGHT bat's blade extends LEFT of its pivot, which is exactly
+    // where the flying-strike captures measured the -1. So: the right bat, a
+    // sweep of sub-pixel x offsets, and the sweep must genuinely cross the
+    // disagreement.
+    const seat = ballRestingOn(RIGHT, FLIPPER_AT_REST, 24);
+    let distinguished = 0;
+    for (let sub = 0; sub < Q10_ONE; sub += 64) {
+      const at = { x: seat.x - (seat.x % Q10_ONE) + sub, y: seat.y };
+      const arm = flipperContactArm(RIGHT, FLIPPER_AT_REST, at.x, at.y);
+      if (arm === null) continue;
+      const touchDx = (arm as { dx: number; contactX: number }).dx;
+      // the machine's order, spelled out from the raw position:
+      const ringDxQ10 = (arm as { contactX: number }).contactX - at.x;
+      expect(Math.abs(ringDxQ10 % Q10_ONE)).toBe(0); // whole-pixel ring offset
+      const machineDx = Math.abs(
+        Math.trunc(at.x / Q10_ONE) + ringDxQ10 / Q10_ONE - q10ToPixel(RIGHT.pivotX),
+      );
+      // ...and the Q10-arm order it must NOT be following:
+      const armDx = Math.trunc(Math.abs(at.x + ringDxQ10 - RIGHT.pivotX) / Q10_ONE);
+      expect(touchDx, `sub-pixel ${sub}`).toBe(machineDx);
+      if (machineDx !== armDx) distinguished += 1;
+    }
+    // The sweep must actually cross sub-pixel offsets where the two orders
+    // disagree — a sweep that never does would be this test agreeing with
+    // itself, which is how the revert-check entry for this arithmetic scored
+    // zero the first time it ran.
+    expect(distinguished).toBeGreaterThan(0);
+  });
+
   /**
    * THE BITE IS SPENT INSIDE THE TICK — `research/flipper-power/BW_RIGHT_BAT.md`
    * §5, and the whole of what this round changed about the bat.
