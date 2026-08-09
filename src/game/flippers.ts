@@ -1973,6 +1973,17 @@ interface BatTouch {
   readonly armY: Q10;
   /** Distance from the pivot along the bat's axis, Q10. */
   readonly along: Q10;
+  /**
+   * The mean contact bearing this touch resolved to, 0..2047, before the ring
+   * quantisation `armX`/`armY` carry — the machine's `$28(a4)`.
+   *
+   * DIAGNOSTIC. Nothing in the physics reads it: `normalX`/`normalY` are the
+   * unquantised vector and the arm is the quantised point, and both are already
+   * here. It is carried so that `flipperContactArm` can hand an instrument the
+   * one word the machine writes at +0x00AD04, which is what a capture of
+   * `$28/$2a/$2c` has to be compared against.
+   */
+  readonly bearing: number;
 }
 
 /**
@@ -2172,6 +2183,7 @@ function touchAt(
     armX: (contactX - config.pivotX) | 0,
     armY: (contactY - config.pivotY) | 0,
     along,
+    bearing: normalizeAngle(contactAngle),
   };
 }
 
@@ -2189,6 +2201,12 @@ function touchAt(
  * three rounds against a helper that recomputed `|ball - pivot|` on its own, and
  * a probe that recomputes what it is scoring is a probe that goes on reporting
  * the old answer after the subject changes.
+ *
+ * `contactX`/`contactY` are the port's own `$2a/$2c` — the whole point, not the
+ * absolute difference — and `bearing` its own `$28`, so a capture of the
+ * machine's three words can be compared with the port's three rather than only
+ * with the radius they produce. `research/flipper-power/FLIPPER_POWER.md` §4.1
+ * is that comparison on strike frames.
  */
 export function flipperContactArm(
   config: FlipperConfig,
@@ -2196,12 +2214,21 @@ export function flipperContactArm(
   ballX: Q10,
   ballY: Q10,
   ballRadius: Q10 = DEFAULT_PROBE_RADIUS,
-): { readonly dx: number; readonly dy: number } | null {
+): {
+  readonly dx: number;
+  readonly dy: number;
+  readonly contactX: Q10;
+  readonly contactY: Q10;
+  readonly bearing: number;
+} | null {
   const touch = touchAt(config, state.stroke, flipperAngle(config, state), ballX, ballY, ballRadius);
   if (touch === null) return null;
   return {
     dx: Math.trunc(Math.abs(touch.armX) / Q10_ONE),
     dy: Math.trunc(Math.abs(touch.armY) / Q10_ONE),
+    contactX: (config.pivotX + touch.armX) | 0,
+    contactY: (config.pivotY + touch.armY) | 0,
+    bearing: touch.bearing,
   };
 }
 
