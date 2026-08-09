@@ -890,10 +890,42 @@ const TICKS = 4000;
  * all three, with the figures recorded in
  * research/parity-ledger/DISPLAY_TEXT.md.
  */
+/**
+ * RE-PINNED — THE MACHINE'S WHOLE PASS (this round). Same script, same
+ * strictness, same 4,000 ticks, three new digests. The old ones were
+ *
+ *   law-n-justice   ed9a8d8da0b6cca1768ded7b835f4b22db9eaf29cb89421bf01b271dea7ae8d3
+ *   babewatch       c66fd3945f17edd996e1b86c1406b64c7067d89f8f469f8a23e7ec2174b660f6
+ *   extreme-sports  e37851e442f80f6f4a4c85705ff1df81f91ea708cfed74f29a9ebb6f6c3922e4
+ *
+ * and they moved because the flipper resolver became the machine's whole pass:
+ * the impulse table is indexed at the CONTACT POINT (`$2a/$2c`, the machine's
+ * own integers) instead of the ball centre, a kicked ball is no longer lifted
+ * out of the blade by the separation search — the machine's responder never
+ * moves one, so the following passes re-kick it, which its own RAM shows it
+ * doing (`research/flipper-power/UPPER_BAT.md` §11) — and where the map probe
+ * was empty the kicked pass applies `+0x00B6BE`'s own half-pixel ejection off
+ * the blade's ring count. On the machine's 139-shot departure corpus the port
+ * goes from 0.9576 of the machine's exit speed (worst table 0.9034) to 1.0282
+ * (worst 1.0213), with the per-frame median difference at -0.001 px/frame.
+ *
+ * THE FIRST DIVERGENT TICK WAS MEASURED, not assumed: this exact script was
+ * run per-tick on this tree and on a602f75 (stash round-trip, no new snapshot
+ * fields to project out), and the digests first differ at
+ *
+ *   law-n-justice   TICK 1025 — the left flipper's press at tick 97*10+55,
+ *                   the first scripted press of that button that meets a ball.
+ *   babewatch       TICK 827  — the right flipper's press at tick 131*6+40.
+ *   extreme-sports  TICK 565  — the right flipper's press at tick 131*4+40.
+ *
+ * Every one is the tick after a flipper press with a ball on the blade, and no
+ * tick before any of them differs, which is the shape a bat-impulse change and
+ * nothing else produces.
+ */
 const PINNED: Record<TableId, string> = {
-  "law-n-justice": "ed9a8d8da0b6cca1768ded7b835f4b22db9eaf29cb89421bf01b271dea7ae8d3",
-  "babewatch": "c66fd3945f17edd996e1b86c1406b64c7067d89f8f469f8a23e7ec2174b660f6",
-  "extreme-sports": "e37851e442f80f6f4a4c85705ff1df81f91ea708cfed74f29a9ebb6f6c3922e4",
+  "law-n-justice": "83017f84b4661737af1721ee753a8fa9e08b3ce3a6a830028e382d229b8a0bb7",
+  "babewatch": "7e530a7b977b9a0c0ceafdf05aee3ca6d2fa6bc9bdd246bf212381cc64465555",
+  "extreme-sports": "1eb663916bb0b3dec396d1cbaa970da1609aef23e158727f34484c6367b1bb7a",
 };
 
 /** Same shape as the determinism harness's input: behaviour = f(tick index). */

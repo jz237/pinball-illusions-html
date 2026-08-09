@@ -2077,9 +2077,9 @@ const RESPOND_EVERY = ORIGINAL_SUBSTEPS_PER_FRAME / ORIGINAL_COLLISION_PASSES_PE
  * half a pixel does not clear it, so all four passes push every frame until the
  * ball is out.
  */
-const EJECTOR_MIN_RING_HITS = 6;
-/** `move.w #$fe00,d0` at +0x00B6CA: half a pixel, per substep, along the normal. */
-const EJECTOR_PUSH_Q10: Q10 = Q10_ONE / 2;
+export const EJECTOR_MIN_RING_HITS = 6;
+/** `move.w #$fe00,d0` at +0x00B6CA: half a pixel, per pass, along the normal. */
+export const EJECTOR_PUSH_Q10: Q10 = Q10_ONE / 2;
 
 /**
  * THE EJECTOR — main.seg00 +0x00B6BE, the machine's own answer to a buried ball,

@@ -113,18 +113,21 @@
  * left is `elasticity` (400, against 612 for the measured rubber row), which is
  * what lets a ball be trapped on a raised flipper.
  *
- * THE RADIUS THIS PORT USES IS THE BALL CENTRE'S, AND THE MACHINE'S IS THE
- * CONTACT POINT'S. This file asserted for four rounds that the two were the same
- * thing — "because that is what +0x00AEB4 measures" — and they are not.
- * `+0x00AEB6`'s `sub.w d3,d0` measures from whatever d0/d1 hold, and what they
- * hold is built seventy instructions earlier in a different routine, at
- * `+0x00AD9E`: the ball's TOP-LEFT CORNER plus the ring offset for its contact
- * bearing, stored to `$2a/$2c(a4)` and carried untouched through the region walk
- * and the surface dispatch into the flipper handler. `flipperImpulseRadius` has
- * the instructions and `resolveAtPass` has the measurement of what happens when
- * this port indexes there instead — the deduction becomes exact on all 43 pinned
- * seats and the departure gets worse on all 139 shots. The difference is
- * therefore NAMED here and not closed, which is the state of it.
+ * THE RADIUS IS THE CONTACT POINT'S — `$2a/$2c`, the machine's one radius —
+ * and it took three rounds to be allowed to be. This file asserted for four
+ * rounds that the contact point and the ball centre were the same thing; the
+ * decode at `+0x00AD9E` (ball's top-left corner plus the ring offset for the
+ * contact bearing, carried untouched into the flipper handler) said otherwise,
+ * and carrying it ALONE made the departure worse on all three tables, which is
+ * why it shipped named-but-uncarried for a round. The cancellation hiding
+ * underneath was `separate` lifting a just-kicked ball out of the blade — the
+ * machine re-kicks an embedded ball on the following passes, this port had
+ * moved it out of reach, and the too-hot centre-indexed magnitude was paying
+ * for the missing passes. Both are now the machine's: the table is indexed at
+ * `$2a/$2c` in the machine's own integers, and a kicked ball is left where the
+ * kick found it. `resolveAtPass` has the verification (332 per-pass RAM
+ * brackets, deduction exact, kick = mag x post at ratio 1.0000) and
+ * `research/flipper-power/UPPER_BAT.md` §11 the pass ledger that settled it.
  *
  * ---------------------------------------------------------------------------
  * WHY THE TICK IS SUBDIVIDED
@@ -169,7 +172,12 @@ import type {
   TableId,
 } from "./contracts.js";
 import type { BatUnionMask, PushClamp } from "./ball-physics.js";
-import { DEFAULT_SIMULATION_OPTIONS, reflectVelocity } from "./ball-physics.js";
+import {
+  DEFAULT_SIMULATION_OPTIONS,
+  EJECTOR_MIN_RING_HITS,
+  EJECTOR_PUSH_Q10,
+  reflectVelocity,
+} from "./ball-physics.js";
 import {
   ANGLE_UNITS_PER_TURN,
   DEFAULT_PROBE_RADIUS,
@@ -521,11 +529,11 @@ export const ORIGINAL_IMPULSE_SCALE_Q16 = 35810;
  * floored to 15, against 9 floored to 13 before. A boss shot leaves marginally
  * stronger, and no radius the bat can produce is outside the table.
  *
- * ON THE MACHINE THE FLOOR DOES MORE THAN THIS. It indexes at the CONTACT POINT
- * (see `flipperImpulseRadius`), which sits a ball radius nearer the pivot, so
- * its smallest reachable entry is `isqrt(8*8*35810>>16)` = 5, floored to 10 —
- * a ball caught against the hub is handed a floor rather than a lever arm. This
- * port does not reach that regime, and `resolveAtPass` says why.
+ * AND THE FLOOR DOES MORE THAN THIS, here as on the machine. The index is the
+ * CONTACT POINT (see `flipperImpulseRadius`), which sits a ball radius nearer
+ * the pivot than the centre, so the smallest reachable entry is
+ * `isqrt(8*8*35810>>16)` = 5, floored to 10 — a ball caught against the hub is
+ * handed a floor rather than a lever arm.
  */
 export const ORIGINAL_IMPULSE_FLOOR = 46;
 
@@ -1984,6 +1992,27 @@ interface BatTouch {
    * `$28/$2a/$2c` has to be compared against.
    */
   readonly bearing: number;
+  /**
+   * The contact point in WHOLE pixels, by the machine's own arithmetic: the
+   * truncated ball centre plus the ring offset — `$12/$14(a4)` is a truncated
+   * corner and `+0x00AD9E` adds an integer table entry, so `$2a/$2c` is always
+   * `trunc(centre) + ring`, never `trunc(centre + ring)`. `armX`/`armY` keep
+   * the sub-pixel remainder for the geometry; THESE are what the impulse
+   * table is indexed by, because on a flying ball the two truncations differ
+   * by a pixel often enough to move the entry (measured: median -1 px on the
+   * lnj-c/bw-c/es-c strike captures against the machine's own words).
+   */
+  readonly contactPixelX: number;
+  readonly contactPixelY: number;
+  /**
+   * Ring points on the blade — this pass's share of the machine's `$c(a4)`.
+   *
+   * The machine counts its ring over `map OR bat` in ONE blit and its ejector
+   * gates on that count; where the map contributed nothing (a blade in
+   * mid-air, or over the drain), the count IS the blade's own. `resolveAtPass`
+   * needs it for exactly that case — see the ejection there.
+   */
+  readonly ringHits: number;
 }
 
 /**
@@ -2144,6 +2173,10 @@ function touchAt(
   // synthetic radius — and it is what makes the lever arm the real one.
   const contactX = (ballX + pixelsToQ10(numberAt(ring.dx, contactIndex))) | 0;
   const contactY = (ballY + pixelsToQ10(numberAt(ring.dy, contactIndex))) | 0;
+  // ... and the same point in the machine's own integers: truncate FIRST, add
+  // the ring second, exactly as `$12/$14 + (a0,d5.w*4)` does. See `BatTouch`.
+  const contactPixelX = centreX + numberAt(ring.dx, contactIndex);
+  const contactPixelY = centreY + numberAt(ring.dy, contactIndex);
   const along = q10Clamp(
     q10Multiply(contactX - config.pivotX, axisX) + q10Multiply(contactY - config.pivotY, axisY),
     0,
@@ -2184,6 +2217,9 @@ function touchAt(
     armY: (contactY - config.pivotY) | 0,
     along,
     bearing: normalizeAngle(contactAngle),
+    contactPixelX,
+    contactPixelY,
+    ringHits: contacts.length,
   };
 }
 
@@ -2192,15 +2228,14 @@ function touchAt(
  * at `ballX`,`ballY` against a bat in `state` — `|contact point - pivot|` per
  * axis — or `null` if nothing touches.
  *
- * NOT what `resolveAtPass` indexes at. That is the whole point of it existing:
- * the machine's rule and this port's rule are different, the difference is
- * measured rather than assumed, and both instruments that measure it — the
- * pinned-seat probe in `research/flipper-power` and the case in
- * `tests/flippers.test.ts` — read the machine's radius from HERE instead of
- * restating the arithmetic beside the resolver. §4.2's residual was measured for
- * three rounds against a helper that recomputed `|ball - pivot|` on its own, and
- * a probe that recomputes what it is scoring is a probe that goes on reporting
- * the old answer after the subject changes.
+ * Since the contact-point round landed, this IS what `resolveAtPass` indexes
+ * at, and the helper keeps its original job with the roles reversed: the
+ * instruments that measure the port against the machine — the pinned-seat
+ * probe in `research/flipper-power` and the case in `tests/flippers.test.ts` —
+ * read the radius from HERE instead of restating the arithmetic beside the
+ * resolver, so a probe cannot go on reporting an old answer after the subject
+ * changes. §4.2's residual was measured for three rounds against a helper that
+ * recomputed `|ball - pivot|` on its own, which is how that class of rot looks.
  *
  * `contactX`/`contactY` are the port's own `$2a/$2c` — the whole point, not the
  * absolute difference — and `bearing` its own `$28`, so a capture of the
@@ -2224,8 +2259,12 @@ export function flipperContactArm(
   const touch = touchAt(config, state.stroke, flipperAngle(config, state), ballX, ballY, ballRadius);
   if (touch === null) return null;
   return {
-    dx: Math.trunc(Math.abs(touch.armX) / Q10_ONE),
-    dy: Math.trunc(Math.abs(touch.armY) / Q10_ONE),
+    // The machine's own integers — truncate the centre, then add the ring —
+    // which is `contactPixelX/Y`, not a truncation of the Q10 arm. The two
+    // differ by a pixel on a median flying strike and this helper exists to be
+    // compared word for word with `$2a/$2c`.
+    dx: Math.abs(touch.contactPixelX - q10ToPixel(config.pivotX)),
+    dy: Math.abs(touch.contactPixelY - q10ToPixel(config.pivotY)),
     contactX: (config.pivotX + touch.armX) | 0,
     contactY: (config.pivotY + touch.armY) | 0,
     bearing: touch.bearing,
@@ -2294,6 +2333,17 @@ export interface FlipperContact {
    * is what let the blade over-travel; see `FlipperSweep`.
    */
   readonly rateTaken: number;
+  /**
+   * WHICH of the frame's four collision passes this contact resolved at, 0..3.
+   *
+   * DIAGNOSTIC, in `BatTouch.bearing`'s precedent: nothing in the physics reads
+   * it. It exists so an instrument comparing this port's strike against a RAM
+   * capture can line the port's contacts up with the machine's own per-pass
+   * rate write-backs — the machine multi-kicks a departing ball on consecutive
+   * passes, and a comparison that pools a tick's contacts cannot see a missing
+   * pass. `research/flipper-power/passes.mts` is that instrument.
+   */
+  readonly pass: number;
 }
 
 // The original's own clamp, +-4095 of its velocity units. See `timebase.ts`.
@@ -2554,46 +2604,43 @@ function resolveAtPass(
   const facing =
     q10Multiply(surfaceX, touch.normalX) + q10Multiply(surfaceY, touch.normalY);
   let rateTaken = 0;
+  let kicked = false;
   if (state.rate !== 0 && facing > 0) {
-    // THE BALL CENTRE — AND THE MACHINE USES THE CONTACT POINT. That is not a
-    // slip left lying about. It was decoded, implemented, measured on both
-    // instruments and WITHDRAWN on 2026-08-08, and the two numbers are why.
+    // THE CONTACT POINT, THE MACHINE'S OWN INTEGERS — and for four rounds this
+    // was the ball centre, with the decode named in this comment and NOT
+    // carried, because carrying it alone made the departure worse on all three
+    // tables (0.9576 -> 0.9173 on the 139 old-capture shots) while making the
+    // deduction exact on all 43 pinned seats. That cancellation was real and
+    // it has now been DECODED rather than lived with: the compensating error
+    // was never in this index at all. It was `separate` below lifting a JUST-
+    // KICKED ball out of the blade, which the machine never does, so the
+    // machine's next pass re-kicks a ball this port had already moved out of
+    // reach — and the too-hot centre-indexed magnitude (+15 % a pass, measured)
+    // was paying for the missing passes.
     //
-    // `flipperImpulseRadius` carries the bytes. Swapping these two lines for
-    // `touch.armX/armY` — which IS `contact - pivot` and needs nothing else —
-    // makes the DEDUCTION exact: on the 43 pinned seats that load a blade
-    // without stopping it, `flipperRateTaken` goes from exact on 2, within one
-    // on 38, median +1, to exact on ALL 43, median 0. That is the residual
-    // `FLIPPER_POWER.md` §4 chased twice and mis-attributed once, and it closes
-    // completely.
+    // Both halves are the machine's, verified against its own RAM on the
+    // lnj-c/bw-c/es-c strike captures (research/flipper-power/chain.mts,
+    // 332 per-pass write-back brackets):
     //
-    // But the machine reads ONE table entry and spends it twice — `move.w d0,d3
-    // / lsr.w #1,d3` is the deduction and `add.w d5,d0` at +0x00AEF6 is the
-    // magnitude, both off the `d0` loaded at +0x00AEC6 — so the same swap moves
-    // the magnitude, and the magnitude is what the ball leaves at. On the 139
-    // machine-captured shots of §5 the departure ratio goes 0.9576 -> 0.9173 and
-    // the difference goes -0.612 +-0.494 -> -1.197 +-0.476 px/frame: from an
-    // interval that nearly contains zero to one that plainly does not. All three
-    // tables get worse — 0.9681 -> 0.9551, 0.9034 -> 0.8356, 0.9665 -> 0.8966.
-    //
-    // So the decode is right and this port's arithmetic does not reach it the
-    // same way: something in the magnitude path carries a compensating error of
-    // about a ball radius, and indexing at the centre has been hiding it.
-    // MEASURED, not inferred — charging the deduction at the contact point and
-    // leaving the magnitude here scores 0.9672 / -0.475 +-0.508, better than
-    // either whole answer. That is the shape of a cancellation, and it is
-    // exactly why it is not shipped: the machine has one radius, not two, and a
-    // port that used two because the pair scored well would be tuned rather than
-    // decoded.
-    //
-    // WHAT WOULD SETTLE IT is `$2a/$2c` captured on STRIKE frames. The pinned
-    // and grid captures carry those columns and say the port's contact point is
-    // the machine's there; none of the three strike captures the departure is
-    // measured on does, because they predate the columns. `flippers.test.ts`
-    // executes both halves of this note, so it cannot rot the way BUG_HUNT
-    // §A#1's citation did.
-    const dx = Math.trunc(Math.abs(ball.x - config.pivotX) / Q10_ONE);
-    const dy = Math.trunc(Math.abs(ball.y - config.pivotY) / Q10_ONE);
+    //   * deduction = entry($2a/$2c - pivot) >> 1, EXACT on 332 of 332, where
+    //     the centre's entry is one high on median. The same table entry is the
+    //     magnitude (`move.w d0,d3 / lsr.w #1,d3` then `add.w d5,d0`), and the
+    //     observed per-pass kick along the machine's own `$28` normal is
+    //     mag x post to a ratio of 1.0000 / 1.0000 / 0.9988 per table — with
+    //     the only outliers decomposing into the machine's own ±4095 clamp,
+    //     the octant mask withholding the kick on the return stroke, and the
+    //     restitution branch. One radius, at the contact point, in integers:
+    //     `$12/$14` is a truncated corner, so the machine truncates the centre
+    //     BEFORE adding the ring offset — `contactPixelX/Y`, not `armX/armY`,
+    //     whose sub-pixel remainder reads the table one pixel low on a median
+    //     flying strike.
+    //   * a struck ball is never repositioned by the responder. See the
+    //     `separate` call below, and `UPPER_BAT.md` §11 for the pass ledger
+    //     that caught the machine kicking one ball three times across two
+    //     frames while this port, having lifted the ball 2 px on the first
+    //     kick, could reach it only once.
+    const dx = Math.abs(touch.contactPixelX - q10ToPixel(config.pivotX));
+    const dy = Math.abs(touch.contactPixelY - q10ToPixel(config.pivotY));
     rateTaken = Math.min(Math.abs(state.rate), flipperRateTaken(dx, dy));
     // THE WRITE-BACK, AND IT LANDS INSIDE THE TICK. `+0x00AED2` stores the
     // reduced rate to `$10(a0)` here, in the pass, and the animation step at
@@ -2612,6 +2659,10 @@ function resolveAtPass(
     // right at +120, which this port folds into `direction`.
     const driven =
       (Math.abs(state.rate) - rateTaken) * (config.direction * state.rate < 0 ? -1 : 1);
+    // A pass that imparted an outward kick leaves the ball where it is (see the
+    // `separate` call below). A stalled blade — the ball took the whole rate,
+    // `driven` 0 — imparts nothing and keeps the anti-sink lift.
+    kicked = driven !== 0;
     const magnitude = flipperImpulseMagnitude(dx, dy);
     // WHY THERE IS NO FACTOR OF TWO HERE and the sub-handlers have one. The
     // rotation into the contact frame at +0x00B4FE multiplies by tables
@@ -2770,10 +2821,50 @@ function resolveAtPass(
   // to the last Q10 for ever. Left to the ejector alone the port's first frame
   // lands 0.004 px from the machine's own RAM read-back and the ball is out.
   //
-  // Everywhere the ejector did NOT fire — which is every blade in mid-air, the
-  // ejector being reached only through the map's own probe — this is exactly
-  // the lift it always was. See `BatPassResolver` in `ball-physics.ts`.
-  if (!ejected) separate(ball, touch, clamp);
+  // AND A KICKED BALL GETS THE MACHINE'S OWN LIFT, WHICH IS HALF A PIXEL, NOT
+  // A SEPARATION SEARCH. The pass ledger (research/flipper-power/passes.mts,
+  // UPPER_BAT.md §11) caught BabeWatch's lower-right boss in the act: the
+  // machine kicked the same ball at stroke 900, again at 1012 and again at
+  // 1124 — its own RAM shows the rate write-back and the velocity step each
+  // time — and departed at 17.77 px/frame, while this port, having lifted the
+  // ball 2 px out of the blade on the first kick, could reach it only once and
+  // departed at 10.84. That was the whole of §5.2b's BabeWatch deficit, and
+  // the "compensating error of about a ball radius" the withdrawn
+  // contact-point round measured was the centre-indexed magnitude (+15 % a
+  // pass) paying for those missing passes.
+  //
+  // Skipping the lift outright overshoots the other way (departure 1.048 on
+  // the same corpus), and the machine's own polls say why: at
+  // lnj-c t=1778001591618 the ball's position entering the pass after a kick
+  // is its integrated position PLUS 0.5 px along `$28`'s outward normal, to
+  // the sub-pixel — `+0x00B6BE`, the responder's own last instruction, firing
+  // on the kicked pass. Where the map probe found something, this port's
+  // `respondAt` already ran that ejector over `map OR bat` and `ejected` says
+  // so. Where the map probe was EMPTY — a blade in mid-air or over the drain,
+  // which is most of a flipper — the responder was never called, and the
+  // machine's blit, being the UNION, still counted the blade's own ring points
+  // against the six-hit gate. So a kicked pass the map never saw applies
+  // exactly that: >= 6 blade points -> half a pixel out along the mean contact
+  // bearing, floor semantics, through the same push clamp. A cradled or
+  // stalled ball (no kick) keeps the separation search: the machine's bob
+  // (0.4922 px, `EJECTOR_MIN_RING_HITS`'s note) is a smaller lift than the
+  // mask body's own overlap accumulation and a cradle that sinks is a ball
+  // confiscated.
+  if (!ejected) {
+    if (kicked) {
+      if (touch.ringHits >= EJECTOR_MIN_RING_HITS) {
+        const outward = outwardNormalOf(touch.bearing);
+        moveBy(
+          ball,
+          (EJECTOR_PUSH_Q10 * outward.x) >> 10,
+          (EJECTOR_PUSH_Q10 * outward.y) >> 10,
+          clamp,
+        );
+      }
+    } else {
+      separate(ball, touch, clamp);
+    }
+  }
 
   const batSpeed = tangentialSpeed(
     integerSqrt(touch.armX * touch.armX + touch.armY * touch.armY),
@@ -2789,6 +2880,7 @@ function resolveAtPass(
     approachSpeed,
     struck: state.rate !== 0 && facing > 0,
     rateTaken,
+    pass,
   };
 }
 

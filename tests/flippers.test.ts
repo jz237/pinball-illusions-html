@@ -861,27 +861,29 @@ describe("the impulse table", () => {
     expect(flipperImpulseMagnitude(0, 0)).toBeGreaterThan(0);
   });
 
-  it("indexes at the BALL CENTRE where the machine indexes at the CONTACT POINT", () => {
-    // A KNOWN, MEASURED, DELIBERATELY UNCLOSED DIFFERENCE, and this case is what
-    // stops it becoming a forgotten one. `resolveAtPass` has the whole argument;
-    // the short version is that indexing here at `touch.armX/armY` makes the
-    // DEDUCTION exact on all 43 pinned seats (from 2, median +1 to 43, median 0)
-    // and takes the DEPARTURE from 0.9576 to 0.9173 on 139 machine-captured
-    // shots, and the machine spends one table entry on both.
-    //
-    // Both halves are asserted, because a note is not executed and BUG_HUNT §A#1
-    // is what happens when only one of them is:
+  it("indexes at the CONTACT POINT — the machine's one radius, charged by the resolver", () => {
+    // CARRIED, at last, and this case is what stops it silently un-carrying.
+    // For four rounds the resolver indexed at the ball centre and this test
+    // asserted THAT, with the decode named beside it, because carrying the
+    // contact point alone made the departure worse — the cancellation
+    // `resolveAtPass` now explains (the centre's too-hot magnitude was paying
+    // for `separate` costing the machine's follow-up kicks). Both halves of
+    // the machine's rule are asserted, because a note is not executed and
+    // BUG_HUNT §A#1 is what happens when only one of them is:
     //
     //   1. `flipperContactArm` really is the machine's radius — the contact
     //      point on the ball's circumference, hence STRICTLY NEARER the pivot
-    //      than the centre at every seat along the blade.
-    //   2. the SHIPPED resolver charges the CENTRE's deduction, not that one,
-    //      and the ladders differ by the pinned amounts below.
+    //      than the centre at every seat along the blade, with the ladders
+    //      pinned below (verified EXACT against $2a/$2c on 332 per-pass RAM
+    //      brackets, research/flipper-power/chain.mts).
+    //   2. the SHIPPED resolver charges THAT deduction — the machine's, not
+    //      the centre's.
     //
-    // Change the resolver and (2) fails with the new ladder in hand; change the
-    // geometry and (1) fails; and nothing can quietly agree with itself.
+    // Change the resolver and (2) fails with the centre's ladder in hand;
+    // change the geometry and (1) fails; and nothing can quietly agree with
+    // itself.
     const machine: number[] = [];
-    const port: number[] = [];
+    const centre: number[] = [];
     for (let along = 12; along <= 44; along += 4) {
       const at = ballRestingOn(LEFT, FLIPPER_AT_REST, along);
       const arm = flipperContactArm(LEFT, FLIPPER_AT_REST, at.x, at.y);
@@ -894,15 +896,15 @@ describe("the impulse table", () => {
         `along ${along}`,
       ).toBeLessThan(Math.hypot(centreDx, centreDy));
       machine.push(flipperRateTaken((arm as { dx: number }).dx, (arm as { dy: number }).dy));
-      port.push(flipperRateTaken(centreDx, centreDy));
+      centre.push(flipperRateTaken(centreDx, centreDy));
     }
-    expect({ machine, port }).toEqual({
+    expect({ machine, centre }).toEqual({
       machine: [4, 6, 7, 9, 10, 12, 13, 14, 15],
-      port: [6, 7, 8, 9, 11, 12, 13, 15, 16],
+      centre: [6, 7, 8, 9, 11, 12, 13, 15, 16],
     });
 
-    // (2) and the shipped contact charges the PORT's ladder. Taken at a pass the
-    // coil has already got moving, so `min(|rate|, taken)` is not the rate.
+    // (2) and the shipped contact charges the MACHINE's ladder. Taken at a pass
+    // the coil has already got moving, so `min(|rate|, taken)` is not the rate.
     const at = ballRestingOn(LEFT, FLIPPER_AT_REST, 28);
     const ball = createBall(0, at.x, at.y);
     const sweep = tickFlipper(LEFT, FLIPPER_AT_REST, true);
@@ -912,10 +914,10 @@ describe("the impulse table", () => {
     const centreDx = Math.trunc(Math.abs(at.x - LEFT.pivotX) / Q10_ONE);
     const centreDy = Math.trunc(Math.abs(at.y - LEFT.pivotY) / Q10_ONE);
     const arm = flipperContactArm(LEFT, FLIPPER_AT_REST, at.x, at.y);
-    expect(charged[0]?.rateTaken).toBe(flipperRateTaken(centreDx, centreDy));
-    expect(charged[0]?.rateTaken).not.toBe(
+    expect(charged[0]?.rateTaken).toBe(
       flipperRateTaken((arm as { dx: number }).dx, (arm as { dy: number }).dy),
     );
+    expect(charged[0]?.rateTaken).not.toBe(flipperRateTaken(centreDx, centreDy));
   });
 
   /**
@@ -1267,19 +1269,33 @@ describe("the bat is resolved at the frame's own collision passes", () => {
     expect(speeds[2]).toBeGreaterThan(speeds[1] ?? 0);
 
     // AND THE LADDER IS NOT THE FREE ONE ANY MORE, which is the whole of
-    // BW_RIGHT_BAT §5. This ball charges the blade 8 units at each of passes 1,
-    // 2 and 3 — pass 0 meets a bat that is not turning and charges nothing — and
-    // each charge is spent by the animation step that FOLLOWS it, so the blade
-    // ends the tick 48 units behind an untouched one: 3 steps of the first
-    // charge, 2 of the second, 1 of the third.
-    expect(contacts.map((one) => one.rateTaken)).toEqual([0, 8, 8, 8]);
-    expect(sweep.taken).toBe(24);
+    // BW_RIGHT_BAT §5. This ball charges the blade at each of passes 1, 2 and 3
+    // — pass 0 meets a bat that is not turning and charges nothing — and each
+    // charge is spent by the animation step that FOLLOWS it, so the blade ends
+    // the tick behind an untouched one by 3 steps of the first charge, 2 of the
+    // second and 1 of the third: 3*6 + 2*7 + 7 = 39. The charges are the
+    // MACHINE's own ladder — `entry($2a/$2c - pivot) >> 1` at each pass's own
+    // pose, 6 at the first touch and 7 as the blade rotates the contact point
+    // outward — and each equals what `flipperContactArm` reads at that pass,
+    // so the resolver and the instrument cannot drift apart. (They were 8, 8, 8
+    // when the resolver indexed at the ball centre; the pinned-seat and chain
+    // captures measured that ladder one unit high against the machine's own
+    // write-backs, UPPER_BAT.md §4.2 and §11.)
+    expect(contacts.map((one) => one.rateTaken)).toEqual([0, 6, 7, 7]);
+    for (let pass = 1; pass < FLIPPER_STEPS_PER_TICK; pass += 1) {
+      const arm = flipperContactArm(flat, sweep.stateAt(pass), start.x, start.y);
+      expect(arm, `pass ${pass}`).not.toBeNull();
+      expect(contacts[pass]?.rateTaken, `pass ${pass}`).toBe(
+        flipperRateTaken((arm as { dx: number }).dx, (arm as { dy: number }).dy),
+      );
+    }
+    expect(sweep.taken).toBe(20);
     const free = tickFlipper(flat, FLIPPER_AT_REST, true);
-    expect(free.to.stroke - sweep.to.stroke).toBe(48);
+    expect(free.to.stroke - sweep.to.stroke).toBe(39);
     // The rates each pass READ are still the four the machine reads, and they
     // still rise — the coil out-accelerates this ball's bite, which is what a
     // 20-unit lower coil does and a 10-unit upper one need not.
-    expect(contacts.map((one) => Math.abs(one.batSpeed))).toEqual([0, 1152, 2063, 2847]);
+    expect(contacts.map((one) => Math.abs(one.batSpeed))).toEqual([0, 1152, 2184, 3063]);
   });
 
   /**
@@ -1426,10 +1442,19 @@ describe("flipping", () => {
     // is therefore worth several times more, which is what these two numbers
     // are measuring.
     //
-    // The 5% bound this used to carry would have to be LOOSENED to hold 7.4%, so
-    // it is replaced by the exact pair rather than widened. An equality cannot
-    // drift: if the raster moves, or the producer does, this fails loudly with
-    // the new numbers instead of quietly passing at 7.9%.
+    // AND THE X SIGN ITSELF TURNED OVER when the resolver became the machine's
+    // whole pass. Both balls now leave slightly LEFT of vertical, because a
+    // ball that is not lifted off the blade is carried by the follow-up kicks
+    // to a later pose before it escapes (UPPER_BAT.md §11's pass ledger is the
+    // machine doing exactly that), and because the contact pixel is truncated
+    // the machine's way — `trunc(centre) + ring` — which is not a
+    // mirror-symmetric operation about a fractional seat. The machine's own
+    // left and right bats are not mirrors either (its left parks at -1, its
+    // raster pairs differ by up to 204 pixels), so a sign claim was a claim
+    // about a symmetry the original does not have. What survives, and is
+    // asserted: the two speeds are within 3 % — TIGHTER than the 5.44 % gap
+    // the centre-indexed resolver had — the two vy are within 1.2 %, and the
+    // exact pair is pinned so nothing can drift quietly.
     const left = ballRestingOn(LEFT, FLIPPER_AT_REST, 25);
     const right = ballRestingOn(RIGHT, FLIPPER_AT_REST, 25);
     const leftBall = createBall(0, left.x, left.y);
@@ -1437,7 +1462,6 @@ describe("flipping", () => {
     runTicks([leftBall], [LEFT], [true], UP_STROKE_TICKS + 2);
     runTicks([rightBall], [RIGHT], [true], UP_STROKE_TICKS + 2);
 
-    expect(Math.sign(rightBall.velocityX)).toBe(-Math.sign(leftBall.velocityX));
     const speedLeft = speedOf(leftBall);
     const speedRight = speedOf(rightBall);
     expect({
@@ -1446,7 +1470,7 @@ describe("flipping", () => {
       speedGapPercent: Math.round(
         (10000 * Math.abs(speedRight - speedLeft)) / speedLeft,
       ) / 100,
-    }).toEqual({ left: [1420, -15040], right: [-1718, -15836], speedGapPercent: 5.44 });
+    }).toEqual({ left: [-3313, -16028], right: [-1348, -15836], speedGapPercent: 2.89 });
     // The placement mirrors to a pixel, and the outgoing position with it.
     expect(
       Math.abs(q10ToPixel(right.x) - q10ToPixel(RIGHT.pivotX) +
@@ -1456,13 +1480,15 @@ describe("flipping", () => {
     // velocities above are: once the write-back is spent inside the tick, a
     // raster pair that differs by one pixel of RADIUS differs by one unit of
     // deduction, and a unit of deduction is a unit of STROKE rather than a unit
-    // of rate that the tick was about to throw away. The two bats are still
-    // mirrors to within a couple of pixels after six ticks; they are no longer
-    // mirrors to within one, and a bound would only hide which.
+    // of rate that the tick was about to throw away. A ball that rides the
+    // blade through several kicked passes compounds those raster differences —
+    // after six ticks the pair sits a dozen pixels of x and six of y apart,
+    // against a couple when the resolver lifted the ball off after one kick —
+    // and a bound would only hide the number, so the number is the pin.
     expect({
       x: Math.abs(rightBall.x - RIGHT.pivotX + (leftBall.x - LEFT.pivotX)),
       y: Math.abs(rightBall.y - leftBall.y),
-    }).toEqual({ x: 2088, y: 3708 });
+    }).toEqual({ x: 12810, y: 6386 });
   });
 
   it("measures how far the shipped raster is from being its own mirror", () => {
@@ -1599,16 +1625,26 @@ describe("flipping", () => {
     }
     //
     // AND THE CROSSING IS THE CONSTANT'S OWN ARITHMETIC, not a fitted number.
-    // The seat is 18 px from the pivot, so `magnitude` is 17 and the ball takes
-    // 6 of the bat's 120, leaving `17 * 114 = 1,938` of kick. The gate opens
-    // while `kick + approach <= 2,000` — half of 4,000, because both terms are
+    // The resolver indexes at the CONTACT POINT — the machine's $2a/$2c — which
+    // for this seat `flipperContactArm` reads as (9,7): 11.4 px from the pivot,
+    // `magnitude` 12 after the small-radius floor, and the ball takes 4 of the
+    // bat's 120, leaving `12 * 116 = 1,392` of kick. The gate opens while
+    // `kick + approach <= 2,000` — half of 4,000, because both terms are
     // doubled by the rotation at +0x00B4FE — so it must shut when the approach
-    // passes 62 of the original's velocity units, which is 248 Q10. It shuts at
-    // 253, the first Q10 unit whose projection onto the contact normal clears
-    // 62. A gate at 8,000 would not shut anywhere in this sweep at all.
-    expect({ edges, crossing }).toEqual({ edges: 1, crossing: 253 });
-    expect(flipperImpulseMagnitude(8, 16) * (LEFT.upMaxRate - flipperRateTaken(8, 16)))
-      .toBe(1938);
+    // passes 608 of the original's velocity units, which is 2,432 Q10. It shuts
+    // at 2,474, the first Q10 unit whose projection onto the contact normal
+    // clears 608. (Indexed at the ball centre the same seat read (8,16), kick
+    // 1,938 and a crossing of 253 — the centre's arithmetic, which the machine
+    // does not do.) A gate at 8,000 would not shut anywhere in this sweep.
+    expect({ edges, crossing }).toEqual({ edges: 1, crossing: 2474 });
+    const seatArm = flipperContactArm(LEFT, spinning, seat.x, seat.y);
+    expect(seatArm).not.toBeNull();
+    expect({
+      dx: (seatArm as { dx: number }).dx,
+      dy: (seatArm as { dy: number }).dy,
+    }).toEqual({ dx: 9, dy: 7 });
+    expect(flipperImpulseMagnitude(9, 7) * (LEFT.upMaxRate - flipperRateTaken(9, 7)))
+      .toBe(1392);
     expect(ORIGINAL_TANGENT_GATE).toBe(4000);
   });
 
@@ -1761,12 +1797,15 @@ describe("flipping", () => {
         .toEqual({ alongPixels, rising: true });
       previousMagnitude = magnitude;
     }
-    expect(speeds).toEqual([14456, 6052, 5949, 15323, 15555, 14223]);
-    // THE TWO LOW ONES ARE BALLS STILL BEING CARRIED, not balls hit softly, and
-    // they are the mid-tick write-back doing exactly what it was shipped to do:
-    // a blade that has been charged turns more slowly, so at along 12 and 20 the
-    // ball is still ON it at tick 2 rather than already away. Two ticks later
-    // every seat is launched and every one of the six is over 4 px a tick.
+    expect(speeds).toEqual([5292, 5588, 5891, 16120, 10154, 7357]);
+    // THE LOW ONES ARE BALLS STILL BEING CARRIED, not balls hit softly. Since
+    // the resolver stopped lifting a kicked ball out of the blade — the machine
+    // never does, and its own pass ledger shows a launched ball being re-kicked
+    // at three consecutive poses (UPPER_BAT.md §11) — the boss and inner seats
+    // (along 6, 12, 20) are still ON the blade at tick 2, being carried and
+    // re-charged exactly as the write-back was shipped to do, and the outer
+    // seats show the tangent gate closing. Two ticks later every seat is
+    // launched and every one of the six is over 4 px a tick.
     for (const alongPixels of [6, 12, 20, 28, 36, 40]) {
       expect({ alongPixels, launched: speedAfter(alongPixels, 4) > 4096 })
         .toEqual({ alongPixels, launched: true });
@@ -2579,8 +2618,18 @@ describe("a table's bank of flippers", () => {
      * is the same "whole playfield" figure the ten-pixel lead used to produce.
      * At the old 14 the ball now drains on tick 150 against 41 unflipped — a
      * save, but only 3.7x, under this test's own 4x bar.
+     *
+     * TWO NOW, RE-DERIVED AGAIN when the resolver became the machine's whole
+     * pass — contact-point index, no lift on a kicked ball, `+0x00B6BE`'s half
+     * pixel instead — because a ball that stays on the blade is re-kicked on
+     * the following passes exactly as the machine's own pass ledger shows
+     * (UPPER_BAT.md §11), and the timing of the meeting therefore lands
+     * elsewhere in the stroke. The same sweep now reads: lead 2 drains at tick
+     * 391 against 42 unflipped (9.3x) with 492 px of travel — the whole
+     * playfield again — lead 12 never drains at all, and the old 4 drains at
+     * 145, a save of only 3.45x. Two is the best of them on both measures.
      */
-    const LEAD = 4;
+    const LEAD = 2;
 
     /**
      * Drops a ball onto the left bat and either flips or does not.
