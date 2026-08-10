@@ -353,6 +353,12 @@ export interface ModeCounter {
   readonly target: number;
   /** +$48, the script queued when the count reaches `cap`, or -1. */
   readonly continuation: number;
+  /**
+   * The +$4C LADDER-COMPLETE script, or -1: queued by the walk's wrap when it
+   * finds every entry's per-player done bit set (+0x005F32), right before the
+   * whole record is reset and the done bits cleared.
+   */
+  readonly ladderComplete: number;
   /** The launcher table inline at +$50: index into `ladders`, or -1. */
   readonly ladder: number;
   /**
@@ -379,6 +385,13 @@ export interface ModeCounter {
 export interface ModeLadderEntry {
   readonly id: number;
   readonly script: number;
+  /**
+   * The rung's LAMP as a flat lamp index, or -1. The walk's own lamp block
+   * (+0x005ECE passed / +0x005EF6 current) is what drives it: a rung the
+   * count has passed goes steady always-on, the current rung blinks, and
+   * award effect 22's launch sets the launched rung steady (+0x006172).
+   */
+  readonly lamp: number;
 }
 
 /**
@@ -668,6 +681,21 @@ export interface ModeTrigger {
   readonly script: number;
 }
 
+/**
+ * One type-1 (mode-kind) device chain: the devices whose +$0B hit flags must
+ * all be set before the shared object's script queues. See
+ * `TableModes.modeChains` for the decode.
+ */
+export interface ModeChain {
+  readonly level: PlayfieldLevel;
+  /** Surface ids of every device on the object's +$1E chain, in chain order. */
+  readonly devices: readonly number[];
+  /** The object's +$16 script, queued when the whole chain has been hit. */
+  readonly script: number;
+  /** True when any member's +$04 bit 0 keeps the hit flags across a ball. */
+  readonly sticky: boolean;
+}
+
 /** A lock device, named by the zone that feeds it. */
 export interface LockDevice {
   readonly level: PlayfieldLevel;
@@ -683,8 +711,40 @@ export interface TableModes {
   readonly messages: readonly ModeMessage[];
   readonly scripts: readonly ModeScript[];
   readonly missions: readonly ModeMission[];
-  /** Indices into `missions` of the modes a selector table offers, in table order. */
-  readonly selectable: readonly number[];
+  /**
+   * DECODED: the script each bumper record queues on a latched hit, in the
+   * +$30 table's own order — which is the order the devices document's bumpers
+   * carry, both being reads of the same list. The coil at +0x00B5AE queues the
+   * record's +$06 through the background ring on every hit its 6-frame latch
+   * lets through; the slingshot path at +0x00B5D4 has no such queue. These are
+   * the scripts that AWARD the effect-21 mission-ladder advance elements
+   * (Law 'n Justice e9, Extreme Sports e82) and BabeWatch's counter-9 feeder,
+   * which is the machine-only counter stepping CONFORMANCE.md §3.1 measured.
+   */
+  readonly bumperScripts: readonly number[];
+  /**
+   * DECODED: descriptor +$6C and +$70 — the two serve scripts.
+   *
+   * `$d7b(a5)` is set by the charged serve (state 5, +0x0049BA) and the
+   * extra-ball serve (state 7, +0x004FC0) and consumed once, at the served
+   * ball's first entry into a type-0 zone (+0x005494..+0x0054B4): index 0's
+   * script when `$e84(a5) == $d82(a5)` (no rotation wrap yet — ball one),
+   * index 1's on every later ball. Machine-owed serves (the $65EE lane
+   * server: multiball top-ups, ball-save returns) set neither.
+   */
+  readonly serveScripts: readonly [number, number];
+  /**
+   * DECODED: the type-1 (mode-kind) device chains and their gated scripts.
+   *
+   * A mode device pays its shared object's BCD pair on EVERY hit and marks its
+   * own +$0B hit flag; the object's +$16 script is queued only when every
+   * device on the object's +$1E chain has been hit (+0x005688..+0x0056A0).
+   * The flags clear at game start (+0x004204) and at ball start (+0x00423C)
+   * unless the device's +$04 bit 0 is set — `sticky` below. One chain ships:
+   * Law 'n Justice devices 128+129 gating s78 (START e26, the crater lock
+   * lamp), which is the §3.3 gate the referee measured the port ignoring.
+   */
+  readonly modeChains: readonly ModeChain[];
   /**
    * THE MODE-ARM ELEMENTS, derived rather than declared.
    *
@@ -1002,6 +1062,7 @@ export function parseTableModesDocument(doc: TableModesDocument): TableModes {
         Object.freeze({
           id,
           script: requireWholeNumber(record["script"], `${where} entry ${entryAt} script`, 0, scriptCount - 1),
+          lamp: requireWholeNumber(record["lamp"] ?? -1, `${where} entry ${entryAt} lamp`, -1, 4095),
         }),
       );
     }
@@ -1023,6 +1084,7 @@ export function parseTableModesDocument(doc: TableModesDocument): TableModes {
         step: requireWholeNumber(item["step"], `${where} step`, 0, Number.MAX_SAFE_INTEGER),
         target: requireWholeNumber(item["target"] ?? -1, `${where} target`, -1, Number.MAX_SAFE_INTEGER),
         continuation: requireWholeNumber(item["continuation"], `${where} continuation`, -1, scriptCount - 1),
+        ladderComplete: requireWholeNumber(item["ladderComplete"] ?? -1, `${where} ladderComplete`, -1, scriptCount - 1),
         ladder: requireWholeNumber(item["ladder"], `${where} ladder`, -1, ladders.length - 1),
         keepAcrossBall: item["keepAcrossBall"] === true,
       }),
@@ -1295,7 +1357,45 @@ export function parseTableModesDocument(doc: TableModesDocument): TableModes {
 
   const opcodeNames = opcodes.map((op) => op.name);
 
-  const selectable = missions.flatMap((mission, at) => (mission.selected ? [at] : []));
+  // --- the three decoded native edges --------------------------------------
+  //
+  // Bumper scripts (+$30 table order), the two serve scripts (+$6C/+$70), and
+  // the type-1 device chains. All validated against the script pool; the
+  // interface fields carry the decode citations.
+  const scriptTotal = scripts.length;
+  const rawBumperScripts = raw["bumperScripts"];
+  if (!Array.isArray(rawBumperScripts)) throw new Error(`${label} bumperScripts is not an array`);
+  const bumperScripts = rawBumperScripts.map((value, at) =>
+    requireWholeNumber(value, `${label} bumperScripts[${at}]`, -1, scriptTotal - 1),
+  );
+  const rawServeScripts = raw["serveScripts"];
+  if (!Array.isArray(rawServeScripts) || rawServeScripts.length !== 2) {
+    throw new Error(`${label} serveScripts is not a pair`);
+  }
+  const serveScripts: [number, number] = [
+    requireWholeNumber(rawServeScripts[0], `${label} serveScripts[0]`, 0, scriptTotal - 1),
+    requireWholeNumber(rawServeScripts[1], `${label} serveScripts[1]`, 0, scriptTotal - 1),
+  ];
+  const rawModeChains = raw["modeChains"];
+  if (!Array.isArray(rawModeChains)) throw new Error(`${label} modeChains is not an array`);
+  const modeChains = rawModeChains.map((value, at) => {
+    const item = value as Record<string, unknown>;
+    const level = requireWholeNumber(item["level"], `${label} modeChains[${at}] level`, 0, 1);
+    const rawDevices = item["devices"];
+    if (!Array.isArray(rawDevices) || rawDevices.length === 0) {
+      throw new Error(`${label} modeChains[${at}] devices is not a non-empty array`);
+    }
+    return Object.freeze({
+      level: (level === 1 ? 1 : 0) as PlayfieldLevel,
+      devices: Object.freeze(
+        rawDevices.map((id, i) =>
+          requireWholeNumber(id, `${label} modeChains[${at}] devices[${i}]`, 32, 191),
+        ),
+      ),
+      script: requireWholeNumber(item["script"], `${label} modeChains[${at}] script`, 0, scriptTotal - 1),
+      sticky: item["sticky"] === true,
+    });
+  });
 
   // The MULTIBALL ladders: an effect-6 ladder one of whose launcher scripts
   // asks for balls, directly or through the mode it MODE_STARTs. Their feeder
@@ -1383,7 +1483,9 @@ export function parseTableModesDocument(doc: TableModesDocument): TableModes {
     messages: Object.freeze(messages),
     scripts: Object.freeze(scripts),
     missions: Object.freeze(missions),
-    selectable: Object.freeze(selectable),
+    bumperScripts: Object.freeze(bumperScripts),
+    serveScripts: Object.freeze(serveScripts) as readonly [number, number],
+    modeChains: Object.freeze(modeChains),
     armElements: Object.freeze(armElements),
     ladders: Object.freeze(ladders),
     counters: Object.freeze(counters),

@@ -81,6 +81,9 @@ function minimalDocument(): TableModesDocument {
       { id: 1, selector: 0, selected: true, script: 0, launcher: 0, lamp: true, title: "TEST" },
     ],
     triggers: { devices: [{ level: 0, surfaceId: 32, script: 0 }], zones: [], locks: [] },
+    bumperScripts: [],
+    serveScripts: [0, 0],
+    modeChains: [],
   } as unknown as TableModesDocument;
 }
 
@@ -98,7 +101,8 @@ describe("the shipped mission layer", () => {
       expect(modes.tableId).toBe(tableId);
       expect(modes.scripts.length, `${tableId} has no scripts`).toBeGreaterThan(0);
       expect(modes.elements.length, `${tableId} has no elements`).toBeGreaterThan(0);
-      expect(modes.selectable.length, `${tableId} selector missions`).toBe(
+      const selected = modes.missions.filter((mission) => mission.selected);
+      expect(selected.length, `${tableId} selector missions`).toBe(
         DECLARED_SELECTOR_MISSIONS[tableId],
       );
     }
@@ -200,7 +204,8 @@ describe("the shipped mission layer", () => {
     // Sports share one — but the eight Law 'n Justice missions all do, and their
     // text is the original's, verbatim.
     const titles = modesFor("law-n-justice")
-      .selectable.map((at) => modesFor("law-n-justice").missions[at]?.title ?? "")
+      .missions.filter((mission) => mission.selected)
+      .map((mission) => mission.title)
       .filter((title) => title.length > 0);
     expect(titles).toContain("BLOW ALL BOMBS BEFORE TIMER REACHES ZERO");
     expect(titles).toContain("SHOOT ALL TERRORISTS TO FREE HOSTAGES");

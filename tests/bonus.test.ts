@@ -573,6 +573,9 @@ describe("the mission layer reaches the player record's bonus fields", () => {
       scripts: [{ index: 0, ops: [{ pc: 0, op: 5, args: [0] }, { pc: 6, op: 0, args: [] }] }],
       missions: [],
       triggers: { devices: [], zones: [], locks: [] },
+      bumperScripts: [],
+      serveScripts: [0, 0],
+      modeChains: [],
     } as unknown as Parameters<typeof parseTableModesDocument>[0]);
   }
 

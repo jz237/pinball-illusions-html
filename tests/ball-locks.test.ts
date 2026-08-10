@@ -531,6 +531,43 @@ describe("a lock in a running game", () => {
     expect(state.locks, "ejected, not held").toEqual([]);
   });
 
+  it("law-n-justice's LIT crater EATS the ball: trough and one owed serve, not a held ball", () => {
+    // CONFORMANCE.md 3.3, measured on two cold boots: a crater capture with
+    // e26 lit ends with the ball in the trough and a replacement serve owed.
+    // The script data says why: s63's lit branch AWARDs e26 and ENDs with no
+    // ball opcode, where its unlit tail ejects with `PUSH e24`. Timing is the
+    // proof here — the eat lands the tick s63 ENDs (~8 ticks after capture),
+    // long before the ladder's id-1 launcher could have PUSHed the ball out
+    // (its eject would fire ~60 ticks in), so a port that kept the ball held
+    // for the old in-place eject fails the 25-tick check below.
+    const game = started("law-n-justice");
+    runTicks(game, idleInput(), 60);
+    const jail = ballLocksFor("law-n-justice").find((one) => one.id === "right-crater");
+    expect(jail).toBeDefined();
+    if (jail === undefined) return;
+    expect(game.modeState).not.toBeNull();
+    if (game.modeState === null) return;
+    game.modeState.armed[26] = 1;
+
+    const ball = game.balls.balls.find((one) => one.active && one.heldBy === null);
+    expect(ball).toBeDefined();
+    if (ball === undefined) return;
+    if (game.laneBallId === ball.id) game.laneBallId = null;
+    ball.x = pixelsToQ10(Math.floor((jail.minX + jail.maxX) / 2));
+    ball.y = pixelsToQ10(Math.floor((jail.minY + jail.maxY) / 2));
+    ball.velocityX = 0;
+    ball.velocityY = 0;
+    ball.level = jail.level;
+    runTicks(game, idleInput(), 25);
+
+    expect(heldBallIn(game.locks, jail.id), "the crater must not still hold the ball").toBeNull();
+    expect(debugSnapshot(game).pendingServes, "one replacement serve owed").toBe(1);
+    expect(
+      game.balls.balls.some((one) => one.active && one.heldBy === null),
+      "the eaten ball is in the trough, not in play",
+    ).toBe(false);
+  });
+
   it("law-n-justice starts a TWO-ball multiball on the second LIT jail lock", () => {
     // The decoded ladder h4+0x40F4: tiers of 2/3/4/5 jail locks, multiball at
     // ids 2/5/9/14. Id 1 -> launcher 80 ("1 MORE FOR M-BALL", ejects the
@@ -543,31 +580,55 @@ describe("a lock in a running game", () => {
     if (jail === undefined) return;
     const counter = modes.elements[26]?.counter ?? -1;
 
-    // Light the jail lamp the decoded way: the script the SHOOT JAIL targets
-    // fire, which STARTs element 26.
-    const shootJail = modes.scriptForDevice(0, 128);
-    expect(shootJail).toBeGreaterThanOrEqual(0);
+    // Light the jail lamp the decoded way: the gated pair's script s78, the
+    // one the machine queues when BOTH mode targets 128 and 129 have been hit
+    // (the chain walk at +0x005688 — see `modeDeviceScript`).
+    const shootJail = modes.modeChains[0]?.script ?? -1;
+    expect(shootJail).toBe(78);
     expect(game.modeState).not.toBeNull();
     if (game.modeState === null) return;
     queueScript(game.modeState, shootJail);
     runTicks(game, idleInput(), 10);
 
-    // First counted lock: the alternate. Ball ejected, no multiball.
-    dropInto(game, jail);
+    // Captures the LIVE ball, machine-style, rather than minting an extra one:
+    // the eat's replacement serve is part of the economy under test.
+    const capture = () => {
+      const ball = game.balls.balls.find((one) => one.active && one.heldBy === null);
+      expect(ball, "a rolling ball to capture").toBeDefined();
+      if (ball === undefined) return;
+      if (game.laneBallId === ball.id) game.laneBallId = null;
+      ball.x = pixelsToQ10(Math.floor((jail.minX + jail.maxX) / 2));
+      ball.y = pixelsToQ10(Math.floor((jail.minY + jail.maxY) / 2));
+      ball.velocityX = 0;
+      ball.velocityY = 0;
+      ball.level = jail.level;
+    };
+
+    // First counted lock: the alternate. THE MACHINE EATS THE BALL —
+    // CONFORMANCE.md §3.3, measured: the lit crater capture ends with the ball
+    // in the trough and a replacement serve owed; the id-1 launcher's PUSH
+    // then finds the saucer already empty. ("Intermediate locks eject in
+    // place" was the pre-referee reconstruction.)
+    capture();
     const seen = collectMessages(game, idleInput(), 200);
     expect(game.modeState.counterTotals[counter]).toBe(1);
     expect([...seen].some((line) => line.includes("MORE FOR M-BALL")), [...seen].join(" | ")).toBe(true);
     expect(debugSnapshot(game).multiball).toBe(false);
-    expect(debugSnapshot(game).locks, "intermediate locks eject").toEqual([]);
+    expect(debugSnapshot(game).locks, "the eat empties the jail").toEqual([]);
+    expect(
+      freeBallCount(game.balls) + debugSnapshot(game).pendingServes,
+      "one ball eaten, one replacement",
+    ).toBe(1);
 
-    // Second counted lock completes the tier: the ball stays held for the
-    // mode's BALL_REMOVE, and the mode tops the table up to two.
-    dropInto(game, jail);
+    // Second counted lock completes the tier: the capture is eaten the same
+    // way, s93's BALL_REMOVE finds the jail already empty, and BALLS_UP_TO 2
+    // counts the eat's owed replacement — two balls total, not three.
+    capture();
     expect(runToMultiball(game, idleInput(), 600), "multiball never started").toBeGreaterThanOrEqual(0);
     expect(game.modeState.counterTotals[counter]).toBe(2);
     const state = debugSnapshot(game);
     expect(state.multiball).toBe(true);
-    expect(state.locks, "BALL_REMOVE emptied the jail").toEqual([]);
+    expect(state.locks, "the jail is empty at multiball start").toEqual([]);
     expect(freeBallCount(game.balls) + state.pendingServes, "balls promised").toBe(2);
     // Script 93 puts the jail lamp out again: the next multiball needs the
     // SHOOT JAIL targets first.

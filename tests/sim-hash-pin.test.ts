@@ -922,9 +922,51 @@ const TICKS = 4000;
  * tick before any of them differs, which is the shape a bat-impulse change and
  * nothing else produces.
  */
+/**
+ * RE-PINNED — THE MISSION FLOW BECOMES THE MACHINE'S (this round). Same
+ * script, same strictness, same 4,000 ticks. The old digests were
+ *
+ *   law-n-justice   83017f84b4661737af1721ee753a8fa9e08b3ce3a6a830028e382d229b8a0bb7
+ *   babewatch       7e530a7b977b9a0c0ceafdf05aee3ca6d2fa6bc9bdd246bf212381cc64465555
+ *   extreme-sports  1eb663916bb0b3dec396d1cbaa970da1609aef23e158727f34484c6367b1bb7a
+ *
+ * and two of the three moved because the invented round-robin selector was
+ * retired for the referee round's decoded flow (research/referee/
+ * CONFORMANCE.md sections 3.1-3.3): missions launch on award effect 22 at a
+ * lock, the counter is advanced by the bumper and serve scripts, the mode
+ * device pair gates s78, and a lit capture the script never gives back is
+ * eaten into the trough.
+ *
+ * THE FIRST DIVERGENT TICK WAS MEASURED, not assumed: this exact script was
+ * dumped per-tick on this tree and on a 4231026 worktree, and the snapshots
+ * first differ at
+ *
+ *   law-n-justice   TICK 1043 — the old tree's snapshot reads
+ *                   `mission: {index 4, "BLOW ALL BOMBS..."}` where the new
+ *                   one reads `mission: null`: the invented selector had
+ *                   started the census's over-represented mission #4 off the
+ *                   arm shot, and the machine (CONFORMANCE.md 3.2, driven)
+ *                   arms that element and starts NOTHING. Every tick before
+ *                   it is byte-identical.
+ *   babewatch       TICK 168 — one field, `serveCountdown 49 -> 50`: the
+ *                   scripted ball drops into the top-lane lock and the
+ *                   insurance serve countdown now waits while the capture
+ *                   script's verdict is still in the background ring
+ *                   (`pendingLockScripts` in the serve gate), where the old
+ *                   tree kept counting toward an insurance ball the eject
+ *                   then obsoleted. One tick of countdown phase, cascading.
+ *   extreme-sports  NO DIVERGENCE over all 4,000 ticks — digest unchanged,
+ *                   and the zero is PROVEN, not assumed: the serve edge DID
+ *                   fire in this window (counter 1's total steps 0->1 at tick
+ *                   143, ->2 at 1343, ->3 at 1749, measured), but e82's award
+ *                   pays zero score with no display record, counter totals
+ *                   are not snapshot fields, and e83 never arms in this
+ *                   script so no launch ever fires. Every snapshot the pin
+ *                   hashes is string-identical to the old tree's.
+ */
 const PINNED: Record<TableId, string> = {
-  "law-n-justice": "83017f84b4661737af1721ee753a8fa9e08b3ce3a6a830028e382d229b8a0bb7",
-  "babewatch": "7e530a7b977b9a0c0ceafdf05aee3ca6d2fa6bc9bdd246bf212381cc64465555",
+  "law-n-justice": "0d9bbabff3cf148c751c99bc10a77febfcfa2472c0dc9e595b60603550b59c38",
+  "babewatch": "cb951c9f57c01c564e6ecdbc815ba9f53abf32199b58e17e3101f19057235b53",
   "extreme-sports": "1eb663916bb0b3dec396d1cbaa970da1609aef23e158727f34484c6367b1bb7a",
 };
 

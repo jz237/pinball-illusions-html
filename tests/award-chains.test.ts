@@ -362,6 +362,9 @@ describe("the mission-milestone ladders can fire", () => {
       expect(modes.ladders[10]!.entries[rung.total - 1]).toEqual({
         id: rung.total,
         script: rung.entry,
+        // BabeWatch's mission ladder carries no rung lamps (counter 5's flags
+        // are $01 — no bit 1 — and every entry's +$08 is null).
+        lamp: -1,
       });
 
       // The milestone shot. Its entry script arms the rung's feature element.

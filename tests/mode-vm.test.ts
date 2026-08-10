@@ -19,15 +19,14 @@ import {
   TICKS_PER_SECOND,
   comboCount,
   createModeState,
-  endMission,
   lightGroupLampsForTrigger,
   litElements,
   missionRunning,
   missionSecondsLeft,
+  modeDeviceScript,
   queueScript,
   resetModesForNewBall,
   restoreMultiplierLamps,
-  startSelectedMission,
   tickModes,
 } from "../src/game/mode-vm.js";
 import type { ModeState } from "../src/game/mode-vm.js";
@@ -42,6 +41,29 @@ import { CONTROLS, IDLE_SNAPSHOT } from "../src/browser/input.js";
 import type { Control, ControlEdges, ControlSnapshot } from "../src/browser/input.js";
 import { devicesFor, mapFor, modesFor } from "./table-fixtures.js";
 import { pixelsToQ10 } from "../src/core/fixed-point.js";
+
+/** One tick of a player who only plunges: serve-edge tests need no bats. */
+function plungerOnlyInput(tick: number): InputSource {
+  const wanted = new Set<Control>();
+  const phase = tick % 400;
+  if (phase >= 100 && phase < 130) wanted.add("plunger");
+  const previous = new Set<Control>();
+  const priorPhase = (tick - 1 + 400) % 400;
+  if (tick > 0 && priorPhase >= 100 && priorPhase < 130) previous.add("plunger");
+  const controls = {} as Record<Control, ControlEdges>;
+  for (const control of CONTROLS) {
+    const down = wanted.has(control);
+    const was = previous.has(control);
+    controls[control] = {
+      down,
+      pressed: down && !was,
+      released: !down && was,
+      pressCount: down && !was ? 1 : 0,
+      releaseCount: !down && was ? 1 : 0,
+    };
+  }
+  return { sample: () => ({ sequence: tick + 1, controls }) };
+}
 
 /**
  * One tick of a player who plunges early and taps both bats on fixed beats.
@@ -162,6 +184,9 @@ function fixtureDocument(): TableModesDocument {
     ],
     missions: [{ id: 1, selector: 0, selected: true, script: 0, launcher: 1, lamp: true, title: "FIXTURE" }],
     triggers: { devices: [{ level: 0, surfaceId: 32, script: 3 }], zones: [], locks: [] },
+    bumperScripts: [],
+    serveScripts: [2, 2],
+    modeChains: [],
   } as unknown as TableModesDocument;
 }
 
@@ -349,8 +374,7 @@ function digest(state: ModeState): string {
     suspended: state.suspended,
     waitElement: state.waitElement,
     waitTicks: state.waitTicks,
-    cursor: state.selectorCursor,
-    played: [...state.played],
+    chainHits: [...state.chainHits],
   });
 }
 
@@ -959,32 +983,111 @@ describe("the multiball opcode", () => {
   });
 });
 
-describe("the selector reconstruction", () => {
-  it("walks the selector in order and does not repeat until it has run out", () => {
+describe("the decoded mission flow", () => {
+  // The referee round (research/referee/CONFORMANCE.md §3.1/§3.2) replaced the
+  // invented round-robin selector with the machine's own three-part flow:
+  // native edges advance the mission counter (bumper scripts, serve scripts,
+  // mission prologues), the arm shot only ARMS, and award effect 22 at a lock
+  // launches the ladder entry whose id equals the counter's current total.
+
+  it("law-n-justice: the arm shot arms and starts NOTHING", () => {
+    // Driven on the machine: the mode-arm element arms bit-for-bit identically
+    // and `$daa` stays 0 — no mission script ever runs (§3.2, all three
+    // tables). s56 is zone-1-9's script, whose body STARTs e10.
     const modes = modesFor("law-n-justice");
     const state = createModeState(modes);
-    const seen: number[] = [];
-    for (let i = 0; i < modes.selectable.length; i += 1) {
-      const started = startSelectedMission(modes, state);
-      expect(started).toBeGreaterThanOrEqual(0);
-      seen.push(started);
-      endMission(state);
-    }
-    expect(new Set(seen).size).toBe(modes.selectable.length);
-    expect(seen).toEqual(modes.selectable);
-
-    // Round the loop again once every mission has been played.
-    const again = startSelectedMission(modes, state);
-    expect(again).toBe(modes.selectable[0]);
+    queueScript(state, 56);
+    run(modes, state, 40);
+    expect(state.armed[10]).toBe(1);
+    expect(missionRunning(state)).toBe(false);
   });
 
-  it("will not start anything while a mission is running", () => {
+  it("law-n-justice: the lit lock launches the ladder entry at the counter's total", () => {
+    // s64 is jail-throat zone-0-7's capture script: `JMP_IF_UNLIT 10` past an
+    // `AWARD 10`, and e10 is award effect 22 — read the total, walk ladder 8,
+    // queue the entry whose id equals it exactly (+0x006146). With counter 13
+    // on 2, that is ladder 8 id 2 -> launcher s22 -> its MODE_START.
     const modes = modesFor("law-n-justice");
     const state = createModeState(modes);
-    startSelectedMission(modes, state);
-    run(modes, state, 2);
+    state.armed[10] = 1;
+    state.counterTotals[13] = 2;
+    state.counterCounts[13] = 2;
+    queueScript(state, 64);
+    run(modes, state, 120);
     expect(missionRunning(state)).toBe(true);
-    expect(startSelectedMission(modes, state)).toBe(-1);
+    const launcher = modes.ladders[8]?.entries.find((entry) => entry.id === 2)?.script ?? -1;
+    const started = modes.scripts[launcher]?.ops.find((op) => op.op === 9)?.args[0] ?? -1;
+    expect(state.mission).toBe(started);
+  });
+
+  it("law-n-justice: a total past the last rung launches nothing (the bmi at 0x6198)", () => {
+    const modes = modesFor("law-n-justice");
+    const state = createModeState(modes);
+    state.armed[10] = 1;
+    state.counterTotals[13] = 9; // ladder 8's last id is 8
+    queueScript(state, 64);
+    run(modes, state, 120);
+    expect(missionRunning(state)).toBe(false);
+  });
+
+  it("the mode-device pair gates its script on BOTH targets, and the ball start clears it", () => {
+    // +0x005688's chain walk: device 128 alone queues nothing; 129 completes
+    // the pair and s78 queues (START e26, the crater lock lamp). The +$0B hit
+    // flags are cleared by the ball-start walk at +0x00423C — the pair is
+    // per-ball. CONFORMANCE.md §3.3 measured the port's old per-hit edge
+    // arming e26 where the machine leaves it dark.
+    const modes = modesFor("law-n-justice");
+    const state = createModeState(modes);
+    expect(modes.modeChains.length).toBe(1);
+    expect(modeDeviceScript(modes, state, 0, 128)).toBe(-1);
+    expect(state.armed[26]).toBe(0);
+    expect(modeDeviceScript(modes, state, 0, 129)).toBe(78);
+    // Every hit after completion re-queues, exactly as the walk re-passes.
+    expect(modeDeviceScript(modes, state, 0, 128)).toBe(78);
+    queueScript(state, 78);
+    run(modes, state, 20);
+    expect(state.armed[26]).toBe(1);
+    resetModesForNewBall(modes, state);
+    expect(modeDeviceScript(modes, state, 0, 128)).toBe(-1);
+    // A device on no chain is the caller's ordinary per-hit edge.
+    expect(modeDeviceScript(modes, state, 0, 32)).toBeNull();
+  });
+
+  it("babewatch and extreme-sports have no mode-device chains", () => {
+    expect(modesFor("babewatch").modeChains).toEqual([]);
+    expect(modesFor("extreme-sports").modeChains).toEqual([]);
+  });
+
+  it("the serve edge pays one rung on the served ball's first type-0 zone", () => {
+    // `$d7b(a5)` is set by the charged serve (+0x0049BA) and consumed at the
+    // type-0 zone handler (+0x005494..+0x0054B4), which queues descriptor
+    // +$6C's script — on Law 'n Justice s13, whose AWARD e9 advances counter
+    // 13 by one. Driven with the plunger alone: serve, launch, and the ball's
+    // first crossing of the top arch pays exactly one rung (measured: tick
+    // 167 of this exact input, deterministic).
+    const game = createGame(mapFor("law-n-justice"), { ballsPerGame: 3 });
+    startGame(game);
+    expect(game.serveScriptPending, "startGame owes no serve script yet").toBe(false);
+    let advancedAt = -1;
+    for (let tick = 0; tick < 400 && advancedAt < 0; tick += 1) {
+      runTicks(game, plungerOnlyInput(tick), 1);
+      if (((game.modeState?.counterTotals[13] ?? 0) > 0)) advancedAt = tick;
+    }
+    expect(advancedAt, "the serve's advance never landed").toBeGreaterThanOrEqual(0);
+    expect(game.serveScriptPending, "the latch is one-shot").toBe(false);
+    expect(game.modeState?.counterTotals[13]).toBe(1);
+  });
+
+  it("the advance elements relight, so every native award counts", () => {
+    // e9 (LnJ) carries flags $22 — lit at game start plus the $0A relight —
+    // so s13/s14/s59/s60/s61 can AWARD it over and over, +1 each time.
+    const modes = modesFor("law-n-justice");
+    const state = createModeState(modes);
+    const before = state.counterTotals[13] ?? 0;
+    for (const script of [59, 13, 60]) queueScript(state, script);
+    run(modes, state, 60);
+    expect(state.counterTotals[13]).toBe(before + 3);
+    expect(state.armed[9]).toBe(1);
   });
 });
 
@@ -1110,10 +1213,10 @@ describe("on the shipped Law 'n Justice data", () => {
   it("runs a real mission from its launcher and lights the shots it names", () => {
     const modes = modesFor("law-n-justice");
     const state = createModeState(modes);
-    const started = startSelectedMission(modes, state);
-    expect(started).toBeGreaterThanOrEqual(0);
-    const mission = modes.missions[started];
-    expect(mission?.selected).toBe(true);
+    // Ladder 8's first launcher, queued as the decoded effect-22 launch would.
+    const launcher = modes.ladders[8]?.entries[0]?.script ?? -1;
+    expect(launcher).toBeGreaterThanOrEqual(0);
+    queueScript(state, launcher);
 
     run(modes, state, 200);
     expect(missionRunning(state)).toBe(true);
@@ -1130,8 +1233,9 @@ describe("on the shipped Law 'n Justice data", () => {
     // resolve. What must NOT happen is a mission still executing instructions
     // after ten minutes of frames, because that is a loop with no exit.
     const modes = modesFor("law-n-justice");
+    const selected = modes.missions.flatMap((mission, at) => (mission.selected ? [at] : []));
     let parked = 0;
-    for (const at of modes.selectable) {
+    for (const at of selected) {
       const state = createModeState(modes);
       state.mission = modes.missions[at]?.script ?? -1;
       state.missionIndex = at;
@@ -1144,7 +1248,7 @@ describe("on the shipped Law 'n Justice data", () => {
     }
     // Most of them do end on their own; if they ALL parked, the timeout branches
     // would not be working and this test would be asserting nothing.
-    expect(parked).toBeLessThan(modes.selectable.length);
+    expect(parked).toBeLessThan(selected.length);
   });
 
   it("counts a COMBO on each of the six shots the bonus routine pays for", () => {
@@ -1263,7 +1367,7 @@ describe("on the shipped Law 'n Justice data", () => {
     const a = createModeState(modes);
     const b = createModeState(modes);
     for (const state of [a, b]) {
-      startSelectedMission(modes, state);
+      queueScript(state, modes.ladders[8]?.entries[0]?.script ?? -1);
       for (let i = 0; i < 900; i += 1) {
         if (i % 137 === 0) queueScript(state, i % modes.scripts.length);
         tickModes(modes, state);
@@ -1449,30 +1553,13 @@ describe("the missions, wired into a real game", () => {
     return found;
   }
 
-  it("start from EVERY shot on the disk that arms one, one shot at a time", () => {
-    // THE MECHANISM TEST, and it replaces a blind-cadence one that was really a
-    // coin flip. Round 5 found the old single 23/29 player no longer reaching a
-    // mission and widened the test to "any of four cadences". Measured on three
-    // fully-specified grids (Law 'n Justice, 3 balls, 20,000 ticks each, every
-    // ordered pair of bat cadences from the set, diagonal excluded):
-    //
-    //   {17,19,23,29,31,37}                        HEAD 18/30    now 15/30
-    //   {13,17,19,21,23,25,27,29,31,33,35,37}      HEAD 60/132   now 61/132
-    //   {17,19,23,29,31,37,41,43,47,53,59,61}      HEAD 53/132   now 43/132
-    //
-    // Note what those three disagree about: whether the rate went DOWN at all
-    // depends on which cadences you happen to pick — flat on the second grid,
-    // down a fifth on the third. That is the whole argument. A randomly chosen
-    // cadence is close to a coin flip on either tree, "at least one of four"
-    // passes by luck most of the time WHATEVER the physics does, and a quantity
-    // whose sign is set by the choice of probe cannot pin a regression.
-    //
-    // So the end-to-end claim is split in two. This half is deterministic and
-    // names every shot: the ball is pinned inside each arming rectangle in turn
-    // — the pattern `scoring-play.test.ts` uses for the lock award — and each
-    // must pay its zone and put a mission on the machine. It is strictly
-    // stronger than the cadence pin it replaces, which could only ever have
-    // exercised whichever one shot that cadence happened to find.
+  it("arm from EVERY arming shot on the disk — and start NOTHING, as the machine does", () => {
+    // THE REFEREE'S CORRECTION (CONFORMANCE.md §3.2): this test used to demand
+    // a MISSION from each arming shot, which was the invented selector. Driven
+    // on the 1995 machine, the arm shot arms the element bit-for-bit
+    // identically to the port and starts nothing — `$daa` stays 0. So the
+    // deterministic half now asserts exactly that: each arming zone pays its
+    // own score and puts its ARM element on the machine, and no mission runs.
     const zones = armingZones();
     expect(zones.length, "the disk's arming shots").toBe(3);
     expect(zones).toEqual([
@@ -1482,6 +1569,8 @@ describe("the missions, wired into a real game", () => {
     ]);
 
     const devices = devicesFor("law-n-justice");
+    const modes = modesFor("law-n-justice");
+    const armed = new Set(modes.armElements);
     for (const where of zones) {
       const zone = devices.zones.find(
         (one) => one.level === where.level && one.index === where.index,
@@ -1511,65 +1600,129 @@ describe("the missions, wired into a real game", () => {
         for (const award of report?.awards ?? []) paid.push(award.score);
       }
       expect(paid, `zone ${where.level}-${where.index} paid nothing`).toContain(zone.score);
-      const mission = runningMission(game);
-      expect(mission, `zone ${where.level}-${where.index} started no mission`).not.toBeNull();
-      expect(mission?.title.length, `mission from ${where.level}-${where.index} is nameless`)
-        .toBeGreaterThan(0);
+      expect(runningMission(game), `the arm shot must start nothing`).toBeNull();
+      const lit = game.modeState === null ? [] : litElements(game.modeState);
+      expect(
+        lit.some((element) => armed.has(element)),
+        `zone ${where.level}-${where.index} armed no arm element`,
+      ).toBe(true);
     }
   });
 
-  it("are reached by blind play often enough to be part of the game", () => {
-    // THE RATE HALF, stated as a rate with its budget the way this project
-    // states a census. BUDGET: Law 'n Justice, 30 blind players — every ordered
-    // pair of bat cadences from {17, 19, 23, 29, 31, 37} except the diagonal —
-    // 3 balls each, 20,000 ticks each. MEASURED: HEAD 18 of 30, this tree 15 of
-    // 30 — but see the three grids quoted on the test above, which disagree
-    // about the sign of that change. This number carries cadence-choice noise,
-    // not just physics.
+  it("launch through the decoded route: jail-throat with the counter walked by REAL bumper hits", () => {
+    // The whole machine flow end to end, no counter poked: three real bumper
+    // strikes queue s59/s60/s61 (the +$30 records' own scripts), each AWARDs
+    // e9 (effect 21) and walks counter 13 to 3; zone-1-9 arms e10 (s56); the
+    // jail-throat capture (s64) AWARDs e10 (effect 22), which launches ladder
+    // 8's id-3 entry — s23's MODE_START. The serve edge is left unconsumed by
+    // parking the launched ball straight onto the bumpers (it fires on the
+    // first TYPE-0 zone entry, and the bumper nest is not a zone), so the
+    // count here is the bumpers' own.
+    const game = createGame(mapFor("law-n-justice"), { ballsPerGame: 3 });
+    startGame(game);
+    const input = { sample: () => IDLE_SNAPSHOT };
+    runTicks(game, input, 60);
+    const ball = game.balls.balls[0];
+    expect(ball).toBeDefined();
+    if (ball === undefined) return;
+    game.laneBallId = null;
+
+    // One pass through the bumper nest: released from the free centre
+    // (250,290) toward bumper 17's face, the ball chains three latched
+    // contacts (17, 16, 17 — six-frame latch between them), and each queues
+    // that record's own script. Deterministic: same release, same three hits.
+    const state = game.modeState;
+    expect(state).not.toBeNull();
+    if (state === null) return;
+    const before = state.counterTotals[13] ?? 0;
+    ball.x = pixelsToQ10(250);
+    ball.y = pixelsToQ10(290);
+    ball.velocityX = 2005;
+    ball.velocityY = 1594;
+    ball.level = 0;
+    runTicks(game, input, 30);
+    expect(state.counterTotals[13] ?? 0, "three latched bumper hits advance by three").toBe(
+      before + 3,
+    );
+
+    // Light the launch element the machine's own way (zone-1-9 -> s56).
+    queueScript(state, 56);
+    runTicks(game, input, 20);
+    expect(state.armed[10]).toBe(1);
+
+    // The jail throat. Its capture runs s64, whose effect-22 AWARD launches
+    // ladder 8 at the current total — read the total at the capture, because
+    // the ball is still live and the serve edge or a stray carom may have
+    // added a rung since the bumper check (each is the mechanism working).
+    const lock = devicesFor("law-n-justice").zones.find(
+      (one) => one.kind === "lock" && one.level === 0 && one.index === 7,
+    );
+    expect(lock).toBeDefined();
+    if (lock === undefined) return;
+    ball.x = pixelsToQ10(Math.floor((lock.minX + lock.maxX) / 2));
+    ball.y = pixelsToQ10(Math.floor((lock.minY + lock.maxY) / 2));
+    ball.velocityX = 0;
+    ball.velocityY = 0;
+    ball.level = 0;
+    const total = state.counterTotals[13] ?? 0;
+    expect(total, "the bumper advances must survive to the capture").toBeGreaterThanOrEqual(3);
+    runTicks(game, input, 120);
+    const mission = runningMission(game);
+    expect(mission, "the lit lock must launch the mission at the count").not.toBeNull();
+    const launcher = modesFor("law-n-justice").ladders[8]?.entries.find((entry) => entry.id === total)?.script ?? -1;
+    const target = modesFor("law-n-justice").scripts[launcher]?.ops.find((op) => op.op === 9)?.args[0] ?? -1;
+    expect(game.modeState?.mission).toBe(target);
+  });
+
+  it("advance the ladder and arm the launch shot under blind play — the decoded canaries", () => {
+    // THE RATE HALF, re-scoped by the referee round. The old floor here was
+    // "10 of 30 blind players reach a mission", calibrated to the INVENTED
+    // selector (a mission per arm shot). Under the machine's decoded flow the
+    // measured rate is 0 of 30 — and that agrees with the film: the filmed
+    // original's whole three-ball game never started a mission either
+    // (research/SCORING_LEDGER.md). A mission needs the upper-level arm shot
+    // AND a jail-throat capture with the ladder mid-run; blind cadences do
+    // neither on purpose.
     //
-    // What physics it does carry is priced in rather than a defect: round 6
-    // halved every coil constant after finding the responder works at twice the
-    // ball's velocity scale, and the four filmed slingshot junctions went from
-    // 4.23 to 0.25 px/f RMS against the original. Where the machine got harder
-    // it got harder because the original IS harder, and census medians moved the
-    // same way for the same reason.
-    //
-    // The floor is two thirds of the measured 15, so it tolerates that noise but
-    // catches any further third lost — and it goes to zero the moment one of the
-    // three arming shots stops firing, which is the regression it exists to
-    // catch.
+    // What blind play MUST still show is the two native edges working, and
+    // those are the canaries with measured budgets (same 30-cell cadence
+    // grid, 3 balls, 20,000 ticks): the mission ladder ADVANCED in 30 of 30
+    // games (the bumper scripts — floor 27), and the launch element e10 was
+    // ARMED in 4 of 30 (the zone-1-9 shot — floor 1). Either going to zero is
+    // the regression this test exists to catch.
     const cadences = [17, 19, 23, 29, 31, 37];
     const modeAwards: number[] = [];
-    let players = 0;
+    let advanced = 0;
+    let armedGames = 0;
     let cells = 0;
-    const titles = new Set<string>();
     for (const left of cadences) {
       for (const right of cadences) {
         if (left === right) continue;
         cells += 1;
         const game = createGame(mapFor("law-n-justice"), { ballsPerGame: 3 });
         startGame(game);
-        let started = false;
+        let sawAdvance = false;
+        let sawArm = false;
         for (let tick = 0; tick < 20_000; tick += 1) {
-          const before = game.modeState === null ? -1 : game.modeState.mission;
           const report = runTicks(game, playingInput(tick, left, right), 1)[0];
           if (report === undefined) break;
           for (const award of report.awards) {
             if (award.source === "mode") modeAwards.push(award.score);
           }
-          const mission = runningMission(game);
-          if (mission !== null && before < 0) {
-            started = true;
-            if (mission.title.length > 0) titles.add(mission.title);
+          const state = game.modeState;
+          if (state !== null) {
+            if ((state.counterTotals[13] ?? 0) > 0) sawAdvance = true;
+            if (state.armed[10] === 1) sawArm = true;
           }
         }
-        if (started) players += 1;
+        if (sawAdvance) advanced += 1;
+        if (sawArm) armedGames += 1;
       }
     }
     expect(cells).toBe(30);
-    expect(players, `only ${players} of ${cells} blind players reached a mission`)
-      .toBeGreaterThanOrEqual(10);
-    expect(titles.size, "no mission announced itself to any player").toBeGreaterThan(0);
+    expect(advanced, `only ${advanced} of ${cells} blind players advanced the mission ladder`)
+      .toBeGreaterThanOrEqual(27);
+    expect(armedGames, `no blind player armed the launch element`).toBeGreaterThanOrEqual(1);
     // Every value paid is an element score off the disks, checked the same way
     // `scoring-play.test.ts` checks the device layer.
     const permitted = new Set(modesFor("law-n-justice").elements.map((element) => element.score));
@@ -1583,8 +1736,12 @@ describe("the missions, wired into a real game", () => {
     expect(state).not.toBeNull();
     if (state === null) return;
 
-    startSelectedMission(modesFor("law-n-justice"), state);
+    // Launch through the decoded route: a ladder-8 launcher's MODE_START.
+    const launcher = modesFor("law-n-justice").ladders[8]?.entries[0]?.script ?? -1;
+    expect(launcher).toBeGreaterThanOrEqual(0);
+    queueScript(state, launcher);
     runTicks(game, { sample: () => IDLE_SNAPSHOT }, 5);
+    expect(runningMission(game)).not.toBeNull();
     // Force the end of the ball the way a drain does.
     resetModesForNewBall(modesFor("law-n-justice"), state);
     expect(runningMission(game)).toBeNull();

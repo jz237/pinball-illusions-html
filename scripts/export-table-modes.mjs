@@ -204,6 +204,60 @@ const HEADER_COUNTERS = 0x40;
 /** The table's own end-of-ball bonus routine, called at `$51BE`. See `comboCounterOf`. */
 const HEADER_BONUS_ROUTINE = 0x80;
 /**
+ * THE BUMPER TABLE — descriptor +$30, read by exactly two routines:
+ *
+ *     00B590  movea.l $231e(a5),a1          ; the bumper COIL, on contact
+ *     00B594  adda.w -$2(a1,d3.w),a1        ; d3 = contact index * 2; the table
+ *                                           ; opens with one offset word per
+ *                                           ; record, 0-terminated
+ *     00B598  tst.b $1(a1) / bne            ; the 6-frame LATCH (tilt kills it)
+ *     00B59E  move.b #$6,$1(a1)
+ *     00B5A4  lea $16(a1),a3 / jsr $6BCC    ; pay the record's own BCD pair
+ *     00B5AE  move.l $6(a1),d3 / beq        ; +$06 — THE RECORD'S OWN SCRIPT —
+ *     00B5B8  jsr $6C10                     ; queued through the background ring
+ *     00B5C0  move.l $2(a1),d3 / jsr $779E  ; +$02 display record
+ *
+ *     005700  movea.l $231e(a5),a0          ; the per-frame latch decrement
+ *
+ * The +$06 script is the native edge the static audit could not see: it is what
+ * queues the orphan awarders (Law 'n Justice s59/s60/s61, BabeWatch s49/s50/s51,
+ * Extreme Sports s35 on all four bumpers), and through their effect-21 / effect-6
+ * AWARDs it is what advances the mission ladders during ordinary play — the
+ * machine-only counter stepping CONFORMANCE.md §3.1 measured. The slingshot
+ * table at +$34 goes through the same coil shape at +0x00B5D4 with NO script
+ * queue, which is why slingshots advance nothing.
+ */
+const HEADER_BUMPERS = 0x30;
+/**
+ * THE SERVE SCRIPTS — descriptor +$6C and +$70, each a pointer to one script.
+ *
+ * `$d7b(a5)` is set by exactly two state handlers — the charged serve (state 5,
+ * `st.b $d7b(a5)` at +0x0049BA, right after the ball-saver arm) and the
+ * extra-ball serve (state 7, +0x004FC0) — and consumed at exactly one site, the
+ * type-0 zone-entry handler:
+ *
+ *     005494  tst.b $d7b(a5) / beq $54B6    ; a serve is in flight?
+ *     00549A  movea.l $235a(a5),a0          ; descriptor +$6C's script
+ *     00549E  move.w $e84(a5),d1            ; balls-per-game (option record)
+ *     0054A2  cmp.w $d82(a5),d1             ; == balls remaining -> first ball
+ *     0054A6  beq $54AC
+ *     0054A8  movea.l $235e(a5),a0          ; else descriptor +$70's script
+ *     0054AC  jsr $6C10                     ; queue it
+ *     0054B6  clr.w $23f0(a5)               ; (tilt meter)
+ *     0054BA  clr.b $d7b(a5)                ; one-shot
+ *     0054C2  clr.b $d88(a5)                ; the lane latch, same handler
+ *
+ * So every charged or extra-ball serve queues one of these two scripts on the
+ * served ball's first entry into a type-0 zone. On Law 'n Justice they are
+ * s13/s14 (AWARD e9 — one mission-ladder rung per serve) and on Extreme Sports
+ * s14/s15 (AWARD e82, same); BabeWatch's s12/s13 award nothing and only START
+ * e13 / cue music, which is why its mission counter does not step on serves.
+ * Machine-owed serves (the $65EE lane server: multiball top-ups, ball-save
+ * returns) never pass through state 5 or 7 and queue neither.
+ */
+const HEADER_SERVE_FIRST_BALL = 0x6c;
+const HEADER_SERVE_LATER_BALL = 0x70;
+/**
  * THE LAMP-GROUP TABLE — descriptor +$38, a NULL-terminated array of pointers
  * to GROUP records, and the structure that closes the multiplier gap: the ONLY
  * callers of the three orphan multiplier-arming scripts (Law 'n Justice 237,
@@ -518,6 +572,15 @@ const COUNTER_STEP = 0x32;
  */
 const COUNTER_BCD_TARGET = 0x40;
 const COUNTER_CONTINUATION = 0x48;
+/**
+ * The LADDER-COMPLETE script at +$4C — queued by the walk's own wrap when it
+ * runs off the 0xFFFE terminator having found EVERY entry's per-player done
+ * bit set (+0x005F32, `move.l $4C(a0),d0 / jsr $6C10`), right before the walk
+ * resets the whole record and clears the entry done bits (+0x005F44..$5F74).
+ */
+const COUNTER_LADDER_COMPLETE = 0x4c;
+/** Ladder entry fields: +$00 id, +$02 per-player done mask, +$04 script, +$08 lamp. */
+const LADDER_ENTRY_LAMP = 0x08;
 /** Flags bit 0: the ball-start walk branches away before the count reset. */
 const COUNTER_FLAG_BCD_FROM_COUNT = 0x01;
 /** Flags bit 3: the ball-start walk skips the count reset. */
@@ -1003,7 +1066,13 @@ function ladderOf(pkg, record, scriptIndex) {
     const launcher = follow(pkg, record, delta + 4);
     const script = launcher === null ? undefined : scriptIndex.get(key(launcher));
     if (script === undefined) return null;
-    entries.push({ id, script });
+    // The entry's RUNG LAMP at +$08, carried as its address for now: the flat
+    // lamp order does not exist yet when the ladders are built, so `decode`
+    // resolves `lampAt` to a flat index after the group walk. The walk's own
+    // lamp block (+0x005ECE / +0x005EF6) is what reads this pointer: a passed
+    // rung's lamp goes steady always-on, the current rung's blinks.
+    const lampAt = follow(pkg, record, delta + LADDER_ENTRY_LAMP);
+    entries.push({ id, script, lampAt: lampAt === null ? null : key(lampAt) });
     delta += LADDER_ENTRY_BYTES;
   }
 }
@@ -1926,6 +1995,129 @@ function zoneBindings(pkg) {
 }
 
 /**
+ * The bumper records off descriptor +$30: one script pointer per record.
+ *
+ * The table opens with one offset word per record (the coil indexes them with
+ * `adda.w -$2(a1,d3.w)`, d3 = contact index * 2), terminated by a zero word;
+ * each record's +$06 is the script the coil queues on a latched hit. See
+ * `HEADER_BUMPERS` for the whole decode. Refused rather than dropped when the
+ * pointer is not a decoded script, for the same reason `chainScript` refuses.
+ */
+function bumperScriptsOf(pkg, bindScript) {
+  const base = descriptorPointer(pkg, HEADER_BUMPERS);
+  if (base === null) return [];
+  const out = [];
+  for (let index = 0; ; index += 1) {
+    if (!inBounds(pkg, base, 2 * index + 2)) break;
+    const offset = readU16(pkg, base, 2 * index);
+    if (offset === 0) break;
+    if (index > 15) throw new Error(`${pkg.stem}: bumper table at +$30 is not terminated`);
+    const script = follow(pkg, { hunk: base.hunk, offset: base.offset + offset }, 6);
+    const bound = script === null ? -1 : bindScript(script);
+    if (script !== null && bound < 0) {
+      throw new Error(
+        `${pkg.stem}: bumper record ${index} points its +$06 at ${key(script)}, ` +
+          "which is not a decoded script; the coil at +0x00B5B8 would queue it",
+      );
+    }
+    out.push(bound);
+  }
+  return out;
+}
+
+/**
+ * The two serve scripts off descriptor +$6C/+$70. See `HEADER_SERVE_*`.
+ * Both slots are populated on every shipped table; a missing or undecoded
+ * pointer is refused because the zone handler at +0x0054AC would queue it.
+ */
+function serveScriptsOf(pkg, bindScript) {
+  const out = [];
+  for (const header of [HEADER_SERVE_FIRST_BALL, HEADER_SERVE_LATER_BALL]) {
+    const at = descriptorPointer(pkg, header);
+    const bound = at === null ? -1 : bindScript(at);
+    if (bound < 0) {
+      throw new Error(
+        `${pkg.stem}: descriptor +$${header.toString(16)} does not name a decoded script; ` +
+          "the serve edge at +0x00549A/+0x0054A8 queues it on the served ball's first zone",
+      );
+    }
+    out.push(bound);
+  }
+  return out;
+}
+
+/**
+ * MODE-DEVICE CHAINS — the gate CONFORMANCE.md §3.3 left open, now decoded.
+ *
+ * A type-1 (mode-kind) device does NOT queue a script on every hit. Its handler
+ * (+0x00564C, device dispatch entry for type word 2):
+ *
+ *     00564C  movea.l $22(a0),a1            ; the shared MODE OBJECT
+ *     00565C  bset.b d0,(a2)                ; first-hit flag, result unused
+ *     00565E  lea $16(a1),a3 / jsr $6B96    ; pay the object's BCD pair EVERY hit
+ *     005676  st.b $b(a0)                   ; mark THIS device hit
+ *     005688  move.l (a1),d0                ; object +$00: chain head
+ *     00568C  tst.b $b(a2) / beq rts        ; ANY chained device unhit -> no script
+ *     005692  move.l $1e(a2),d0 / bne loop  ; +$1E: next device in the chain
+ *     005698  move.l $16(a1),d0 / jsr $6C10 ; whole chain hit -> queue the script
+ *
+ * (Object +$16 is both the END pointer of the {bonus,pad,score} pay block that
+ * $6B96 predecrements through AND the longword holding the script — the layouts
+ * nest exactly.) The +$0B hit flags are cleared for every type-1 device at game
+ * start (+0x004204) and at ball start (+0x00423C) unless the device's +$04 bit 0
+ * is set. On the shipped tables exactly one chain exists: Law 'n Justice devices
+ * 128+129 sharing the object at h4+0x3F60, script s78 (START e26 — the crater
+ * lock lamp), neither sticky. So the crater lights when BOTH mode targets have
+ * been struck within one ball — the port's old per-hit edge was the
+ * over-generous reconstruction the referee measured against the machine.
+ */
+function modeChainsOf(pkg, bindScript) {
+  const out = [];
+  const seen = new Set();
+  for (const level of [0, 1]) {
+    const base = descriptorPointer(pkg, level === 1 ? HEADER_UPPER_DEVICES : HEADER_LOWER_DEVICES);
+    if (base === null) continue;
+    const slotOf = new Map();
+    for (let index = 0; index < DEVICE_SLOTS; index += 1) {
+      const record = follow(pkg, base, 4 * index);
+      if (record !== null) slotOf.set(key(record), index + DEVICE_ID_BASE);
+    }
+    for (let index = 0; index < DEVICE_SLOTS; index += 1) {
+      const record = follow(pkg, base, 4 * index);
+      if (record === null || readU16(pkg, record, 0) !== 1) continue;
+      const object = follow(pkg, record, DEVICE_MODE_POINTER);
+      if (object === null || seen.has(key(object))) continue;
+      seen.add(key(object));
+      const devices = [];
+      let sticky = false;
+      let node = follow(pkg, object, 0);
+      for (let hops = 0; node !== null; hops += 1) {
+        if (hops > 8) throw new Error(`${pkg.stem}: mode-device chain at ${key(object)} does not end`);
+        const id = slotOf.get(key(node));
+        if (id === undefined) {
+          throw new Error(
+            `${pkg.stem}: mode-device chain at ${key(object)} links to ${key(node)}, ` +
+              "which is not on the level's device list",
+          );
+        }
+        devices.push(id);
+        if ((readU8(pkg, node, 4) & 1) !== 0) sticky = true;
+        node = follow(pkg, node, 0x1e);
+      }
+      const script = follow(pkg, object, MODE_EVENT);
+      const bound = script === null ? -1 : bindScript(script);
+      if (bound < 0) {
+        throw new Error(
+          `${pkg.stem}: mode-device chain at ${key(object)} has no decoded script at +$16`,
+        );
+      }
+      out.push({ level, devices, script: bound, sticky });
+    }
+  }
+  return out;
+}
+
+/**
  * The mission selector tables: 12-byte records with ids ascending from 1.
  *
  * Found by scanning rather than by a pointer, because nothing in the image
@@ -2140,6 +2332,8 @@ function decode(pkg, table) {
   const counters = counterRecords.map((at, index) => {
     const continuation = follow(pkg, at, COUNTER_CONTINUATION);
     const script = continuation === null ? -1 : (scriptIndex.get(key(continuation)) ?? -1);
+    const complete = follow(pkg, at, COUNTER_LADDER_COMPLETE);
+    const completeScript = complete === null ? -1 : (scriptIndex.get(key(complete)) ?? -1);
     return {
       index,
       flags: readU8(pkg, at, COUNTER_FLAGS),
@@ -2155,6 +2349,9 @@ function decode(pkg, table) {
       // $FFFFFFFF sentinel. See `COUNTER_BCD_TARGET` and `counterTarget`.
       target: counterTarget(pkg, at),
       continuation: script,
+      // The +$4C ladder-complete script the wrap fires when every entry is
+      // done — see `COUNTER_LADDER_COMPLETE`.
+      ladderComplete: completeScript,
       ladder: ladderIndexOf(at),
       keepAcrossBall: (readU8(pkg, at, COUNTER_FLAGS) & COUNTER_FLAGS_KEEP_ACROSS_BALL) !== 0,
     };
@@ -2309,6 +2506,44 @@ function decode(pkg, table) {
   // decoded from the descriptor's own tail. See `HEADER_LAMP_GROUPS`.
   const groups = lampGroups(pkg, scriptIndex, elementList, residue);
   const multiplierRestore = multiplierRestoreOf(pkg, counterIndexOf);
+
+  // RESOLVE THE LADDER RUNG LAMPS to flat lamp indices — the port's own
+  // `groupLampLit`/`groupLampAlways` order: groups in table order, lamps in
+  // chain order. The ladders were built before the group walk existed, so the
+  // entries carried the lamp ADDRESS; a rung lamp that is not on the group
+  // table would be a lamp the runtime has no byte for, and is refused.
+  {
+    const flatByKey = new Map();
+    const bases = descriptorPointer(pkg, HEADER_LAMP_GROUPS);
+    let flat = 0;
+    for (let index = 0; ; index += 1) {
+      const record = follow(pkg, bases, 4 * index);
+      if (record === null) break;
+      let lamp = follow(pkg, record, GROUP_FIRST_LAMP);
+      let position = 0;
+      const seen = new Set();
+      while (lamp !== null && position < GROUP_MAX_LAMPS) {
+        if (seen.has(key(lamp))) break;
+        seen.add(key(lamp));
+        flatByKey.set(key(lamp), flat);
+        lamp = follow(pkg, lamp, LAMP_NEXT);
+        flat += 1;
+        position += 1;
+      }
+    }
+    for (const ladder of ladders) {
+      ladder.entries = ladder.entries.map((entry) => {
+        const lamp = entry.lampAt === null ? -1 : (flatByKey.get(entry.lampAt) ?? -2);
+        if (lamp === -2) {
+          throw new Error(
+            `${pkg.stem}: ladder ${ladder.index} entry id ${entry.id} names a rung lamp at ` +
+              `${entry.lampAt} that is not on the group table`,
+          );
+        }
+        return { id: entry.id, script: entry.script, lamp };
+      });
+    }
+  }
 
   const elements = elementList.map((at, index) => ({
     index,
@@ -2518,6 +2753,14 @@ function decode(pkg, table) {
   }
   const unreachable = [...waited].filter((element) => !shootable.has(element)).sort((a, b) => a - b);
 
+  // The three native edges off the descriptor, decoded in this round: the
+  // per-bumper scripts (+$30), the two serve scripts (+$6C/+$70) and the
+  // mode-device chains (type-1 devices' shared object). See HEADER_BUMPERS,
+  // HEADER_SERVE_* and `modeChainsOf`.
+  const bumperScripts = bumperScriptsOf(pkg, bindScript);
+  const serveScripts = serveScriptsOf(pkg, bindScript);
+  const modeChains = modeChainsOf(pkg, bindScript);
+
   return {
     elements,
     messages,
@@ -2530,6 +2773,9 @@ function decode(pkg, table) {
     lampGroups: groups,
     multiplierRestore,
     triggers: { devices, zones, locks },
+    bumperScripts,
+    serveScripts,
+    modeChains,
     selectors: selectors.map((entry, index) => ({
       index,
       entries: entry.entries.length,
@@ -2599,6 +2845,9 @@ function buildDocument(table, decoded) {
     lampGroups: decoded.lampGroups,
     multiplierRestore: decoded.multiplierRestore,
     triggers: decoded.triggers,
+    bumperScripts: decoded.bumperScripts,
+    serveScripts: decoded.serveScripts,
+    modeChains: decoded.modeChains,
   };
 }
 

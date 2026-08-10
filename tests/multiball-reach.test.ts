@@ -507,6 +507,15 @@ describe("multiball can be started on every table", () => {
     // What lights them is a MISSION: script 120's `START 29` at pc 102, after
     // its forty-second window. Then one counted grid capture puts counter 8 on
     // 1, and ladder 2 id 1 launches script 110 -> MODE_START 179 -> two balls.
+    //
+    // HOW s120 STARTS is BabeWatch's player-driven chooser ("CHOOSE LEFT
+    // RIGHT / SELECT WITH RETURN", s226/s227) — display-layer work this port
+    // has not modelled, and the invented selector that used to stand in for it
+    // was refuted by the referee (CONFORMANCE.md §3.2: the machine arms and
+    // starts nothing). Queueing the mission's own launcher here is the
+    // harness's stand-in for the player's pick, and everything after it —
+    // the grid lamp, the counted capture, the ladder, the top-up — is the
+    // decoded machinery under test.
     const game = createGame(mapFor("babewatch"), { ballsPerGame: 5 });
     startGame(game);
     const input = plungingInput();
@@ -515,12 +524,8 @@ describe("multiball can be started on every table", () => {
     expect(game.modeState).not.toBeNull();
     if (game.modeState === null) return;
 
-    // Start a mission the decoded way: queue the script the mode shot fires.
-    // Which mission the selector picks is the port's own reconstruction (see
-    // `startSelectedMission`); that it is one of the four that light a lock
-    // lamp is the shipped table's.
-    const armScript = modes.scriptForLock(0, 16);
-    expect(armScript, "zone-0-16's capture script").toBeGreaterThanOrEqual(0);
+    const chooserPick = modes.missions.find((mission) => mission.script === 120)?.launcher ?? -1;
+    expect(chooserPick, "s120's launcher").toBeGreaterThanOrEqual(0);
     const topLane = ballLocksFor("babewatch").find((one) => one.id === "top-lane");
     expect(topLane).toBeDefined();
     if (topLane === undefined) return;
@@ -529,10 +534,10 @@ describe("multiball can be started on every table", () => {
     for (let round = 0; round < 4 && !outcome.started; round += 1) {
       const lit = [29, 30, 31].some((element) => game.modeState?.armed[element] === 1);
       if (!lit) {
-        if (game.modeState !== null) queueScript(game.modeState, armScript);
+        if (game.modeState !== null) queueScript(game.modeState, chooserPick);
         // Run the mission out: its `START 29` is on the far side of a
         // forty-second WAIT, and `MODE_START` refuses a second mission while
-        // one is live, so the launcher below needs this one finished.
+        // one is live, so the ladder's launcher below needs this one finished.
         parkBall(game, PARK.babewatch);
         runParked(game, input, "babewatch", 2600);
       }
@@ -546,31 +551,62 @@ describe("multiball can be started on every table", () => {
     expect(outcome.promised, "script 179 asks for two balls").toBeGreaterThanOrEqual(2);
   });
 
-  it("extreme-sports: no lock feeds a ladder, so its multiball is a MISSION", () => {
-    // Extreme Sports' two saucers award effect-6 elements on counters 4, 11 and
-    // 13 — none of which drives a ladder that reaches `BALLS_UP_TO`. Both of
-    // its multiball routes are mission ladders (6 and 8), so the shot that
-    // starts a multiball here is the mission-arm shot, taken enough times.
+  it("extreme-sports: bumpers advance the mission counter and the lit bowl launches the 3-ball", () => {
+    // THE DECODED ROUTE END TO END (CONFORMANCE.md §3.1/§3.2, es-12 driven on
+    // the machine): the four bumpers' shared script s35 AWARDs e82 (effect 21,
+    // +1 on counter 1) per latched hit; device-36's s48 STARTs e83 (MODES
+    // ENABLED); the bowl capture's s37 AWARDs e83 (effect 22), which launches
+    // ladder 8's entry at the counter's total — id 6 is s179, whose mission
+    // s112 carries `BALLS_UP_TO 3`. The machine demonstrated exactly this
+    // launch with its own 3-ball multiball, reproduced on two boots.
     const game = createGame(mapFor("extreme-sports"), { ballsPerGame: 5 });
     startGame(game);
     const input = plungingInput();
     expect(launchFromLane(game, input)).toBe(true);
     expect(game.modeState).not.toBeNull();
-    if (game.modeState === null) return;
+    const state = game.modeState;
+    if (state === null) return;
     const modes = modesFor("extreme-sports");
-    const armScript = modes.scriptForDevice(0, 36);
-    expect(armScript, "the mode device's script").toBeGreaterThanOrEqual(0);
 
-    // Ten mode shots, each starting the selector's next mission: the FIFTH
-    // selectable mission is script 166, whose body is `BALLS_UP_TO 3`.
-    let outcome = { started: false, promised: 0 };
-    for (let round = 0; round < 14 && !outcome.started; round += 1) {
-      if (debugSnapshot(game).mission === null && game.modeState !== null) {
-        queueScript(game.modeState, armScript);
+    // Walk counter 1 to exactly 6 with real bumper strikes, one contact at a
+    // time: release toward bumper 16's face from the free centre above it,
+    // then park the ball away before a second contact latches.
+    const bowl = ballLocksFor("extreme-sports").find((one) => one.id === "bowl");
+    expect(bowl).toBeDefined();
+    if (bowl === undefined) return;
+    const wantTotal = 6;
+    for (let strike = 0; strike < 40 && (state.counterTotals[1] ?? 0) < wantTotal; strike += 1) {
+      const before = state.counterTotals[1] ?? 0;
+      const laneId = debugSnapshot(game).laneBallId;
+      const ball = game.balls.balls.find(
+        (one) => one.active && one.heldBy === null && one.id !== laneId,
+      );
+      expect(ball, "a rolling ball to strike with").toBeDefined();
+      if (ball === undefined) return;
+      // Bumper 16's box is (223..257, 215..249); (240,200) is free above it.
+      ball.x = pixelsToQ10(240);
+      ball.y = pixelsToQ10(202);
+      ball.velocityX = 0;
+      ball.velocityY = 2048;
+      ball.level = 0 as PlayfieldLevel;
+      for (let tick = 0; tick < 40 && (state.counterTotals[1] ?? 0) === before; tick += 1) {
+        runTicks(game, input, 1);
       }
-      outcome = runParked(game, input, "extreme-sports", 3000);
+      parkBall(game, PARK["extreme-sports"]);
+      runTicks(game, input, 8); // let the 6-frame latch expire clear of the nest
     }
-    expect(outcome.started, "no multiball after fourteen mission windows").toBe(true);
+    expect(state.counterTotals[1], "the bumpers must reach the 3-ball rung").toBe(wantTotal);
+
+    // MODES ENABLED — the arm device's own script, then the bowl.
+    queueScript(state, modes.scriptForDevice(0, 36));
+    runTicks(game, input, 10);
+    expect(state.armed[83], "e83 must be lit for the launch").toBe(1);
+    parkBall(game, {
+      x: Math.floor((bowl.minX + bowl.maxX) / 2),
+      y: Math.floor((bowl.minY + bowl.maxY) / 2),
+    });
+    const outcome = runParked(game, input, "extreme-sports", 3000);
+    expect(outcome.started, "the lit bowl at count 6 must start the 3-ball multiball").toBe(true);
     expect(outcome.promised, "the mission asks for three balls").toBeGreaterThanOrEqual(2);
   });
 });

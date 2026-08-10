@@ -190,7 +190,7 @@ import {
 } from "../game/flippers.js";
 import { materialTableFor } from "../game/materials.js";
 import type { TableDevices, ZoneEject } from "../game/table-devices.js";
-import { DEVICE_ID_BASE } from "../game/surface-physics.js";
+import { DEVICE_ID_BASE, bumperIndexOf } from "../game/surface-physics.js";
 import { originalVelocityToQ10 } from "../game/timebase.js";
 import { tableDevicesFor } from "../game/table-devices.js";
 import type { Award, ScoringState } from "../game/scoring.js";
@@ -239,6 +239,7 @@ import {
   lightGroupLampsForTrigger,
   litElements,
   missionSecondsLeft,
+  modeDeviceScript,
   queueScript,
   resetModesForNewBall,
   restoreMultiplierLamps,
@@ -729,6 +730,28 @@ export interface Game {
    * The original's `$D86(a5)`.
    */
   pendingServes: number;
+  /**
+   * The original's `$D7B(a5)`: a serve is in flight and the served ball's
+   * first entry into a type-0 zone should queue one of the table's two serve
+   * scripts (descriptor +$6C/+$70). Set by exactly the two states that set it
+   * on the machine — the charged serve (state 5, `st.b $d7b(a5)` at
+   * +0x0049BA) and the extra-ball serve (state 7, +0x004FC0) — and consumed
+   * one-shot at +0x005494..+0x0054B4. Machine-owed serves (multiball top-ups,
+   * lock replacements, ball-save returns through the $65EE lane server) never
+   * set it, which is why those balls advance no mission ladder. One
+   * machine-global byte, like the ball saver: the loop owns it, not the bank.
+   */
+  serveScriptPending: boolean;
+  /**
+   * Lock-capture scripts queued and not yet finished, each with the lock
+   * device whose ball the capture is holding. When such a script reaches its
+   * END with the ball still held and no eject queued or running for that
+   * lock, the machine keeps the ball: it goes to the trough and a replacement
+   * serve is owed — CONFORMANCE.md §3.3's measured crater eat, corroborated by
+   * the script data (the lit path of every eating capture ends without the
+   * unlit tail's PUSH). See `runModes`.
+   */
+  pendingLockScripts: { script: number; deviceId: string }[];
   /** True from the moment a multiball starts until it is back down to one ball. */
   multiball: boolean;
   /**
@@ -1163,6 +1186,8 @@ export function createGame(map: TableMap, options?: Partial<GameOptions>): Game 
     announcingServe: false,
     locks: createLockBank(map.tableId),
     pendingServes: 0,
+    serveScriptPending: false,
+    pendingLockScripts: [],
     multiball: false,
     ballSaveTicks: 0,
     ballSaving: false,
@@ -1218,6 +1243,8 @@ export function startGame(game: Game, players: number = 1): void {
   // old bank still held would name a ball that no longer exists.
   game.locks = createLockBank(game.map.tableId);
   game.pendingServes = 0;
+  game.serveScriptPending = false;
+  game.pendingLockScripts = [];
   game.multiball = false;
   game.lockEjectStack = [];
   game.lockEjecting = null;
@@ -1544,7 +1571,16 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
     // to play with. That replacement is the one piece of the round-4 lock
     // reconstruction that survives, and it is charged as a MACHINE serve rather
     // than as one of the player's three.
-    const returning = game.lockEjecting !== null || game.lockEjectStack.length > 0;
+    // A capture script still on its way through the background ring has not
+    // decided the held ball's fate yet: it will PUSH it back, BALL_REMOVE it,
+    // or finish holding it — in which case the eat in `runModes` sends it to
+    // the trough and OWES the replacement. Serving early here double-served
+    // exactly the crater case the eat now covers (one insurance ball plus one
+    // owed ball for a single eaten one).
+    const returning =
+      game.lockEjecting !== null ||
+      game.lockEjectStack.length > 0 ||
+      game.pendingLockScripts.length > 0;
     if (owed || (freeBallCount(game.balls) === 0 && !returning)) {
       if (game.serveCountdown > 0) {
         game.serveCountdown -= 1;
@@ -1578,6 +1614,10 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
           // it. And it does not touch `ballsServed`, because $5070's two
           // decrements were jumped clear over. See `Game.extraBallServe`.
           game.extraBallServe = false;
+          // `+0x004FC0  st.b $d7b(a5)` — state 7 sets the serve-script latch
+          // exactly as state 5 does; the served ball's first type-0 zone will
+          // queue descriptor +$6C/+$70's script. See `Game.serveScriptPending`.
+          game.serveScriptPending = true;
           game.tilt = resetTiltForNewBall();
           game.ballsLocked = 0;
           game.searchPulses = BALL_SEARCH_PULSES;
@@ -1595,6 +1635,10 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
           game.autoLaunchCountdown = AUTO_LAUNCH_DELAY_TICKS;
         } else {
           game.ballsServed += 1;
+          // `+0x0049BA  st.b $d7b(a5)` — state 5's fourth instruction, right
+          // after the saver arm below: every charged serve arms the
+          // serve-script latch. See `Game.serveScriptPending`.
+          game.serveScriptPending = true;
           // THE BALL SAVE IS ARMED HERE AND NOWHERE ELSE. State 5 opens with
           // `move.w $e8e(a5),d0 / mulu.w $50(a5),d0 / move.w d0,$d8a(a5)` at
           // +0x0049AE, and `$d8a` has exactly two writers in the segment: that
@@ -2042,6 +2086,9 @@ export function tickGame(game: Game, snapshot: ControlSnapshot): GameTickReport 
       if (game.modes !== null && game.modeState !== null) {
         resetModesForNewBall(game.modes, game.modeState);
       }
+      // The reset just wiped the background queue, so any capture script still
+      // pending in it will never run: its lock bookkeeping dies with it.
+      game.pendingLockScripts = [];
       game.modeMessages = [];
       game.multiball = false;
       // THE BONUS IS READ BEFORE THE TILT IS CLEARED, because the machine does:
@@ -2295,6 +2342,7 @@ function endBallAfterBonus(game: Game): boolean {
   if (game.modes !== null && game.modeState !== null) {
     resetModesForNewBall(game.modes, game.modeState);
   }
+  game.pendingLockScripts = [];
   game.modeMessages = [];
   clearBonusForNewBall(game.scoring);
   if (game.modes !== null && game.modeState !== null) {
@@ -2450,6 +2498,22 @@ function runModes(game: Game, awards: readonly Award[]): ModeTickReport {
   if (modes === null || state === null) return EMPTY_MODE_TICK;
 
   for (const award of awards) {
+    // THE BUMPER EDGE, +0x00B5AE..+0x00B5BE: a latched bumper hit queues the
+    // bumper record's own +$06 script through the background ring. These are
+    // the scripts that AWARD the mission-ladder advance elements (LnJ
+    // s59/s60/s61 -> e9, ES s35 -> e82) and BabeWatch's counter-9 feeder
+    // (s49/s50/s51 -> e14) — the machine-only counter stepping the referee
+    // measured. The award list already carries exactly one entry per latched
+    // hit (`pushHit`'s 6-frame debounce is the machine's own `move.b #$6,
+    // $1(a1)` latch), so queueing per award is queueing per coil fire. The
+    // slingshot path (+0x00B5D4) has no script queue, and neither does this.
+    if (award.source === "bumper") {
+      const index = Number.parseInt(award.id.slice("bumper-".length), 10);
+      if (Number.isInteger(index)) {
+        queueScript(state, modes.bumperScripts[bumperIndexOf(index) - 1] ?? -1);
+      }
+      continue;
+    }
     const trigger = awardTrigger(award);
     if (trigger === null) continue;
     if (trigger.kind === "device") {
@@ -2458,6 +2522,18 @@ function runModes(game: Game, awards: readonly Award[]): ModeTickReport {
       // completing a group of them queues the group's event. This is the join
       // that arms the bonus multiplier — see `lampGroups` in table-modes.ts.
       lightGroupLampsForTrigger(modes, state, "device", -1, trigger.id);
+      // A type-1 (mode-kind) device is GATED: the shared object's script only
+      // queues when every device on its chain has been hit this ball —
+      // +0x005688's walk over the +$0B flags, CONFORMANCE.md §3.3. The port
+      // used to queue s78 on every 128/129 hit, which armed the crater lock
+      // lamp the machine leaves dark and COMPLETEd e27 out from under the
+      // capture's own 1,000,000 bonus.
+      const gatedLower = modeDeviceScript(modes, state, 0, trigger.id);
+      const gated = gatedLower !== null ? gatedLower : modeDeviceScript(modes, state, 1, trigger.id);
+      if (gated !== null) {
+        queueScript(state, gated);
+        continue;
+      }
       const lower = modes.scriptForDevice(0, trigger.id);
       queueScript(state, lower >= 0 ? lower : modes.scriptForDevice(1, trigger.id));
       continue;
@@ -2466,12 +2542,34 @@ function runModes(game: Game, awards: readonly Award[]): ModeTickReport {
     // A trigger zone's flag byte at object +$0A is the same shape (+0x00543A);
     // BabeWatch's and Extreme Sports' rollover-lane groups light this way.
     if (trigger.kind === "zone") lightGroupLampsForTrigger(modes, state, "zone", level, trigger.id);
-    queueScript(
-      state,
-      trigger.kind === "lock"
-        ? modes.scriptForLock(level, trigger.id)
-        : modes.scriptForZone(level, trigger.id),
-    );
+    if (trigger.kind === "zone") {
+      // THE SERVE EDGE, +0x005494..+0x0054B4: while `$d7b` is set, the first
+      // entry into a TYPE-0 zone queues descriptor +$6C's script — +$70's from
+      // the second ball on (`$e84` vs `$d82`, the rotation-wrap test) — and
+      // clears the latch. Type-0 is the zone family the exporter files as
+      // "trigger-a"; the same handler is the one that clears the lane latch
+      // `$d88`, which is why a serve's advance lands where the launched ball
+      // first crosses the top lanes. LnJ pays +1 mission-ladder rung here
+      // (s13/s14 -> e9), ES the same (s14/s15 -> e82), BabeWatch only music
+      // and e13's START (s12/s13) — decoded, not policy.
+      if (game.serveScriptPending && zoneKindAt(game, level, trigger.id) === "trigger-a") {
+        queueScript(state, modes.serveScripts[ballNumber(game) <= 1 ? 0 : 1] ?? -1);
+        game.serveScriptPending = false;
+      }
+      queueScript(state, modes.scriptForZone(level, trigger.id));
+      continue;
+    }
+    const lockScript = modes.scriptForLock(level, trigger.id);
+    if (lockScript >= 0) {
+      // Remember which lock this capture script belongs to: if the script
+      // finishes with the ball still held and no eject on the way, the
+      // machine keeps the ball (the crater eat below).
+      const device = lockForZone(game.locks, level, trigger.id);
+      if (device !== null && heldBallIn(game.locks, device.id) !== null) {
+        game.pendingLockScripts.push({ script: lockScript, deviceId: device.id });
+      }
+    }
+    queueScript(state, lockScript);
   }
 
   const report = tickModes(modes, state);
@@ -2548,6 +2646,46 @@ function runModes(game: Game, awards: readonly Award[]): ModeTickReport {
     if (releaseLock(game.locks, device.id, game.balls.balls) !== null) released = true;
     cancelLockEject(game, device.id);
   }
+
+  // THE MACHINE KEEPS A BALL ITS CAPTURE SCRIPT NEVER GAVE BACK — the crater
+  // eat. MEASURED (CONFORMANCE.md §3.3, two cold boots): a Law 'n Justice
+  // crater capture with e26 lit ends with the ball in the trough and a
+  // replacement serve owed, "the machine's own lock-multiball behaviour". The
+  // script data says why the lit path is different: s63's unlit tail ends
+  // `PUSH e24` (spit it back) where its lit branch AWARDs e26 and ENDs with no
+  // ball opcode at all — and the same shape holds for every launch lock (LnJ
+  // s64, ES s37). So the rule is the script's END, not a table name: when a
+  // capture script finishes and its lock still holds the ball with no eject
+  // queued, running or just executed, the ball goes to the trough and one
+  // serve is owed. A PUSH path never gets here (the eject is queued before the
+  // END lands) and a BALL_REMOVE path finds the lock already empty.
+  //
+  // The native transfer path on the machine — which routine moves the held
+  // ball's record to the trough — is NOT decoded; this port reaches the
+  // measured observable through its own trough machinery, and the serve it
+  // owes is a machine-owed one (no `$d7b`, no saver), which is why an eaten
+  // ball's replacement advances no mission ladder.
+  if (report.scriptsEnded.length > 0 && game.pendingLockScripts.length > 0) {
+    for (const ended of report.scriptsEnded) {
+      const at = game.pendingLockScripts.findIndex((entry) => entry.script === ended);
+      if (at < 0) continue;
+      const pending = game.pendingLockScripts[at];
+      if (pending === undefined) continue;
+      game.pendingLockScripts.splice(at, 1);
+      const ejecting =
+        game.lockEjecting?.deviceId === pending.deviceId ||
+        game.lockEjectStack.includes(pending.deviceId) ||
+        report.lockEjects.some(
+          (eject) => lockForZone(game.locks, eject.level, eject.index)?.id === pending.deviceId,
+        );
+      if (ejecting) continue;
+      if (heldBallIn(game.locks, pending.deviceId) === null) continue;
+      if (releaseLock(game.locks, pending.deviceId, game.balls.balls) !== null) {
+        released = true;
+        oweServes(game, 1);
+      }
+    }
+  }
   if (released) pruneInactiveBalls(game.balls);
 
   // `BALLS_UP_TO` is the multiball opcode and it is a TOP-UP with a ceiling of
@@ -2579,6 +2717,20 @@ function runModes(game: Game, awards: readonly Award[]): ModeTickReport {
   // plain `move.w`, so it SETS the countdown rather than adding to it.
   if (report.ballSaveTicks >= 0) game.ballSaveTicks = report.ballSaveTicks;
   return report;
+}
+
+/**
+ * The kind of one zone record, or null: the serve edge only fires on the
+ * "trigger-a" family, which is the type-0 the machine's +0x005494 handler
+ * belongs to.
+ */
+function zoneKindAt(game: Game, level: PlayfieldLevel, index: number): string | null {
+  const devices = game.devices;
+  if (devices === null) return null;
+  for (const zone of devices.zones) {
+    if (zone.level === level && zone.index === index) return zone.kind;
+  }
+  return null;
 }
 
 /**
