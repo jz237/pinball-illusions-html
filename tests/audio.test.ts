@@ -18,6 +18,7 @@ import {
   parseTableAudioDocument,
 } from "../src/game/table-audio.js";
 import type { AudioSample, EngineAudio, TableAudio } from "../src/game/table-audio.js";
+import { EFFECT_MASTER_LEVEL, MUSIC_MASTER_LEVEL } from "../src/audio/master-level.js";
 import {
   createAudioBank,
   loadAudioBank,
@@ -449,12 +450,18 @@ describe("the tick report reaches the engine sounds", () => {
 
 describe("the effect channel", () => {
   it("plays a bound award and gives it Paula's own volume", async () => {
+    // Paula's register over its scale, times the platform master the sibling
+    // ports share — the record's own volume is untouched, the constant is the
+    // loudness convention. See `src/audio/master-level.ts`.
     const bank = await bankFor("law-n-justice");
     const host = bank.host as FakeHost;
     const sample = bank.audio.samples.find((one) => one.priority > 0) as AudioSample;
     expect(playSample(bank, sample)).toBe(true);
     expect(host.started.length).toBe(1);
-    expect(host.started[0]?.gain).toBeCloseTo(sample.volume / PAULA_MAX_VOLUME, 6);
+    expect(host.started[0]?.gain).toBeCloseTo(
+      (sample.volume / PAULA_MAX_VOLUME) * EFFECT_MASTER_LEVEL,
+      6,
+    );
   });
 
   it("refuses to let a quieter event interrupt a louder one", async () => {
@@ -1014,7 +1021,9 @@ describe("the shell music follows the shell", () => {
 
     expect(music.toggleMuted()).toBe(false);
     expect(storage.data.get(MUSIC_MUTED_STORAGE_KEY)).toBe("0");
-    expect((music.output.master as unknown as FakeMusicGain).gain.value).toBe(1);
+    // Unmuting restores the CALIBRATED level — the platform master under the
+    // unit player volume — not raw unity. See `src/audio/master-level.ts`.
+    expect((music.output.master as unknown as FakeMusicGain).gain.value).toBe(MUSIC_MASTER_LEVEL);
 
     // A stored mute is applied before the first note sounds.
     const rebootHost = new FakeMusicHost();

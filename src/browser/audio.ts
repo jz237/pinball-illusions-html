@@ -76,6 +76,7 @@ import {
   PAULA_MAX_VOLUME,
   audioSampleUrl,
 } from "../game/table-audio.js";
+import { EFFECT_MASTER_LEVEL } from "../audio/master-level.js";
 import type { GameTickReport } from "./game-loop.js";
 
 /** The slice of `AudioContext` this module uses, so a test can supply one. */
@@ -207,7 +208,10 @@ export function playSample(bank: AudioBank, sample: AudioSample): boolean {
   const source = bank.host.createBufferSource();
   source.buffer = buffer;
   const gain = bank.host.createGain();
-  gain.gain.value = sample.volume / PAULA_MAX_VOLUME;
+  // Paula's register over its scale, then the platform master: the record's
+  // own volume is the machine's, the constant is the loudness convention the
+  // sibling ports share. See `src/audio/master-level.ts`.
+  gain.gain.value = (sample.volume / PAULA_MAX_VOLUME) * EFFECT_MASTER_LEVEL;
   source.connect(gain);
   gain.connect(bank.host.destination);
   source.start();

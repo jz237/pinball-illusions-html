@@ -38,6 +38,7 @@
 
 import type { ChipInstrument, InstrumentId } from "./instruments.js";
 import { instrumentById, playbackRateFor } from "./instruments.js";
+import { MUSIC_MASTER_LEVEL } from "./master-level.js";
 
 /**
  * WHICH BANK A STREAM PLAYS ON.
@@ -311,7 +312,10 @@ function ensureHost(output: TrackerOutput): TrackerHost | null {
     output.host = output.hostFactory();
     if (output.host !== null) {
       const master = output.host.createGain();
-      master.gain.value = output.muted ? 0 : output.masterVolume;
+      // The platform master sits UNDER the player-facing volume: 1.0 here
+      // means "the calibrated level", so a future volume control cannot
+      // silently undo the loudness convention. See `master-level.ts`.
+      master.gain.value = output.muted ? 0 : output.masterVolume * MUSIC_MASTER_LEVEL;
       master.connect(output.host.destination);
       output.master = master;
       for (let channel = 0; channel < TRACKER_CHANNELS; channel += 1) {
@@ -567,14 +571,18 @@ export function setTrackerChannelLevel(output: TrackerOutput, channel: number, l
  */
 export function setTrackerMuted(output: TrackerOutput, muted: boolean): boolean {
   output.muted = muted;
-  if (output.master !== null) output.master.gain.value = muted ? 0 : output.masterVolume;
+  if (output.master !== null) {
+    output.master.gain.value = muted ? 0 : output.masterVolume * MUSIC_MASTER_LEVEL;
+  }
   return output.muted;
 }
 
 /** Master volume, 0..1, clamped. Applied unless muted. Returns what stuck. */
 export function setTrackerMasterVolume(output: TrackerOutput, volume: number): number {
   output.masterVolume = Math.min(Math.max(volume, 0), 1);
-  if (output.master !== null && !output.muted) output.master.gain.value = output.masterVolume;
+  if (output.master !== null && !output.muted) {
+    output.master.gain.value = output.masterVolume * MUSIC_MASTER_LEVEL;
+  }
   return output.masterVolume;
 }
 

@@ -41,6 +41,7 @@ import type {
   TrackerHost,
   TrackerOutput,
 } from "../src/audio/tracker-output.js";
+import { MUSIC_MASTER_LEVEL } from "../src/audio/master-level.js";
 
 // ---------------------------------------------------------------------------
 // Instruments
@@ -471,20 +472,24 @@ describe("the tracker output layer", () => {
   });
 
   it("keeps mute and master volume at the master gain, so unmute rejoins mid-song", () => {
+    // The master node carries `masterVolume x MUSIC_MASTER_LEVEL`: the player
+    // volume rides ON TOP of the platform loudness convention, so no volume
+    // call can undo the calibration. See `src/audio/master-level.ts` and
+    // `tests/audio-level.test.ts` for the level itself.
     const host = new FakeTrackerHost();
     const output = outputOn(host);
     startTracker(output, once([note(0, 0, "pulse50", 440, 64)], 100));
     const master = host.gains[0] as FakeGain;
-    expect(master.gain.value).toBe(1);
+    expect(master.gain.value).toBe(MUSIC_MASTER_LEVEL);
 
     expect(setTrackerMasterVolume(output, 0.5)).toBe(0.5);
-    expect(master.gain.value).toBe(0.5);
+    expect(master.gain.value).toBe(0.5 * MUSIC_MASTER_LEVEL);
     expect(setTrackerMuted(output, true)).toBe(true);
     expect(master.gain.value).toBe(0);
     expect(setTrackerMasterVolume(output, 0.8)).toBe(0.8);
     expect(master.gain.value).toBe(0); // still muted
     expect(setTrackerMuted(output, false)).toBe(false);
-    expect(master.gain.value).toBe(0.8);
+    expect(master.gain.value).toBe(0.8 * MUSIC_MASTER_LEVEL);
     expect(setTrackerMasterVolume(output, 7)).toBe(1); // clamped
   });
 

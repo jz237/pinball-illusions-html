@@ -114,6 +114,7 @@ import {
   createShellMusic,
 } from "./browser/shell-music.js";
 import { createTableMusic } from "./browser/table-music.js";
+import { version } from "../package.json";
 
 /** One table, assembled and ready to play. */
 interface LoadedTable {
@@ -209,8 +210,14 @@ function requireContext(canvas: HTMLCanvasElement): CanvasRenderingContext2D {
  */
 let hdActive = false;
 
-/** The version the front door's footer and the game bar print. */
-const BUILD_VERSION = "v0.1.0";
+/**
+ * The version the front door's footer and the game bar print — read from
+ * `package.json` so there is exactly ONE place a release bumps. It shipped
+ * as a separate hand-written literal for the project's whole life and was
+ * never bumped once; the sibling ports print theirs the same way this now
+ * does (Dreams II "v1.0.3", Fantasies "v1.34.0" — semver behind a "v").
+ */
+const BUILD_VERSION = `v${version}`;
 
 /**
  * THE FRAMING — the render-layer full-table/Amiga choice of
