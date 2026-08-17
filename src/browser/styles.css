@@ -278,6 +278,19 @@ html[data-door-mode="door"] .cabinet {
   color: #ffd98a;
 }
 
+/*
+ * The GLOBAL board's line, under the local champion's. Cooler and dimmer than
+ * the gold local line — the local ladder is the machine's own record, the
+ * global line is site-wide decoration — and held to one line of height so a
+ * card never jumps when the async fetch lands (or never lands: offline paints
+ * an empty string, not an error). Pure CSS, no asset.
+ */
+.door__card-global {
+  font-size: 11px;
+  color: #7fa5d6;
+  min-height: 1.3em;
+}
+
 .door__card-play {
   align-self: flex-start;
   margin-top: 2px;

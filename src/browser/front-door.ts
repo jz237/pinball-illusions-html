@@ -67,6 +67,17 @@ export interface FrontDoorHost {
   playTable(tableId: TableId): void;
   /** The five-slot ladder for one table, for the champion line. */
   ladder(tableId: TableId): readonly HighScoreEntry[];
+  /**
+   * The GLOBAL board's one line for a card — a synchronous read of whatever
+   * the host's client has cached, formatted by `globalChampionLine`. The
+   * async part lives in the host: it kicks the fetch when the door shows and
+   * calls `refreshChampions` when the answer lands. Optional, and an absent
+   * or offline board is an empty string — the card simply keeps the line
+   * blank, exactly as every sibling treats the global board: decoration,
+   * never an error. The LOCAL ladder's champion line above stays the
+   * machine-decoded source of truth.
+   */
+  globalLine?(tableId: TableId): string;
   /** A gesture landed on the door; the audio unlock rides it. */
   gesture(): void;
   /** The build's version string, for the footer. */
@@ -103,7 +114,11 @@ export interface FrontDoor {
   idling(): boolean;
   /** The mode last painted, for the host's own routing decisions. */
   mode(): DoorMode;
-  /** Repaints the champion lines, for after a game banks a score. */
+  /**
+   * Repaints the champion lines — the local ladder's and the global board's —
+   * for after a game banks a score, and for the moment an async global fetch
+   * lands while the door is up (`main.ts` calls it exactly then).
+   */
   refreshChampions(): void;
   detach(): void;
 }
@@ -147,6 +162,7 @@ export function attachFrontDoor(door: HTMLElement, host: FrontDoorHost): FrontDo
   // -- the card data, written once from the same records the shell reads ----
 
   const champions = new Map<TableId, HTMLElement>();
+  const globals = new Map<TableId, HTMLElement>();
 
   for (const table of SHELL_TABLES) {
     const name = door.querySelector(`[data-door-name="${table.id}"]`);
@@ -158,6 +174,8 @@ export function attachFrontDoor(door: HTMLElement, host: FrontDoorHost): FrontDo
     if (blurb instanceof HTMLElement) blurb.textContent = table.blurb.join(" ");
     const champ = door.querySelector(`[data-door-champ="${table.id}"]`);
     if (champ instanceof HTMLElement) champions.set(table.id, champ);
+    const global = door.querySelector(`[data-door-global="${table.id}"]`);
+    if (global instanceof HTMLElement) globals.set(table.id, global);
 
     const thumb = door.querySelector(`[data-door-thumb="${table.id}"]`);
     if (thumb instanceof HTMLElement) {
@@ -185,6 +203,13 @@ export function attachFrontDoor(door: HTMLElement, host: FrontDoorHost): FrontDo
   const paintChampions = (): void => {
     for (const [tableId, element] of champions) {
       const line = championLine(host.ladder(tableId));
+      if (element.textContent !== line) element.textContent = line;
+    }
+    // The global line under it, from the host's cache. Painted here so the
+    // door-re-entry repaint and the host's `refreshChampions` — called when
+    // an async board fetch lands — both keep it current for free.
+    for (const [tableId, element] of globals) {
+      const line = host.globalLine?.(tableId) ?? "";
       if (element.textContent !== line) element.textContent = line;
     }
   };

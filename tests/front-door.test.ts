@@ -95,6 +95,7 @@ describe("the shipped door markup", () => {
     expect(markup.names).toEqual([...TABLE_IDS]);
     expect(markup.blurbs).toEqual([...TABLE_IDS]);
     expect(markup.champs).toEqual([...TABLE_IDS]);
+    expect(markup.globals).toEqual([...TABLE_IDS]);
     expect(markup.thumbs).toEqual([...TABLE_IDS]);
     for (const [tableId, href] of markup.hrefs) {
       expect(href).toBe(`?table=${tableId}`);
@@ -158,6 +159,65 @@ describe("the card data", () => {
     const { h } = fixture();
     const version = h.door.querySelector("[data-door-version]");
     expect(version?.textContent).toBe("v9.9.9-test");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The global board's line — async by nature, so the door only ever reads a
+// synchronous cache through the host and the host repaints when a fetch lands
+// ---------------------------------------------------------------------------
+
+describe("the global champion line", () => {
+  it("prints the host's cached global line beside the local champion's", () => {
+    const lines = new Map<TableId, string>([
+      ["law-n-justice", "Global ★ JEZ · 20,088,580"],
+      ["babewatch", "No global score yet"],
+      ["extreme-sports", ""],
+    ]);
+    const { h } = fixture({ globalLine: (tableId) => lines.get(tableId) ?? "" });
+    expect(span(h, "data-door-global", "law-n-justice")).toBe("Global ★ JEZ · 20,088,580");
+    expect(span(h, "data-door-global", "babewatch")).toBe("No global score yet");
+    expect(span(h, "data-door-global", "extreme-sports")).toBe("");
+    // The LOCAL champion line is untouched by the global one existing — the
+    // machine-decoded ladder stays the card's source of truth.
+    expect(span(h, "data-door-champ", "law-n-justice")).toBe("★ AXL · 1,000,000,000");
+  });
+
+  it("repaints when the async fetch lands and the host calls refreshChampions", () => {
+    // The live sequence: the door paints before the worker answers (blank),
+    // the fetch resolves, main.ts calls refreshChampions, the line appears.
+    let line = "";
+    const f = fixture({ globalLine: () => line });
+    expect(span(f.h, "data-door-global", "babewatch")).toBe("");
+    line = "Global ★ JEZ · 12,345";
+    f.door.refreshChampions();
+    expect(span(f.h, "data-door-global", "babewatch")).toBe("Global ★ JEZ · 12,345");
+  });
+
+  it("repaints when the door takes the screen back, like the champion lines", () => {
+    let line = "";
+    const f = fixture({ globalLine: () => line });
+    f.door.refresh("play", "babewatch" as TableId, 0);
+    line = "Global ★ ONE · 4,000,000";
+    f.door.refresh("attract", null, 1);
+    expect(span(f.h, "data-door-global", "babewatch")).toBe("Global ★ ONE · 4,000,000");
+  });
+
+  it("a host without the accessor — every older fixture — leaves the line blank", () => {
+    const { h } = fixture();
+    expect(span(h, "data-door-global", "law-n-justice")).toBe("");
+    // And the rest of the card painted exactly as it always did.
+    expect(span(h, "data-door-champ", "law-n-justice")).toBe("★ AXL · 1,000,000,000");
+  });
+
+  it("offline stays NOTHING: an empty line is never replaced with an error", () => {
+    // The host's cache line for an offline board is the empty string by
+    // contract (`globalChampionLine`); the door must not invent copy for it.
+    const f = fixture({ globalLine: () => "" });
+    f.door.refreshChampions();
+    for (const tableId of TABLE_IDS) {
+      expect(span(f.h, "data-door-global", tableId)).toBe("");
+    }
   });
 });
 

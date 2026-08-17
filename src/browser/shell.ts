@@ -384,6 +384,16 @@ export type ShellEffect =
 export interface ScoreStore {
   load(tableId: TableId): HighScoreEntry[];
   save(tableId: TableId, entries: readonly HighScoreEntry[]): void;
+  /**
+   * One qualifying player's row for the GLOBAL board, fired at the exact
+   * moment `commitInitials` has both the typed name and the score being
+   * placed — `entryScore`, the walk's own figure, never `finalScore`.
+   * Optional and fire-and-forget: the shell never awaits it, never reads a
+   * result, and the machine-faithful entry walk runs identically whether it
+   * is absent, succeeds, fails, or throws. `main.ts` wires it to
+   * `src/browser/global-scores.ts`; every existing store fake stays valid.
+   */
+  submitGlobal?(tableId: TableId, initials: string, score: number): void;
 }
 
 /** A store backed by `localStorage`, or by nothing when there is none. */
@@ -1064,6 +1074,17 @@ function commitInitials(state: ShellState, store: ScoreStore): ShellEffect[] {
     // the same ladder written a few seconds earlier, and it survives a browser
     // tab closed on the score screen — which the Amiga's teardown would not.
     store.save(tableId, state.ladder);
+    // The global board rides the same commit: this is the one moment a
+    // QUALIFYING player's initials and per-player score coexist, so one row
+    // per qualifier leaves here, in walk order. `entryScore`, never
+    // `finalScore` — the split at the top of this file is exactly about a
+    // walk that stops on somebody who is not the last player. Guarded so a
+    // throwing submitter cannot touch the machine-faithful walk.
+    try {
+      store.submitGlobal?.(tableId, initials, state.entryScore);
+    } catch {
+      // The walk is machine state; the network is decoration.
+    }
   }
   state.initials = "";
   // The machine's walk moves to the next player's record (+0x004842); with

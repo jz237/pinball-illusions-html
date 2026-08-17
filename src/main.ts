@@ -53,6 +53,7 @@ import type { Game, GameDebugState, GameTickReport, RenderFraming } from "./brow
 import { VIEWPORT_HEIGHT } from "./browser/camera.js";
 import { attachFrontDoor } from "./browser/front-door.js";
 import type { FrontDoor } from "./browser/front-door.js";
+import { createGlobalScores } from "./browser/global-scores.js";
 import { INTRO_BASE_PATH, INTRO_HD_FILE, attachIntro, introFireKey, loadIntroAssets } from "./browser/intro.js";
 import type { IntroHandle } from "./browser/intro.js";
 import { setPlayfieldArtwork, setPlayfieldArtworkHd } from "./browser/playfield-renderer.js";
@@ -95,7 +96,7 @@ import {
   shellTableLoaded,
   shellTick,
 } from "./browser/shell.js";
-import type { ShellEffect, ShellKey, ShellState } from "./browser/shell.js";
+import type { ScoreStore, ShellEffect, ShellKey, ShellState } from "./browser/shell.js";
 import { ShellClock } from "./browser/shell-clock.js";
 import { renderShell, shellDrawsOverPlayfield } from "./browser/shell-screens.js";
 import type { ShellArtworkSource } from "./browser/shell-screens.js";
@@ -508,7 +509,21 @@ async function boot(): Promise<void> {
   const sound = new SoundDeck();
   const thumbnails = new ThumbnailCache();
   const storage = readStorage();
-  const store = createScoreStore(storage);
+  /**
+   * The GLOBAL board client (`src/browser/global-scores.ts`): the shared
+   * site-wide worker every sibling remake reports to. Wired in two places and
+   * read in a third, all fire-and-forget: `submitGlobal` on the store posts
+   * each qualifying player's row at the walk's own commit, the frame loop
+   * kicks the board fetch when the front door takes the screen, and the door
+   * host reads the cached champion line below. The LOCAL machine-decoded
+   * ladder stays the source of truth for everything in the game; nothing here
+   * feeds back into it.
+   */
+  const globalScores = createGlobalScores();
+  const store: ScoreStore = {
+    ...createScoreStore(storage),
+    submitGlobal: (tableId, initials, score) => void globalScores.submit(tableId, initials, score),
+  };
   const shell = createShell(store);
   /**
    * The shell's own 50 Hz clock, for every frame the playfield is not driving.
@@ -544,6 +559,12 @@ async function boot(): Promise<void> {
    * without a temporal dead zone.
    */
   let door: FrontDoor | null = null;
+
+  /**
+   * Whether the door held the screen on the previous frame, so the frame loop
+   * can kick the global-board fetch exactly on the transition — not per frame.
+   */
+  let doorShown = false;
 
   /**
    * THE INTRO — `intro.bin`'s cold-boot cinematic, attached at the bottom of
@@ -1135,6 +1156,11 @@ async function boot(): Promise<void> {
       // The decoded F-key path, so a card click and F1 are the same state.
       playTable: (tableId) => apply(shellPlayTable(shell, store, tableId)),
       ladder: (tableId) => store.load(tableId),
+      // The global board's line for each card: a synchronous read of the
+      // client's cache. The fetch itself is kicked by the frame loop the
+      // moment the door takes the screen, and `refreshChampions` repaints
+      // when it lands — see the frame() below.
+      globalLine: (tableId) => globalScores.topLine(tableId),
       gesture: unlockAudio,
       version: () => BUILD_VERSION,
       // The stepper reads and writes the shell's sticky player selection —
@@ -1276,6 +1302,17 @@ async function boot(): Promise<void> {
     // the post-intro boot state.
     if (intro === null) door?.refresh(shell.phase, shell.tableId, timeMs);
     const covered = intro === null && door?.showing() === true;
+    // The door just took the screen — at boot, or back from a game whose
+    // submit invalidated a board's cache — so kick the global boards and
+    // repaint the cards as each answer lands. `fetchTop` caches and coalesces,
+    // so a door that flaps costs nothing, and it never rejects, so the walk
+    // of frames above is completely undisturbed by the network.
+    if (covered && !doorShown) {
+      for (const tableId of TABLE_IDS) {
+        void globalScores.fetchTop(tableId).then(() => door?.refreshChampions());
+      }
+    }
+    doorShown = covered;
     // Read the layout BEFORE the deck writes to it, so a relabel never forces a
     // synchronous reflow. Two integers compared per frame is nothing, and it
     // makes the fit self-healing: the `ResizeObserver` above reacts sooner, but

@@ -1019,3 +1019,134 @@ describe("the multi-player high-score walk", () => {
     expect(state.finalScore).toBe(third);
   });
 });
+
+describe("the global submit hook", () => {
+  // `commitInitials` is the one moment a QUALIFYING player's initials and
+  // per-player score coexist, so the optional `submitGlobal` on the store
+  // fires there — once per qualifier, in walk order, with `entryScore` and
+  // never `finalScore`. Everything below drives a recording fake; nothing in
+  // this suite may ever reach the real worker.
+
+  interface Submission {
+    readonly tableId: TableId;
+    readonly initials: string;
+    readonly score: number;
+  }
+
+  function globalStore(): ReturnType<typeof fakeStore> & { submitted: Submission[] } {
+    const base = fakeStore();
+    const submitted: Submission[] = [];
+    return {
+      ...base,
+      submitted,
+      submitGlobal: (tableId, initials, score) => void submitted.push({ tableId, initials, score }),
+    };
+  }
+
+  function intoPlayGlobal(tableId: TableId): {
+    state: ShellState;
+    store: ReturnType<typeof globalStore>;
+  } {
+    const store = globalStore();
+    const state = createShell(store);
+    shellPlayTable(state, store, tableId);
+    shellTableLoaded(state);
+    return { state, store };
+  }
+
+  function type(state: ShellState, store: ScoreStore, initials: string): void {
+    for (const character of initials) {
+      shellKey(state, store, key("text", character));
+    }
+  }
+
+  it("submits the QUALIFIER's entryScore — never finalScore, the last player's", () => {
+    // The hot-seat split, aimed at the wire: player 1 qualifies, player 2's
+    // 1,000 does not, and `finalScore` is player 2's for the whole walk. The
+    // row that leaves must be player 1's score, or the global board would
+    // caption the winner with the loser's figure.
+    const { state, store } = intoPlayGlobal("law-n-justice");
+    const winner = (state.ladder[0]?.score ?? 0) + 2_000_000;
+    shellGameEnded(state, [winner, 1_000]);
+    press(state, store, SELECT); // cut the card
+    press(state, store, SELECT); // cut the fanfare
+    type(state, store, "ABC");
+    expect(state.phase).toBe("ladder");
+    expect(store.submitted).toEqual([
+      { tableId: "law-n-justice", initials: "ABC", score: winner },
+    ]);
+    expect(state.finalScore).toBe(1_000);
+  });
+
+  it("submits once per qualifier, in walk order, each under their own name", () => {
+    const { state, store } = intoPlayGlobal("babewatch");
+    const top = state.ladder[0]?.score ?? 0;
+    const first = top + 4_000_000;
+    const third = top + 2_000_000;
+    shellGameEnded(state, [first, 1_000, third]);
+    press(state, store, SELECT);
+    press(state, store, SELECT);
+    type(state, store, "ONE");
+    press(state, store, SELECT);
+    type(state, store, "TRE");
+    expect(state.phase).toBe("ladder");
+    expect(store.submitted).toEqual([
+      { tableId: "babewatch", initials: "ONE", score: first },
+      { tableId: "babewatch", initials: "TRE", score: third },
+    ]);
+  });
+
+  it("never submits a non-qualifier — they never even type a name", () => {
+    const { state, store } = intoPlayGlobal("extreme-sports");
+    shellGameEnded(state, [0, 0, 0, 0]);
+    press(state, store, SELECT);
+    expect(state.phase).toBe("ladder");
+    expect(store.submitted).toEqual([]);
+  });
+
+  it("submits the machine's AAA when the name box is accepted blank", () => {
+    const { state, store } = intoPlayGlobal("babewatch");
+    const bar = (state.ladder[HIGH_SCORE_SLOTS - 1]?.score ?? 0) + 500;
+    shellGameEnded(state, bar);
+    press(state, store, SELECT);
+    press(state, store, SELECT);
+    press(state, store, key("select", null)); // RETURN on an empty box
+    expect(store.submitted).toEqual([{ tableId: "babewatch", initials: "AAA", score: bar }]);
+  });
+
+  it("a THROWING submitter changes nothing: the walk and the local ladder are identical", () => {
+    const run = (broken: boolean): { ladder: readonly HighScoreEntry[]; phase: string } => {
+      const store = fakeStore() as ReturnType<typeof fakeStore> & Partial<ScoreStore>;
+      if (broken) {
+        store.submitGlobal = () => {
+          throw new Error("the worker is on fire");
+        };
+      }
+      const state = createShell(store);
+      shellPlayTable(state, store, "law-n-justice");
+      shellTableLoaded(state);
+      const winner = (state.ladder[0]?.score ?? 0) + 2_000_000;
+      shellGameEnded(state, [winner, 1_000]);
+      press(state, store, SELECT);
+      press(state, store, SELECT);
+      type(state, store, "ABC");
+      return { ladder: state.ladder, phase: state.phase };
+    };
+    const clean = run(false);
+    const onFire = run(true);
+    expect(onFire.phase).toBe(clean.phase);
+    expect(onFire.ladder).toEqual(clean.ladder);
+    expect(clean.ladder.find((entry) => entry.initials === "ABC")).toBeDefined();
+  });
+
+  it("a store WITHOUT the hook — every fake this suite already had — walks unchanged", () => {
+    const { state, store } = intoPlay("law-n-justice");
+    const winner = (state.ladder[0]?.score ?? 0) + 1_000_000;
+    shellGameEnded(state, [winner]);
+    press(state, store, SELECT);
+    press(state, store, SELECT);
+    type(state, store, "JEZ");
+    expect(state.phase).toBe("ladder");
+    expect(state.ladder.find((entry) => entry.initials === "JEZ")?.score).toBe(winner);
+  });
+});

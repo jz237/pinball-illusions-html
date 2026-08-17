@@ -645,6 +645,8 @@ export interface DoorMarkup {
   readonly names: readonly string[];
   readonly blurbs: readonly string[];
   readonly champs: readonly string[];
+  /** Ids with a global-board line slot (`data-door-global`). */
+  readonly globals: readonly string[];
   readonly thumbs: readonly string[];
   /** The card hrefs, which are the `?table=` boot links. */
   readonly hrefs: readonly (readonly [string, string])[];
@@ -670,6 +672,7 @@ export function readDoorMarkup(html = shippedHtml()): DoorMarkup {
     names: attr("data-door-name"),
     blurbs: attr("data-door-blurb"),
     champs: attr("data-door-champ"),
+    globals: attr("data-door-global"),
     thumbs: attr("data-door-thumb"),
     hrefs,
     hasVersion: /data-door-version/.test(html),
@@ -818,6 +821,7 @@ export function createTouchHarness(options: HarnessOptions = {}): TouchHarness {
       ["data-door-name", doorMarkup.names],
       ["data-door-blurb", doorMarkup.blurbs],
       ["data-door-champ", doorMarkup.champs],
+      ["data-door-global", doorMarkup.globals],
     ] as const) {
       if (!present.includes(tableId)) continue;
       const span = card.append(document.createElement("span"));
