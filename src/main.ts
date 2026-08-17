@@ -53,7 +53,7 @@ import type { Game, GameDebugState, GameTickReport, RenderFraming } from "./brow
 import { VIEWPORT_HEIGHT } from "./browser/camera.js";
 import { attachFrontDoor } from "./browser/front-door.js";
 import type { FrontDoor } from "./browser/front-door.js";
-import { attachIntro, introFireKey, loadIntroAssets } from "./browser/intro.js";
+import { INTRO_BASE_PATH, INTRO_HD_FILE, attachIntro, introFireKey, loadIntroAssets } from "./browser/intro.js";
 import type { IntroHandle } from "./browser/intro.js";
 import { setPlayfieldArtwork, setPlayfieldArtworkHd } from "./browser/playfield-renderer.js";
 import { canvasFitFor } from "./browser/canvas-fit.js";
@@ -1439,6 +1439,12 @@ async function boot(): Promise<void> {
   if (bootTable === null) {
     try {
       const assets = await loadIntroAssets();
+      // The coda's HD title card, fetched OUTSIDE the awaited asset set on
+      // purpose: an <img> that never resolved only disables the presenter
+      // overlay (the core shows the original still instead), whereas a
+      // rejection inside this try would skip the whole show.
+      const introHdCard = new Image();
+      introHdCard.src = `${INTRO_BASE_PATH}${INTRO_HD_FILE}`;
       intro = attachIntro(assets, {
         context,
         canvas,
@@ -1448,6 +1454,8 @@ async function boot(): Promise<void> {
           surface.height = height;
           return surface;
         },
+        hdCard: () =>
+          introHdCard.complete && introHdCard.naturalWidth > 0 ? introHdCard : null,
         onDone: () => {
           // The next animation frame takes the normal path: the shell clock
           // resumes itself and the front door paints — the same first frame

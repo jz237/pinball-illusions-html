@@ -196,6 +196,13 @@ const DERIVED_MARKERS = [
   // panel blits the bits at runtime — so its medium is one `.bin`, claimed
   // through the same data[] branch and digest-checked the same way.
   { class: "disk-derived-panel-font", noun: "score panel font" },
+  // The intro CODA's HD title card (scripts/export-intro-coda.mjs): the
+  // ILLUSIONS still HAM8-decoded and upscaled by the measured recipe, with an
+  // "HD" composed from the intro's own glyphs. A transformation of
+  // disk-rendered art is still disk-derived — the loading-logo-hd argument —
+  // so it ships as one finished-RGBA PNG claimed by its own manifest through
+  // the single-image branch, behind the same gate.
+  { class: "disk-derived-intro-hd", noun: "HD intro still" },
 ];
 
 /** Manifest classes that must account for the binary files they ship beside. */
@@ -215,6 +222,7 @@ const MEDIA_MARKERS = new Map([
   ["disk-derived-table-thumbnail", { noun: "table thumbnail", extensions: IMAGE_EXT }],
   ["disk-derived-intro", { noun: "intro animation", extensions: DATA_EXT }],
   ["disk-derived-panel-font", { noun: "score panel font", extensions: DATA_EXT }],
+  ["disk-derived-intro-hd", { noun: "HD intro still", extensions: IMAGE_EXT }],
 ]);
 
 /** Classes whose manifest claims exactly one raster through an `image` field. */
@@ -227,6 +235,7 @@ const SINGLE_IMAGE_CLASSES = new Set([
   "disk-derived-loading-logo",
   "disk-derived-loading-logo-hd",
   "disk-derived-table-thumbnail",
+  "disk-derived-intro-hd",
 ]);
 
 /** Manifest classes whose media are BINARY BLOCKS, claimed through `data: []`. */

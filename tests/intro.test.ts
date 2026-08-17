@@ -48,6 +48,7 @@ const GUARD = fileURLToPath(new URL("../scripts/check-public-build.mjs", import.
 const MAIN_TS = fileURLToPath(new URL("../src/main.ts", import.meta.url));
 
 const exported = existsSync(`${INTRO_DIR}intro.json`);
+const hdExported = existsSync(`${INTRO_DIR}intro-hd.png`);
 
 function loadShippedAssets(): IntroAssets {
   const manifest = introManifestFrom(
@@ -206,6 +207,29 @@ describe.skipIf(!exported)("the shipped intro assets", () => {
 });
 
 // ---------------------------------------------------------------------------
+// 1b. The coda's one shipped asset: the HD title card and its manifest
+// ---------------------------------------------------------------------------
+
+describe.skipIf(!hdExported)("the shipped HD intro card", () => {
+  it("matches the digest, size and provenance its manifest claims", () => {
+    const manifest = JSON.parse(readFileSync(`${INTRO_DIR}intro-hd.json`, "utf8")) as {
+      image: { file: string; width: number; height: number; byteLength: number; sha256: string };
+      provenance?: { sourceClass?: string; authorizationRequired?: boolean };
+      coda?: { startT?: number; endT?: number };
+    };
+    expect(manifest.provenance?.sourceClass).toBe("disk-derived-intro-hd");
+    expect(manifest.provenance?.authorizationRequired).toBe(true);
+    expect(manifest.coda?.endT).toBe(5105);
+    const bytes = readFileSync(`${INTRO_DIR}${manifest.image.file}`);
+    expect(bytes.length).toBe(manifest.image.byteLength);
+    expect(createHash("sha256").update(bytes).digest("hex")).toBe(manifest.image.sha256);
+    // The still band at 4x: 640x120 -> 2560x480.
+    expect(manifest.image.width).toBe(2560);
+    expect(manifest.image.height).toBe(480);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 2. The rights gate: authorization, claims, and the tamper test
 // ---------------------------------------------------------------------------
 
@@ -272,6 +296,33 @@ describe.skipIf(!exported)("the rights gate over the intro class", () => {
     expect(result.status).toBe(1);
     expect(result.output).toContain("media file with no manifest");
   });
+
+  it.skipIf(!hdExported)("knows the HD card's class and refuses it unauthorized", () => {
+    const dir = guardFixture();
+    const refused = runGuard(dir, false);
+    expect(refused.status).toBe(1);
+    expect(refused.output).toContain("HD intro still");
+  });
+
+  it.skipIf(!hdExported)("REFUSES the build when one byte of the HD card is flipped", () => {
+    const dir = guardFixture();
+    const target = join(dir, "generated", "shell", "intro", "intro-hd.png");
+    const bytes = readFileSync(target);
+    bytes[1000] = (bytes[1000] ?? 0) ^ 0x01;
+    writeFileSync(target, bytes);
+    const result = runGuard(dir, true);
+    expect(result.status).toBe(1);
+    expect(result.output).toContain("does not match");
+  });
+
+  it.skipIf(!hdExported)("refuses a stray unclaimed image beside the claimed card", () => {
+    const dir = guardFixture();
+    const target = join(dir, "generated", "shell", "intro", "mystery.png");
+    writeFileSync(target, readFileSync(join(dir, "generated", "shell", "intro", "intro-hd.png")));
+    const result = runGuard(dir, true);
+    expect(result.status).toBe(1);
+    expect(result.output).toContain("media file with no manifest");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -288,15 +339,22 @@ interface DrawCall {
 interface FakePresentation {
   host: IntroHost;
   readonly draws: DrawCall[];
+  /** 5-argument drawImage calls — the coda's HD card overlay. */
+  readonly overlays: DrawCall[];
   puts: number;
   doneCalls: number;
   canvas: { width: number; height: number };
 }
 
-function fakePresentation(width = 672, height = 512): FakePresentation {
+function fakePresentation(
+  width = 672,
+  height = 512,
+  hdCard?: () => CanvasImageSource | null,
+): FakePresentation {
   const record: FakePresentation = {
     host: null as unknown as IntroHost,
     draws: [],
+    overlays: [],
     puts: 0,
     doneCalls: 0,
     canvas: { width, height },
@@ -317,16 +375,22 @@ function fakePresentation(width = 672, height = 512): FakePresentation {
     fillRect: () => undefined,
     drawImage: (
       _surface: unknown,
-      _sx: number,
-      _sy: number,
-      _sw: number,
-      _sh: number,
-      dx: number,
-      dy: number,
-      dw: number,
-      dh: number,
+      sx: number,
+      sy: number,
+      sw: number,
+      sh: number,
+      dx?: number,
+      dy?: number,
+      dw?: number,
+      dh?: number,
     ) => {
-      record.draws.push({ dx, dy, dw, dh });
+      // The letterbox uses the 9-argument form; the HD overlay the 5-argument
+      // one, whose (dx, dy, dw, dh) arrive in the source-rect positions.
+      if (dx === undefined || dy === undefined || dw === undefined || dh === undefined) {
+        record.overlays.push({ dx: sx, dy: sy, dw: sw, dh: sh });
+      } else {
+        record.draws.push({ dx, dy, dw, dh });
+      }
     },
   };
   record.host = {
@@ -334,6 +398,7 @@ function fakePresentation(width = 672, height = 512): FakePresentation {
     canvas: record.canvas as unknown as HTMLCanvasElement,
     surface: (w, h) =>
       ({ width: w, height: h, getContext: () => surfaceContext }) as unknown as HTMLCanvasElement,
+    ...(hdCard === undefined ? {} : { hdCard }),
     onDone: () => {
       record.doneCalls += 1;
     },
@@ -407,7 +472,8 @@ describe.skipIf(!exported)("the intro handle", () => {
   it("hands off by itself when the script exits", () => {
     const p = fakePresentation();
     // Pre-roll deep into the credits so the run to the exit stays cheap: the
-    // whole show is 4446 frames and the pixel gate already walks all of them.
+    // whole show is 4446 frames plus the 659-frame coda, and the pixel gate
+    // already walks all of them.
     const handle = attachIntro(loadShippedAssets(), p.host, 4400);
     handle.frame(0);
     let time = 0;
@@ -419,7 +485,48 @@ describe.skipIf(!exported)("the intro handle", () => {
     }
     expect(handle.done()).toBe(true);
     expect(p.doneCalls).toBe(1);
-    expect(handle.t()).toBe(4446);
+    // The coda's own end: 4446 original frames + 659 (INTRO_DECODE §9).
+    expect(handle.t()).toBe(5105);
+  });
+
+  it("skips from inside the coda: the fire ends everything, onDone once", () => {
+    const p = fakePresentation();
+    const handle = attachIntro(loadShippedAssets(), p.host, 4600);
+    handle.frame(0);
+    expect(handle.t()).toBe(4600); // mid-coda, on the iN tHE yEAR hold
+    expect(handle.done()).toBe(false);
+    handle.skip();
+    expect(handle.done()).toBe(true);
+    expect(p.doneCalls).toBe(1);
+    handle.skip();
+    handle.frame(20);
+    expect(p.doneCalls).toBe(1);
+  });
+
+  it("overlays the HD card exactly while the coda's card holds", () => {
+    const marker = {} as CanvasImageSource;
+    // Mid-card (t=4847): the surface draw plus the overlay draw.
+    const onCard = fakePresentation(672, 512, () => marker);
+    attachIntro(loadShippedAssets(), onCard.host, 4847).frame(0);
+    expect(onCard.draws.length).toBe(1);
+    expect(onCard.overlays.length).toBe(1);
+    const overlay = onCard.overlays[0];
+    expect(overlay).toBeDefined();
+    if (overlay === undefined) return;
+    // 672x512 letterboxes to 672x504 at (0,4); the card band is rows 32..151
+    // of 240 — the overlay covers exactly that band, full width.
+    expect(overlay.dw).toBe(672);
+    expect(overlay.dh).toBe(504 * (120 / 240));
+    expect(overlay.dy).toBe(4 + 504 * (32 / 240));
+    // Before the card (mid-coda text scene): no overlay.
+    const beforeCard = fakePresentation(672, 512, () => marker);
+    attachIntro(loadShippedAssets(), beforeCard.host, 4600).frame(0);
+    expect(beforeCard.overlays.length).toBe(0);
+    // A host whose card never loaded: no overlay, no error — the original
+    // still underneath is the picture.
+    const noCard = fakePresentation(672, 512, () => null);
+    attachIntro(loadShippedAssets(), noCard.host, 4847).frame(0);
+    expect(noCard.overlays.length).toBe(0);
   });
 
   it("pause holds the clock; resume does not bank the gap", () => {
@@ -479,6 +586,10 @@ describe("the boot wiring", () => {
     expect(source).toContain("intro = null");
     // A ?table= deep link boots straight to its game, no show.
     expect(source).toMatch(/if \(bootTable === null\) \{\s*\n\s*try \{\s*\n\s*const assets = await loadIntroAssets/);
+    // The coda's HD card rides an <img> outside the awaited asset set, so a
+    // missing card only disables the overlay, never the show.
+    expect(source).toContain("INTRO_HD_FILE");
+    expect(source).toMatch(/hdCard: \(\) =>\s*\n\s*introHdCard\.complete && introHdCard\.naturalWidth > 0 \? introHdCard : null/);
   });
 
   it("drives the player from the frame loop on the paused shell clock", () => {

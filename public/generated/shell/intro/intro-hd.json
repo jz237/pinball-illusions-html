@@ -1,0 +1,41 @@
+{
+  "schema": "pinball-illusions/intro-hd/v1",
+  "scale": 4,
+  "card": {
+    "y0": 32,
+    "rows": 120
+  },
+  "image": {
+    "file": "intro-hd.png",
+    "width": 2560,
+    "height": 480,
+    "byteLength": 736612,
+    "sha256": "004e62f4e6b3dacfaf3d07444c6726b823b8c1024bcc12647697a6d731710c16"
+  },
+  "hd": {
+    "tool": "xbrz-js@1.9.2 (xBRZ v1.9), format argb, default config",
+    "dedither": "exact-checkerboard prepass"
+  },
+  "source": {
+    "file": "intro-data.bin",
+    "sha256": "7d370343c7dfe5de8f18e9d21f92a621a4a27f63b080a2ed4eaf805ca80e9a02",
+    "still": "still-illusions",
+    "glyphs": "text-anim deltas 1..149 (ENHANCED H at 115,47 and D at 246,47, 17x25 each)"
+  },
+  "coda": {
+    "startT": 4447,
+    "endT": 5105,
+    "pins": [
+      4487,
+      4567,
+      4677,
+      4847,
+      5102
+    ]
+  },
+  "provenance": {
+    "sourceClass": "disk-derived-intro-hd",
+    "description": "The boot-intro coda's HD title card: the PINBALL ILLUSIONS still from `intro.bin` (HAM8 640x120) decoded and upscaled 4x by the project's measured recipe (exact-checkerboard de-dither + xBRZ), with an 'HD' composed from the intro's own ENHANCED glyphs, upscaled the same way. A transformation of disk-rendered art, shipped behind the same authorization gate as every other disk-derived class.",
+    "authorizationRequired": true
+  }
+}

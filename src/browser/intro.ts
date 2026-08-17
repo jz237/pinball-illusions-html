@@ -91,6 +91,17 @@ export const INTRO_WIDTH = 640;
 export const INTRO_ROWS = 240;
 
 /**
+ * The coda's pre-baked HD title card (2560x480, the ILLUSIONS still xBRZ-4x'd
+ * with the "HD" glyph pair composited; `scripts/export-intro-coda.mjs`). Loaded
+ * OUTSIDE the gated asset path — a missing or failed card only disables the
+ * presenter overlay, never the show.
+ */
+export const INTRO_HD_FILE = "intro-hd.png";
+/** The 120-row still band's place on the 640x240 canvas (the still lists' y0). */
+export const INTRO_CARD_Y0 = 32;
+export const INTRO_CARD_ROWS = 120;
+
+/**
  * Where playback starts: the frame whose dispatch is the backdrop fade-in.
  * Script time t=1..351 is BLACK — the original runs it while the floppies
  * load, with only the music up — and INTRO_DECODE.md §7 is explicit that the
@@ -311,6 +322,191 @@ export async function loadIntroAssets(
 }
 
 // ---------------------------------------------------------------------------
+// THE CODA — a deliberate 2026 addition, not a decode
+// ---------------------------------------------------------------------------
+//
+// The original show plays byte-identical through its exit dispatch at t=4446
+// (screen black). The coda is appended INSIDE the same generator at that exit
+// branch — every original frame executes identically, and the coda rides the
+// same one-yield-per-PAL-frame engine, fade tables, rasteriser and skip
+// wiring. Storyboard (all timing values measured off the original's own run,
+// see research/INTRO_DECODE.md §9): "AND NOW" (the original page verbatim,
+// revealed by the show's opening fade), "iN tHE yEAR" (the original page,
+// written by the original deltas at the shipped one-glyph-per-frame cadence),
+// "2026 AD" (the 1995 AD dress — rules, AD unit — with the 0 and 6
+// synthesized in-face from the 1992 digits), then the ILLUSIONS still held its
+// own 338 frames while the presenter overlays the pre-baked HD card, then the
+// credits white flash, the show's own ending fade, and 8 black frames. The
+// coda consumes only the already-shipped delta stream and fade tables; the
+// one new asset is the presenter-level HD card PNG.
+//
+// c = t - CODA.startT is the coda frame index; dispatch at c, visible c+1,
+// blocking fades burn their 16 frames internally — the original's discipline.
+
+const CODA = {
+  /** t of the first coda frame; the show's exit dispatch is t=4446. */
+  startT: 4447,
+  /** t of the last coda frame; the generator returns after yielding it. */
+  endT: 5105,
+  /** The text canvas: 320x120, two planes. */
+  canvasWidth: 320,
+  canvasHeight: 120,
+  /** Fade tables (h0 offsets; all twelve ship in the manifest). */
+  sceneInFade: 0x0f9c, // scene in from black, colour 0 held black (show opening)
+  textOutFade: 0x1108, // letters dissolve into the clouds
+  textSetFade: 0x1134, // the instant SET that pops the hidden 'i' white
+  /** Delta indices, 1-based over the 176 shipped OP_ANIM steps. */
+  digitsDelta: 107, // "1992" fully written — the 9 and 2 the digits are cut from
+  andNowDelta: 150, // the AND NOW page, stamped whole
+  adPageDelta: 172, // "1995 AD" fully written — the AD unit and the two rules
+  letterDeltas: 9, // deltas 151..159: i, N, t, H, E, y, E, A, R
+  /** Glyph rects on the canvas: [x, y, w, h], verified against the stream. */
+  rect9: [103, 28, 37, 62],
+  rect2: [179, 29, 38, 61],
+  rectAd: [233, 66, 30, 23],
+  /** The 1995 page's two full-width white rules (canvas rows). */
+  ruleRows: [28, 89],
+  /** The 9's closed bowl: rows 0..41, NN-stretched to 62 to make the 0. */
+  bowlRows: 42,
+  /** "2026" at the 1995 layout: [x, top, which] per digit, pitch 38. */
+  digitAt: [
+    [84, 29, "2"],
+    [122, 28, "0"],
+    [160, 29, "2"],
+    [198, 28, "6"],
+  ],
+  /** The AD unit, tucked low against the right side of the 6. */
+  adAt: [239, 66],
+  /** Timing, in c: the measured envelope of the run the coda mirrors. */
+  andNowHoldEnd: 51, // AND NOW holds c=18..52; text-out dispatched at 51
+  morphStart: 165, // 13 morph dispatches at c=165..177, one per frame
+  morphFrames: 13,
+  ruleSweepFrames: 3, // rules sweep in across the first 3 morph frames
+  digitGrowFrames: 9, // then the digits expand vertically over 9
+  cardCut: 278, // the whiteout+cut still handler dispatches at c=278
+  cardHoldEnd: 632, // the card holds 338 frames, c=295..632 (the show's longest)
+  blackTail: 9, // pass-16 black plus the show's own 8 black frames
+} as const;
+
+/** A cut or synthesized glyph: 2-bit palette values (0..3), row-major. */
+interface CodaGlyph {
+  readonly w: number;
+  readonly h: number;
+  readonly v: Uint8Array;
+}
+
+/** What `#codaGlyphs` cuts out of the shipped delta stream at coda entry. */
+interface CodaGlyphs {
+  /** The raw 2-plane canvas after delta 150 — the AND NOW page, whole. */
+  readonly andNowPlanes: Uint8Array;
+  /** Where the stream stands after delta 150: delta 151, the hidden 'i'. */
+  readonly animAt: number;
+  /** The canvas after delta 159 as values — the iN tHE yEAR page, whole. */
+  readonly yearPage: Uint8Array;
+  readonly digit2: CodaGlyph;
+  readonly digit0: CodaGlyph;
+  readonly digit6: CodaGlyph;
+  readonly ad: CodaGlyph;
+  /** The two rule rows after delta 172, 320 values each. */
+  readonly rules: readonly [Uint8Array, Uint8Array];
+}
+
+function canvasValue(planes: Uint8Array, planeStride: number, x: number, y: number): number {
+  const at = y * (CODA.canvasWidth >> 3) + (x >> 3);
+  const bit = 7 - (x & 7);
+  return (((planes[at] ?? 0) >> bit) & 1) | ((((planes[planeStride + at] ?? 0) >> bit) & 1) << 1);
+}
+
+function cutGlyph(
+  planes: Uint8Array,
+  planeStride: number,
+  rect: readonly [number, number, number, number],
+): CodaGlyph {
+  const [x0, y0, w, h] = rect;
+  const v = new Uint8Array(w * h);
+  for (let y = 0; y < h; y += 1) {
+    for (let x = 0; x < w; x += 1) {
+      v[y * w + x] = canvasValue(planes, planeStride, x0 + x, y0 + y);
+    }
+  }
+  return { w, h, v };
+}
+
+/** The 6: the 9 rotated 180° — same face, same lean, same weight. */
+function rot180(g: CodaGlyph): CodaGlyph {
+  const v = new Uint8Array(g.w * g.h);
+  for (let y = 0; y < g.h; y += 1) {
+    for (let x = 0; x < g.w; x += 1) {
+      v[y * g.w + x] = g.v[(g.h - 1 - y) * g.w + (g.w - 1 - x)] ?? 0;
+    }
+  }
+  return { w: g.w, h: g.h, v };
+}
+
+/** The 0: the 9's closed bowl (rows 0..bowlRows-1) NN-stretched to full height. */
+function stretchBowl(g: CodaGlyph, bowlRows: number): CodaGlyph {
+  const v = new Uint8Array(g.w * g.h);
+  for (let y = 0; y < g.h; y += 1) {
+    const src = Math.min(bowlRows - 1, Math.floor((y * bowlRows) / g.h));
+    for (let x = 0; x < g.w; x += 1) {
+      v[y * g.w + x] = g.v[src * g.w + x] ?? 0;
+    }
+  }
+  return { w: g.w, h: g.h, v };
+}
+
+function blitGlyph(page: Uint8Array, g: CodaGlyph, x0: number, y0: number, rows?: number): void {
+  // `rows`: draw the glyph NN-compressed to that many rows, centred on its
+  // final vertical span — the morph's vertical-growth step.
+  const h = rows ?? g.h;
+  const top = y0 + Math.round((g.h - h) / 2);
+  for (let y = 0; y < h; y += 1) {
+    const src = rows === undefined ? y : Math.min(g.h - 1, Math.floor((y * g.h) / h));
+    for (let x = 0; x < g.w; x += 1) {
+      const value = g.v[src * g.w + x] ?? 0;
+      if (value !== 0) page[(top + y) * CODA.canvasWidth + (x0 + x)] = value;
+    }
+  }
+}
+
+/**
+ * Morph state k of `CODA.morphFrames`: the 1995 morph's exact dress and
+ * envelope — the rules sweep in first, then the digits expand vertically, and
+ * the AD unit lands on the final frame. The intermediate pixel content is
+ * authored (the envelope is the measured fact); see INTRO_DECODE.md §9.
+ */
+function codaMorphValues(glyphs: CodaGlyphs, k: number): Uint8Array {
+  const page = new Uint8Array(CODA.canvasWidth * CODA.canvasHeight);
+  const rules = (cols: number): void => {
+    for (let i = 0; i < CODA.ruleRows.length; i += 1) {
+      const row = CODA.ruleRows[i] ?? 0;
+      const line = glyphs.rules[i === 0 ? 0 : 1];
+      for (let x = 0; x < cols; x += 1) page[row * CODA.canvasWidth + x] = line[x] ?? 0;
+    }
+  };
+  if (k <= CODA.ruleSweepFrames) {
+    // The old page still up; the rules wipe across it left to right.
+    page.set(glyphs.yearPage);
+    rules(Math.ceil((CODA.canvasWidth * k) / CODA.ruleSweepFrames));
+    return page;
+  }
+  rules(CODA.canvasWidth);
+  const digitFor = (which: string): CodaGlyph =>
+    which === "0" ? glyphs.digit0 : which === "6" ? glyphs.digit6 : glyphs.digit2;
+  const step = Math.min(CODA.digitGrowFrames, k - CODA.ruleSweepFrames);
+  for (const [x, top, which] of CODA.digitAt) {
+    const digit = digitFor(which);
+    const rows = Math.max(1, Math.round((digit.h * step) / CODA.digitGrowFrames));
+    blitGlyph(page, digit, x, top, rows === digit.h ? undefined : rows);
+  }
+  if (k >= CODA.morphFrames) {
+    const [adX, adY] = CODA.adAt;
+    blitGlyph(page, glyphs.ad, adX, adY);
+  }
+  return page;
+}
+
+// ---------------------------------------------------------------------------
 // The core: the script engine and the display model. Pure — no DOM, no clock.
 // ---------------------------------------------------------------------------
 
@@ -343,6 +539,8 @@ export class IntroCore {
   #bufA: number;
   #bufB: number;
   #finished = false;
+  /** True while the coda's title card holds — the presenter's HD overlay window. */
+  #codaCard = false;
 
   /** Display state changed since the last rasterise. */
   #dirty = true;
@@ -380,6 +578,11 @@ export class IntroCore {
 
   get finished(): boolean {
     return this.#finished;
+  }
+
+  /** True while the coda's title card holds; the presenter's HD overlay window. */
+  get codaCard(): boolean {
+    return this.#codaCard;
   }
 
   /** Bumps when the picture actually changed; holds cost nothing. */
@@ -441,6 +644,9 @@ export class IntroCore {
       } else if (op === ops.credits) {
         yield* this.#credits();
       } else if (op === ops.exit) {
+        // THE SEAM: the show has ended, screen black, every original frame
+        // already played byte-identical. The coda rides the same generator.
+        yield* this.#coda();
         return;
       } else if (backdropByOp.has(op)) {
         yield* this.#showBackdrop(backdropByOp.get(op)?.fade ?? 0);
@@ -464,11 +670,12 @@ export class IntroCore {
    * The whole "FreeAnim" format: `u16 N` then N+1 groups — 0x00: u16 skip;
    * 0x80|k: (k&0x7F)+1 literal bytes; 0x01..0x7F: repeat next byte c times.
    * Returns where the stream ended, which for the delta animation is the next
-   * frame's start.
+   * frame's start. `into` defaults to screen memory; the coda's glyph cutter
+   * passes a scratch canvas so it can walk the stream without display effect.
    */
-  #unpack(srcAt: number, dstAt: number): number {
+  #unpack(srcAt: number, dstAt: number, into?: Uint8Array): number {
     const h1 = this.#h1;
-    const h4 = this.#h4;
+    const h4 = into ?? this.#h4;
     let src = srcAt;
     let dst = dstAt;
     const groups = readU16(h1, src) + 1;
@@ -637,6 +844,179 @@ export class IntroCore {
   *#wait(span: number): Generator<void, void, void> {
     const until = this.#t + span;
     while (this.#t < until) yield* this.#frame();
+  }
+
+  // -- the coda (see the CODA block above; an addition, not a decode) --------
+
+  /** Burns frames until the counter reaches an absolute t. */
+  *#until(t: number): Generator<void, void, void> {
+    while (this.#t < t) yield* this.#frame();
+  }
+
+  /**
+   * Cuts the coda's material out of the shipped delta stream: walk deltas
+   * 1..172 into a scratch canvas (the stream is cumulative — each delta's
+   * skips preserve the previous frame, exactly what the double buffer's
+   * copy-then-patch achieves) and snapshot the states the coda draws from.
+   */
+  #codaGlyphs(): CodaGlyphs {
+    const stream = this.#manifest.streams.find((s) => s.frames !== undefined);
+    if (stream === undefined) throw new Error("the coda needs the text-anim stream");
+    const { size, planeStride } = this.#manifest.anim;
+    const canvas = new Uint8Array(size);
+    let at = stream.at;
+    let andNowPlanes: Uint8Array | null = null;
+    let animAt = 0;
+    let yearPage: Uint8Array | null = null;
+    let digit9: CodaGlyph | null = null;
+    let digit2: CodaGlyph | null = null;
+    let ad: CodaGlyph | null = null;
+    let rules: [Uint8Array, Uint8Array] | null = null;
+    for (let delta = 1; delta <= CODA.adPageDelta; delta += 1) {
+      at = this.#unpack(at, 0, canvas);
+      if (delta === CODA.digitsDelta) {
+        digit9 = cutGlyph(canvas, planeStride, CODA.rect9);
+        digit2 = cutGlyph(canvas, planeStride, CODA.rect2);
+      } else if (delta === CODA.andNowDelta) {
+        andNowPlanes = canvas.slice();
+        animAt = at;
+      } else if (delta === CODA.andNowDelta + CODA.letterDeltas) {
+        const values = new Uint8Array(CODA.canvasWidth * CODA.canvasHeight);
+        for (let y = 0; y < CODA.canvasHeight; y += 1) {
+          for (let x = 0; x < CODA.canvasWidth; x += 1) {
+            values[y * CODA.canvasWidth + x] = canvasValue(canvas, planeStride, x, y);
+          }
+        }
+        yearPage = values;
+      } else if (delta === CODA.adPageDelta) {
+        ad = cutGlyph(canvas, planeStride, CODA.rectAd);
+        const cutRow = (row: number): Uint8Array => {
+          const line = new Uint8Array(CODA.canvasWidth);
+          for (let x = 0; x < CODA.canvasWidth; x += 1) line[x] = canvasValue(canvas, planeStride, x, row);
+          return line;
+        };
+        rules = [cutRow(CODA.ruleRows[0] ?? 0), cutRow(CODA.ruleRows[1] ?? 0)];
+      }
+    }
+    if (andNowPlanes === null || yearPage === null || digit9 === null || digit2 === null || ad === null || rules === null) {
+      throw new Error("the coda's glyph cut walked past its snapshots");
+    }
+    return {
+      andNowPlanes,
+      animAt,
+      yearPage,
+      digit2,
+      digit0: stretchBowl(digit9, CODA.bowlRows),
+      digit6: rot180(digit9),
+      ad,
+      rules,
+    };
+  }
+
+  /**
+   * Zeroes every palette MOVE in the text scene's copper list, so the scene
+   * cut in at c=1 is black and the show's own opening fade (0xF9C, colour 0
+   * held black) raises it — the coda emerges from the credits' black rather
+   * than a whiteout, and this is the show's from-black grammar.
+   */
+  #codaBlackenTextList(): void {
+    const h2 = this.#h2;
+    let at = this.#manifest.backdrop.list;
+    while (at + 4 <= h2.length) {
+      const first = readU16(h2, at);
+      const second = readU16(h2, at + 2);
+      if (first === 0xffff && second === 0xfffe) break;
+      if ((first & 1) === 0) {
+        const register = first & 0x1fe;
+        if (register >= 0x180 && register <= 0x1be) writeU16(h2, at + 2, 0);
+      }
+      at += 4;
+    }
+    this.#dirty = true;
+  }
+
+  /** One authored canvas as a text-anim frame: swap, pack, poke — the delta discipline. */
+  #codaCanvasFrame(values: Uint8Array): void {
+    const { size, planeStride, textSlot } = this.#manifest.anim;
+    const shown = this.#bufA;
+    this.#bufA = this.#bufB;
+    this.#bufB = shown;
+    const base = this.#bufB;
+    this.#h4.fill(0, base, base + size);
+    for (let y = 0; y < CODA.canvasHeight; y += 1) {
+      for (let x = 0; x < CODA.canvasWidth; x += 1) {
+        const value = values[y * CODA.canvasWidth + x] ?? 0;
+        if (value === 0) continue;
+        const at = base + y * (CODA.canvasWidth >> 3) + (x >> 3);
+        const bit = 0x80 >> (x & 7);
+        if ((value & 1) !== 0) this.#h4[at] = (this.#h4[at] ?? 0) | bit;
+        if ((value & 2) !== 0) {
+          this.#h4[at + planeStride] = (this.#h4[at + planeStride] ?? 0) | bit;
+        }
+      }
+    }
+    this.#pokePlanes(textSlot, this.#bufB, planeStride, 2);
+  }
+
+  /**
+   * THE CODA ITSELF. Dispatch discipline as the show's: at most one action per
+   * frame, dispatched after the frame it is dated on, blocking fades burning
+   * their 16 frames internally. Every timing value is measured off the run the
+   * coda mirrors (AND NOW → iN tHE yEAR → 1995 AD → stills), mapped to
+   * c = t - CODA.startT; see the CODA table above and INTRO_DECODE.md §9.
+   */
+  *#coda(): Generator<void, void, void> {
+    const glyphs = this.#codaGlyphs();
+    const c = (frame: number): number => CODA.startT + frame;
+    // c=0: screen black (the credits list's palette ended all-zero). The
+    // dispatch re-arms the purple-clouds text scene: black palette, the AND
+    // NOW page pre-drawn whole into the text buffer (the original stamped it
+    // whole too), the stream pointer parked at delta 151.
+    yield* this.#frame();
+    this.#codaBlackenTextList();
+    this.#h4.set(glyphs.andNowPlanes, this.#bufB);
+    this.#animAt = glyphs.animAt;
+    // c=1: the scene cut + 16-pass fade-in from black, the show's opening
+    // grammar; AND NOW is revealed whole, as the original page was.
+    yield* this.#frame();
+    yield* this.#showBackdrop(CODA.sceneInFade); // burns c=2..17
+    yield* this.#until(c(CODA.andNowHoldEnd)); // AND NOW holds, 35 frames
+    yield* this.#fade(CODA.textOutFade); // letters dissolve; burns c=52..67
+    // c=68: delta 151 draws the 'i' hidden (faint, its banks dissolved) —
+    yield* this.#frame();
+    this.#animFrame();
+    // — and c=69's instant SET pops it white, exactly as shipped.
+    yield* this.#frame();
+    this.#pset(CODA.textSetFade);
+    // c=70..77: N, t, H, E, y, E, A, R — one glyph per frame, the collapsed
+    // cadence the original's past-due entries actually shipped.
+    for (let letter = 1; letter < CODA.letterDeltas; letter += 1) {
+      yield* this.#frame();
+      this.#animFrame();
+    }
+    yield* this.#until(c(CODA.morphStart - 1)); // iN tHE yEAR holds, 87 frames
+    // c=165..177: the morph to 2026 AD — rules sweep, digits grow, AD lands.
+    for (let k = 1; k <= CODA.morphFrames; k += 1) {
+      yield* this.#frame();
+      this.#codaCanvasFrame(codaMorphValues(glyphs, k));
+    }
+    yield* this.#until(c(CODA.cardCut)); // 2026 AD holds, 102 frames
+    // c=278: the still handler — 16-pass whiteout of the current scene, then
+    // the hard cut to the ILLUSIONS card at full palette, cards' own grammar.
+    const still = this.#manifest.stills.find((entry) => entry.stream === "still-illusions");
+    if (still === undefined) throw new Error("the coda needs the still-illusions handler");
+    yield* this.#still(still); // burns c=279..294; card from c=295
+    this.#codaCard = true;
+    yield* this.#until(c(CODA.cardHoldEnd + 1)); // the card holds 338 frames
+    // c=633: how the original leaves this very logo — cut to the credits list
+    // and set every bank white in one frame — then the show's own ending fade
+    // and its 8 black frames. The HAM8 still is never palette-faded (HAM
+    // modify pixels would not follow); the flash-then-fade is solid-shade.
+    this.#coplc = this.#manifest.credits.list;
+    this.#pset(this.#manifest.credits.whiteSet);
+    this.#codaCard = false;
+    yield* this.#fade(this.#manifest.credits.blackFade); // burns c=634..649
+    yield* this.#wait(CODA.blackTail); // 8 black frames; ends at t=5105
   }
 
   // -- the rasteriser -------------------------------------------------------
@@ -848,6 +1228,14 @@ export interface IntroHost {
   readonly canvas: HTMLCanvasElement;
   /** Offscreen surface factory, exactly `createShellSkin`'s. */
   surface(width: number, height: number): HTMLCanvasElement;
+  /**
+   * The coda's pre-baked HD title card, if it loaded. Optional and consulted
+   * per frame while `codaCard` holds; `null` (or absence) means the core's own
+   * still — the original picture — shows instead, a graceful degrade. The
+   * host loads it OUTSIDE the gated asset path so a failure cannot skip the
+   * show.
+   */
+  hdCard?(): CanvasImageSource | null;
   /** Fired exactly once, when the show ends or is skipped. */
   onDone(): void;
 }
@@ -932,18 +1320,25 @@ export function attachIntro(
     const scale = Math.min(width / INTRO_WIDTH, height / (INTRO_ROWS * 2));
     const drawWidth = Math.max(1, Math.round(INTRO_WIDTH * scale));
     const drawHeight = Math.max(1, Math.round(INTRO_ROWS * 2 * scale));
+    const drawX = (width - drawWidth) >> 1;
+    const drawY = (height - drawHeight) >> 1;
     context.imageSmoothingEnabled = true;
-    context.drawImage(
-      surface,
-      0,
-      0,
-      INTRO_WIDTH,
-      INTRO_ROWS,
-      (width - drawWidth) >> 1,
-      (height - drawHeight) >> 1,
-      drawWidth,
-      drawHeight,
-    );
+    context.drawImage(surface, 0, 0, INTRO_WIDTH, INTRO_ROWS, drawX, drawY, drawWidth, drawHeight);
+    // The coda's title card: the HD still drawn over the still's own 120-row
+    // band while the core holds the card. The core underneath keeps showing
+    // the original picture, so a missing card is the original show, no worse.
+    if (core.codaCard) {
+      const hd = host.hdCard?.() ?? null;
+      if (hd !== null) {
+        context.drawImage(
+          hd,
+          drawX,
+          drawY + (drawHeight * INTRO_CARD_Y0) / INTRO_ROWS,
+          drawWidth,
+          (drawHeight * INTRO_CARD_ROWS) / INTRO_ROWS,
+        );
+      }
+    }
   };
 
   return {

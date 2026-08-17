@@ -165,21 +165,89 @@ describe.skipIf(!exported || !filmed)(
       expect(mismatches).toBe(0);
     });
 
-    it("runs the whole show to the scripted exit at t=4446", () => {
+    it("plays the original show to its exit dispatch at t=4446, on black", () => {
+      // The exit entry is timed t=2892 but fires only after the credits
+      // choreography returns at t=4445; it dispatches on the NEXT frame,
+      // t=4446, which is INTRO_DECODE §6's own exit figure — 88.9 s. This
+      // probe pins the ORIGINAL's ending independent of the coda appended
+      // behind it: at the exit dispatch the screen is fully black.
+      const core = new IntroCore(loadShippedAssets());
+      while (core.t < 4446) {
+        if (!core.step()) throw new Error(`show ended at t=${core.t} before the exit dispatch`);
+      }
+      expect(core.t).toBe(4446);
+      expect(core.finished).toBe(false); // the coda is still to play
+      expect(core.rgb().every((byte) => byte === 0)).toBe(true);
+    });
+
+    it("plays the coda to its end at t=5105, on black", () => {
       const core = new IntroCore(loadShippedAssets());
       let steps = 0;
       while (core.step()) {
         steps += 1;
         if (steps > 6000) throw new Error("the show never ends");
       }
-      // The exit entry is timed t=2892 but fires only after the credits
-      // choreography returns at t=4445; it dispatches on the NEXT frame,
-      // t=4446, which is INTRO_DECODE §6's own exit figure — 88.9 s.
-      expect(core.t).toBe(4446);
+      // 4446 original frames + the 659-frame coda (13.18 s): INTRO_DECODE §9.
+      expect(core.t).toBe(5105);
       expect(core.finished).toBe(true);
-      // And it ends on black: the last fade table's targets are all zero.
+      // And it still ends on black: the coda exits through the credits white
+      // flash and the show's own 16-pass fade to black plus 8 black frames.
       const final = core.rgb();
       expect(final.every((byte) => byte === 0)).toBe(true);
+    });
+  },
+);
+
+// ---------------------------------------------------------------------------
+// The coda gate: the player against the exporter's INDEPENDENT render.
+// `scripts/export-intro-coda.mjs` renders these frames with its own JS
+// transliteration of the machinery (no code shared with src/browser/intro.ts),
+// so byte-equality here pins the glyph cutting, the 0/6 syntheses, the morph,
+// the fades and the exit against an implementation that cannot share a bug.
+// c = t - 4447; one checkpoint per coda scene at a clean hold frame.
+// ---------------------------------------------------------------------------
+
+const CODA_START = 4447;
+const CODA_PINS = [4487, 4567, 4677, 4847, 5102] as const;
+const CODA_FRAMES_DIR = fileURLToPath(
+  new URL("../../research/view/intro/coda-frames/", import.meta.url),
+);
+const codaFramed = existsSync(`${CODA_FRAMES_DIR}c0040.png`);
+
+describe.skipIf(!exported || !codaFramed)(
+  "the coda, byte-identical to the exporter's reference render",
+  () => {
+    it("matches every coda checkpoint frame exactly", () => {
+      const core = new IntroCore(loadShippedAssets());
+      let mismatches = 0;
+      for (const checkpoint of CODA_PINS) {
+        while (core.t < checkpoint) {
+          if (!core.step()) throw new Error(`show ended at t=${core.t} before checkpoint ${checkpoint}`);
+        }
+        expect(core.t).toBe(checkpoint);
+        const name = `c${String(checkpoint - CODA_START).padStart(4, "0")}.png`;
+        const reference = decodeRgbPng(readFileSync(`${CODA_FRAMES_DIR}${name}`));
+        expect(reference.width).toBe(INTRO_WIDTH);
+        expect(reference.height).toBe(INTRO_ROWS * 2);
+        const rendered = core.rgb();
+        let firstDiff = -1;
+        for (let row = 0; row < INTRO_ROWS * 2 && firstDiff < 0; row += 1) {
+          const ours = (row >> 1) * INTRO_WIDTH * 3;
+          const theirs = row * INTRO_WIDTH * 3;
+          for (let x = 0; x < INTRO_WIDTH * 3; x += 1) {
+            if (rendered[ours + x] !== reference.rgb[theirs + x]) {
+              firstDiff = theirs + x;
+              break;
+            }
+          }
+        }
+        if (firstDiff >= 0) {
+          mismatches += 1;
+          const pixel = Math.floor(firstDiff / 3);
+          expect.soft(firstDiff, `t=${checkpoint} first differing byte (pixel x=${pixel % INTRO_WIDTH}, y=${Math.floor(pixel / INTRO_WIDTH)})`).toBe(-1);
+        }
+      }
+      expect(mismatches).toBe(0);
     });
   },
 );
