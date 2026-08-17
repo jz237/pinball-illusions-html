@@ -215,11 +215,15 @@ describe.skipIf(!hdExported)("the shipped HD intro card", () => {
     const manifest = JSON.parse(readFileSync(`${INTRO_DIR}intro-hd.json`, "utf8")) as {
       image: { file: string; width: number; height: number; byteLength: number; sha256: string };
       provenance?: { sourceClass?: string; authorizationRequired?: boolean };
-      coda?: { startT?: number; endT?: number };
+      coda?: { startT?: number; endT?: number; showEndT?: number };
     };
     expect(manifest.provenance?.sourceClass).toBe("disk-derived-intro-hd");
     expect(manifest.provenance?.authorizationRequired).toBe(true);
-    expect(manifest.coda?.endT).toBe(5105);
+    // The 2026 splice: the coda plays t=2892..3550, inside the announcement
+    // arc, and the whole show ends at 4446 + 659 = 5105.
+    expect(manifest.coda?.startT).toBe(2892);
+    expect(manifest.coda?.endT).toBe(3550);
+    expect(manifest.coda?.showEndT).toBe(5105);
     const bytes = readFileSync(`${INTRO_DIR}${manifest.image.file}`);
     expect(bytes.length).toBe(manifest.image.byteLength);
     expect(createHash("sha256").update(bytes).digest("hex")).toBe(manifest.image.sha256);
@@ -472,9 +476,9 @@ describe.skipIf(!exported)("the intro handle", () => {
   it("hands off by itself when the script exits", () => {
     const p = fakePresentation();
     // Pre-roll deep into the credits so the run to the exit stays cheap: the
-    // whole show is 4446 frames plus the 659-frame coda, and the pixel gate
-    // already walks all of them.
-    const handle = attachIntro(loadShippedAssets(), p.host, 4400);
+    // whole show is 4446 original frames plus the 659-frame coda spliced at
+    // t=2891, and the pixel gate already walks all of them.
+    const handle = attachIntro(loadShippedAssets(), p.host, 5050);
     handle.frame(0);
     let time = 0;
     let frames = 0;
@@ -485,15 +489,15 @@ describe.skipIf(!exported)("the intro handle", () => {
     }
     expect(handle.done()).toBe(true);
     expect(p.doneCalls).toBe(1);
-    // The coda's own end: 4446 original frames + 659 (INTRO_DECODE §9).
+    // The show's end: 4446 original frames + the 659-frame coda (§9).
     expect(handle.t()).toBe(5105);
   });
 
   it("skips from inside the coda: the fire ends everything, onDone once", () => {
     const p = fakePresentation();
-    const handle = attachIntro(loadShippedAssets(), p.host, 4600);
+    const handle = attachIntro(loadShippedAssets(), p.host, 3012);
     handle.frame(0);
-    expect(handle.t()).toBe(4600); // mid-coda, on the iN tHE yEAR hold
+    expect(handle.t()).toBe(3012); // mid-coda, on the iN tHE yEAR hold (c=120)
     expect(handle.done()).toBe(false);
     handle.skip();
     expect(handle.done()).toBe(true);
@@ -505,9 +509,9 @@ describe.skipIf(!exported)("the intro handle", () => {
 
   it("overlays the HD card exactly while the coda's card holds", () => {
     const marker = {} as CanvasImageSource;
-    // Mid-card (t=4847): the surface draw plus the overlay draw.
+    // Mid-card (t=3292, c=400): the surface draw plus the overlay draw.
     const onCard = fakePresentation(672, 512, () => marker);
-    attachIntro(loadShippedAssets(), onCard.host, 4847).frame(0);
+    attachIntro(loadShippedAssets(), onCard.host, 3292).frame(0);
     expect(onCard.draws.length).toBe(1);
     expect(onCard.overlays.length).toBe(1);
     const overlay = onCard.overlays[0];
@@ -518,14 +522,23 @@ describe.skipIf(!exported)("the intro handle", () => {
     expect(overlay.dw).toBe(672);
     expect(overlay.dh).toBe(504 * (120 / 240));
     expect(overlay.dy).toBe(4 + 504 * (32 / 240));
-    // Before the card (mid-coda text scene): no overlay.
+    // Before the card (mid-coda text scene, the iN tHE yEAR hold): no overlay.
     const beforeCard = fakePresentation(672, 512, () => marker);
-    attachIntro(loadShippedAssets(), beforeCard.host, 4600).frame(0);
+    attachIntro(loadShippedAssets(), beforeCard.host, 3012).frame(0);
     expect(beforeCard.overlays.length).toBe(0);
+    // On the ORIGINAL logo hold before the splice: no overlay — the plain
+    // logo, then the pages, then the logo WITH the card is the echo shape.
+    const preSplice = fakePresentation(672, 512, () => marker);
+    attachIntro(loadShippedAssets(), preSplice.host, 2700).frame(0);
+    expect(preSplice.overlays.length).toBe(0);
+    // After the coda, inside the credits: the window closed again.
+    const inCredits = fakePresentation(672, 512, () => marker);
+    attachIntro(loadShippedAssets(), inCredits.host, 4000).frame(0);
+    expect(inCredits.overlays.length).toBe(0);
     // A host whose card never loaded: no overlay, no error — the original
     // still underneath is the picture.
     const noCard = fakePresentation(672, 512, () => null);
-    attachIntro(loadShippedAssets(), noCard.host, 4847).frame(0);
+    attachIntro(loadShippedAssets(), noCard.host, 3292).frame(0);
     expect(noCard.overlays.length).toBe(0);
   });
 

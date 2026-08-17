@@ -13,19 +13,26 @@
  * integer arithmetic (the three-opcode unpacker, the nibble fader, the AGA
  * palette combine, HAM8), so any inequality at all is a porting bug.
  *
- * The checkpoints, chosen as landmarks rather than round numbers:
+ * THE 2026 SPLICE moved the coda from behind the credits into the
+ * announcement arc: it now plays at the credits dispatch (t=2891), between
+ * the ILLUSIONS logo's own hold and the credits, so every original frame
+ * AFTER the splice keeps its bytes and gains exactly +659 on its clock (the
+ * coda's length; the show ends at 4446+659 = 5105). The reference PNGs are
+ * still named by the ORIGINAL t they render; checkpoints after the splice
+ * drive the core to t+659 and compare against the original-t file:
  *
- *   t=575    "wAY bACK" mid-write — text deltas + backdrop palette (LORES 7bpl)
- *   t=1350   PINBALL DREAMS still           (HIRES HAM8 640x120)
- *   t=1875   PINBALL FANTASIES still        (HIRES HAM8 640x120)
- *   t=2250   21st CENTURY still             (HIRES 8bpl 256-colour 640x201)
- *   t=2400   DIGITAL ILLUSIONS still        (LORES HAM8 320x240)
- *   t=2475   the gag card mid-write         (text scene again, post-stills)
- *   t=2600   PINBALL ILLUSIONS still        (HIRES HAM8 640x120)
- *   t=2925   credits clouds fading in after the white flash (8bpl banks)
- *   t=3150   credits page 1 settled         (the bank compositor at rest)
- *   t=3300   credits page 1 -> 2, ONE FRAME INTO THE CROSSFADE — the
- *            strictest palette-state checkpoint the sampling offers
+ *   drive t  reference  what
+ *   575      t0575      "wAY bACK" mid-write — text deltas + backdrop palette
+ *   1350     t1350      PINBALL DREAMS still           (HIRES HAM8 640x120)
+ *   1875     t1875      PINBALL FANTASIES still        (HIRES HAM8 640x120)
+ *   2250     t2250      21st CENTURY still             (HIRES 8bpl 256c 640x201)
+ *   2400     t2400      DIGITAL ILLUSIONS still        (LORES HAM8 320x240)
+ *   2475     t2475      the gag card mid-write         (text scene, post-stills)
+ *   2600     t2600      PINBALL ILLUSIONS still        (HIRES HAM8 640x120)
+ *   3584     t2925      credits clouds fading in after the white flash (+659)
+ *   3809     t3150      credits page 1 settled                         (+659)
+ *   3959     t3300      credits page 1 -> 2, ONE FRAME INTO THE CROSSFADE — the
+ *                       strictest palette-state checkpoint offered      (+659)
  *
  * The frames live in the operator's research tree beside this repo and are not
  * part of the build, so the whole suite skips — loudly — where that tree is
@@ -124,7 +131,19 @@ function decodeRgbPng(bytes: Buffer): { width: number; height: number; rgb: Uint
 // The gate
 // ---------------------------------------------------------------------------
 
-const CHECKPOINTS = [575, 1350, 1875, 2250, 2400, 2475, 2600, 2925, 3150, 3300] as const;
+/** [drive t, reference-file t]: post-splice checkpoints drive to t+659. */
+const CHECKPOINTS = [
+  [575, 575],
+  [1350, 1350],
+  [1875, 1875],
+  [2250, 2250],
+  [2400, 2400],
+  [2475, 2475],
+  [2600, 2600],
+  [3584, 2925],
+  [3809, 3150],
+  [3959, 3300],
+] as const;
 
 describe.skipIf(!exported || !filmed)(
   "the intro player, byte-identical to the reference render",
@@ -132,13 +151,13 @@ describe.skipIf(!exported || !filmed)(
     it("matches every checkpoint frame exactly", () => {
       const core = new IntroCore(loadShippedAssets());
       let mismatches = 0;
-      for (const checkpoint of CHECKPOINTS) {
+      for (const [checkpoint, referenceT] of CHECKPOINTS) {
         while (core.t < checkpoint) {
           if (!core.step()) throw new Error(`show ended at t=${core.t} before checkpoint ${checkpoint}`);
         }
         expect(core.t).toBe(checkpoint);
         const reference = decodeRgbPng(
-          readFileSync(`${FRAMES_DIR}t${String(checkpoint).padStart(4, "0")}.png`),
+          readFileSync(`${FRAMES_DIR}t${String(referenceT).padStart(4, "0")}.png`),
         );
         expect(reference.width).toBe(INTRO_WIDTH);
         expect(reference.height).toBe(INTRO_ROWS * 2);
@@ -165,33 +184,45 @@ describe.skipIf(!exported || !filmed)(
       expect(mismatches).toBe(0);
     });
 
-    it("plays the original show to its exit dispatch at t=4446, on black", () => {
-      // The exit entry is timed t=2892 but fires only after the credits
-      // choreography returns at t=4445; it dispatches on the NEXT frame,
-      // t=4446, which is INTRO_DECODE §6's own exit figure — 88.9 s. This
-      // probe pins the ORIGINAL's ending independent of the coda appended
-      // behind it: at the exit dispatch the screen is fully black.
+    it("hands the coda to the credits at t=3550: card to the last frame, then the flash", () => {
+      // The seam-out pin (the equivalent of the retired "original black at
+      // t=4446" probe, whose event moved to the show's end below): the coda's
+      // card must hold through its very last frame, t=3550, and the credits'
+      // own white flash — the original's leaving of this logo, the coda's
+      // exit — must land on the next frame, t=3551: the 120-row band (canvas
+      // rows 32..151) all white, the borders black.
       const core = new IntroCore(loadShippedAssets());
-      while (core.t < 4446) {
-        if (!core.step()) throw new Error(`show ended at t=${core.t} before the exit dispatch`);
+      while (core.t < 3550) {
+        if (!core.step()) throw new Error(`show ended at t=${core.t} before the coda's last frame`);
       }
-      expect(core.t).toBe(4446);
-      expect(core.finished).toBe(false); // the coda is still to play
-      expect(core.rgb().every((byte) => byte === 0)).toBe(true);
+      expect(core.t).toBe(3550);
+      expect(core.codaCard).toBe(true); // the HD overlay window is still open
+      core.step();
+      expect(core.t).toBe(3551);
+      expect(core.codaCard).toBe(false); // and the credits closed it
+      const flash = core.rgb();
+      for (let row = 0; row < INTRO_ROWS; row += 1) {
+        const want = row >= 32 && row < 152 ? 0xff : 0x00;
+        for (let at = row * INTRO_WIDTH * 3; at < (row + 1) * INTRO_WIDTH * 3; at += 1) {
+          if (flash[at] !== want) {
+            throw new Error(`t=3551 is not the credits white flash at byte ${at} (row ${row})`);
+          }
+        }
+      }
     });
 
-    it("plays the coda to its end at t=5105, on black", () => {
+    it("plays the spliced show to its exit dispatch at t=5105, on black", () => {
+      // The original's exit dispatch, 88.9 s in INTRO_DECODE §6, shifted by
+      // the coda's 659 frames: 4446 + 659 = 5105 (102.1 s), still on black —
+      // the credits' own 16-pass fade to black is the show's last event.
       const core = new IntroCore(loadShippedAssets());
       let steps = 0;
       while (core.step()) {
         steps += 1;
         if (steps > 6000) throw new Error("the show never ends");
       }
-      // 4446 original frames + the 659-frame coda (13.18 s): INTRO_DECODE §9.
       expect(core.t).toBe(5105);
       expect(core.finished).toBe(true);
-      // And it still ends on black: the coda exits through the credits white
-      // flash and the show's own 16-pass fade to black plus 8 black frames.
       const final = core.rgb();
       expect(final.every((byte) => byte === 0)).toBe(true);
     });
@@ -203,12 +234,21 @@ describe.skipIf(!exported || !filmed)(
 // `scripts/export-intro-coda.mjs` renders these frames with its own JS
 // transliteration of the machinery (no code shared with src/browser/intro.ts),
 // so byte-equality here pins the glyph cutting, the 0/6 syntheses, the morph,
-// the fades and the exit against an implementation that cannot share a bug.
-// c = t - 4447; one checkpoint per coda scene at a clean hold frame.
+// the fades and both seams against an implementation that cannot share a bug.
+// c = t - 2892 since the splice; the pins moved with it (old t -> new t):
+//
+//   c=9    (new)         t=2901  seam-in: pass 8 of the 0xFE0 fade out of the
+//                                whiteout's white — the splice's own grammar
+//   c=40   4487 -> 2932  AND NOW hold
+//   c=120  4567 -> 3012  iN tHE yEAR hold
+//   c=230  4677 -> 3122  2026 AD hold
+//   c=400  4847 -> 3292  the ILLUSIONS card mid-hold
+//   c=658  5102 -> 3550  seam-out: the card's LAST frame (the old c=655 black
+//                                tail is retired; the credits flash follows)
 // ---------------------------------------------------------------------------
 
-const CODA_START = 4447;
-const CODA_PINS = [4487, 4567, 4677, 4847, 5102] as const;
+const CODA_START = 2892;
+const CODA_PINS = [2901, 2932, 3012, 3122, 3292, 3550] as const;
 const CODA_FRAMES_DIR = fileURLToPath(
   new URL("../../research/view/intro/coda-frames/", import.meta.url),
 );

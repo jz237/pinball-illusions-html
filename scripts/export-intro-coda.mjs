@@ -31,7 +31,9 @@
 //       the INDEPENDENT player below — a JS transliteration of
 //       research/intro/render.py's machinery plus the coda choreography — so
 //       tests/intro-pixels.test.ts can byte-compare the browser core against
-//       an implementation that shares none of its code. c = t - 4447.
+//       an implementation that shares none of its code. c = t - 2892: the coda
+//       is spliced at the credits dispatch (t=2891), between the ILLUSIONS
+//       logo's own hold and the credits, and everything after it shifts +659.
 //
 // ---------------------------------------------------------------------------
 // THE CODA IS AN ADDITION, NOT A DECODE
@@ -66,11 +68,11 @@ const INTRO_WIDTH = 640;
 const INTRO_ROWS = 240;
 
 const CODA = {
-  startT: 4447,
-  endT: 5105,
+  startT: 2892, // the credits dispatch is t=2891; the coda runs in its place
+  endT: 3550, // last coda frame; the credits handler dispatches right after
   canvasWidth: 320,
   canvasHeight: 120,
-  sceneInFade: 0x0f9c,
+  sceneInFade: 0x0fe0, // the still->page return that revealed AND NOW at t=1937
   textOutFade: 0x1108,
   textSetFade: 0x1134,
   digitsDelta: 107,
@@ -98,12 +100,18 @@ const CODA = {
   ruleSweepFrames: 3,
   digitGrowFrames: 9,
   cardCut: 278,
-  cardHoldEnd: 632,
-  blackTail: 9,
+  cardHoldEnd: 658, // 364 frames: the logo's own 338 + the retired 26-frame tail
 };
 
-/** The pixel gate's coda checkpoints (t), one per coda scene at a clean hold. */
-const CODA_PINS = [4487, 4567, 4677, 4847, 5102];
+/** The spliced show's exit dispatch: 4446 original frames + the 659-frame coda. */
+const SHOW_END_T = 5105;
+
+/**
+ * The pixel gate's coda checkpoints (t): the seam-in mid-fade (c=9), one per
+ * text page at a clean hold (c=40/120/230), the card mid-hold (c=400) and the
+ * card's last frame before the credits' white flash (c=658, the seam-out).
+ */
+const CODA_PINS = [2901, 2932, 3012, 3122, 3292, 3550];
 
 /** The HD card: the still band at 4x, and where the HD glyph pair lands. */
 const CARD_WIDTH = 2560;
@@ -364,9 +372,11 @@ class ReferencePlayer {
       } else if (op === ops.anim) {
         this.animFrame();
       } else if (op === ops.credits) {
+        // The splice: the coda plays where the original leaves the ILLUSIONS
+        // logo, and the credits' own opening (cut + white pset) ends it.
+        yield* this.coda();
         yield* this.credits();
       } else if (op === ops.exit) {
-        yield* this.coda();
         return;
       } else if (backdropByOp.has(op)) {
         yield* this.showBackdrop(backdropByOp.get(op).fade);
@@ -510,21 +520,6 @@ class ReferencePlayer {
 
   // -- the coda, mirroring src/browser/intro.ts's #coda step for step --------
 
-  codaBlackenTextList() {
-    const h2 = this.h2;
-    let at = this.manifest.backdrop.list;
-    while (at + 4 <= h2.length) {
-      const first = readU16(h2, at);
-      const second = readU16(h2, at + 2);
-      if (first === 0xffff && second === 0xfffe) break;
-      if ((first & 1) === 0) {
-        const register = first & 0x1fe;
-        if (register >= 0x180 && register <= 0x1be) writeU16(h2, at + 2, 0);
-      }
-      at += 4;
-    }
-  }
-
   codaCanvasFrame(values) {
     const { size, planeStride, textSlot } = this.manifest.anim;
     const shown = this.bufA;
@@ -548,11 +543,10 @@ class ReferencePlayer {
   *coda() {
     const glyphs = cutCodaGlyphs(this.manifest, this.h1);
     const c = (frame) => CODA.startT + frame;
-    yield* this.frame(); // c=0, black
-    this.codaBlackenTextList();
+    yield* this.frame(); // c=0: the logo holds; AND NOW stamped hidden (t=1936's own move)
     this.h4.set(glyphs.andNowPlanes, this.bufB);
     this.animAt = glyphs.animAt;
-    yield* this.frame(); // c=1
+    yield* this.frame(); // c=1: cut to the whited text list + 0xFE0 (t=1937's own move)
     yield* this.showBackdrop(CODA.sceneInFade); // burns c=2..17
     yield* this.until(c(CODA.andNowHoldEnd));
     yield* this.fade(CODA.textOutFade); // burns c=52..67
@@ -573,11 +567,9 @@ class ReferencePlayer {
     const still = this.manifest.stills.find((entry) => entry.stream === "still-illusions");
     if (still === undefined) throw new Error("no still-illusions handler");
     yield* this.still(still); // burns c=279..294; card from c=295
-    yield* this.until(c(CODA.cardHoldEnd + 1));
-    this.coplc = this.manifest.credits.list;
-    this.pset(this.manifest.credits.whiteSet);
-    yield* this.fade(this.manifest.credits.blackFade); // burns c=634..649
-    yield* this.wait(CODA.blackTail); // ends at t=5105
+    yield* this.until(c(CODA.cardHoldEnd)); // the card holds to c=658 (t=3550);
+    // the credits handler dispatches next and its own cut + white pset — the
+    // original's leaving of this very logo — is the coda's exit.
   }
 
   // -- the rasteriser --------------------------------------------------------
@@ -848,10 +840,27 @@ function renderCodaPins(assets) {
   const player = new ReferencePlayer(assets);
   const wanted = new Set(CODA_PINS);
   const frames = new Map();
-  let blackAt4446 = false;
+  let logoAt2891 = false;
+  let flashAt3551 = false;
   while (player.step()) {
-    if (player.t === 4446) {
-      blackAt4446 = player.rgb().every((byte) => byte === 0);
+    if (player.t === 2891) {
+      // The last pre-splice frame: the ILLUSIONS logo still up, untouched.
+      logoAt2891 = player.rgb().some((byte) => byte !== 0);
+    }
+    if (player.t === 3551) {
+      // The frame after the coda: the credits' white flash — the 120-row band
+      // (canvas rows 32..151) all white, the borders black, nothing else.
+      const rgb = player.rgb();
+      flashAt3551 = true;
+      for (let row = 0; row < INTRO_ROWS && flashAt3551; row += 1) {
+        const want = row >= 32 && row < 152 ? 0xff : 0x00;
+        for (let at = row * INTRO_WIDTH * 3; at < (row + 1) * INTRO_WIDTH * 3; at += 1) {
+          if (rgb[at] !== want) {
+            flashAt3551 = false;
+            break;
+          }
+        }
+      }
     }
     if (wanted.has(player.t)) {
       const rgb = player.rgb();
@@ -865,11 +874,13 @@ function renderCodaPins(assets) {
       frames.set(player.t, encodePng(doubled, INTRO_WIDTH, INTRO_ROWS * 2, 3));
     }
   }
-  // Fatal self-checks: the show must still end black at t=4446, the coda must
-  // end at exactly t=5105 on black, and every pin must have been reached.
-  if (!blackAt4446) throw new Error("the original show does not end on black at t=4446");
-  if (player.t !== CODA.endT) throw new Error(`the coda ends at t=${player.t}, expected ${CODA.endT}`);
-  if (!player.rgb().every((byte) => byte === 0)) throw new Error("the coda does not end on black");
+  // Fatal self-checks: the logo must still hold at the splice, the credits'
+  // white flash must land the frame after the coda, the spliced show must end
+  // at exactly t=5105 on black, and every pin must have been reached.
+  if (!logoAt2891) throw new Error("the ILLUSIONS logo is not up at t=2891, before the splice");
+  if (!flashAt3551) throw new Error("the credits white flash does not land at t=3551, after the coda");
+  if (player.t !== SHOW_END_T) throw new Error(`the show ends at t=${player.t}, expected ${SHOW_END_T}`);
+  if (!player.rgb().every((byte) => byte === 0)) throw new Error("the show does not end on black");
   for (const pin of CODA_PINS) {
     if (!frames.has(pin)) throw new Error(`pin t=${pin} was never rendered`);
   }
@@ -914,7 +925,7 @@ function main(argv) {
       still: "still-illusions",
       glyphs: "text-anim deltas 1..149 (ENHANCED H at 115,47 and D at 246,47, 17x25 each)",
     },
-    coda: { startT: CODA.startT, endT: CODA.endT, pins: CODA_PINS },
+    coda: { startT: CODA.startT, endT: CODA.endT, showEndT: SHOW_END_T, pins: CODA_PINS },
     provenance: PROVENANCE,
   };
   const json = Buffer.from(JSON.stringify(manifest, null, 2) + "\n", "utf8");

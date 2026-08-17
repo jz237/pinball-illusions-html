@@ -325,34 +325,44 @@ export async function loadIntroAssets(
 // THE CODA — a deliberate 2026 addition, not a decode
 // ---------------------------------------------------------------------------
 //
-// The original show plays byte-identical through its exit dispatch at t=4446
-// (screen black). The coda is appended INSIDE the same generator at that exit
-// branch — every original frame executes identically, and the coda rides the
-// same one-yield-per-PAL-frame engine, fade tables, rasteriser and skip
-// wiring. Storyboard (all timing values measured off the original's own run,
-// see research/INTRO_DECODE.md §9): "AND NOW" (the original page verbatim,
-// revealed by the show's opening fade), "iN tHE yEAR" (the original page,
-// written by the original deltas at the shipped one-glyph-per-frame cadence),
-// "2026 AD" (the 1995 AD dress — rules, AD unit — with the 0 and 6
-// synthesized in-face from the 1992 digits), then the ILLUSIONS still held its
-// own 338 frames while the presenter overlays the pre-baked HD card, then the
-// credits white flash, the show's own ending fade, and 8 black frames. The
-// coda consumes only the already-shipped delta stream and fade tables; the
-// one new asset is the presenter-level HD card PNG.
+// The coda is SPLICED INTO the announcement arc, at the exact point the
+// original leaves the ILLUSIONS logo for the credits (the credits dispatch,
+// t=2891): the logo's own 338-frame hold plays untouched, then the coda's
+// pages (AND NOW / iN tHE yEAR / 2026 AD), then the return to the logo with
+// the presenter's HD card — the same logo/pages/logo echo as the original's
+// own DREAMS -> FANTASIES -> ILLUSIONS repetition — and then the credits play
+// verbatim, every original frame byte-identical with its clock shifted +659.
+// Storyboard (all timing values measured off the original's own run, see
+// research/INTRO_DECODE.md §9): "AND NOW" (the original page verbatim,
+// revealed by the very still->page grammar that revealed it in 1995: the
+// text list left all-white by the pre-still whiteout, faded down by 0xFE0),
+// "iN tHE yEAR" (the original page, written by the original deltas at the
+// shipped one-glyph-per-frame cadence), "2026 AD" (the 1995 AD dress —
+// rules, AD unit — with the 0 and 6 synthesized in-face from the 1992
+// digits), then the ILLUSIONS still held while the presenter overlays the
+// pre-baked HD card, ending exactly where the original's credits transition
+// takes over: the white pset + COP1LC cut is the credits handler's own first
+// act, one-for-one the original's leaving of this very logo. The coda
+// consumes only the already-shipped delta stream and fade tables; the one
+// new asset is the presenter-level HD card PNG.
 //
 // c = t - CODA.startT is the coda frame index; dispatch at c, visible c+1,
 // blocking fades burn their 16 frames internally — the original's discipline.
 
 const CODA = {
-  /** t of the first coda frame; the show's exit dispatch is t=4446. */
-  startT: 4447,
-  /** t of the last coda frame; the generator returns after yielding it. */
-  endT: 5105,
+  /**
+   * t of the first coda frame. The credits entry dispatches at t=2891; the
+   * coda runs in its place and the credits follow at t=3550 — the original's
+   * own transition shifted by exactly the coda's 659 frames.
+   */
+  startT: 2892,
+  /** t of the last coda frame; the credits handler dispatches right after. */
+  endT: 3550,
   /** The text canvas: 320x120, two planes. */
   canvasWidth: 320,
   canvasHeight: 120,
   /** Fade tables (h0 offsets; all twelve ship in the manifest). */
-  sceneInFade: 0x0f9c, // scene in from black, colour 0 held black (show opening)
+  sceneInFade: 0x0fe0, // the still->page return (0x4D6's table, the very fade that revealed AND NOW at t=1937)
   textOutFade: 0x1108, // letters dissolve into the clouds
   textSetFade: 0x1134, // the instant SET that pops the hidden 'i' white
   /** Delta indices, 1-based over the 176 shipped OP_ANIM steps. */
@@ -384,8 +394,14 @@ const CODA = {
   ruleSweepFrames: 3, // rules sweep in across the first 3 morph frames
   digitGrowFrames: 9, // then the digits expand vertically over 9
   cardCut: 278, // the whiteout+cut still handler dispatches at c=278
-  cardHoldEnd: 632, // the card holds 338 frames, c=295..632 (the show's longest)
-  blackTail: 9, // pass-16 black plus the show's own 8 black frames
+  /**
+   * The card holds c=295..658, 364 frames — the original's own 338-frame hold
+   * of this very logo plus the 26 frames of the retired append-tail (white
+   * pset + 16-pass black fade + 8 black frames), absorbed here so everything
+   * after the splice shifts by exactly the coda's 659 frames. Still the
+   * show's longest hold; the credits' white flash ends it, as it always did.
+   */
+  cardHoldEnd: 658,
 } as const;
 
 /** A cut or synthesized glyph: 2-bit palette values (0..3), row-major. */
@@ -642,11 +658,15 @@ export class IntroCore {
       } else if (op === ops.anim) {
         this.#animFrame();
       } else if (op === ops.credits) {
+        // THE SEAM: the credits dispatch is the original's leaving of the
+        // ILLUSIONS logo (COP1LC cut + white pset, first thing the handler
+        // does). The coda splices in exactly here — logo, coda pages, logo
+        // with the HD card — and then hands the credits that same transition
+        // 659 frames later, every original frame byte-identical after it.
+        yield* this.#coda();
         yield* this.#credits();
       } else if (op === ops.exit) {
-        // THE SEAM: the show has ended, screen black, every original frame
-        // already played byte-identical. The coda rides the same generator.
-        yield* this.#coda();
+        // The show has ended, screen black (now at t=5105).
         return;
       } else if (backdropByOp.has(op)) {
         yield* this.#showBackdrop(backdropByOp.get(op)?.fade ?? 0);
@@ -913,28 +933,6 @@ export class IntroCore {
     };
   }
 
-  /**
-   * Zeroes every palette MOVE in the text scene's copper list, so the scene
-   * cut in at c=1 is black and the show's own opening fade (0xF9C, colour 0
-   * held black) raises it — the coda emerges from the credits' black rather
-   * than a whiteout, and this is the show's from-black grammar.
-   */
-  #codaBlackenTextList(): void {
-    const h2 = this.#h2;
-    let at = this.#manifest.backdrop.list;
-    while (at + 4 <= h2.length) {
-      const first = readU16(h2, at);
-      const second = readU16(h2, at + 2);
-      if (first === 0xffff && second === 0xfffe) break;
-      if ((first & 1) === 0) {
-        const register = first & 0x1fe;
-        if (register >= 0x180 && register <= 0x1be) writeU16(h2, at + 2, 0);
-      }
-      at += 4;
-    }
-    this.#dirty = true;
-  }
-
   /** One authored canvas as a text-anim frame: swap, pack, poke — the delta discipline. */
   #codaCanvasFrame(values: Uint8Array): void {
     const { size, planeStride, textSlot } = this.#manifest.anim;
@@ -968,16 +966,18 @@ export class IntroCore {
   *#coda(): Generator<void, void, void> {
     const glyphs = this.#codaGlyphs();
     const c = (frame: number): number => CODA.startT + frame;
-    // c=0: screen black (the credits list's palette ended all-zero). The
-    // dispatch re-arms the purple-clouds text scene: black palette, the AND
-    // NOW page pre-drawn whole into the text buffer (the original stamped it
-    // whole too), the stream pointer parked at delta 151.
+    // c=0: the ILLUSIONS logo still holds; the AND NOW page is pre-drawn
+    // whole into the hidden text buffer and the stream pointer parked at
+    // delta 151 — the mirror of the original's own anim dispatch at t=1936,
+    // which stamped this very page (delta 150) while the FANTASIES card held.
     yield* this.#frame();
-    this.#codaBlackenTextList();
     this.#h4.set(glyphs.andNowPlanes, this.#bufB);
     this.#animAt = glyphs.animAt;
-    // c=1: the scene cut + 16-pass fade-in from black, the show's opening
-    // grammar; AND NOW is revealed whole, as the original page was.
+    // c=1: the still->page return, the original's own t=1937 dispatch: cut to
+    // the text list — all-white since the pre-ILLUSIONS whiteout (0x1074),
+    // exactly the state the 1995 run left it in — and the 16-pass 0xFE0 fade
+    // sinks it onto the page. AND NOW is revealed whole, out of white, frame
+    // for frame the grammar that revealed it the first time.
     yield* this.#frame();
     yield* this.#showBackdrop(CODA.sceneInFade); // burns c=2..17
     yield* this.#until(c(CODA.andNowHoldEnd)); // AND NOW holds, 35 frames
@@ -1007,16 +1007,12 @@ export class IntroCore {
     if (still === undefined) throw new Error("the coda needs the still-illusions handler");
     yield* this.#still(still); // burns c=279..294; card from c=295
     this.#codaCard = true;
-    yield* this.#until(c(CODA.cardHoldEnd + 1)); // the card holds 338 frames
-    // c=633: how the original leaves this very logo — cut to the credits list
-    // and set every bank white in one frame — then the show's own ending fade
-    // and its 8 black frames. The HAM8 still is never palette-faded (HAM
-    // modify pixels would not follow); the flash-then-fade is solid-shade.
-    this.#coplc = this.#manifest.credits.list;
-    this.#pset(this.#manifest.credits.whiteSet);
+    yield* this.#until(c(CODA.cardHoldEnd)); // the card holds 364 frames
+    // c=658 was the last coda frame. The credits entry dispatches next, and
+    // its own first act — cut to the credits list, every bank white in one
+    // frame — IS how the original leaves this very logo: the coda's exit and
+    // the original's t=2891 transition are the same event, played once.
     this.#codaCard = false;
-    yield* this.#fade(this.#manifest.credits.blackFade); // burns c=634..649
-    yield* this.#wait(CODA.blackTail); // 8 black frames; ends at t=5105
   }
 
   // -- the rasteriser -------------------------------------------------------

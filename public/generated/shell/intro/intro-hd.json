@@ -23,14 +23,16 @@
     "glyphs": "text-anim deltas 1..149 (ENHANCED H at 115,47 and D at 246,47, 17x25 each)"
   },
   "coda": {
-    "startT": 4447,
-    "endT": 5105,
+    "startT": 2892,
+    "endT": 3550,
+    "showEndT": 5105,
     "pins": [
-      4487,
-      4567,
-      4677,
-      4847,
-      5102
+      2901,
+      2932,
+      3012,
+      3122,
+      3292,
+      3550
     ]
   },
   "provenance": {
